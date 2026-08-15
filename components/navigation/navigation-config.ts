@@ -1,18 +1,9 @@
-import {
-  Bell,
-  ClipboardCheck,
-  Headphones,
-  LayoutDashboard,
-  ListChecks,
-  UsersRound,
-  Settings,
-  UserRound,
-} from "lucide-react";
+import type { IconName } from "@/lib/iconography";
 
 export type NavigationItem = {
   title: string;
   href: string;
-  icon: typeof LayoutDashboard;
+  icon: IconName;
 };
 
 export type NavigationGroup = {
@@ -23,23 +14,23 @@ export type NavigationGroup = {
 export const navigationGroups: NavigationGroup[] = [
   {
     label: "Overview",
-    items: [{ title: "Dashboard", href: "/dashboard", icon: LayoutDashboard }],
+    items: [{ title: "Dashboard", href: "/dashboard", icon: "dashboard" }],
   },
   {
     label: "My work",
     items: [
-      { title: "My Clients", href: "/dashboard/myClients", icon: UsersRound },
-      { title: "My Tasks", href: "/dashboard/myTasks", icon: ListChecks },
-      { title: "My Activity", href: "/dashboard/myActivity", icon: ClipboardCheck },
+      { title: "My Clients", href: "/dashboard/myClients", icon: "clients" },
+      { title: "My Tasks", href: "/dashboard/myTasks", icon: "tasks" },
+      { title: "My Activity", href: "/dashboard/myActivity", icon: "employeeActivity" },
     ],
   },
   {
     label: "Account",
     items: [
-      { title: "Notifications", href: "/dashboard/notifications", icon: Bell },
-      { title: "Support", href: "/dashboard/support", icon: Headphones },
-      { title: "Profile", href: "/dashboard/profile", icon: UserRound },
-      { title: "Settings", href: "/dashboard/settings", icon: Settings },
+      { title: "Notifications", href: "/dashboard/notifications", icon: "notifications" },
+      { title: "Support", href: "/dashboard/support", icon: "support" },
+      { title: "Profile", href: "/dashboard/profile", icon: "user" },
+      { title: "Settings", href: "/dashboard/settings", icon: "settings" },
     ],
   },
 ];
