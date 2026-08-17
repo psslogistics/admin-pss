@@ -2,12 +2,13 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Bell, ChevronRight, Menu, Moon, PanelLeftIcon, Search, Sun, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { PssIcon } from "@/components/ui/icon";
 import { employee } from "@/lib/employee-data";
 import { allNavigationItems, navigationGroups } from "@/components/navigation/navigation-config";
+import { searchEmployeeMaster } from "@/lib/employee-search";
 
 function Brand({ compact = false }: { compact?: boolean }) {
   return (
@@ -28,11 +29,13 @@ export default function EmployeeShell({ children }: { children: React.ReactNode 
   const [collapsed, setCollapsed] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
   const [theme, setTheme] = useState<"light" | "dark">("light");
   const [themeReady, setThemeReady] = useState(false);
   const profileRef = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const currentRoute = allNavigationItems.find((item) => item.href === pathname)?.title ?? "Dashboard";
+  const searchResults = useMemo(() => searchEmployeeMaster(searchQuery), [searchQuery]);
 
   useEffect(() => {
     const saved = localStorage.getItem("pss-theme");
@@ -94,7 +97,7 @@ export default function EmployeeShell({ children }: { children: React.ReactNode 
         <header className="sticky top-0 z-20 flex h-14 items-center gap-3 border-b border-border/70 bg-background/90 px-4 backdrop-blur-xl"><button aria-label="Open navigation" className="rounded-lg p-2 hover:bg-muted md:hidden" onClick={() => setSidebarOpen(true)}><Menu className="size-5" /></button><button aria-label="Toggle sidebar" className="hidden rounded-lg p-2 text-muted-foreground hover:bg-muted md:block" onClick={() => setCollapsed((value) => !value)}><PanelLeftIcon className="size-4" /></button><span className="shrink-0 text-sm font-semibold">{currentRoute}</span><button onClick={() => setSearchOpen(true)} className="ml-auto flex h-8 min-w-0 flex-1 items-center gap-2 rounded-lg border border-border/60 bg-muted/40 px-3 text-sm text-muted-foreground hover:bg-muted/60 sm:ml-8"><Search className="size-4 shrink-0 opacity-60" /><span className="truncate text-left">Search tasks, clients, shipments...</span><kbd className="ml-auto hidden shrink-0 text-[10px] sm:inline">⌘ K</kbd></button><Link href="/dashboard/notifications" aria-label="Notifications" className="relative grid size-8 place-items-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground"><Bell className="size-[18px]" /><span className="absolute -right-1 -top-1 size-1.5 rounded-full border-2 border-background bg-destructive" /></Link><button aria-label={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"} disabled={!themeReady} onClick={toggleTheme} className="grid size-8 place-items-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground disabled:pointer-events-none">{!themeReady ? <span className="block size-4" /> : theme === "dark" ? <Sun className="size-4" /> : <Moon className="size-4" />}</button><div className="relative" ref={profileRef}><button onClick={() => setProfileOpen((value) => !value)} aria-label="Open employee menu"><EmployeeAvatar small /></button>{profileOpen && <div className="absolute right-0 top-11 z-50 w-56 animate-in fade-in zoom-in-95 duration-150 rounded-xl border border-border bg-popover p-1.5 shadow-lg motion-reduce:animate-none"><div className="border-b border-border/60 px-3 py-2"><p className="text-sm font-medium">{employee.name}</p><p className="text-xs text-muted-foreground">{employee.email}</p></div><Link href="/dashboard/profile" onClick={() => setProfileOpen(false)} className="mt-1 block rounded-lg px-3 py-2 text-sm hover:bg-accent">Profile</Link><Link href="/dashboard/settings" onClick={() => setProfileOpen(false)} className="block rounded-lg px-3 py-2 text-sm hover:bg-accent">Settings</Link></div>}</div></header>
         <main className="mx-auto w-full max-w-[1500px] p-4">{children}</main>
       </div>
-      {searchOpen && <div className="fixed inset-0 z-50 flex animate-in fade-in duration-150 items-start justify-center pt-[20vh] motion-reduce:animate-none" onClick={() => setSearchOpen(false)}><div className="absolute inset-0 bg-background/60 backdrop-blur-sm" /><div className="relative mx-4 w-full max-w-lg animate-in fade-in zoom-in-95 duration-150 overflow-hidden rounded-xl border border-border bg-popover shadow-2xl motion-reduce:animate-none" onClick={(event) => event.stopPropagation()}><div className="flex h-12 items-center gap-3 border-b border-border/60 px-4"><Search className="size-[18px] text-muted-foreground" /><input ref={searchRef} placeholder="Search tasks, clients, shipments..." className="flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground/60" /><kbd className="text-[10px] text-muted-foreground">ESC</kbd></div><div className="p-3 text-center text-xs text-muted-foreground">Start typing to search across your workspace.</div></div></div>}
+      {searchOpen && <div className="fixed inset-0 z-50 flex animate-in fade-in duration-150 items-start justify-center pt-[20vh] motion-reduce:animate-none" onClick={() => setSearchOpen(false)}><div className="absolute inset-0 bg-background/60 backdrop-blur-sm" /><div className="relative mx-4 w-full max-w-lg animate-in fade-in zoom-in-95 duration-150 overflow-hidden rounded-xl border border-border bg-popover shadow-2xl motion-reduce:animate-none" onClick={(event) => event.stopPropagation()}><div className="flex h-12 items-center gap-3 border-b border-border/60 px-4"><Search className="size-[18px] text-muted-foreground" /><input ref={searchRef} value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Search tasks, clients, shipments..." className="flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground/60" /><kbd className="text-[10px] text-muted-foreground">ESC</kbd></div><div className="max-h-80 overflow-y-auto p-2">{!searchQuery.trim() ? <p className="p-4 text-center text-xs text-muted-foreground">Search your assigned clients, tasks, activity, notifications, and pages.</p> : searchResults.length ? searchResults.map((result) => <Link key={result.id} href={result.href} onClick={() => { setSearchOpen(false); setSearchQuery(""); }} className="flex items-start gap-3 rounded-lg px-3 py-2.5 transition-colors hover:bg-accent"><Search className="mt-0.5 size-4 shrink-0 text-primary" /><span className="min-w-0"><span className="flex items-center gap-2 text-xs font-semibold"><span className="truncate">{result.title}</span><span className="rounded-full bg-muted px-1.5 py-0.5 text-[9px] font-medium text-muted-foreground">{result.type}</span></span><span className="mt-0.5 block truncate text-[10px] text-muted-foreground">{result.detail}</span></span></Link>) : <p className="p-4 text-center text-xs text-muted-foreground">No matching workspace records or pages.</p>}</div></div></div>}
     </div>
   );
 }
