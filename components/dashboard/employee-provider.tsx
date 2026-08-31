@@ -12,6 +12,7 @@ type EmployeeContextValue = EmployeeState & { profile: DemoEmployee; hydrated: b
 const STORAGE_KEY = "pss_employee_frontend_demo_v2";
 const defaultState = (): EmployeeState => ({ employeeId: "rahul", tasks: initialTasks, tickets: initialTickets, notifications: initialNotifications, activity: initialActivity, settings: initialSettings, shipments: initialShipments, profileOverrides: {} });
 const EmployeeContext = createContext<EmployeeContextValue | null>(null);
+let liveSlaNow: number | undefined;
 
 export function EmployeeProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<EmployeeState>(defaultState);
@@ -25,6 +26,7 @@ export function EmployeeProvider({ children }: { children: React.ReactNode }) {
         const saved = localStorage.getItem(STORAGE_KEY);
         if (saved) { const parsed = JSON.parse(saved) as Partial<EmployeeState>; setState({ ...defaultState(), ...parsed, profileOverrides: parsed.profileOverrides ?? {} }); }
       } catch { /* local demo state can safely fall back to seed data */ }
+      liveSlaNow = Date.now();
       setHydrated(true);
     }, 0);
     return () => window.clearTimeout(timer);
@@ -50,5 +52,5 @@ export function EmployeeProvider({ children }: { children: React.ReactNode }) {
 }
 
 export function useEmployee() { const value = useContext(EmployeeContext); if (!value) throw new Error("useEmployee must be used inside EmployeeProvider"); return value; }
-export function formatSla(ticket: DemoTicket, now = Date.now()) { const age = now - new Date(ticket.createdAt).getTime(); const remaining = Math.max(0, 24 * 60 * 60 * 1000 - age); const hours = Math.floor(remaining / 3600000); const minutes = Math.floor((remaining % 3600000) / 60000); const state = getSlaState(ticket, now); return { state, label: state === "Escalated" ? "Escalated to Super Admin" : `${hours}h ${minutes}m remaining` }; }
+export function formatSla(ticket: DemoTicket, now = liveSlaNow ?? new Date(ticket.createdAt).getTime()) { const age = now - new Date(ticket.createdAt).getTime(); const remaining = Math.max(0, 24 * 60 * 60 * 1000 - age); const hours = Math.floor(remaining / 3600000); const minutes = Math.floor((remaining % 3600000) / 60000); const state = getSlaState(ticket, now); return { state, label: state === "Escalated" ? "Escalated to Super Admin" : `${hours}h ${minutes}m remaining` }; }
 export type { AssignedClient, DemoEmployee, DemoNotification, DemoShipment, DemoTicket, EmployeeActivity, EmployeeSettings, EmployeeTask, PermissionKey, TaskPriority, TaskStatus, TicketStatus };
