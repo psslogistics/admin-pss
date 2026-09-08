@@ -1,4 +1,4 @@
-import { Activity, ArrowUpRight, Boxes, LockKeyhole, Route, ShieldCheck } from "lucide-react";
+import { ArrowUpRight, LockKeyhole, Route, ShieldCheck } from "lucide-react";
 import type { ReactNode } from "react";
 
 type AuthShellProps = {
@@ -26,9 +26,6 @@ export default function AuthShell({ eyebrow, title, description, children }: Aut
               <h2 className="text-5xl font-semibold leading-[1.04] tracking-[-0.055em] xl:text-6xl">Every shipment.<br /><span className="text-[#7dd3fc]">One clear view.</span></h2>
               <p className="mt-7 max-w-md text-[15px] leading-7 text-white/65">Coordinate bookings, track movement, and keep every customer promise visible from pickup to delivery.</p>
             </div>
-          </div>
-          <div className="relative grid max-w-xl grid-cols-3 gap-3">
-            {[{ icon: Activity, label: "Network health", value: "99.8%", tone: "text-emerald-300" }, { icon: Boxes, label: "Shipments today", value: "12,480", tone: "text-[#7dd3fc]" }, { icon: ShieldCheck, label: "Protected access", value: "24/7", tone: "text-violet-300" }].map(({ icon: Icon, label, value, tone }) => <div key={label} className="rounded-2xl border border-white/10 bg-white/[0.07] p-4 backdrop-blur-sm"><Icon className={`size-4 ${tone}`} /><p className="mt-5 text-lg font-semibold tracking-tight">{value}</p><p className="mt-1 text-[10px] uppercase tracking-wider text-white/45">{label}</p></div>)}
           </div>
         </section>
         <section className="flex min-w-0 flex-col justify-center px-5 py-8 sm:px-10 lg:px-12 xl:px-20">

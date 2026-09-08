@@ -31,7 +31,7 @@ const STATUS_META: Record<number, StatusMeta> = {
   505: { title: "HTTP version unsupported", description: "The requested HTTP protocol version is not supported.", category: "PROTOCOL FAILURE" },
 };
 
-const HOME_URL = "https://admin.psslogisitics.in";
+const HOME_URL = "https://admin.psslogistics.in";
 
 export function ErrorScreen({ statusCode, title, description, requestId, retry, homeUrl = HOME_URL }: ErrorScreenProps) {
   const router = useRouter();

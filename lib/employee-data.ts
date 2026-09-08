@@ -1,14 +1,14 @@
 export type PermissionKey =
   | "dashboard.view" | "clients.view" | "booking.view" | "tracking.view" | "pickup.view" | "reports.view"
   | "tasks.view" | "tasks.manage" | "activity.view" | "notifications.view" | "support.view" | "tickets.manage"
-  | "profile.view" | "settings.view";
+  | "profile.view" | "settings.view" | "rate_cards.manage";
 
 export type TaskStatus = "In progress" | "Pending" | "Completed";
 export type TaskPriority = "High" | "Medium" | "Low";
 export type TicketStatus = "Open" | "In progress" | "Waiting" | "Resolved" | "Closed";
 export type TicketSlaState = "Healthy" | "Due soon" | "Escalated";
 
-export type DemoEmployee = { id: string; name: string; initials: string; role: string; email: string; employeeId: string; workspace: string; assignedClientIds: string[]; permissions: PermissionKey[]; panelRole: "admin" };
+export type DemoEmployee = { id: string; name: string; initials: string; role: string; email: string; phone?: string; companyName?: string; employeeId: string; workspace: string; assignedClientIds: string[]; permissions: PermissionKey[]; panelRole: "admin" };
 export type EmployeeTask = { id: string; title: string; context: string; due: string; dueAt?: string; status: TaskStatus; priority: TaskPriority; clientId?: string };
 export type EmployeeActivity = { id: string; title: string; detail: string; time: string; tone: "blue" | "green" | "amber" | "slate" };
 export type DemoNotification = { id: string; title: string; detail: string; tone: "warning" | "info" | "success"; read: boolean; href?: string };
@@ -23,6 +23,7 @@ export const permissions: { key: PermissionKey; label: string }[] = [
   { key: "tasks.view", label: "Tasks" }, { key: "tasks.manage", label: "Manage tasks" }, { key: "activity.view", label: "Activity" },
   { key: "notifications.view", label: "Notifications" }, { key: "support.view", label: "Support" }, { key: "tickets.manage", label: "Manage tickets" },
   { key: "profile.view", label: "Profile" }, { key: "settings.view", label: "Settings" },
+  { key: "rate_cards.manage", label: "Manage rate cards" },
 ];
 
 const baseline: PermissionKey[] = ["dashboard.view", "tasks.view", "activity.view", "notifications.view", "profile.view", "settings.view"];
