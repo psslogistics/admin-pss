@@ -1,0 +1,32 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "pss-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-17",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "psslogisticsdatabase",
+      "database_id": "798a571d-5e56-45a0-85f8-8d71bad284e9"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "FILES",
+      "bucket_name": "pss-private-files"
+    }
+  ],
+  "vars": {
+    "ENVIRONMENT": "production",
+    "ALLOWED_ORIGINS": "https://psslogistics.in,https://www.psslogistics.in,https://client.psslogistics.in,https://admin.psslogistics.in,https://master.psslogistics.in",
+    "SUPABASE_URL": "https://qyelfkmafzspctqkrwxf.supabase.co",
+    "DELHIVERY_API_BASE_URL": "https://track.delhivery.com/api/v1",
+    "EKART_API_BASE_URL": "https://api.ekartlogistics.com",
+    "ENABLE_PROVIDER_CALLS": "false"
+  }
+}

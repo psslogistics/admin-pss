@@ -1,2 +1,3 @@
 import WorkspacePage from "@/components/dashboard/workspace-page";
-export default function MyTasksPage() { return <WorkspacePage kind="tasks" />; }
+import { requireEmployeePermission } from "@/lib/auth/server";
+export default async function MyTasksPage() { await requireEmployeePermission("admin.tasks.view"); return <WorkspacePage kind="tasks" />; }

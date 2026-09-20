@@ -1,2 +1,3 @@
 import OperationsWorkspace from "@/components/dashboard/operations-workspace";
-export default function ReportsPage() { return <OperationsWorkspace mode="reports" />; }
+import { requireEmployeePermission } from "@/lib/auth/server";
+export default async function ReportsPage() { await requireEmployeePermission("admin.reports.view"); return <OperationsWorkspace mode="reports" />; }

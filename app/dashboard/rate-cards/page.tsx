@@ -1,4 +1,5 @@
 "use client";
+/* eslint-disable react-hooks/set-state-in-effect */
 import { useEffect, useState } from "react";
 import { Download, Upload } from "lucide-react";
 import { useEmployee } from "@/components/dashboard/employee-provider";

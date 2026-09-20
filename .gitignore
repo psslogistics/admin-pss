@@ -39,3 +39,9 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# local production verification artifacts
+/output/
+/worker/.wrangler/
+/worker/backups/
+/tools/

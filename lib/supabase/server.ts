@@ -1,8 +1,11 @@
 import { createServerClient } from '@supabase/ssr'
-import { cookies } from 'next/headers'
+import { cookies, headers } from 'next/headers'
+import { authCookieDomain } from '@/lib/auth/workspace-routing'
 
 export async function createClient() {
   const cookieStore = await cookies()
+  const requestHeaders = await headers()
+  const domain = authCookieDomain(requestHeaders.get('host') ?? '')
 
   return createServerClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -22,6 +25,7 @@ export async function createClient() {
           }
         },
       },
+      cookieOptions: { ...(domain ? { domain } : {}), sameSite: 'lax', secure: process.env.NODE_ENV === 'production' },
     },
   )
 }

@@ -22,3 +22,12 @@ export async function requireEmployeeAccess() {
   if (data.must_change_password === true) redirect('/reset-password?required=1');
   return { userId, profile: data, roles };
 }
+
+export async function requireEmployeePermission(permission: string) {
+  const actor = await requireEmployeeAccess();
+  const supabase = await createClient();
+  const { data, error } = await supabase.rpc('has_permission', { required_permission: permission });
+  if (error) redirect('/access-denied?reason=database');
+  if (!data) redirect('/access-denied?reason=permission');
+  return actor;
+}
