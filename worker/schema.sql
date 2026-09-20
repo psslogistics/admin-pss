@@ -200,6 +200,8 @@ CREATE TABLE IF NOT EXISTS integration_requests (
 
 CREATE INDEX IF NOT EXISTS idx_shipments_client_created ON shipments(client_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_shipments_provider_reference ON shipments(provider, provider_reference);
+CREATE INDEX IF NOT EXISTS idx_shipments_tracking_number ON shipments(tracking_number);
+CREATE INDEX IF NOT EXISTS idx_shipments_provider_reference_lookup ON shipments(provider_reference);
 CREATE INDEX IF NOT EXISTS idx_shipment_events_shipment_time ON shipment_events(shipment_id, occurred_at);
 CREATE INDEX IF NOT EXISTS idx_shipment_events_client_time ON shipment_events(client_id, occurred_at);
 CREATE INDEX IF NOT EXISTS idx_pickups_client_date ON pickups(client_id, scheduled_date);
