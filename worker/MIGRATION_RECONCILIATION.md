@@ -18,6 +18,7 @@ Evidence collected on 2026-09-19 from the remote `psslogisticsdatabase` database
 | `20260918_tracking_events.sql` | `tracking_events` exists with the normalized Worker event columns | Not recorded in `d1_migrations` |
 | `20260919_departments.sql` | `departments` exists with status, manager, capacity, and audit ownership columns | Applied directly with `wrangler d1 execute --remote`; intentionally not replayed through the drifted ledger |
 | `20260919_provider_accounts.sql` | `provider_accounts` exists with provider, client binding, secret-name, capability, and status columns | Applied directly with `wrangler d1 execute --remote`; intentionally not replayed through the drifted ledger |
+| `20260920_tracking_lookup_indexes.sql` | Dedicated indexes for `shipments.tracking_number` and `shipments.provider_reference` | Pending deployment; apply directly against the verified production schema rather than replaying the drifted migration ledger |
 
 The remote ledger currently contains only `20260917_production_contract.sql` and `20260918_address_kinds.sql`. The unrecorded files include non-idempotent `ALTER TABLE` or table-rebuild statements; they must not be replayed against production merely to populate history. Any future reconciliation must use a verified backup, a controlled migration/rollback exercise, and explicit change approval.
 
