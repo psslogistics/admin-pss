@@ -62,7 +62,7 @@ async function loadUserAuth(env: Env, token: string): Promise<Auth | null> {
   const roles = roleIds.length ? await supabaseGet<Role>(env, `roles?id=in.(${roleIds.join(",")})&select=role_code,scope`, token) : [];
   const rolePermissions = roleIds.length ? await supabaseGet<{ permission_key: string }>(env, `role_permissions?role_id=in.(${roleIds.join(",")})&select=permission_key`, token) : [];
   const permissionOverrides = await supabaseGet<{ permission_key: string; mode: "grant" | "revoke" }>(env, `employee_permission_overrides?employee_user_id=eq.${encodeURIComponent(user.id)}&select=permission_key,mode`, token);
-  const assignments = await supabaseGet<{ client_id: string }>(env, `employee_client_assignments?employee_user_id=eq.${user.id}&select=client_id`, token);
+  const assignments = await supabaseGet<{ client_id: string }>(env, `employee_client_assignments?employee_user_id=eq.${user.id}&is_active=eq.true&select=client_id`, token);
   const memberships = await supabaseGet<{ client_id: string; membership_status?: string }>(env, `client_memberships?user_id=eq.${user.id}&select=client_id,membership_status`, token);
   const requestedClientIds = [...new Set([...assignments, ...memberships.filter((row) => !row.membership_status || row.membership_status === "active")].map((row) => row.client_id).filter(Boolean))];
   const activeClients = requestedClientIds.length
@@ -163,7 +163,15 @@ function normalizeProviderShipmentStatus(value: unknown) {
 }
 function hasRole(auth: Auth, roles: string[]) { return auth.system || roles.some((role) => auth.roles.has(role)); }
 function canAccessClient(auth: Auth, clientId: string) { return auth.system || auth.clientIds.has(clientId); }
-function requireClient(auth: Auth, requested: unknown) { if (typeof requested === "string" && requested) return requested; if (auth.clientId) return auth.clientId; if (auth.clientIds.size === 1) return [...auth.clientIds][0]; return null; }
+function requireClient(auth: Auth, requested: unknown) {
+  const requestedId = typeof requested === "string" ? requested.trim() : "";
+  if (auth.kind === "api") return auth.clientId ?? null;
+  if (auth.system) return requestedId || (auth.clientIds.size === 1 ? [...auth.clientIds][0] : null);
+  if (requestedId && auth.clientIds.has(requestedId)) return requestedId;
+  if (auth.clientId) return auth.clientId;
+  if (auth.clientIds.size === 1) return [...auth.clientIds][0];
+  return null;
+}
 async function shipmentBelongsToClient(env: Env, shipmentId: unknown, clientId: string) {
   if (typeof shipmentId !== "string" || !shipmentId.trim()) return false;
   const shipment = await env.DB.prepare("SELECT id FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(shipmentId.trim(), clientId).first<{ id: string }>();
