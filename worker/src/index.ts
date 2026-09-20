@@ -1215,7 +1215,7 @@ const worker = {
           const payload = await bodyJson(request); const requestHash = await payloadFingerprint(payload); const kind = String(payload.kind ?? "").trim(); const title = String(payload.title ?? "").trim();
           if (!kind || kind.length > 160 || !title || title.length > 240) return error("VALIDATION_ERROR", "Record kind and title are required", 400, id, headers);
           const clientId = typeof payload.client_id === "string" ? payload.client_id : null;
-          if (clientId && !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
+          if ((!auth.system && !clientId) || (clientId && !canAccessClient(auth, clientId))) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
           const idempotencyKey = request.headers.get("Idempotency-Key");
           if (!idempotencyKey) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
           const idempotencyClient = clientId ?? auth.clientId ?? (auth.clientIds.size === 1 ? [...auth.clientIds][0] : "system");
@@ -1231,7 +1231,7 @@ const worker = {
         }
         if (masterRecordRoute[1] && request.method === "PATCH") {
           const current = await env.DB.prepare("SELECT id, client_id, kind FROM master_records WHERE id = ? LIMIT 1").bind(masterRecordRoute[1]).first<{ id: string; client_id: string | null; kind: string }>();
-          if (!current || (current.client_id && !canAccessClient(auth, current.client_id))) return error("NOT_FOUND", "Master record not found", 404, id, headers);
+          if (!current || (!auth.system && (!current.client_id || !canAccessClient(auth, current.client_id)))) return error("NOT_FOUND", "Master record not found", 404, id, headers);
           const payload = await bodyJson(request); const requestHash = await payloadFingerprint(payload); const allowed = ["title", "detail", "status", "meta"] as const; const field = allowed.find((name) => typeof payload[name] === "string");
           if (!field) return error("VALIDATION_ERROR", "A supported record update is required", 400, id, headers);
           const idempotencyKey = request.headers.get("Idempotency-Key"); if (!idempotencyKey) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
