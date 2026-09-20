@@ -1129,14 +1129,17 @@ const worker = {
         const action = typeof payload.action === "string" ? payload.action.trim() : "";
         const entityType = typeof payload.entity_type === "string" ? payload.entity_type.trim() : "";
         const entityId = payload.entity_id === undefined || payload.entity_id === null ? null : String(payload.entity_id).trim();
-        const clientId = payload.client_id === undefined || payload.client_id === null ? auth.clientId ?? null : String(payload.client_id).trim();
+        let clientId = payload.client_id === undefined || payload.client_id === null ? auth.clientId ?? null : String(payload.client_id).trim();
         const shipmentId = payload.shipment_id === undefined || payload.shipment_id === null ? null : String(payload.shipment_id).trim();
         if (!action || action.length > 240 || !entityType || entityType.length > 120) return error("VALIDATION_ERROR", "Activity action and entity type are required", 400, id, headers);
         if (clientId && !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
         if (shipmentId) {
           const shipment = await env.DB.prepare("SELECT client_id FROM shipments WHERE id = ? LIMIT 1").bind(shipmentId).first<{ client_id: string }>();
           if (!shipment || !canAccessClient(auth, shipment.client_id) || (clientId && shipment.client_id !== clientId)) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
+          clientId = shipment.client_id;
         }
+        const employeeScopedActivity = entityType === "employee_workspace" && !clientId && !shipmentId;
+        if (!auth.system && !clientId && !employeeScopedActivity) return error("FORBIDDEN", "Client scope is required for operational activity", 403, id, headers);
         const key = request.headers.get("Idempotency-Key"); if (!key) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
         const scopeKey = clientId ?? auth.userId ?? "system"; const endpoint = "POST /v1/activity"; const existing = await idempotentResponse(env, key, scopeKey, endpoint, requestHash);
         if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
