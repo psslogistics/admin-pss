@@ -30,7 +30,7 @@ function allowedOrigins(env: Env) { return new Set((env.ALLOWED_ORIGINS ?? "").s
 function originAllowed(request: Request, env: Env) { const origin = request.headers.get("Origin"); return !origin || allowedOrigins(env).has(origin); }
 function corsHeaders(request: Request, env: Env): HeadersInit {
   const origin = request.headers.get("Origin");
-  const headers: Record<string, string> = { "access-control-allow-headers": "Authorization, Content-Type, Idempotency-Key, X-Webhook-Signature", "access-control-allow-methods": "GET, POST, PATCH, PUT, DELETE, OPTIONS", "access-control-max-age": "86400", vary: "Origin" };
+  const headers: Record<string, string> = { "access-control-allow-headers": "Authorization, Content-Type, Idempotency-Key, X-Webhook-Signature", "access-control-allow-methods": "GET, POST, PATCH, PUT, DELETE, OPTIONS", "access-control-max-age": "86400", "x-content-type-options": "nosniff", "x-frame-options": "DENY", "referrer-policy": "no-referrer", vary: "Origin" };
   if (origin && allowedOrigins(env).has(origin)) headers["access-control-allow-origin"] = origin;
   return headers;
 }
