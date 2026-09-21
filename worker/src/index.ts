@@ -40,6 +40,20 @@ function hex(bytes: Uint8Array) { return [...bytes].map((byte) => byte.toString(
 async function sha256(value: string) { return hex(new Uint8Array(await crypto.subtle.digest("SHA-256", textBytes(value)))); }
 function timingSafeEqual(left: string, right: string) { const a = textBytes(left); const b = textBytes(right); const length = Math.max(a.length, b.length); let result = a.length ^ b.length; for (let index = 0; index < length; index += 1) result |= (a[index] ?? 0) ^ (b[index] ?? 0); return result === 0; }
 async function hmac(secret: string, payload: string) { const key = await crypto.subtle.importKey("raw", textBytes(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]); return hex(new Uint8Array(await crypto.subtle.sign("HMAC", key, textBytes(payload)))); }
+function documentSignatureMatches(contentType: string, bytes: Uint8Array) {
+  const startsWith = (...values: number[]) => values.every((value, index) => bytes[index] === value);
+  if (contentType === "application/pdf") return startsWith(0x25, 0x50, 0x44, 0x46);
+  if (contentType === "image/jpeg") return startsWith(0xff, 0xd8, 0xff);
+  if (contentType === "image/png") return startsWith(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a);
+  if (contentType === "image/webp") return startsWith(0x52, 0x49, 0x46, 0x46) && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50;
+  if (contentType === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" || contentType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") return startsWith(0x50, 0x4b, 0x03, 0x04);
+  if (contentType === "application/msword" || contentType === "application/vnd.ms-excel") return startsWith(0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1);
+  if (contentType === "text/csv" || contentType === "application/csv") {
+    const sample = new TextDecoder().decode(bytes.slice(0, 4096));
+    return !sample.includes("\u0000");
+  }
+  return false;
+}
 
 async function supabaseGet<T>(env: Env, path: string, token: string): Promise<T[]> {
   const response = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, { headers: { apikey: env.SUPABASE_PUBLISHABLE_KEY, Authorization: `Bearer ${token}` } });
@@ -724,6 +738,7 @@ const worker = {
         let binary: string;
         try { binary = atob(base64); } catch { return error("VALIDATION_ERROR", "File content is not valid base64", 400, id, headers); }
         const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0)); if (bytes.byteLength > 10 * 1024 * 1024) return error("PAYLOAD_TOO_LARGE", "Document is larger than 10 MB", 413, id, headers);
+        if (!documentSignatureMatches(contentType, bytes)) return error("VALIDATION_ERROR", "File content does not match the declared document type", 400, id, headers);
         const documentId = crypto.randomUUID(); const objectKey = `clients/${clientId}/shipments/${shipmentId}/${documentId}-${name.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
         await env.FILES.put(objectKey, bytes, { httpMetadata: { contentType } });
         try {
