@@ -18,10 +18,12 @@ Evidence collected on 2026-09-19 from the remote `psslogisticsdatabase` database
 | `20260918_tracking_events.sql` | `tracking_events` exists with the normalized Worker event columns | Not recorded in `d1_migrations` |
 | `20260919_departments.sql` | `departments` exists with status, manager, capacity, and audit ownership columns | Applied directly with `wrangler d1 execute --remote`; intentionally not replayed through the drifted ledger |
 | `20260919_provider_accounts.sql` | `provider_accounts` exists with provider, client binding, secret-name, capability, and status columns | Applied directly with `wrangler d1 execute --remote`; intentionally not replayed through the drifted ledger |
-| `20260920_tracking_lookup_indexes.sql` | Dedicated indexes for `shipments.tracking_number` and `shipments.provider_reference` | Pending deployment; apply directly against the verified production schema rather than replaying the drifted migration ledger |
+| `20260920_tracking_lookup_indexes.sql` | Dedicated indexes for `shipments.tracking_number` and `shipments.provider_reference` | Applied directly with `wrangler d1 execute --remote` on 2026-09-21; verified in `sqlite_master`; intentionally not replayed through the drifted ledger |
 
 The remote ledger currently contains only `20260917_production_contract.sql` and `20260918_address_kinds.sql`. The unrecorded files include non-idempotent `ALTER TABLE` or table-rebuild statements; they must not be replayed against production merely to populate history. Any future reconciliation must use a verified backup, a controlled migration/rollback exercise, and explicit change approval.
 
 The departments contract was applied directly on 2026-09-19 after the table definition was reviewed. Wrangler reported three statements executed, one schema change, and a successful production bookmark. This direct execution is recorded here so the table is not accidentally replayed by a future blanket `migrations apply` command.
 
 The provider-account contract was applied directly on 2026-09-19 after the account-binding fields and secret-name validation were reviewed. Wrangler reported three statements executed, one schema change, and a successful production bookmark. The Worker resolves a client-specific active binding server-side and never accepts a raw provider credential from a browser.
+
+The tracking lookup indexes were applied directly on 2026-09-21 after a live schema query confirmed both indexes were absent. Wrangler reported two statements executed, two rows written, and a successful production bookmark; a follow-up `sqlite_master` query verified `idx_shipments_tracking_number` and `idx_shipments_provider_reference_lookup`. This additive change was not inserted into the drifted migration ledger.
