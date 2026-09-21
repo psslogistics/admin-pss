@@ -231,31 +231,21 @@ async function idempotentResponse(env: Env, key: string | null, clientId: string
   return existing;
 }
 async function saveIdempotent(env: Env, key: string, clientId: string, endpoint: string, responseStatus: number, body: string, requestHash: string) { await env.DB.prepare("INSERT INTO idempotency_keys (idempotency_key, client_id, endpoint, request_hash, response_status, response_body, expires_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now', '+24 hours'))").bind(key, clientId, endpoint, requestHash, responseStatus, body).run(); }
+async function rateLimitExceeded(env: Env, key: string, limit: number) {
+  const windowStart = Math.floor(Date.now() / 60000);
+  await env.DB.prepare("INSERT INTO request_rate_limits (rate_key, window_start, request_count) VALUES (?, ?, 1) ON CONFLICT(rate_key) DO UPDATE SET window_start = CASE WHEN request_rate_limits.window_start = excluded.window_start THEN request_rate_limits.window_start ELSE excluded.window_start END, request_count = CASE WHEN request_rate_limits.window_start = excluded.window_start THEN request_rate_limits.request_count + 1 ELSE 1 END").bind(key, windowStart).run();
+  const current = await env.DB.prepare("SELECT request_count FROM request_rate_limits WHERE rate_key = ? LIMIT 1").bind(key).first<{ request_count: number }>();
+  return Number(current?.request_count ?? limit + 1) > limit;
+}
 async function rateLimited(env: Env, request: Request, auth: Auth, route: string) {
   const identity = auth.userId ?? auth.clientId ?? request.headers.get("CF-Connecting-IP") ?? "anonymous";
   const key = await sha256(`${identity}:${route}`);
-  const windowStart = Math.floor(Date.now() / 60000);
-  const current = await env.DB.prepare("SELECT window_start, request_count FROM request_rate_limits WHERE rate_key = ? LIMIT 1").bind(key).first<{ window_start: number; request_count: number }>();
-  if (!current || current.window_start !== windowStart) {
-    await env.DB.prepare("INSERT INTO request_rate_limits (rate_key, window_start, request_count) VALUES (?, ?, 1) ON CONFLICT(rate_key) DO UPDATE SET window_start = excluded.window_start, request_count = 1").bind(key, windowStart).run();
-    return false;
-  }
-  if (current.request_count >= 120) return true;
-  await env.DB.prepare("UPDATE request_rate_limits SET request_count = request_count + 1 WHERE rate_key = ?").bind(key).run();
-  return false;
+  return rateLimitExceeded(env, key, 120);
 }
 async function publicRateLimited(env: Env, request: Request, route: string, limit = 30) {
   const identity = request.headers.get("CF-Connecting-IP") ?? request.headers.get("X-Forwarded-For")?.split(",")[0]?.trim() ?? "anonymous";
   const key = await sha256(`public:${identity}:${route}`);
-  const windowStart = Math.floor(Date.now() / 60000);
-  const current = await env.DB.prepare("SELECT window_start, request_count FROM request_rate_limits WHERE rate_key = ? LIMIT 1").bind(key).first<{ window_start: number; request_count: number }>();
-  if (!current || current.window_start !== windowStart) {
-    await env.DB.prepare("INSERT INTO request_rate_limits (rate_key, window_start, request_count) VALUES (?, ?, 1) ON CONFLICT(rate_key) DO UPDATE SET window_start = excluded.window_start, request_count = 1").bind(key, windowStart).run();
-    return false;
-  }
-  if (current.request_count >= limit) return true;
-  await env.DB.prepare("UPDATE request_rate_limits SET request_count = request_count + 1 WHERE rate_key = ?").bind(key).run();
-  return false;
+  return rateLimitExceeded(env, key, limit);
 }
 
 function ekartAddress(value: unknown, fallbackName: string) {
