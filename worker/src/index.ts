@@ -1009,8 +1009,10 @@ const worker = {
         if (!hasScope(auth, "quotes.create")) return error("FORBIDDEN", "Serviceability scope required", 403, id, headers);
         const payload = await bodyJson(request); const origin = String(payload.origin_pincode ?? ""); const destination = String(payload.destination_pincode ?? "");
         if (!/^\d{6}$/.test(origin) || !/^\d{6}$/.test(destination)) return error("VALIDATION_ERROR", "Valid origin and destination pincodes are required", 400, id, headers);
-        const providers = [env.DELHIVERY_API_BASE_URL && env.DELHIVERY_API_TOKEN ? "delhivery" : null, env.EKART_API_BASE_URL && env.EKART_API_KEY ? "ekart" : null].filter(Boolean).filter(() => String(env.ENABLE_PROVIDER_CALLS) === "true");
-        return json({ ok: true, data: { origin_pincode: origin, destination_pincode: destination, serviceable: providers.length > 0, providers, status: providers.length > 0 ? "available" : "provider_unavailable" } }, 200, headers);
+        const configuredProviders = [env.DELHIVERY_API_BASE_URL && env.DELHIVERY_API_TOKEN ? "delhivery" : null, env.EKART_API_BASE_URL && env.EKART_API_KEY ? "ekart" : null].filter(Boolean).filter(() => String(env.ENABLE_PROVIDER_CALLS) === "true");
+        // Credentials alone cannot prove a route is serviceable. Provider-specific
+        // serviceability contracts must be verified before this endpoint reports success.
+        return json({ ok: true, data: { origin_pincode: origin, destination_pincode: destination, serviceable: false, providers: [], configured_providers: configuredProviders, status: configuredProviders.length > 0 ? "serviceability_contract_not_verified" : "provider_unavailable" } }, 200, headers);
       }
       if (route === "/departments" && request.method === "GET") {
         if (!hasScope(auth, "departments.read")) return error("FORBIDDEN", "Department read scope required", 403, id, headers);
