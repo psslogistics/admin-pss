@@ -23,7 +23,7 @@
   ],
   "vars": {
     "ENVIRONMENT": "production",
-    "ALLOWED_ORIGINS": "https://psslogistics.in,https://www.psslogistics.in,https://client.psslogistics.in,https://admin.psslogistics.in,https://master.psslogistics.in",
+    "ALLOWED_ORIGINS": "https://psslogistics.in,https://www.psslogistics.in,https://client.psslogistics.in,https://admin.psslogistics.in,https://master.psslogistics.in,https://hero-pss.vercel.app,https://client-pss.vercel.app,https://admin-pss.vercel.app,https://master-pss.vercel.app",
     "SUPABASE_URL": "https://qyelfkmafzspctqkrwxf.supabase.co",
     "DELHIVERY_API_BASE_URL": "https://track.delhivery.com/api/v1",
     "EKART_API_BASE_URL": "https://api.ekartlogistics.com",

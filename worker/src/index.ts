@@ -457,7 +457,8 @@ const worker = {
         env.DB.prepare("INSERT INTO api_key_usage (id, api_key_id, client_id, endpoint, method, status_code, bytes_in, bytes_out, request_id) VALUES (?, ?, ?, ?, ?, NULL, ?, 0, ?)").bind(crypto.randomUUID(), auth.apiKeyId, auth.clientId, url.pathname, request.method, Number(request.headers.get("content-length") ?? 0), id).run(),
       ]).then(() => undefined).catch(() => undefined));
     }
-    const route = url.pathname.slice(4);
+    // Strip only the `/v1` prefix and preserve the leading slash expected by route matchers.
+    const route = url.pathname.slice(3);
     try {
       if (await rateLimited(env, request, auth, route)) return new Response(JSON.stringify({ ok: false, error: { code: "RATE_LIMITED", message: "Too many requests" }, request_id: id }), { status: 429, headers: { ...headers, "content-type": "application/json", "retry-after": "60" } });
       if (route === "/me" && request.method === "GET") return json({ ok: true, authenticated: true, user_id: auth.userId, client_id: auth.clientId, client_ids: [...auth.clientIds], roles: [...auth.roles], system: auth.system }, 200, withCors(request, env));
@@ -1119,13 +1120,15 @@ const worker = {
           taskUpdates.push({ field: "priority", value: payload.priority.trim().toLowerCase() });
         }
         if (payload.due_at !== undefined) {
-          if (payload.due_at !== null && (typeof payload.due_at !== "string" || Number.isNaN(Date.parse(payload.due_at)))) return error("VALIDATION_ERROR", "Task due_at must be a valid date", 400, id, headers);
-          taskUpdates.push({ field: "due_at", value: payload.due_at === null ? "" : payload.due_at });
+          const dueAt = payload.due_at;
+          if (dueAt !== null && (typeof dueAt !== "string" || Number.isNaN(Date.parse(dueAt)))) return error("VALIDATION_ERROR", "Task due_at must be a valid date", 400, id, headers);
+          taskUpdates.push({ field: "due_at", value: dueAt === null ? "" : String(dueAt) });
         }
         if (payload.assigned_to_user_id !== undefined) {
-          if (payload.assigned_to_user_id !== null && typeof payload.assigned_to_user_id !== "string") return error("VALIDATION_ERROR", "Assigned employee must be a valid user", 400, id, headers);
-          if (payload.assigned_to_user_id !== null && !(await employeeCanBeAssigned(env, auth, payload.assigned_to_user_id, targetClientId ?? "system"))) return error("FORBIDDEN", "Assigned employee is not active or is outside the client scope", 403, id, headers);
-          taskUpdates.push({ field: "assigned_to_user_id", value: payload.assigned_to_user_id ?? "" });
+          const assignedToUserId = payload.assigned_to_user_id;
+          if (assignedToUserId !== null && typeof assignedToUserId !== "string") return error("VALIDATION_ERROR", "Assigned employee must be a valid user", 400, id, headers);
+          if (assignedToUserId !== null && !(await employeeCanBeAssigned(env, auth, assignedToUserId, targetClientId ?? "system"))) return error("FORBIDDEN", "Assigned employee is not active or is outside the client scope", 403, id, headers);
+          taskUpdates.push({ field: "assigned_to_user_id", value: assignedToUserId === null ? "" : String(assignedToUserId) });
         }
         if (!taskUpdates.length) return error("VALIDATION_ERROR", "A supported task update is required", 400, id, headers);
         const idempotencyKey = request.headers.get("Idempotency-Key"); if (!idempotencyKey) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
