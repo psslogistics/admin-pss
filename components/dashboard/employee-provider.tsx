@@ -41,7 +41,18 @@ export function EmployeeProvider({ children }: { children: React.ReactNode }) {
         supabase.from("employee_permission_overrides").select("permission_key,mode").eq("employee_user_id", user.id),
       ]);
       const allowed = new Set((catalogue ?? []).map((item) => item.permission_key));
-      const effectivePermissions = new Set(permissionSet((rolePermissions ?? []) as Array<{ permission_key?: string }>, allowed));
+      let apiPermissions: string[] | null = null;
+      try {
+        const identity = await pssApi<{ permissions?: string[] }>("/v1/me");
+        if (Array.isArray(identity.permissions)) apiPermissions = identity.permissions;
+      } catch {
+        // Fall back to the Supabase permission query if the API identity check is unavailable.
+      }
+      const effectivePermissions = new Set(
+        apiPermissions
+          ? apiPermissions.filter((permission): permission is PermissionKey => allowed.has(permission) && isAdminPermission(permission))
+          : permissionSet((rolePermissions ?? []) as Array<{ permission_key?: string }>, allowed),
+      );
       for (const override of (overrides ?? []) as Array<{ permission_key?: string; mode?: string }>) {
         if (!override.permission_key || !allowed.has(override.permission_key) || !isAdminPermission(override.permission_key)) continue;
         if (override.mode === "grant") effectivePermissions.add(override.permission_key);
