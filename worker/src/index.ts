@@ -524,9 +524,9 @@ const worker = {
       if (route === "/provider-accounts" && request.method === "GET") {
         if (!hasScope(auth, "provider_accounts.read")) return error("FORBIDDEN", "Provider account visibility permission required", 403, id, headers);
         const rows = auth.system
-          ? await env.DB.prepare("SELECT id, provider, account_name, account_type, credential_secret_name, client_id, capabilities_json, status, created_by_user_id, created_at, updated_at FROM provider_accounts ORDER BY provider, account_name").all()
+          ? await env.DB.prepare("SELECT id, provider, account_name, account_type, credential_secret_name, client_id, capabilities_json, status, created_by_user_id, created_at, updated_at FROM provider_accounts ORDER BY provider, account_name LIMIT 100").all()
           : auth.clientIds.size
-            ? await env.DB.prepare(`SELECT id, provider, account_name, account_type, credential_secret_name, client_id, capabilities_json, status, created_by_user_id, created_at, updated_at FROM provider_accounts WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY provider, account_name`).bind(...auth.clientIds).all()
+            ? await env.DB.prepare(`SELECT id, provider, account_name, account_type, credential_secret_name, client_id, capabilities_json, status, created_by_user_id, created_at, updated_at FROM provider_accounts WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY provider, account_name LIMIT 100`).bind(...auth.clientIds).all()
             : { results: [] };
         return json({ ok: true, data: rows.results.map((row) => { const value = row as Record<string, unknown>; let capabilities: unknown[] = []; try { capabilities = JSON.parse(String(value.capabilities_json ?? "[]")); } catch { capabilities = []; } return { ...value, capabilities }; }) }, 200, headers);
       }
@@ -654,7 +654,7 @@ const worker = {
         if (!hasScope(auth, "documents.read")) return error("FORBIDDEN", "Document read scope required", 403, id, headers);
         const shipment = await env.DB.prepare("SELECT client_id FROM shipments WHERE id = ? LIMIT 1").bind(shipmentDocuments[1]).first<{ client_id: string }>();
         if (!shipment || !canAccessClient(auth, shipment.client_id)) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
-        const documents = await env.DB.prepare("SELECT id, shipment_id, original_filename, content_type, file_size_bytes, uploaded_by_user_id, created_at FROM shipment_documents WHERE shipment_id = ? ORDER BY created_at DESC").bind(shipmentDocuments[1]).all();
+        const documents = await env.DB.prepare("SELECT id, shipment_id, original_filename, content_type, file_size_bytes, uploaded_by_user_id, created_at FROM shipment_documents WHERE shipment_id = ? ORDER BY created_at DESC LIMIT 100").bind(shipmentDocuments[1]).all();
         return json({ ok: true, data: documents.results }, 200, headers);
       }
 
@@ -664,7 +664,7 @@ const worker = {
         const shipment = await env.DB.prepare("SELECT * FROM shipments WHERE id = ? LIMIT 1").bind(shipmentGet[1]).first<{ client_id: string; provider: string | null; tracking_number: string | null; provider_reference: string | null }>();
         if (!shipment || !canAccessClient(auth, shipment.client_id)) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
         if (route.endsWith("/tracking")) {
-          const events = await env.DB.prepare("SELECT * FROM tracking_events WHERE shipment_id = ? ORDER BY event_time ASC").bind(shipmentGet[1]).all();
+          const events = await env.DB.prepare("SELECT * FROM tracking_events WHERE shipment_id = ? ORDER BY event_time ASC LIMIT 100").bind(shipmentGet[1]).all();
           const provider = shipment.provider === "delhivery" || shipment.provider === "ekart" ? shipment.provider : null;
           const providerResult = provider ? await providerRequest(env, provider, "tracking", { shipment_id: shipmentGet[1], tracking_number: shipment.tracking_number, provider_reference: shipment.provider_reference }, id, shipment.client_id) : { enabled: false, status: "not_requested" as const };
           return json({ ok: true, data: events.results, provider_result: providerResult }, 200, headers);
@@ -943,7 +943,7 @@ const worker = {
         if (!hasScope(auth, "tickets.read")) return error("FORBIDDEN", "Ticket read permission required", 403, id, headers);
         const ticket = await env.DB.prepare("SELECT client_id FROM support_tickets WHERE id = ? LIMIT 1").bind(ticketMessages[1]).first<{ client_id: string }>();
         if (!ticket || !canAccessClient(auth, ticket.client_id)) return error("NOT_FOUND", "Ticket not found", 404, id, headers);
-        const messages = await env.DB.prepare("SELECT id, ticket_id, author_user_id, body AS message, created_at FROM support_messages WHERE ticket_id = ? ORDER BY created_at ASC").bind(ticketMessages[1]).all();
+        const messages = await env.DB.prepare("SELECT id, ticket_id, author_user_id, body AS message, created_at FROM support_messages WHERE ticket_id = ? ORDER BY created_at ASC LIMIT 500").bind(ticketMessages[1]).all();
         return json({ ok: true, data: messages.results }, 200, headers);
       }
       if (ticketMessages && ticketMessages[1] && request.method === "POST") {
@@ -1188,7 +1188,7 @@ const worker = {
       }
       if (route === "/api-keys" && request.method === "GET") {
         if (!hasScope(auth, "api_keys.read")) return error("FORBIDDEN", "API key read permission required", 403, id, headers);
-        const rows = auth.system ? await env.DB.prepare("SELECT id, client_id, name, key_prefix, environment, status, expires_at, last_used_at, created_at, revoked_at FROM api_keys ORDER BY created_at DESC").all() : auth.clientIds.size ? await env.DB.prepare(`SELECT id, client_id, name, key_prefix, environment, status, expires_at, last_used_at, created_at, revoked_at FROM api_keys WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY created_at DESC`).bind(...auth.clientIds).all() : { results: [] };
+        const rows = auth.system ? await env.DB.prepare("SELECT id, client_id, name, key_prefix, environment, status, expires_at, last_used_at, created_at, revoked_at FROM api_keys ORDER BY created_at DESC LIMIT 100").all() : auth.clientIds.size ? await env.DB.prepare(`SELECT id, client_id, name, key_prefix, environment, status, expires_at, last_used_at, created_at, revoked_at FROM api_keys WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY created_at DESC LIMIT 100`).bind(...auth.clientIds).all() : { results: [] };
         return json({ ok: true, data: rows.results }, 200, headers);
       }
       if (route === "/api-keys" && request.method === "POST") {
