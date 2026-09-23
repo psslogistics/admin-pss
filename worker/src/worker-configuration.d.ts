@@ -8,8 +8,12 @@ interface __BaseEnv_Env {
 	ALLOWED_ORIGINS: "https://psslogistics.in,https://www.psslogistics.in,https://client.psslogistics.in,https://admin.psslogistics.in,https://master.psslogistics.in,https://hero-pss.vercel.app,https://client-pss.vercel.app,https://admin-pss.vercel.app,https://master-pss.vercel.app";
 	SUPABASE_URL: "https://qyelfkmafzspctqkrwxf.supabase.co";
 	DELHIVERY_API_BASE_URL: "https://track.delhivery.com/api/v1";
+	DELHIVERY_CLIENT_NAME: "PSS LOGISTICS";
+	DELHIVERY_DEFAULT_PICKUP_LOCATION: "PSS B2C";
+	DELHIVERY_ENABLE_SHIPMENT_CREATION: "false";
+	DELHIVERY_ENABLE_PICKUP_CREATION: "false";
 	EKART_API_BASE_URL: "https://api.ekartlogistics.com";
-	ENABLE_PROVIDER_CALLS: "false";
+	ENABLE_PROVIDER_CALLS: "true";
 }
 declare namespace Cloudflare {
 	interface GlobalProps {
@@ -22,7 +26,7 @@ type StringifyValues<EnvType extends Record<string, unknown>> = {
 	[Binding in keyof EnvType]: EnvType[Binding] extends string ? EnvType[Binding] : string;
 };
 declare namespace NodeJS {
-	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "ENVIRONMENT" | "ALLOWED_ORIGINS" | "SUPABASE_URL" | "DELHIVERY_API_BASE_URL" | "EKART_API_BASE_URL" | "ENABLE_PROVIDER_CALLS">> {}
+	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "ENVIRONMENT" | "ALLOWED_ORIGINS" | "SUPABASE_URL" | "DELHIVERY_API_BASE_URL" | "DELHIVERY_CLIENT_NAME" | "DELHIVERY_DEFAULT_PICKUP_LOCATION" | "DELHIVERY_ENABLE_SHIPMENT_CREATION" | "DELHIVERY_ENABLE_PICKUP_CREATION" | "EKART_API_BASE_URL" | "ENABLE_PROVIDER_CALLS">> {}
 }
 
 // Begin runtime types

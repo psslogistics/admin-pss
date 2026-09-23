@@ -288,6 +288,87 @@ function ekartCreatePayload(payload: Record<string, unknown>) {
   return { request_Id: String(payload.request_id ?? crypto.randomUUID()), client_name: "PSS", services: [{ service_code: String(payload.service_code ?? "ECONOMY"), service_details: [{ service_leg: "FORWARD", service_data: { vendor_name: "Ekart", amount_to_collect: paymentMode === "C" ? value.toFixed(2) : "0.00", dispatch_date: new Date().toISOString().slice(0, 19).replace("T", " "), source: { address: origin }, destination: { address: destination }, return_location: { address: origin } }, shipment: { tracking_id: trackingId, shipment_value: value.toFixed(2), shipment_dimensions: { length: { value: Number(payload.length ?? 0) }, breadth: { value: Number(payload.width ?? 0) }, height: { value: Number(payload.height ?? 0) }, weight: { value: weight } }, shipment_items: [item] } }] }] };
 }
 
+function delhiveryAddress(value: unknown, fallbackName: string) {
+  const address = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const line = String(address.line ?? address.address_line1 ?? address.address ?? "").trim();
+  const city = String(address.city ?? "").trim();
+  const state = String(address.state ?? "").trim();
+  const pincode = String(address.pincode ?? address.pin ?? "").trim();
+  const name = String(address.name ?? fallbackName).trim();
+  const phone = String(address.phone ?? address.primary_contact_number ?? "").replace(/[^0-9]/g, "").slice(-10);
+  if (!line || !city || !state || !/^\d{6}$/.test(pincode) || !/^\d{10}$/.test(phone)) return null;
+  return { line, city, state, pincode, name, phone, country: String(address.country ?? "India").trim() || "India" };
+}
+
+function delhiveryCreatePayload(env: Env, payload: Record<string, unknown>) {
+  const origin = delhiveryAddress(payload.origin_address, String(payload.origin ?? "PSS Logistics"));
+  const destination = delhiveryAddress(payload.destination_address, String(payload.consignee ?? "Consignee"));
+  const client = String(payload.delhivery_client_name ?? env.DELHIVERY_CLIENT_NAME ?? "").trim();
+  const pickupLocation = String(payload.delhivery_pickup_location ?? payload.pickup_location ?? env.DELHIVERY_DEFAULT_PICKUP_LOCATION ?? "").trim();
+  const weightKg = Number(payload.total_weight_kg ?? 0);
+  const pieces = Number(payload.pieces ?? 1);
+  const declaredValue = Math.max(Number(payload.declared_value ?? 0), 0);
+  if (!origin || !destination || !client || !pickupLocation || !Number.isFinite(weightKg) || weightKg <= 0 || !Number.isInteger(pieces) || pieces < 1) return null;
+  const paymentMode = String(payload.payment_mode ?? "prepaid").trim().toLowerCase() === "cod" ? "COD" : "Pre-paid";
+  const orderId = String(payload.order_id ?? payload.shipment_id ?? crypto.randomUUID()).trim().slice(0, 50);
+  const shipment: Record<string, unknown> = {
+    client,
+    order: orderId,
+    order_date: String(payload.order_date ?? new Date().toISOString().slice(0, 10)),
+    product_type: String(payload.product_type ?? "B2C"),
+    name: destination.name,
+    add: destination.line,
+    city: destination.city,
+    state: destination.state,
+    country: destination.country,
+    pin: destination.pincode,
+    phone: destination.phone,
+    payment_mode: paymentMode,
+    total_amount: declaredValue.toFixed(2),
+    cod_amount: paymentMode === "COD" ? String(payload.cod_amount ?? declaredValue.toFixed(2)) : "0",
+    weight: Math.max(1, Math.round(weightKg * 1000)),
+    quantity: pieces,
+    products_desc: String(payload.description ?? "Shipment").replace(/[&#%;\\]/g, " ").slice(0, 500),
+    pickup_location: pickupLocation,
+    seller_name: origin.name,
+    seller_add: origin.line,
+    seller_city: origin.city,
+    seller_state: origin.state,
+    seller_pin: origin.pincode,
+    seller_phone: origin.phone,
+    return_add: origin.line,
+    return_city: origin.city,
+    return_state: origin.state,
+    return_pin: origin.pincode,
+    return_country: origin.country,
+    return_phone: origin.phone,
+  };
+  const optional: Record<string, unknown> = {
+    waybill: payload.waybill,
+    shipment_length: payload.length,
+    shipment_width: payload.width,
+    shipment_height: payload.height,
+    seller_gst_tin: payload.seller_gst_tin,
+    client_gst_tin: payload.client_gst_tin,
+    consignee_gst_tin: payload.consignee_gst_tin,
+    hsn_code: payload.hsn_code,
+    invoice_reference: payload.invoice_reference,
+    e_waybill_no: payload.e_waybill_no,
+    fragile_shipment: payload.fragile_shipment,
+  };
+  for (const [key, value] of Object.entries(optional)) if (value !== undefined && value !== null && String(value).trim() !== "") shipment[key] = value;
+  return { shipments: [shipment] };
+}
+
+function delhiveryPickupPayload(env: Env, payload: Record<string, unknown>) {
+  const pickupLocation = String(payload.delhivery_pickup_location ?? payload.pickup_location ?? env.DELHIVERY_DEFAULT_PICKUP_LOCATION ?? "").trim();
+  const pickupDate = String(payload.scheduled_date ?? "").trim();
+  const rawWindow = String(payload.window ?? payload.pickup_time ?? "10:00:00").trim();
+  const pickupTime = (rawWindow.match(/\b\d{1,2}:\d{2}(?::\d{2})?\b/)?.[0] ?? "10:00:00").split(":").map((part) => part.padStart(2, "0"));
+  if (!pickupLocation || !/^\d{4}-\d{2}-\d{2}$/.test(pickupDate)) return null;
+  return { pickup_time: `${pickupTime[0]}:${pickupTime[1]}:${pickupTime[2] ?? "00"}`, pickup_date: pickupDate, pickup_location: pickupLocation, expected_package_count: Math.max(1, Number(payload.expected_package_count ?? payload.package_count ?? 1)) };
+}
+
 function findProviderReference(value: unknown, keys: Set<string>, depth = 0): string | null {
   if (depth > 8 || value === null || value === undefined) return null;
   if (Array.isArray(value)) {
@@ -329,7 +410,9 @@ async function providerRequest(env: Env, provider: "delhivery" | "ekart", operat
   if (String(env.ENABLE_PROVIDER_CALLS) !== "true") return { enabled: false, status: "disabled" as const };
   const trackingNumber = String(payload.tracking_number ?? payload.provider_reference ?? "").trim();
   if (operation === "tracking" && !trackingNumber) return { enabled: false, status: "invalid_request" as const, reason: "A provider tracking reference is required" };
-  if (provider === "delhivery" && operation !== "tracking") return { enabled: false, status: "unsupported" as const, reason: "Delhivery shipment and pickup contracts are not enabled" };
+  if (provider === "delhivery" && operation === "shipments" && String(env.DELHIVERY_ENABLE_SHIPMENT_CREATION) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "Delhivery shipment creation is safety-disabled until live billing approval" };
+  if (provider === "delhivery" && operation === "pickups" && String(env.DELHIVERY_ENABLE_PICKUP_CREATION) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "Delhivery pickup creation is safety-disabled until live operations approval" };
+  if (provider === "delhivery" && !new Set(["tracking", "shipments", "pickups", "serviceability"]).has(operation)) return { enabled: false, status: "unsupported" as const, reason: "Delhivery operation is not supported" };
   if (provider === "ekart" && operation === "pickups") return { enabled: false, status: "unsupported" as const, reason: "Ekart pickup contract is not verified" };
   if (provider === "ekart" && operation !== "tracking" && operation !== "shipments") return { enabled: false, status: "unsupported" as const, reason: "Ekart operation is not supported" };
   const base = provider === "delhivery" ? env.DELHIVERY_API_BASE_URL : env.EKART_API_BASE_URL;
@@ -344,22 +427,43 @@ async function providerRequest(env: Env, provider: "delhivery" | "ekart", operat
   const headers: Record<string, string> = { "content-type": "application/json", "x-request-id": requestIdValue, Authorization: authorization };
   const ekartCreate = provider === "ekart" && operation === "shipments" ? ekartCreatePayload(payload) : null;
   if (provider === "ekart" && operation === "shipments" && !ekartCreate) return { enabled: false, status: "invalid_request" as const, reason: "Origin and destination addresses require valid six-digit pincodes and ten-digit phone numbers" };
+  const delhiveryCreate = provider === "delhivery" && operation === "shipments" ? delhiveryCreatePayload(env, payload) : null;
+  if (provider === "delhivery" && operation === "shipments" && !delhiveryCreate) return { enabled: false, status: "invalid_request" as const, reason: "Delhivery requires valid origin/destination addresses, a registered client name, and a pickup location" };
+  const delhiveryPickup = provider === "delhivery" && operation === "pickups" ? delhiveryPickupPayload(env, payload) : null;
+  if (provider === "delhivery" && operation === "pickups" && !delhiveryPickup) return { enabled: false, status: "invalid_request" as const, reason: "Delhivery requires a valid pickup date and registered pickup location" };
   const integrationId = crypto.randomUUID();
   await env.DB.prepare("INSERT INTO integration_requests (id, provider, client_id, operation, idempotency_key, provider_request_id, status, attempt_count) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0)").bind(integrationId, provider, clientId ?? null, operation, idempotencyKey ?? null, requestIdValue).run();
-  const url = provider === "delhivery"
+  const delhiveryOrigin = provider === "delhivery" ? new URL(base).origin : "";
+  const url = provider === "delhivery" && operation === "tracking"
     ? `${base.replace(/\/$/, "")}/packages/json/?waybill=${encodeURIComponent(trackingNumber)}&ref_ids=${encodeURIComponent(String(payload.order_id ?? ""))}`
+    : provider === "delhivery" && operation === "shipments"
+      ? `${delhiveryOrigin}/api/cmu/create.json`
+      : provider === "delhivery" && operation === "pickups"
+        ? `${delhiveryOrigin}/fm/request/new/`
+        : provider === "delhivery" && operation === "serviceability"
+          ? `${delhiveryOrigin}/c/api/pin-codes/json/?filter_codes=${encodeURIComponent(String(payload.destination_pincode ?? ""))}`
     : `${base.replace(/\/$/, "")}/v2/shipments/${operation === "shipments" ? "create" : "track"}`;
+  const requestBody = provider === "delhivery" && operation === "shipments"
+    ? `format=json&data=${encodeURIComponent(JSON.stringify(delhiveryCreate))}`
+    : provider === "delhivery" && operation === "pickups"
+      ? JSON.stringify(delhiveryPickup)
+      : provider === "ekart" && operation === "shipments"
+        ? JSON.stringify(ekartCreate)
+        : provider === "ekart" ? JSON.stringify({ tracking_id: trackingNumber }) : undefined;
+  if (provider === "delhivery" && operation === "shipments") headers["content-type"] = "application/x-www-form-urlencoded";
   let response: Response | null = null; let lastError = "provider_request_failed";
   for (let attempt = 0; attempt < 3; attempt += 1) {
     await env.DB.prepare("UPDATE integration_requests SET attempt_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(attempt + 1, integrationId).run();
     const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), 10000);
     try {
-      response = await fetch(url, { method: provider === "delhivery" ? "GET" : "POST", headers, body: provider === "delhivery" ? undefined : JSON.stringify(operation === "shipments" ? ekartCreate : { tracking_id: trackingNumber }), signal: controller.signal });
-      if (response.ok || (response.status >= 400 && response.status < 500)) break;
+      response = await fetch(url, { method: operation === "tracking" || operation === "serviceability" ? "GET" : "POST", headers, body: operation === "tracking" || operation === "serviceability" ? undefined : requestBody, signal: controller.signal });
+      if (response.ok || (response.status >= 400 && response.status < 500 && response.status !== 429)) break;
       lastError = `provider_http_${response.status}`;
     } catch (caught) { lastError = caught instanceof Error ? caught.name === "AbortError" ? "provider_timeout" : caught.message : "provider_request_failed"; }
     finally { clearTimeout(timeout); }
-    await new Promise((resolve) => setTimeout(resolve, 200 * (attempt + 1)));
+    const retryAfter = response?.headers.get("retry-after");
+    const retryDelay = retryAfter && /^\d+$/.test(retryAfter) ? Math.min(Number(retryAfter) * 1000, 5000) : 200 * (attempt + 1);
+    await new Promise((resolve) => setTimeout(resolve, retryDelay));
   }
   if (!response) { await env.DB.prepare("UPDATE integration_requests SET status = 'failed', error_code = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind("PROVIDER_REQUEST_FAILED", lastError, integrationId).run(); return { enabled: true, status: "failed" as const, providerStatus: 0, error: lastError }; }
   // Consume the provider response without forwarding its raw body to browser clients.
@@ -381,6 +485,21 @@ async function providerRequest(env: Env, provider: "delhivery" | "ekart", operat
       }
     }
   }
+  let parsedProviderBody: unknown = null;
+  try { parsedProviderBody = JSON.parse(responseBody); } catch { parsedProviderBody = null; }
+  if (response.ok && provider === "delhivery" && operation === "shipments" && clientId && typeof payload.shipment_id === "string") {
+    const createdReference = findProviderReference(parsedProviderBody, new Set(["waybill", "awb", "tracking_number", "trackingid", "shipment_id"]));
+    if (createdReference) await env.DB.prepare("UPDATE shipments SET tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(provider_reference, ?), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(createdReference, createdReference, payload.shipment_id, clientId).run();
+  }
+  if (response.ok && provider === "delhivery" && operation === "pickups" && typeof payload.pickup_id === "string") {
+    const pickupReference = findProviderReference(parsedProviderBody, new Set(["pickup_id", "pickup_request_id", "pur_id", "request_id"]));
+    if (pickupReference) await env.DB.prepare("UPDATE pickup_requests SET provider = 'delhivery', provider_reference = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(pickupReference, payload.pickup_id, clientId ?? "").run();
+  }
+  if (response.ok && provider === "delhivery" && operation === "serviceability") {
+    const code = Array.isArray((parsedProviderBody as Record<string, unknown> | null)?.delivery_codes) ? (parsedProviderBody as { delivery_codes: Array<Record<string, unknown>> }).delivery_codes[0] : null;
+    const postal = code?.postal_code && typeof code.postal_code === "object" ? code.postal_code as Record<string, unknown> : null;
+    return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable: Boolean(postal && (String(postal.pre_paid ?? "N").toUpperCase() === "Y" || String(postal.cash ?? "N").toUpperCase() === "Y")), prepaid: String(postal?.pre_paid ?? "N").toUpperCase() === "Y", cod: String(postal?.cash ?? "N").toUpperCase() === "Y", pickup: String(postal?.pickup ?? "N").toUpperCase() === "Y" };
+  }
   if (response.ok && provider === "ekart" && operation === "shipments" && clientId && typeof payload.shipment_id === "string" && ekartCreate) {
     let providerReference: string | null = null;
     try { providerReference = findProviderReference(JSON.parse(responseBody), new Set(["tracking_id", "trackingid", "waybill", "awb", "shipment_id"])); } catch { providerReference = null; }
@@ -393,8 +512,25 @@ async function providerRequest(env: Env, provider: "delhivery" | "ekart", operat
 async function verifyWebhook(request: Request, env: Env, provider: "delhivery" | "ekart", rawBody: string) {
   const secret = provider === "delhivery" ? env.DELHIVERY_WEBHOOK_SECRET : env.EKART_WEBHOOK_SECRET;
   if (!secret) return false;
+  const tokenHeader = provider === "delhivery" ? request.headers.get("X-Delhivery-Webhook-Token") ?? request.headers.get("X-Webhook-Token") : null;
+  if (tokenHeader && timingSafeEqual(tokenHeader.trim(), secret.trim())) return true;
   const provided = request.headers.get("X-Webhook-Signature") ?? request.headers.get("X-Signature") ?? "";
+  if (!provided) return false;
   return timingSafeEqual(provided.replace(/^sha256=/, ""), await hmac(secret, rawBody));
+}
+
+function delhiveryWebhookDetails(payload: Record<string, unknown>) {
+  const shipment = payload.Shipment && typeof payload.Shipment === "object" ? payload.Shipment as Record<string, unknown> : payload.shipment && typeof payload.shipment === "object" ? payload.shipment as Record<string, unknown> : payload;
+  const statusObject = shipment.Status && typeof shipment.Status === "object" ? shipment.Status as Record<string, unknown> : shipment.status && typeof shipment.status === "object" ? shipment.status as Record<string, unknown> : {};
+  const rawStatus = typeof shipment.Status === "string" ? shipment.Status : statusObject.Status ?? statusObject.status ?? shipment.status ?? payload.status ?? payload.event_type;
+  const reference = String(shipment.AWB ?? shipment.awb ?? shipment.waybill ?? shipment.Waybill ?? shipment.ReferenceNo ?? shipment.reference_no ?? payload.awb ?? payload.waybill ?? payload.tracking_number ?? payload.provider_reference ?? payload.shipment_id ?? "").trim();
+  return {
+    reference,
+    rawStatus,
+    description: String(statusObject.Instructions ?? statusObject.description ?? shipment.Instructions ?? shipment.description ?? payload.description ?? payload.message ?? "Delhivery status update").slice(0, 500),
+    location: String(statusObject.StatusLocation ?? statusObject.location ?? shipment.StatusLocation ?? shipment.location ?? payload.location ?? payload.city ?? "").slice(0, 200),
+    eventTime: typeof (statusObject.StatusDateTime ?? shipment.StatusDateTime ?? payload.event_time ?? payload.timestamp) === "string" ? String(statusObject.StatusDateTime ?? shipment.StatusDateTime ?? payload.event_time ?? payload.timestamp) : null,
+  };
 }
 
 async function handleProviderWebhook(request: Request, env: Env, provider: "delhivery" | "ekart", requestIdValue: string, headers: HeadersInit) {
@@ -404,13 +540,14 @@ async function handleProviderWebhook(request: Request, env: Env, provider: "delh
   let payload: Record<string, unknown>;
   try { payload = JSON.parse(rawBody) as Record<string, unknown>; } catch { return error("INVALID_JSON", "Webhook payload must be valid JSON", 400, requestIdValue, headers); }
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return error("VALIDATION_ERROR", "Webhook payload must be an object", 400, requestIdValue, headers);
-  const suppliedEventId = String(payload.event_id ?? payload.id ?? "").trim();
-  const eventId = suppliedEventId || `${provider}:${await sha256(rawBody)}`;
+  const delhiveryDetails = provider === "delhivery" ? delhiveryWebhookDetails(payload) : null;
+  const suppliedEventId = String(payload.event_id ?? payload.id ?? delhiveryDetails?.reference ?? "").trim();
+  const eventId = suppliedEventId ? `${provider}:${suppliedEventId}:${await sha256(rawBody).then((value) => value.slice(0, 16))}` : `${provider}:${await sha256(rawBody)}`;
   const stored = await env.DB.prepare("INSERT OR IGNORE INTO webhook_events (id, provider, event_id, event_type, payload, signature_valid, status) VALUES (?, ?, ?, ?, ?, 1, 'received')").bind(crypto.randomUUID(), provider, eventId, String(payload.event_type ?? payload.status ?? "unknown"), rawBody).run();
   if (Number(stored.meta?.changes ?? 0) > 0) {
-    const reference = String(payload.tracking_number ?? payload.awb ?? payload.waybill ?? payload.provider_reference ?? payload.shipment_id ?? "").trim();
-    const status = normalizeProviderShipmentStatus(payload.status ?? payload.current_status ?? payload.event_type);
-    const description = String(payload.description ?? payload.message ?? `Webhook event ${eventId}`); const location = String(payload.location ?? payload.city ?? "");
+    const reference = delhiveryDetails?.reference ?? String(payload.tracking_number ?? payload.awb ?? payload.waybill ?? payload.provider_reference ?? payload.shipment_id ?? "").trim();
+    const status = normalizeProviderShipmentStatus(delhiveryDetails?.rawStatus ?? payload.status ?? payload.current_status ?? payload.event_type);
+    const description = delhiveryDetails?.description ?? String(payload.description ?? payload.message ?? `Webhook event ${eventId}`); const location = delhiveryDetails?.location ?? String(payload.location ?? payload.city ?? "");
     const shipment = reference ? await env.DB.prepare("SELECT id FROM shipments WHERE id = ? OR tracking_number = ? OR provider_reference = ? LIMIT 1").bind(reference, reference, reference).first<{ id: string }>() : null;
     if (shipment) {
       const current = await env.DB.prepare("SELECT status FROM shipments WHERE id = ? LIMIT 1").bind(shipment.id).first<{ status: string }>();
@@ -420,7 +557,7 @@ async function handleProviderWebhook(request: Request, env: Env, provider: "delh
       }
       const deliveredAt = status.includes("deliver") ? new Date().toISOString() : null;
       await env.DB.prepare("UPDATE shipments SET provider = ?, provider_reference = COALESCE(?, provider_reference), status = ?, delivered_at = COALESCE(?, delivered_at), updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(provider, reference || null, status, deliveredAt, shipment.id).run();
-      await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, location, description, created_by_user_id, event_time, created_at) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipment.id, status, location, description, `webhook:${provider}`).run();
+      await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, location, description, created_by_user_id, event_time, created_at) VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipment.id, status, location, description, `webhook:${provider}`, delhiveryDetails?.eventTime ?? null).run();
       await env.DB.prepare("UPDATE webhook_events SET status = 'processed', processed_at = CURRENT_TIMESTAMP WHERE provider = ? AND event_id = ?").bind(provider, eventId).run();
     } else {
       await env.DB.prepare("UPDATE webhook_events SET status = 'ignored', processed_at = CURRENT_TIMESTAMP WHERE provider = ? AND event_id = ?").bind(provider, eventId).run();
@@ -689,7 +826,8 @@ const worker = {
         const pickupId = crypto.randomUUID();
         await env.DB.prepare("INSERT INTO pickup_requests (id, shipment_id, client_id, created_by_user_id, requested_date, requested_time_slot, pickup_address, contact_name, contact_phone, status, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?)").bind(pickupId, typeof payload.shipment_id === "string" ? payload.shipment_id : null, clientId, auth.userId ?? `api:${clientId}`, payload.scheduled_date, String(payload.window ?? ""), payload.location, String(payload.contact_name ?? payload.customer ?? "Pickup contact"), String(payload.contact_phone ?? payload.contact ?? ""), typeof payload.notes === "string" ? payload.notes.trim().slice(0, 2000) : null).run();
         const shipment = typeof payload.shipment_id === "string" ? await env.DB.prepare("SELECT provider, tracking_number, provider_reference FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(payload.shipment_id, clientId).first<{ provider: string | null; tracking_number: string | null; provider_reference: string | null }>() : null;
-        const provider = shipment?.provider === "delhivery" || shipment?.provider === "ekart" ? shipment.provider : null;
+        const requestedProvider = payload.provider === "delhivery" || payload.provider === "ekart" ? payload.provider : null;
+        const provider = requestedProvider ?? (shipment?.provider === "delhivery" || shipment?.provider === "ekart" ? shipment.provider : null);
         const providerResult = provider ? await providerRequest(env, provider, "pickups", { pickup_id: pickupId, shipment_id: payload.shipment_id, tracking_number: shipment?.tracking_number, provider_reference: shipment?.provider_reference, ...payload }, id, clientId, key) : { enabled: false, status: "not_requested" as const };
         const serialized = JSON.stringify({ ok: true, data: { id: pickupId, client_id: clientId, status: "scheduled", provider, provider_result: providerResult }, request_id: id });
         await saveIdempotent(env, key, clientId, "POST /v1/pickups", 201, serialized, requestHash); await audit(env, ctx, auth, id, "pickup.created", "pickup", pickupId, { client_id: clientId });
@@ -1017,9 +1155,16 @@ const worker = {
         const payload = await bodyJson(request); const origin = String(payload.origin_pincode ?? ""); const destination = String(payload.destination_pincode ?? "");
         if (!/^\d{6}$/.test(origin) || !/^\d{6}$/.test(destination)) return error("VALIDATION_ERROR", "Valid origin and destination pincodes are required", 400, id, headers);
         const configuredProviders = [env.DELHIVERY_API_BASE_URL && env.DELHIVERY_API_TOKEN ? "delhivery" : null, env.EKART_API_BASE_URL && env.EKART_API_KEY ? "ekart" : null].filter(Boolean).filter(() => String(env.ENABLE_PROVIDER_CALLS) === "true");
-        // Credentials alone cannot prove a route is serviceable. Provider-specific
-        // serviceability contracts must be verified before this endpoint reports success.
-        return json({ ok: true, data: { origin_pincode: origin, destination_pincode: destination, serviceable: false, providers: [], configured_providers: configuredProviders, status: configuredProviders.length > 0 ? "serviceability_contract_not_verified" : "provider_unavailable" } }, 200, headers);
+        if (configuredProviders.includes("delhivery")) {
+          const [originResult, destinationResult] = await Promise.all([
+            providerRequest(env, "delhivery", "serviceability", { destination_pincode: origin }, id, auth.clientId),
+            providerRequest(env, "delhivery", "serviceability", { destination_pincode: destination }, id, auth.clientId),
+          ]);
+          const originServiceable = originResult.status === "accepted" && Boolean(originResult.serviceable);
+          const destinationServiceable = destinationResult.status === "accepted" && Boolean(destinationResult.serviceable);
+          return json({ ok: true, data: { origin_pincode: origin, destination_pincode: destination, serviceable: originServiceable && destinationServiceable, providers: originServiceable && destinationServiceable ? ["delhivery"] : [], configured_providers: configuredProviders, status: originResult.status === "accepted" && destinationResult.status === "accepted" ? "verified" : "provider_error", origin: originResult, destination: destinationResult } }, 200, headers);
+        }
+        return json({ ok: true, data: { origin_pincode: origin, destination_pincode: destination, serviceable: false, providers: [], configured_providers: configuredProviders, status: configuredProviders.length > 0 ? "provider_contract_not_verified" : "provider_unavailable" } }, 200, headers);
       }
       if (route === "/departments" && request.method === "GET") {
         if (!hasScope(auth, "departments.read")) return error("FORBIDDEN", "Department read scope required", 403, id, headers);
