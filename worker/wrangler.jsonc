@@ -27,6 +27,6 @@
     "SUPABASE_URL": "https://qyelfkmafzspctqkrwxf.supabase.co",
     "DELHIVERY_API_BASE_URL": "https://track.delhivery.com/api/v1",
     "EKART_API_BASE_URL": "https://api.ekartlogistics.com",
-    "ENABLE_PROVIDER_CALLS": "false"
+    "ENABLE_PROVIDER_CALLS": "true"
   }
 }
