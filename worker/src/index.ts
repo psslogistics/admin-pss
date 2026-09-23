@@ -706,8 +706,14 @@ const worker = {
       if (pickupMatch && request.method === "PATCH") {
         const pickup = await env.DB.prepare("SELECT client_id, assigned_to_user_id, failure_reason, provider, provider_reference FROM pickup_requests WHERE id = ? LIMIT 1").bind(pickupMatch[1]).first<{ client_id: string; assigned_to_user_id?: string | null; failure_reason?: string | null; provider?: string | null; provider_reference?: string | null }>();
         if (!pickup || !canAccessClient(auth, pickup.client_id)) return error("NOT_FOUND", "Pickup not found", 404, id, headers);
-        const staffUpdate = hasRole(auth, ["employee", "admin", "super_admin"]); if (!staffUpdate && !hasScope(auth, "pickups.manage")) return error("FORBIDDEN", "Pickup update permission required", 403, id, headers);
-        const payload = await bodyJson(request); const requestHash = await payloadFingerprint(payload); const allowedStatuses = new Set(["requested", "scheduled", "assigned", "in_transit", "picked_up", "completed", "cancelled", "failed"]); if (payload.status !== undefined && (typeof payload.status !== "string" || !allowedStatuses.has(payload.status))) return error("VALIDATION_ERROR", "Unsupported pickup status", 400, id, headers); if (!staffUpdate && (payload.status !== "cancelled" || Object.keys(payload).some((key) => key !== "status"))) return error("FORBIDDEN", "Client users may only cancel their own pickup", 403, id, headers);
+        const staffUpdate = hasRole(auth, ["employee", "admin", "super_admin"]);
+        const payload = await bodyJson(request);
+        const requestHash = await payloadFingerprint(payload);
+        const allowedStatuses = new Set(["requested", "scheduled", "assigned", "in_transit", "picked_up", "completed", "cancelled", "failed"]);
+        if (payload.status !== undefined && (typeof payload.status !== "string" || !allowedStatuses.has(payload.status))) return error("VALIDATION_ERROR", "Unsupported pickup status", 400, id, headers);
+        const clientCancel = !staffUpdate && payload.status === "cancelled" && Object.keys(payload).every((key) => key === "status") && hasScope(auth, "pickups.read");
+        if (!staffUpdate && !hasScope(auth, "pickups.manage") && !clientCancel) return error("FORBIDDEN", "Pickup update permission required", 403, id, headers);
+        if (!staffUpdate && !clientCancel) return error("FORBIDDEN", "Client users may only cancel their own pickup", 403, id, headers);
         const updates: string[] = []; const values: unknown[] = [];
         if (typeof payload.status === "string") { updates.push("status = ?"); values.push(payload.status); }
         if (staffUpdate && payload.assigned_to_user_id !== undefined) { if (payload.assigned_to_user_id !== null && typeof payload.assigned_to_user_id !== "string") return error("VALIDATION_ERROR", "Assigned employee must be a user ID", 400, id, headers); if (!(await employeeCanBeAssigned(env, auth, payload.assigned_to_user_id, pickup.client_id))) return error("FORBIDDEN", "Assigned employee is not active or is outside the client scope", 403, id, headers); updates.push("assigned_to_user_id = ?"); values.push(payload.assigned_to_user_id || null); }
