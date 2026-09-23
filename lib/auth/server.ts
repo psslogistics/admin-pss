@@ -6,6 +6,8 @@ export async function requireEmployeeAccess() {
   if (!userId) redirect('/sign-in');
   const { data, error: profileError } = await supabase.from('profiles').select('id,email,display_name,status,must_change_password').eq('id', userId).maybeSingle();
   if (profileError) redirect('/access-denied?reason=database');
+  const { data: employeeProfile, error: employeeProfileError } = await supabase.from('employee_profiles').select('employee_code,workspace_slug,employment_status').eq('user_id', userId).maybeSingle();
+  if (employeeProfileError) redirect('/access-denied?reason=database');
   const { data: assignments, error: assignmentsError } = await supabase.from('user_roles').select('is_active,role_id').eq('user_id', userId);
   if (assignmentsError) redirect('/access-denied?reason=database');
   const roleIds = (assignments ?? []).map((item) => item.role_id);
@@ -15,12 +17,10 @@ export async function requireEmployeeAccess() {
   if (!data || data.status !== 'active' || !roles.some((item) => item.is_active === true && (item.role?.scope === 'employee' || item.role?.scope === 'system'))) redirect('/access-denied');
   const hasSystemRole = roles.some((item) => item.is_active === true && item.role?.scope === 'system');
   if (!hasSystemRole) {
-    const { data: employeeProfile, error: employeeProfileError } = await supabase.from('employee_profiles').select('employment_status').eq('user_id', userId).maybeSingle();
-    if (employeeProfileError) redirect('/access-denied?reason=database');
     if (!employeeProfile || employeeProfile.employment_status !== 'active') redirect('/access-denied?reason=employee-inactive');
   }
   if (data.must_change_password === true) redirect('/reset-password?required=1');
-  return { userId, profile: data, roles };
+  return { userId, profile: data, employee: employeeProfile, roles };
 }
 
 export async function requireEmployeePermission(permission: string) {
