@@ -53,10 +53,15 @@ export function EmployeeProvider({ children, initialIdentity }: { children: Reac
       } catch {
         // Fall back to the Supabase permission query if the API identity check is unavailable.
       }
+      const roleBasedPermissions = permissionSet((rolePermissions ?? []) as Array<{ permission_key?: string }>, allowed);
+      // The Worker is an additional production cross-check, not a reason to
+      // erase permissions when a stale deployment or transient API response
+      // returns an empty list. Supabase is the same authenticated source used
+      // by the server-side permission gate, so retain it as the safe fallback.
       const effectivePermissions = new Set(
-        apiPermissions
+        apiPermissions?.length
           ? apiPermissions.filter((permission): permission is PermissionKey => allowed.has(permission) && isAdminPermission(permission))
-          : permissionSet((rolePermissions ?? []) as Array<{ permission_key?: string }>, allowed),
+          : roleBasedPermissions,
       );
       for (const override of (overrides ?? []) as Array<{ permission_key?: string; mode?: string }>) {
         if (!override.permission_key || !allowed.has(override.permission_key) || !isAdminPermission(override.permission_key)) continue;
