@@ -58,11 +58,15 @@ export function EmployeeProvider({ children, initialIdentity }: { children: Reac
       // erase permissions when a stale deployment or transient API response
       // returns an empty list. Supabase is the same authenticated source used
       // by the server-side permission gate, so retain it as the safe fallback.
-      const effectivePermissions = new Set(
-        apiPermissions?.length
-          ? apiPermissions.filter((permission): permission is PermissionKey => allowed.has(permission) && isAdminPermission(permission))
-          : roleBasedPermissions,
-      );
+      const effectivePermissions = new Set(roleBasedPermissions);
+      // Keep the Worker response as a fallback for deployments where the
+      // Supabase permission query is unavailable. Do not replace the complete
+      // role catalogue with a partial Worker response.
+      if (!roleBasedPermissions.length && apiPermissions?.length) {
+        for (const permission of apiPermissions) {
+          if (allowed.has(permission) && isAdminPermission(permission)) effectivePermissions.add(permission);
+        }
+      }
       for (const override of (overrides ?? []) as Array<{ permission_key?: string; mode?: string }>) {
         if (!override.permission_key || !allowed.has(override.permission_key) || !isAdminPermission(override.permission_key)) continue;
         if (override.mode === "grant") effectivePermissions.add(override.permission_key);
