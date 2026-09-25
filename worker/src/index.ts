@@ -1340,7 +1340,13 @@ const worker = {
 
       if (route === "/rate-quotes" && request.method === "POST") {
         if (!hasScope(auth, "quotes.create")) return error("FORBIDDEN", "Quote scope required", 403, id, headers);
-        return error("PROVIDER_UNAVAILABLE", "Live courier rate quotes are disabled until a verified provider rate contract is configured", 503, id, headers);
+        const payload = await bodyJson(request);
+        const provider = String(payload.provider ?? "xpressbees").toLowerCase();
+        if (provider !== "xpressbees") return error("PROVIDER_UNAVAILABLE", "Live rate quotes are currently available only for the configured XpressBees quote contract", 503, id, headers);
+        const origin = String(payload.origin_pincode ?? payload.origin ?? ""); const destination = String(payload.destination_pincode ?? payload.destination ?? "");
+        if (!/^\d{6}$/.test(origin) || !/^\d{6}$/.test(destination)) return error("VALIDATION_ERROR", "Valid origin and destination pincodes are required", 400, id, headers);
+        const providerResult = await providerRequest(env, "xpressbees", "quotes", { ...payload, origin_pincode: origin, destination_pincode: destination }, id, auth.clientId);
+        return json({ ok: true, data: { provider, origin_pincode: origin, destination_pincode: destination, provider_result: providerResult } }, 200, headers);
       }
       if (route === "/serviceability" && request.method === "POST") {
         if (!hasScope(auth, "quotes.create")) return error("FORBIDDEN", "Serviceability scope required", 403, id, headers);
