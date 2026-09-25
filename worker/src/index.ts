@@ -6,7 +6,17 @@ export interface Env extends Cloudflare.Env {
   EKART_API_KEY?: string;
   EKART_API_SECRET?: string;
   EKART_WEBHOOK_SECRET?: string;
+  TRACKON_API_BASE_URL?: string;
+  TRACKON_CREDENTIALS_JSON?: string;
+  TRACKON_WEBHOOK_SECRET?: string;
+  TRACKON_BOOKING_URL?: string;
+  TRACKON_TRACKING_URL?: string;
+  TRACKON_LABEL_URL?: string;
+  TRACKON_ENABLE_SHIPMENT_CREATION?: string;
+  TRACKON_ENABLE_PICKUP_CREATION?: string;
 }
+
+type CourierProvider = "delhivery" | "ekart" | "trackon";
 
 type Role = { role_code: string; scope: string };
 type Auth = {
@@ -406,25 +416,98 @@ function normalizeProviderTracking(value: unknown, depth = 0): NormalizedProvide
   return null;
 }
 
-async function providerRequest(env: Env, provider: "delhivery" | "ekart", operation: string, payload: Record<string, unknown>, requestIdValue: string, clientId?: string, idempotencyKey?: string) {
+function trackonCredentials(env: Env, accountCredential?: string) {
+  const raw = accountCredential ?? (env as unknown as Record<string, unknown>).TRACKON_CREDENTIALS_JSON;
+  if (typeof raw !== "string" || !raw.trim()) return null;
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const userId = String(parsed.userId ?? parsed.UserID ?? "").trim();
+    const password = String(parsed.password ?? parsed.Pass ?? "").trim();
+    const appKey = String(parsed.appKey ?? parsed.AppKey ?? "").trim();
+    return userId && password && appKey ? { userId, password, appKey } : null;
+  } catch { return null; }
+}
+
+function trackonTrackingUrl(endpoint: string, trackingNumber: string, credentials: { userId: string; password: string; appKey: string }) {
+  const url = new URL(endpoint);
+  url.searchParams.set("AWBNo", trackingNumber);
+  url.searchParams.set("AppKey", credentials.appKey);
+  url.searchParams.set("userID", credentials.userId);
+  url.searchParams.set("Password", credentials.password);
+  return url.toString();
+}
+
+function trackonLabelUrl(endpoint: string, trackingNumber: string, credentials: { userId: string; password: string; appKey: string }) {
+  const url = new URL(endpoint);
+  url.searchParams.set("AWBNo", trackingNumber);
+  url.searchParams.set("Appkey", credentials.appKey);
+  url.searchParams.set("userId", credentials.userId);
+  url.searchParams.set("password", credentials.password);
+  return url.toString();
+}
+
+function trackonPayload(payload: Record<string, unknown>, credentials: { userId: string; password: string; appKey: string }) {
+  const origin = payload.origin_address && typeof payload.origin_address === "object" ? payload.origin_address as Record<string, unknown> : {};
+  const destination = payload.destination_address && typeof payload.destination_address === "object" ? payload.destination_address as Record<string, unknown> : {};
+  return {
+    Appkey: credentials.appKey,
+    userId: credentials.userId,
+    password: credentials.password,
+    SerialNo: String(payload.serial_no ?? payload.serialNo ?? "1"),
+    RefNo: String(payload.ref_no ?? payload.order_id ?? payload.shipment_id ?? ""),
+    ActionType: "Book",
+    CustomerCode: String(payload.customer_code ?? ""),
+    ClientName: String(payload.consignee ?? destination.name ?? "Consignee"),
+    AddressLine1: String(destination.address_line1 ?? destination.address ?? payload.destination ?? ""),
+    AddressLine2: String(destination.address_line2 ?? ""),
+    City: String(destination.city ?? ""),
+    PinCode: String(destination.pincode ?? destination.pin_code ?? payload.destination_pincode ?? ""),
+    MobileNo: String(destination.phone ?? payload.consignee_phone ?? ""),
+    Email: String(destination.email ?? ""),
+    DocType: String(payload.doc_type ?? "N"),
+    TypeOfService: String(payload.service_type ?? "Surface"),
+    Weight: String(payload.total_weight_kg ?? payload.weight ?? ""),
+    InvoiceValue: String(payload.declared_value ?? payload.invoice_value ?? "0"),
+    NoOfPieces: String(payload.pieces ?? "1"),
+    Remark: String(payload.remark ?? ""),
+    PickupCustCode: String(payload.pickup_customer_code ?? ""),
+    PickupCustName: String(origin.name ?? payload.origin ?? "PSS Logistics"),
+    PickupAddr: String(origin.address_line1 ?? origin.address ?? payload.origin ?? ""),
+    PickupCity: String(origin.city ?? ""),
+    PickupState: String(origin.state ?? ""),
+    PickupPincode: String(origin.pincode ?? origin.pin_code ?? payload.origin_pincode ?? ""),
+    PickupPhone: String(origin.phone ?? payload.pickup_phone ?? ""),
+    ServiceType: String(payload.service_type ?? "Standard"),
+  };
+}
+
+async function providerRequest(env: Env, provider: CourierProvider, operation: string, payload: Record<string, unknown>, requestIdValue: string, clientId?: string, idempotencyKey?: string) {
   if (String(env.ENABLE_PROVIDER_CALLS) !== "true") return { enabled: false, status: "disabled" as const };
   const trackingNumber = String(payload.tracking_number ?? payload.provider_reference ?? "").trim();
-  if (operation === "tracking" && !trackingNumber) return { enabled: false, status: "invalid_request" as const, reason: "A provider tracking reference is required" };
+  if ((operation === "tracking" || operation === "labels") && !trackingNumber) return { enabled: false, status: "invalid_request" as const, reason: "A provider tracking reference is required" };
   if (provider === "delhivery" && operation === "shipments" && String(env.DELHIVERY_ENABLE_SHIPMENT_CREATION) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "Delhivery shipment creation is safety-disabled until live billing approval" };
   if (provider === "delhivery" && operation === "pickups" && String(env.DELHIVERY_ENABLE_PICKUP_CREATION) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "Delhivery pickup creation is safety-disabled until live operations approval" };
   if (provider === "delhivery" && !new Set(["tracking", "shipments", "pickups", "serviceability"]).has(operation)) return { enabled: false, status: "unsupported" as const, reason: "Delhivery operation is not supported" };
   if (provider === "ekart" && operation === "pickups") return { enabled: false, status: "unsupported" as const, reason: "Ekart pickup contract is not verified" };
   if (provider === "ekart" && operation !== "tracking" && operation !== "shipments") return { enabled: false, status: "unsupported" as const, reason: "Ekart operation is not supported" };
-  const base = provider === "delhivery" ? env.DELHIVERY_API_BASE_URL : env.EKART_API_BASE_URL;
+  if (provider === "trackon" && operation === "shipments" && String(env.TRACKON_ENABLE_SHIPMENT_CREATION) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "Trackon shipment creation is safety-disabled until live billing approval" };
+  if (provider === "trackon" && operation === "pickups") return { enabled: false, status: "unsupported" as const, reason: "Trackon pickup contract is not verified; use the provider portal until Trackon confirms the endpoint" };
+  if (provider === "trackon" && !new Set(["tracking", "shipments", "labels"]).has(operation)) return { enabled: false, status: "unsupported" as const, reason: "Trackon operation is not supported" };
+  const base = provider === "delhivery" ? env.DELHIVERY_API_BASE_URL : provider === "ekart" ? env.EKART_API_BASE_URL : env.TRACKON_API_BASE_URL;
   const account = clientId ? await env.DB.prepare("SELECT credential_secret_name FROM provider_accounts WHERE provider = ? AND status = 'active' AND (client_id = ? OR client_id IS NULL) ORDER BY CASE WHEN client_id = ? THEN 0 ELSE 1 END, created_at ASC LIMIT 1").bind(provider, clientId, clientId).first<{ credential_secret_name: string }>() : null;
   const secretBag = env as unknown as Record<string, unknown>;
-  const configuredCredential = provider === "delhivery" ? env.DELHIVERY_API_TOKEN : env.EKART_API_KEY;
+  const configuredCredential = provider === "delhivery" ? env.DELHIVERY_API_TOKEN : provider === "ekart" ? env.EKART_API_KEY : undefined;
   const credential = account ? (typeof secretBag[account.credential_secret_name] === "string" ? String(secretBag[account.credential_secret_name]) : undefined) : configuredCredential;
-  if (!base || !credential) return { enabled: false, status: "not_configured" as const };
+  const trackon = provider === "trackon" ? trackonCredentials(env, credential) : null;
+  if (!base || (provider === "trackon" ? !trackon : !credential)) return { enabled: false, status: "not_configured" as const };
   const authorization = provider === "delhivery"
     ? `Token ${credential}`
-    : credential.trim().startsWith("Basic ") ? credential.trim() : `Basic ${credential.trim()}`;
-  const headers: Record<string, string> = { "content-type": "application/json", "x-request-id": requestIdValue, Authorization: authorization };
+    : provider === "ekart"
+      ? credential!.trim().startsWith("Basic ") ? credential!.trim() : `Basic ${credential!.trim()}`
+      : undefined;
+  const headers: Record<string, string> = { "content-type": "application/json", "x-request-id": requestIdValue };
+  if (authorization) headers.Authorization = authorization;
+  if (provider === "trackon") headers["x-trackon-app-key"] = trackon!.appKey;
   const ekartCreate = provider === "ekart" && operation === "shipments" ? ekartCreatePayload(payload) : null;
   if (provider === "ekart" && operation === "shipments" && !ekartCreate) return { enabled: false, status: "invalid_request" as const, reason: "Origin and destination addresses require valid six-digit pincodes and ten-digit phone numbers" };
   const delhiveryCreate = provider === "delhivery" && operation === "shipments" ? delhiveryCreatePayload(env, payload) : null;
@@ -434,29 +517,41 @@ async function providerRequest(env: Env, provider: "delhivery" | "ekart", operat
   const integrationId = crypto.randomUUID();
   await env.DB.prepare("INSERT INTO integration_requests (id, provider, client_id, operation, idempotency_key, provider_request_id, status, attempt_count) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0)").bind(integrationId, provider, clientId ?? null, operation, idempotencyKey ?? null, requestIdValue).run();
   const delhiveryOrigin = provider === "delhivery" ? new URL(base).origin : "";
-  const url = provider === "delhivery" && operation === "tracking"
-    ? `${base.replace(/\/$/, "")}/packages/json/?waybill=${encodeURIComponent(trackingNumber)}&ref_ids=${encodeURIComponent(String(payload.order_id ?? ""))}`
+  const trackonUrl = provider === "trackon" ? operation === "tracking" ? env.TRACKON_TRACKING_URL : operation === "shipments" ? env.TRACKON_BOOKING_URL : env.TRACKON_LABEL_URL : undefined;
+  if (provider === "trackon" && !trackonUrl) return { enabled: false, status: "not_configured" as const, reason: `Trackon ${operation} endpoint is not configured` };
+  const url = provider === "trackon" && operation === "tracking"
+    ? trackonTrackingUrl(trackonUrl!, trackingNumber, trackon!)
+    : provider === "trackon" && operation === "labels"
+      ? trackonLabelUrl(trackonUrl!, trackingNumber, trackon!)
+      : provider === "delhivery" && operation === "tracking"
+        ? `${base.replace(/\/$/, "")}/packages/json/?waybill=${encodeURIComponent(trackingNumber)}&ref_ids=${encodeURIComponent(String(payload.order_id ?? ""))}`
     : provider === "delhivery" && operation === "shipments"
       ? `${delhiveryOrigin}/api/cmu/create.json`
       : provider === "delhivery" && operation === "pickups"
         ? `${delhiveryOrigin}/fm/request/new/`
         : provider === "delhivery" && operation === "serviceability"
           ? `${delhiveryOrigin}/c/api/pin-codes/json/?filter_codes=${encodeURIComponent(String(payload.destination_pincode ?? ""))}`
-    : `${base.replace(/\/$/, "")}/v2/shipments/${operation === "shipments" ? "create" : "track"}`;
+    : provider === "ekart"
+      ? `${base.replace(/\/$/, "")}/v2/shipments/${operation === "shipments" ? "create" : "track"}`
+      : trackonUrl!;
   const requestBody = provider === "delhivery" && operation === "shipments"
     ? `format=json&data=${encodeURIComponent(JSON.stringify(delhiveryCreate))}`
     : provider === "delhivery" && operation === "pickups"
       ? JSON.stringify(delhiveryPickup)
       : provider === "ekart" && operation === "shipments"
         ? JSON.stringify(ekartCreate)
-        : provider === "ekart" ? JSON.stringify({ tracking_id: trackingNumber }) : undefined;
+      : provider === "ekart" ? JSON.stringify({ tracking_id: trackingNumber })
+        : operation === "tracking" ? JSON.stringify({ Appkey: trackon!.appKey, userId: trackon!.userId, password: trackon!.password, AWBNo: trackingNumber })
+          : operation === "shipments" ? JSON.stringify(trackonPayload(payload, trackon!))
+            : JSON.stringify({ Appkey: trackon!.appKey, userId: trackon!.userId, password: trackon!.password, AWBNo: trackingNumber });
   if (provider === "delhivery" && operation === "shipments") headers["content-type"] = "application/x-www-form-urlencoded";
   let response: Response | null = null; let lastError = "provider_request_failed";
   for (let attempt = 0; attempt < 3; attempt += 1) {
     await env.DB.prepare("UPDATE integration_requests SET attempt_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(attempt + 1, integrationId).run();
     const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), 10000);
     try {
-      response = await fetch(url, { method: operation === "tracking" || operation === "serviceability" ? "GET" : "POST", headers, body: operation === "tracking" || operation === "serviceability" ? undefined : requestBody, signal: controller.signal });
+      const isGet = operation === "tracking" || operation === "serviceability" || (provider === "trackon" && operation === "labels");
+      response = await fetch(url, { method: isGet ? "GET" : "POST", headers, body: isGet ? undefined : requestBody, signal: controller.signal });
       if (response.ok || (response.status >= 400 && response.status < 500 && response.status !== 429)) break;
       lastError = `provider_http_${response.status}`;
     } catch (caught) { lastError = caught instanceof Error ? caught.name === "AbortError" ? "provider_timeout" : caught.message : "provider_request_failed"; }
@@ -491,6 +586,14 @@ async function providerRequest(env: Env, provider: "delhivery" | "ekart", operat
     const createdReference = findProviderReference(parsedProviderBody, new Set(["waybill", "awb", "tracking_number", "trackingid", "shipment_id"]));
     if (createdReference) await env.DB.prepare("UPDATE shipments SET tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(provider_reference, ?), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(createdReference, createdReference, payload.shipment_id, clientId).run();
   }
+  if (response.ok && provider === "trackon" && operation === "shipments" && clientId && typeof payload.shipment_id === "string") {
+    const createdReference = findProviderReference(parsedProviderBody, new Set(["docketno", "docket_no", "awbno", "awb"])) ?? responseBody.match(/Docket\s*No\.\s*:\s*([A-Za-z0-9]+)/i)?.[1] ?? null;
+    if (createdReference) await env.DB.prepare("UPDATE shipments SET tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(provider_reference, ?), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(createdReference, createdReference, payload.shipment_id, clientId).run();
+  }
+  if (response.ok && provider === "trackon" && operation === "labels") {
+    const labelUrl = findProviderReference(parsedProviderBody, new Set(["fileurl", "file_url"]));
+    return { enabled: true, status: labelUrl ? "accepted" as const : "failed" as const, providerStatus: response.status, label_url: labelUrl, error: labelUrl ? undefined : "Trackon did not return a label URL" };
+  }
   if (response.ok && provider === "delhivery" && operation === "pickups" && typeof payload.pickup_id === "string") {
     const pickupReference = findProviderReference(parsedProviderBody, new Set(["pickup_id", "pickup_request_id", "pur_id", "request_id"]));
     if (pickupReference) await env.DB.prepare("UPDATE pickup_requests SET provider = 'delhivery', provider_reference = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(pickupReference, payload.pickup_id, clientId ?? "").run();
@@ -509,10 +612,10 @@ async function providerRequest(env: Env, provider: "delhivery" | "ekart", operat
   }
   return { enabled: true, status: response.ok ? "accepted" as const : "failed" as const, providerStatus: response.status, normalized_status: normalizedTracking?.status, error: response.ok ? undefined : lastError };
 }
-async function verifyWebhook(request: Request, env: Env, provider: "delhivery" | "ekart", rawBody: string) {
-  const secret = provider === "delhivery" ? env.DELHIVERY_WEBHOOK_SECRET : env.EKART_WEBHOOK_SECRET;
+async function verifyWebhook(request: Request, env: Env, provider: "delhivery" | "ekart" | "trackon", rawBody: string) {
+  const secret = provider === "delhivery" ? env.DELHIVERY_WEBHOOK_SECRET : provider === "ekart" ? env.EKART_WEBHOOK_SECRET : (env as unknown as Record<string, unknown>).TRACKON_WEBHOOK_SECRET as string | undefined;
   if (!secret) return false;
-  const tokenHeader = provider === "delhivery" ? request.headers.get("X-Delhivery-Webhook-Token") ?? request.headers.get("X-Webhook-Token") : null;
+  const tokenHeader = provider === "delhivery" ? request.headers.get("X-Delhivery-Webhook-Token") ?? request.headers.get("X-Webhook-Token") : provider === "trackon" ? request.headers.get("X-Trackon-Webhook-Token") ?? request.headers.get("X-Webhook-Token") : null;
   if (tokenHeader && timingSafeEqual(tokenHeader.trim(), secret.trim())) return true;
   const provided = request.headers.get("X-Webhook-Signature") ?? request.headers.get("X-Signature") ?? "";
   if (!provided) return false;
@@ -533,7 +636,7 @@ function delhiveryWebhookDetails(payload: Record<string, unknown>) {
   };
 }
 
-async function handleProviderWebhook(request: Request, env: Env, provider: "delhivery" | "ekart", requestIdValue: string, headers: HeadersInit) {
+async function handleProviderWebhook(request: Request, env: Env, provider: "delhivery" | "ekart" | "trackon", requestIdValue: string, headers: HeadersInit) {
   const rawBody = await request.text();
   if (rawBody.length > 1024 * 1024) return error("PAYLOAD_TOO_LARGE", "Webhook payload is too large", 413, requestIdValue, headers);
   if (!await verifyWebhook(request, env, provider, rawBody)) return error("INVALID_SIGNATURE", "Webhook signature is invalid", 401, requestIdValue, headers);
@@ -541,11 +644,11 @@ async function handleProviderWebhook(request: Request, env: Env, provider: "delh
   try { payload = JSON.parse(rawBody) as Record<string, unknown>; } catch { return error("INVALID_JSON", "Webhook payload must be valid JSON", 400, requestIdValue, headers); }
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return error("VALIDATION_ERROR", "Webhook payload must be an object", 400, requestIdValue, headers);
   const delhiveryDetails = provider === "delhivery" ? delhiveryWebhookDetails(payload) : null;
-  const suppliedEventId = String(payload.event_id ?? payload.id ?? delhiveryDetails?.reference ?? "").trim();
+  const suppliedEventId = String(payload.event_id ?? payload.id ?? delhiveryDetails?.reference ?? payload.AWBNo ?? payload.awb ?? payload.waybill ?? "").trim();
   const eventId = suppliedEventId ? `${provider}:${suppliedEventId}:${await sha256(rawBody).then((value) => value.slice(0, 16))}` : `${provider}:${await sha256(rawBody)}`;
   const stored = await env.DB.prepare("INSERT OR IGNORE INTO webhook_events (id, provider, event_id, event_type, payload, signature_valid, status) VALUES (?, ?, ?, ?, ?, 1, 'received')").bind(crypto.randomUUID(), provider, eventId, String(payload.event_type ?? payload.status ?? "unknown"), rawBody).run();
   if (Number(stored.meta?.changes ?? 0) > 0) {
-    const reference = delhiveryDetails?.reference ?? String(payload.tracking_number ?? payload.awb ?? payload.waybill ?? payload.provider_reference ?? payload.shipment_id ?? "").trim();
+    const reference = delhiveryDetails?.reference ?? String(payload.tracking_number ?? payload.AWBNo ?? payload.awb ?? payload.waybill ?? payload.provider_reference ?? payload.shipment_id ?? "").trim();
     const status = normalizeProviderShipmentStatus(delhiveryDetails?.rawStatus ?? payload.status ?? payload.current_status ?? payload.event_type);
     const description = delhiveryDetails?.description ?? String(payload.description ?? payload.message ?? `Webhook event ${eventId}`); const location = delhiveryDetails?.location ?? String(payload.location ?? payload.city ?? "");
     const shipment = reference ? await env.DB.prepare("SELECT id FROM shipments WHERE id = ? OR tracking_number = ? OR provider_reference = ? LIMIT 1").bind(reference, reference, reference).first<{ id: string }>() : null;
@@ -566,6 +669,23 @@ async function handleProviderWebhook(request: Request, env: Env, provider: "delh
   return json({ ok: true, accepted: true, request_id: requestIdValue }, 202, headers);
 }
 
+async function handleDelhiveryDocumentWebhook(request: Request, env: Env, requestIdValue: string, headers: HeadersInit) {
+  const rawBody = await request.text();
+  if (rawBody.length > 1024 * 1024) return error("PAYLOAD_TOO_LARGE", "Webhook payload is too large", 413, requestIdValue, headers);
+  if (!await verifyWebhook(request, env, "delhivery", rawBody)) return error("INVALID_SIGNATURE", "Webhook signature is invalid", 401, requestIdValue, headers);
+  let payload: Record<string, unknown>;
+  try { payload = JSON.parse(rawBody) as Record<string, unknown>; } catch { return error("INVALID_JSON", "Webhook payload must be valid JSON", 400, requestIdValue, headers); }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return error("VALIDATION_ERROR", "Webhook payload must be an object", 400, requestIdValue, headers);
+  const reference = String(payload.AWB ?? payload.awb ?? payload.Waybill ?? payload.waybill ?? payload.tracking_number ?? payload.provider_reference ?? payload.shipment_id ?? "").trim();
+  const eventId = `delhivery:document:${reference || "unknown"}:${await sha256(rawBody).then((value) => value.slice(0, 16))}`;
+  const stored = await env.DB.prepare("INSERT OR IGNORE INTO webhook_events (id, provider, event_id, event_type, payload, signature_valid, status) VALUES (?, 'delhivery', ?, ?, ?, 1, 'received')").bind(crypto.randomUUID(), eventId, String(payload.document_type ?? payload.type ?? "document"), rawBody).run();
+  if (Number(stored.meta?.changes ?? 0) > 0) {
+    const shipment = reference ? await env.DB.prepare("SELECT id FROM shipments WHERE id = ? OR tracking_number = ? OR provider_reference = ? LIMIT 1").bind(reference, reference, reference).first<{ id: string }>() : null;
+    await env.DB.prepare("UPDATE webhook_events SET status = ?, processed_at = CURRENT_TIMESTAMP WHERE provider = 'delhivery' AND event_id = ?").bind(shipment ? "processed" : "ignored", eventId).run();
+  }
+  return json({ ok: true, accepted: true, document_event: true, request_id: requestIdValue }, 202, headers);
+}
+
 const worker = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const id = requestId(request);
@@ -583,8 +703,9 @@ const worker = {
       const events = await env.DB.prepare("SELECT status, location, description, event_time FROM tracking_events WHERE shipment_id = ? ORDER BY event_time ASC LIMIT 20").bind(shipment.id).all();
       return json({ ok: true, data: { tracking_number: shipment.tracking_number, status: shipment.status, edd: shipment.edd, delivered_at: shipment.delivered_at, updated_at: shipment.updated_at, events: events.results }, request_id: id }, 200, withCors(request, env, { "cache-control": "private, no-store" }));
     }
-    const publicWebhook = url.pathname.match(/^\/v1\/webhooks\/(delhivery|ekart)$/);
-    if (publicWebhook && request.method === "POST") return handleProviderWebhook(request, env, publicWebhook[1] as "delhivery" | "ekart", id, headers);
+    if (url.pathname === "/v1/webhooks/delhivery/documents" && request.method === "POST") return handleDelhiveryDocumentWebhook(request, env, id, headers);
+    const publicWebhook = url.pathname.match(/^\/v1\/webhooks\/(delhivery|ekart|trackon)$/);
+    if (publicWebhook && request.method === "POST") return handleProviderWebhook(request, env, publicWebhook[1] as CourierProvider, id, headers);
     if (!url.pathname.startsWith("/v1/")) return error("NOT_FOUND", "Not found", 404, id, headers);
     const auth = await authenticate(request, env);
     if (!auth) return error("AUTHENTICATION_REQUIRED", "Authentication required", 401, id, headers);
@@ -638,9 +759,12 @@ const worker = {
         const ekartConfigured = Boolean(env.EKART_API_BASE_URL && env.EKART_API_KEY);
         const delhiveryWebhookConfigured = Boolean(env.DELHIVERY_WEBHOOK_SECRET);
         const ekartWebhookConfigured = Boolean(env.EKART_WEBHOOK_SECRET);
+        const trackonConfigured = Boolean(env.TRACKON_API_BASE_URL && env.TRACKON_CREDENTIALS_JSON);
+        const trackonWebhookConfigured = Boolean(env.TRACKON_WEBHOOK_SECRET);
         return json({ ok: true, data: {
-          delhivery: { configured: delhiveryConfigured, enabled: callsEnabled && delhiveryConfigured, webhook_configured: delhiveryWebhookConfigured, activation_blockers: [...(!callsEnabled ? ["provider_calls_disabled"] : []), ...(!delhiveryConfigured ? ["provider_credentials_missing"] : []), ...(!delhiveryWebhookConfigured ? ["webhook_secret_missing"] : [])], capabilities: ["tracking", ...(delhiveryWebhookConfigured ? ["webhooks"] : [])] },
+          delhivery: { configured: delhiveryConfigured, enabled: callsEnabled && delhiveryConfigured, webhook_configured: delhiveryWebhookConfigured, activation_blockers: [...(!callsEnabled ? ["provider_calls_disabled"] : []), ...(!delhiveryConfigured ? ["provider_credentials_missing"] : []), ...(!delhiveryWebhookConfigured ? ["webhook_secret_missing"] : [])], capabilities: ["tracking", ...(delhiveryWebhookConfigured ? ["scan_webhooks", "document_webhooks"] : [])] },
           ekart: { configured: ekartConfigured, enabled: callsEnabled && ekartConfigured, webhook_configured: ekartWebhookConfigured, activation_blockers: [...(!callsEnabled ? ["provider_calls_disabled"] : []), ...(!ekartConfigured ? ["provider_credentials_missing"] : []), ...(!ekartWebhookConfigured ? ["webhook_secret_missing"] : [])], capabilities: ["tracking", "shipment_creation", ...(ekartWebhookConfigured ? ["webhooks"] : [])] },
+          trackon: { configured: trackonConfigured, enabled: callsEnabled && trackonConfigured, webhook_configured: trackonWebhookConfigured, activation_blockers: [...(!callsEnabled ? ["provider_calls_disabled"] : []), ...(!trackonConfigured ? ["provider_credentials_or_endpoint_missing"] : []), ...(!trackonWebhookConfigured ? ["webhook_secret_missing"] : [])], capabilities: ["tracking", "labels", ...(trackonWebhookConfigured ? ["webhooks"] : [])] },
         } }, 200, headers);
       }
       if (route === "/security/sessions" && request.method === "GET") {
@@ -670,7 +794,7 @@ const worker = {
       if (route === "/provider-accounts" && request.method === "POST") {
         if (!hasScope(auth, "provider_accounts.manage") || !hasRole(auth, ["admin", "super_admin"])) return error("FORBIDDEN", "Provider account management permission required", 403, id, headers);
         const payload = await bodyJson(request); const provider = String(payload.provider ?? "").toLowerCase(); const accountName = String(payload.account_name ?? "").trim(); const accountType = String(payload.account_type ?? "production").toLowerCase(); const secretName = String(payload.credential_secret_name ?? "").trim(); const clientId = payload.client_id === null || payload.client_id === undefined || payload.client_id === "" ? null : String(payload.client_id);
-        if (!new Set(["delhivery", "ekart"]).has(provider) || !accountName || accountName.length > 120 || !new Set(["production", "staging"]).has(accountType) || !/^[A-Z][A-Z0-9_]{2,63}$/.test(secretName)) return error("VALIDATION_ERROR", "Invalid provider account details", 400, id, headers);
+        if (!new Set(["delhivery", "ekart", "trackon"]).has(provider) || !accountName || accountName.length > 120 || !new Set(["production", "staging"]).has(accountType) || !/^[A-Z][A-Z0-9_]{2,63}$/.test(secretName)) return error("VALIDATION_ERROR", "Invalid provider account details", 400, id, headers);
         if (!auth.system && (!clientId || !canAccessClient(auth, clientId))) return error("FORBIDDEN", "Provider account client scope is not allowed", 403, id, headers);
         if (clientId) { const client = await supabaseGet<{ id: string; status: string }>(env, `client_accounts?id=eq.${encodeURIComponent(clientId)}&status=eq.active&select=id,status`, auth.accessToken ?? ""); if (!client.length) return error("NOT_FOUND", "Client account not found", 404, id, headers); }
         const duplicate = await env.DB.prepare("SELECT id FROM provider_accounts WHERE provider = ? AND account_name = ? LIMIT 1").bind(provider, accountName).first<{ id: string }>(); if (duplicate) return error("CONFLICT", "Provider account name already exists", 409, id, headers);
@@ -732,10 +856,10 @@ const worker = {
         const existing = await idempotentResponse(env, key, clientId, "POST /v1/shipments", requestHash);
         if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
         const shipmentId = crypto.randomUUID();
-        const provider = typeof payload.provider === "string" && ["delhivery", "ekart"].includes(payload.provider) ? payload.provider : null;
+        const provider = typeof payload.provider === "string" && ["delhivery", "ekart", "trackon"].includes(payload.provider) ? payload.provider : null;
         await env.DB.prepare("INSERT INTO shipments (id, client_id, created_by_user_id, provider, status, description, origin, destination, origin_address_json, destination_address_json, consignee, total_weight_kg, declared_value, pieces, edd) VALUES (?, ?, ?, ?, 'booked', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(shipmentId, clientId, auth.userId ?? `api:${clientId}`, provider, description, origin, destination, JSON.stringify(payload.origin_address ?? null), JSON.stringify(payload.destination_address ?? null), String(payload.consignee ?? ""), weight, declaredValue, pieces, typeof payload.edd === "string" ? payload.edd : null).run();
         await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'booked', 'Shipment created', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipmentId, auth.userId ?? `api:${clientId}`).run();
-        const providerResult = provider ? await providerRequest(env, provider as "delhivery" | "ekart", "shipments", { shipment_id: shipmentId, ...payload }, id, clientId, key) : { enabled: false, status: "not_requested" as const };
+        const providerResult = provider ? await providerRequest(env, provider as CourierProvider, "shipments", { shipment_id: shipmentId, ...payload }, id, clientId, key) : { enabled: false, status: "not_requested" as const };
         const serialized = JSON.stringify({ ok: true, data: { id: shipmentId, client_id: clientId, status: "booked", provider, provider_result: providerResult }, request_id: id });
         await saveIdempotent(env, key, clientId, "POST /v1/shipments", 201, serialized, requestHash);
         await audit(env, ctx, auth, id, "shipment.created", "shipment", shipmentId, { client_id: clientId, provider });
@@ -752,7 +876,7 @@ const worker = {
         const allowed = ["provider", "provider_reference", "tracking_number", "status", "description", "origin", "destination", "consignee", "total_weight_kg", "declared_value", "pieces", "edd", "delivered_at"] as const;
         const updates = allowed.filter((field) => typeof payload[field] === "string" || typeof payload[field] === "number").map((field) => ({ field, value: payload[field] }));
         if (!updates.length) return error("VALIDATION_ERROR", "A supported shipment update is required", 400, id, headers);
-        if (payload.provider !== undefined && payload.provider !== null && payload.provider !== "delhivery" && payload.provider !== "ekart") return error("VALIDATION_ERROR", "Unsupported shipment provider", 400, id, headers);
+        if (payload.provider !== undefined && payload.provider !== null && payload.provider !== "delhivery" && payload.provider !== "ekart" && payload.provider !== "trackon") return error("VALIDATION_ERROR", "Unsupported shipment provider", 400, id, headers);
         const status = payload.status === undefined ? null : String(payload.status).toLowerCase();
         if (status && !["booked", "picked_up", "in_transit", "out_for_delivery", "delivered", "cancelled", "exception", "rto"].includes(status)) return error("VALIDATION_ERROR", "Unsupported shipment status", 400, id, headers);
         if (status && !validShipmentTransition(String(current.status).toLowerCase(), status)) return error("CONFLICT", `Shipment cannot transition from ${current.status} to ${status}`, 409, id, headers);
@@ -795,6 +919,16 @@ const worker = {
         return json({ ok: true, data: documents.results }, 200, headers);
       }
 
+      const shipmentLabel = route.match(/^\/shipments\/([^/]+)\/label$/);
+      if (shipmentLabel && request.method === "GET") {
+        if (!hasScope(auth, "tracking.read")) return error("FORBIDDEN", "Tracking read scope required", 403, id, headers);
+        const shipment = await env.DB.prepare("SELECT id, client_id, provider, tracking_number, provider_reference FROM shipments WHERE id = ? LIMIT 1").bind(shipmentLabel[1]).first<{ id: string; client_id: string; provider: string | null; tracking_number: string | null; provider_reference: string | null }>();
+        if (!shipment || !canAccessClient(auth, shipment.client_id)) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
+        if (shipment.provider !== "trackon") return error("UNSUPPORTED_PROVIDER_OPERATION", "Label generation is currently available only for Trackon", 409, id, headers);
+        const providerResult = await providerRequest(env, "trackon", "labels", { shipment_id: shipment.id, tracking_number: shipment.tracking_number, provider_reference: shipment.provider_reference }, id, shipment.client_id);
+        return json({ ok: true, data: providerResult }, 200, headers);
+      }
+
       const shipmentGet = route.match(/^\/shipments\/([^/]+)(?:\/tracking)?$/);
       if (shipmentGet && request.method === "GET") {
         if (!hasScope(auth, route.endsWith("/tracking") ? "tracking.read" : "shipments.read")) return error("FORBIDDEN", "Shipment read scope required", 403, id, headers);
@@ -802,7 +936,7 @@ const worker = {
         if (!shipment || !canAccessClient(auth, shipment.client_id)) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
         if (route.endsWith("/tracking")) {
           const events = await env.DB.prepare("SELECT * FROM tracking_events WHERE shipment_id = ? ORDER BY event_time ASC LIMIT 100").bind(shipmentGet[1]).all();
-          const provider = shipment.provider === "delhivery" || shipment.provider === "ekart" ? shipment.provider : null;
+          const provider = shipment.provider === "delhivery" || shipment.provider === "ekart" || shipment.provider === "trackon" ? shipment.provider : null;
           const providerResult = provider ? await providerRequest(env, provider, "tracking", { shipment_id: shipmentGet[1], tracking_number: shipment.tracking_number, provider_reference: shipment.provider_reference }, id, shipment.client_id) : { enabled: false, status: "not_requested" as const };
           return json({ ok: true, data: events.results, provider_result: providerResult }, 200, headers);
         }
@@ -826,8 +960,8 @@ const worker = {
         const pickupId = crypto.randomUUID();
         await env.DB.prepare("INSERT INTO pickup_requests (id, shipment_id, client_id, created_by_user_id, requested_date, requested_time_slot, pickup_address, contact_name, contact_phone, status, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?)").bind(pickupId, typeof payload.shipment_id === "string" ? payload.shipment_id : null, clientId, auth.userId ?? `api:${clientId}`, payload.scheduled_date, String(payload.window ?? ""), payload.location, String(payload.contact_name ?? payload.customer ?? "Pickup contact"), String(payload.contact_phone ?? payload.contact ?? ""), typeof payload.notes === "string" ? payload.notes.trim().slice(0, 2000) : null).run();
         const shipment = typeof payload.shipment_id === "string" ? await env.DB.prepare("SELECT provider, tracking_number, provider_reference FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(payload.shipment_id, clientId).first<{ provider: string | null; tracking_number: string | null; provider_reference: string | null }>() : null;
-        const requestedProvider = payload.provider === "delhivery" || payload.provider === "ekart" ? payload.provider : null;
-        const provider = requestedProvider ?? (shipment?.provider === "delhivery" || shipment?.provider === "ekart" ? shipment.provider : null);
+        const requestedProvider = payload.provider === "delhivery" || payload.provider === "ekart" || payload.provider === "trackon" ? payload.provider : null;
+        const provider = requestedProvider ?? (shipment?.provider === "delhivery" || shipment?.provider === "ekart" || shipment?.provider === "trackon" ? shipment.provider : null);
         const providerResult = provider ? await providerRequest(env, provider, "pickups", { pickup_id: pickupId, shipment_id: payload.shipment_id, tracking_number: shipment?.tracking_number, provider_reference: shipment?.provider_reference, ...payload }, id, clientId, key) : { enabled: false, status: "not_requested" as const };
         const serialized = JSON.stringify({ ok: true, data: { id: pickupId, client_id: clientId, status: "scheduled", provider, provider_result: providerResult }, request_id: id });
         await saveIdempotent(env, key, clientId, "POST /v1/pickups", 201, serialized, requestHash); await audit(env, ctx, auth, id, "pickup.created", "pickup", pickupId, { client_id: clientId });
