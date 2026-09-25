@@ -195,6 +195,10 @@ function normalizeProviderShipmentStatus(value: unknown) {
 }
 function hasRole(auth: Auth, roles: string[]) { return auth.system || roles.some((role) => auth.roles.has(role)); }
 function canAccessClient(auth: Auth, clientId: string) { return auth.system || auth.clientIds.has(clientId); }
+function providerAccountId(payload: Record<string, unknown>) {
+  const value = payload.provider_account_id;
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
 function requireClient(auth: Auth, requested: unknown) {
   const requestedId = typeof requested === "string" ? requested.trim() : "";
   if (auth.kind === "api") return auth.clientId ?? null;
@@ -401,6 +405,16 @@ function findProviderReference(value: unknown, keys: Set<string>, depth = 0): st
   for (const candidate of Object.values(object)) { const found = findProviderReference(candidate, keys, depth + 1); if (found) return found; }
   return null;
 }
+function findProviderAmount(value: unknown, keys = new Set(["amount", "total_amount", "total", "freight", "grand_total", "shipping_charge"]), depth = 0): number | null {
+  if (depth > 5 || value === null || value === undefined) return null;
+  if (Array.isArray(value)) { for (const item of value) { const found = findProviderAmount(item, keys, depth + 1); if (found !== null) return found; } return null; }
+  if (typeof value !== "object") return null;
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    if (keys.has(key.toLowerCase())) { const numeric = typeof item === "number" ? item : Number(String(item).replace(/[^0-9.-]/g, "")); if (Number.isFinite(numeric)) return numeric; }
+  }
+  for (const item of Object.values(value as Record<string, unknown>)) { const found = findProviderAmount(item, keys, depth + 1); if (found !== null) return found; }
+  return null;
+}
 
 type NormalizedProviderTracking = { status: string; location: string; description: string; eventTime: string | null };
 function normalizeProviderTracking(value: unknown, depth = 0): NormalizedProviderTracking | null {
@@ -534,7 +548,31 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (provider === "xpressbees" && !new Set(["tracking", "shipments", "pickups", "quotes"]).has(operation)) return { enabled: false, status: "unsupported" as const, reason: "XpressBees operation is not enabled" };
   if (provider === "rivigo") return { enabled: false, status: "not_configured" as const, reason: "Rivigo requires a developer-portal app UUID, one-time app secret, approved API endpoints, and production go-live approval" };
   const base = provider === "delhivery" ? env.DELHIVERY_API_BASE_URL : provider === "ekart" ? env.EKART_API_BASE_URL : provider === "trackon" ? env.TRACKON_API_BASE_URL : env.XPRESSBEES_API_BASE_URL;
-  const account = clientId ? await env.DB.prepare("SELECT credential_secret_name FROM provider_accounts WHERE provider = ? AND status = 'active' AND (client_id = ? OR client_id IS NULL) ORDER BY CASE WHEN client_id = ? THEN 0 ELSE 1 END, created_at ASC LIMIT 1").bind(provider, clientId, clientId).first<{ credential_secret_name: string }>() : null;
+  const requestedAccountId = providerAccountId(payload);
+  const account = clientId
+    ? await env.DB.prepare(`
+        SELECT pa.id, pa.provider, pa.account_name, pa.credential_secret_name,
+               COALESCE(p.enabled, 1) AS client_enabled,
+               COALESCE(p.priority, 100) AS priority,
+               COALESCE(p.confidence_score, 0) AS confidence_score,
+               p.rate_card_id
+        FROM provider_accounts pa
+        LEFT JOIN provider_account_client_policies p
+          ON p.provider_account_id = pa.id AND p.client_id = ?
+        WHERE pa.provider = ? AND pa.status = 'active'
+          AND (pa.client_id = ? OR pa.client_id IS NULL)
+          AND (? IS NULL OR pa.id = ?)
+          AND (p.provider_account_id IS NULL OR p.enabled = 1)
+        ORDER BY CASE WHEN p.provider_account_id IS NOT NULL THEN 0 ELSE 1 END,
+                 COALESCE(p.priority, 100) ASC,
+                 COALESCE(p.confidence_score, 0) DESC,
+                 pa.created_at ASC
+        LIMIT 1`).bind(clientId, provider, clientId, requestedAccountId, requestedAccountId).first<{
+          id: string; provider: CourierProvider; account_name: string; credential_secret_name: string;
+          client_enabled: number; priority: number; confidence_score: number; rate_card_id: string | null;
+        }>()
+    : null;
+  if (clientId && requestedAccountId && !account) return { enabled: false, status: "disabled" as const, reason: "The selected courier account is not enabled for this client" };
   const secretBag = env as unknown as Record<string, unknown>;
   const configuredCredential = provider === "delhivery" ? env.DELHIVERY_API_TOKEN : provider === "ekart" ? env.EKART_API_KEY : provider === "xpressbees" ? env.XPRESSBEES_CREDENTIALS_JSON : undefined;
   const credential = account ? (typeof secretBag[account.credential_secret_name] === "string" ? String(secretBag[account.credential_secret_name]) : undefined) : configuredCredential;
@@ -553,9 +591,10 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (provider === "xpressbees") headers.Authorization = `Bearer ${xpressToken}`;
   const ekartCreate = provider === "ekart" && operation === "shipments" ? ekartCreatePayload(payload) : null;
   if (provider === "ekart" && operation === "shipments" && !ekartCreate) return { enabled: false, status: "invalid_request" as const, reason: "Origin and destination addresses require valid six-digit pincodes and ten-digit phone numbers" };
-  const delhiveryCreate = provider === "delhivery" && operation === "shipments" ? delhiveryCreatePayload(env, payload) : null;
+  const providerPayload = account?.provider === "delhivery" ? { ...payload, delhivery_client_name: account.account_name } : payload;
+  const delhiveryCreate = provider === "delhivery" && operation === "shipments" ? delhiveryCreatePayload(env, providerPayload) : null;
   if (provider === "delhivery" && operation === "shipments" && !delhiveryCreate) return { enabled: false, status: "invalid_request" as const, reason: "Delhivery requires valid origin/destination addresses, a registered client name, and a pickup location" };
-  const delhiveryPickup = provider === "delhivery" && operation === "pickups" ? delhiveryPickupPayload(env, payload) : null;
+  const delhiveryPickup = provider === "delhivery" && operation === "pickups" ? delhiveryPickupPayload(env, providerPayload) : null;
   if (provider === "delhivery" && operation === "pickups" && !delhiveryPickup) return { enabled: false, status: "invalid_request" as const, reason: "Delhivery requires a valid pickup date and registered pickup location" };
   const integrationId = crypto.randomUUID();
   await env.DB.prepare("INSERT INTO integration_requests (id, provider, client_id, operation, idempotency_key, provider_request_id, status, attempt_count) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0)").bind(integrationId, provider, clientId ?? null, operation, idempotencyKey ?? null, requestIdValue).run();
@@ -664,7 +703,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     const createdTracking = providerReference ?? requestedReference ?? null;
     if (createdTracking) await env.DB.prepare("UPDATE shipments SET tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(provider_reference, ?), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(createdTracking, createdTracking, payload.shipment_id, clientId).run();
   }
-  return { enabled: true, status: response.ok ? "accepted" as const : "failed" as const, providerStatus: response.status, normalized_status: normalizedTracking?.status, error: response.ok ? undefined : lastError };
+  return { enabled: true, status: response.ok ? "accepted" as const : "failed" as const, providerStatus: response.status, normalized_status: normalizedTracking?.status, amount: provider === "xpressbees" && operation === "quotes" ? findProviderAmount(parsedProviderBody) : undefined, provider_account_id: account?.id, account_name: account?.account_name, confidence_score: account?.confidence_score, priority: account?.priority, rate_card_id: account?.rate_card_id ?? undefined, error: response.ok ? undefined : lastError };
 }
 async function verifyWebhook(request: Request, env: Env, provider: "delhivery" | "ekart" | "trackon", rawBody: string) {
   const secret = provider === "delhivery" ? env.DELHIVERY_WEBHOOK_SECRET : provider === "ekart" ? env.EKART_WEBHOOK_SECRET : (env as unknown as Record<string, unknown>).TRACKON_WEBHOOK_SECRET as string | undefined;
@@ -825,6 +864,51 @@ const worker = {
           rivigo: { configured: rivigoConfigured, enabled: false, webhook_configured: false, activation_blockers: ["developer_portal_app_required", "sandbox_or_production_endpoints_not_verified", "go_live_approval_required"], capabilities: ["tracking", "shipment_creation", "shipment_update", "shipment_cancellation"] },
         } }, 200, headers);
       }
+      if (route === "/provider-account-policies" && request.method === "GET") {
+        if (!hasScope(auth, "provider_accounts.read") && !hasScope(auth, "quotes.create")) return error("FORBIDDEN", "Provider account visibility permission required", 403, id, headers);
+        const requestedClient = new URL(request.url).searchParams.get("client_id");
+        const clientId = requireClient(auth, requestedClient);
+        if (!clientId || !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
+        const rows = await env.DB.prepare(`
+          SELECT pa.id, pa.provider, pa.account_name, pa.account_type, pa.client_id,
+                 pa.capabilities_json, pa.status,
+                 CASE WHEN p.provider_account_id IS NULL THEN CASE WHEN pa.status = 'active' THEN 1 ELSE 0 END ELSE p.enabled END AS enabled,
+                 CASE WHEN p.provider_account_id IS NULL THEN 100 ELSE p.priority END AS priority,
+                 CASE WHEN p.provider_account_id IS NULL THEN 0 ELSE p.confidence_score END AS confidence_score,
+                 p.rate_card_id, p.notes, p.updated_at AS policy_updated_at,
+                 CASE WHEN p.provider_account_id IS NULL THEN 0 ELSE 1 END AS explicitly_configured
+          FROM provider_accounts pa
+          LEFT JOIN provider_account_client_policies p
+            ON p.provider_account_id = pa.id AND p.client_id = ?
+          WHERE pa.status = 'active' AND (pa.client_id = ? OR pa.client_id IS NULL)
+          ORDER BY pa.provider, enabled DESC, priority ASC, confidence_score DESC, pa.account_name`).bind(clientId, clientId).all();
+        return json({ ok: true, data: rows.results.map((row) => ({ ...row, capabilities: (() => { try { return JSON.parse(String((row as Record<string, unknown>).capabilities_json ?? "[]")); } catch { return []; } })(), enabled: Boolean(Number((row as Record<string, unknown>).enabled)), explicitly_configured: Boolean(Number((row as Record<string, unknown>).explicitly_configured)) })) }, 200, headers);
+      }
+      const providerPolicyMatch = route.match(/^\/provider-account-policies\/([^/]+)$/);
+      if (providerPolicyMatch && request.method === "PUT") {
+        if (!hasScope(auth, "provider_accounts.manage") || !hasRole(auth, ["admin", "super_admin"])) return error("FORBIDDEN", "Provider account policy management permission required", 403, id, headers);
+        const account = await env.DB.prepare("SELECT id, provider, client_id, status FROM provider_accounts WHERE id = ? LIMIT 1").bind(providerPolicyMatch[1]).first<{ id: string; provider: CourierProvider; client_id: string | null; status: string }>();
+        if (!account || account.status !== "active") return error("NOT_FOUND", "Active provider account not found", 404, id, headers);
+        const payload = await bodyJson(request);
+        const clientId = typeof payload.client_id === "string" ? payload.client_id.trim() : "";
+        const enabled = payload.enabled === undefined ? true : payload.enabled;
+        const priority = payload.priority === undefined ? 100 : Number(payload.priority);
+        const confidence = payload.confidence_score === undefined ? 0 : Number(payload.confidence_score);
+        const rateCardId = payload.rate_card_id === undefined || payload.rate_card_id === null || payload.rate_card_id === "" ? null : String(payload.rate_card_id).trim();
+        const notes = payload.notes === undefined || payload.notes === null || payload.notes === "" ? null : String(payload.notes).trim();
+        if (!clientId || typeof enabled !== "boolean" || !Number.isInteger(priority) || priority < 0 || priority > 100000 || !Number.isFinite(confidence) || confidence < 0 || confidence > 100 || (notes && notes.length > 500)) return error("VALIDATION_ERROR", "Client, enabled, priority, confidence score, and notes are invalid", 400, id, headers);
+        if (!auth.system && !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
+        const key = request.headers.get("Idempotency-Key"); if (!key) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
+        const requestHash = await payloadFingerprint(payload); const endpoint = `PUT /v1/provider-account-policies/${account.id}`;
+        const existing = await idempotentResponse(env, key, auth.userId ?? "system", endpoint, requestHash); if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
+        await env.DB.prepare(`INSERT INTO provider_account_client_policies (provider_account_id, client_id, enabled, priority, confidence_score, rate_card_id, notes, updated_by_user_id, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+          ON CONFLICT(provider_account_id, client_id) DO UPDATE SET enabled = excluded.enabled, priority = excluded.priority, confidence_score = excluded.confidence_score, rate_card_id = excluded.rate_card_id, notes = excluded.notes, updated_by_user_id = excluded.updated_by_user_id, updated_at = CURRENT_TIMESTAMP`).bind(account.id, clientId, enabled ? 1 : 0, priority, confidence, rateCardId, notes, auth.userId ?? "system").run();
+        await audit(env, ctx, auth, id, "provider_account_client_policy.updated", "provider_account_client_policy", `${account.id}:${clientId}`, { provider: account.provider, client_id: clientId, enabled, priority, confidence_score: confidence, rate_card_id: rateCardId });
+        const serialized = JSON.stringify({ ok: true, data: { provider_account_id: account.id, client_id: clientId, enabled, priority, confidence_score: confidence, rate_card_id: rateCardId, notes }, request_id: id });
+        await saveIdempotent(env, key, auth.userId ?? "system", endpoint, 200, serialized, requestHash);
+        return new Response(serialized, { status: 200, headers: { ...headers, "content-type": "application/json" } });
+      }
       if (route === "/security/sessions" && request.method === "GET") {
         if (!auth.userId || !hasRole(auth, ["admin", "super_admin"])) return error("FORBIDDEN", "Security session visibility permission required", 403, id, headers);
         const sessionId = `current-${(await sha256(auth.accessToken ?? "")).slice(0, 24)}`;
@@ -914,10 +998,12 @@ const worker = {
         const existing = await idempotentResponse(env, key, clientId, "POST /v1/shipments", requestHash);
         if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
         const shipmentId = crypto.randomUUID();
-        const provider = typeof payload.provider === "string" && ["delhivery", "ekart", "trackon"].includes(payload.provider) ? payload.provider : null;
-        await env.DB.prepare("INSERT INTO shipments (id, client_id, created_by_user_id, provider, status, description, origin, destination, origin_address_json, destination_address_json, consignee, total_weight_kg, declared_value, pieces, edd) VALUES (?, ?, ?, ?, 'booked', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(shipmentId, clientId, auth.userId ?? `api:${clientId}`, provider, description, origin, destination, JSON.stringify(payload.origin_address ?? null), JSON.stringify(payload.destination_address ?? null), String(payload.consignee ?? ""), weight, declaredValue, pieces, typeof payload.edd === "string" ? payload.edd : null).run();
+        const provider = typeof payload.provider === "string" && ["delhivery", "ekart", "trackon", "xpressbees", "rivigo"].includes(payload.provider) ? payload.provider : null;
+        await env.DB.prepare("INSERT INTO shipments (id, client_id, created_by_user_id, provider, provider_account_id, status, description, origin, destination, origin_address_json, destination_address_json, consignee, total_weight_kg, declared_value, pieces, edd) VALUES (?, ?, ?, ?, NULL, 'booked', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(shipmentId, clientId, auth.userId ?? `api:${clientId}`, provider, description, origin, destination, JSON.stringify(payload.origin_address ?? null), JSON.stringify(payload.destination_address ?? null), String(payload.consignee ?? ""), weight, declaredValue, pieces, typeof payload.edd === "string" ? payload.edd : null).run();
         await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'booked', 'Shipment created', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipmentId, auth.userId ?? `api:${clientId}`).run();
         const providerResult = provider ? await providerRequest(env, provider as CourierProvider, "shipments", { shipment_id: shipmentId, ...payload }, id, clientId, key) : { enabled: false, status: "not_requested" as const };
+        const selectedProviderAccountId = (providerResult as { provider_account_id?: string }).provider_account_id;
+        if (selectedProviderAccountId) await env.DB.prepare("UPDATE shipments SET provider_account_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(selectedProviderAccountId, shipmentId, clientId).run();
         const serialized = JSON.stringify({ ok: true, data: { id: shipmentId, client_id: clientId, status: "booked", provider, provider_result: providerResult }, request_id: id });
         await saveIdempotent(env, key, clientId, "POST /v1/shipments", 201, serialized, requestHash);
         await audit(env, ctx, auth, id, "shipment.created", "shipment", shipmentId, { client_id: clientId, provider });
@@ -1345,8 +1431,26 @@ const worker = {
         if (provider !== "xpressbees") return error("PROVIDER_UNAVAILABLE", "Live rate quotes are currently available only for the configured XpressBees quote contract", 503, id, headers);
         const origin = String(payload.origin_pincode ?? payload.origin ?? ""); const destination = String(payload.destination_pincode ?? payload.destination ?? "");
         if (!/^\d{6}$/.test(origin) || !/^\d{6}$/.test(destination)) return error("VALIDATION_ERROR", "Valid origin and destination pincodes are required", 400, id, headers);
-        const providerResult = await providerRequest(env, "xpressbees", "quotes", { ...payload, origin_pincode: origin, destination_pincode: destination }, id, auth.clientId);
-        return json({ ok: true, data: { provider, origin_pincode: origin, destination_pincode: destination, provider_result: providerResult } }, 200, headers);
+        const clientId = requireClient(auth, payload.client_id);
+        if (!clientId || !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
+        const requestedAccountId = providerAccountId(payload);
+        const accounts = await env.DB.prepare(`
+          SELECT pa.id, pa.account_name,
+                 COALESCE(p.enabled, 1) AS enabled,
+                 COALESCE(p.priority, 100) AS priority,
+                 COALESCE(p.confidence_score, 0) AS confidence_score,
+                 p.rate_card_id
+          FROM provider_accounts pa
+          LEFT JOIN provider_account_client_policies p ON p.provider_account_id = pa.id AND p.client_id = ?
+          WHERE pa.provider = ? AND pa.status = 'active' AND (pa.client_id = ? OR pa.client_id IS NULL)
+            AND (? IS NULL OR pa.id = ?) AND (p.provider_account_id IS NULL OR p.enabled = 1)
+          ORDER BY priority ASC, confidence_score DESC, pa.created_at ASC`).bind(clientId, provider, clientId, requestedAccountId, requestedAccountId).all<{ id: string; account_name: string; enabled: number; priority: number; confidence_score: number; rate_card_id: string | null }>();
+        const candidates = accounts.results.length ? accounts.results : [null];
+        const quotes = await Promise.all(candidates.map(async (account) => {
+          const result = await providerRequest(env, "xpressbees", "quotes", { ...payload, origin_pincode: origin, destination_pincode: destination, ...(account ? { provider_account_id: account.id } : {}) }, id, clientId);
+          return { provider, provider_account_id: account?.id ?? (result as { provider_account_id?: string }).provider_account_id, account_name: account?.account_name ?? (result as { account_name?: string }).account_name, confidence_score: account?.confidence_score ?? (result as { confidence_score?: number }).confidence_score ?? 0, priority: account?.priority ?? (result as { priority?: number }).priority ?? 100, rate_card_id: account?.rate_card_id ?? (result as { rate_card_id?: string }).rate_card_id, amount: (result as { amount?: number | null }).amount ?? null, provider_result: result };
+        }));
+        return json({ ok: true, data: { client_id: clientId, origin_pincode: origin, destination_pincode: destination, quotes } }, 200, headers);
       }
       if (route === "/serviceability" && request.method === "POST") {
         if (!hasScope(auth, "quotes.create")) return error("FORBIDDEN", "Serviceability scope required", 403, id, headers);
