@@ -37,6 +37,9 @@
     "TRACKON_LABEL_URL": "http://trackon.in:5456/CrmApi/Crm/GenerateSoftdataLabel3x3",
     "TRACKON_ENABLE_SHIPMENT_CREATION": "false",
     "TRACKON_ENABLE_PICKUP_CREATION": "false",
+    "XPRESSBEES_API_BASE_URL": "https://ship.xpressbees.com/api",
+    "XPRESSBEES_ENABLE_SHIPMENT_CREATION": "false",
+    "XPRESSBEES_ENABLE_PICKUP_CREATION": "false",
     "ENABLE_PROVIDER_CALLS": "true"
   }
 }
