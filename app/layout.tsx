@@ -4,6 +4,7 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "PSS Logistics | Employee Portal",
   description: "Internal operations workspace for PSS Logistics employees",
+  icons: { icon: "/pss-logo.png" },
   robots: { index: false, follow: false },
 };
 

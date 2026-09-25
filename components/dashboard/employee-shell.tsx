@@ -6,11 +6,12 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Bell, ChevronRight, Menu, Moon, PanelLeftIcon, Search, Sun, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { PssIcon } from "@/components/ui/icon";
+import { BrandLogo } from "@/components/ui/brand-logo";
 import { navigationGroups } from "@/components/navigation/navigation-config";
 import { searchEmployeeMaster } from "@/lib/employee-search";
 import { useEmployee } from "@/components/dashboard/employee-provider";
 
-function Brand({ compact = false }: { compact?: boolean }) { return <div className={cn("flex items-center gap-2.5", compact && "justify-center")}><div className="grid size-8 shrink-0 place-items-center rounded-lg bg-primary text-sm font-bold text-primary-foreground shadow-xs">P</div>{!compact && <span className="text-[15px] font-semibold tracking-tight">PSS Logistics</span>}</div>; }
+function Brand({ compact = false }: { compact?: boolean }) { return <div className={cn("flex items-center gap-2.5", compact && "justify-center")}><BrandLogo compact={compact} className={compact ? "" : "h-9 w-[132px]"} />{!compact && <span className="sr-only">PSS Logistics</span>}</div>; }
 function Avatar({ initials, small = false }: { initials: string; small?: boolean }) { return <div className={cn("grid shrink-0 place-items-center rounded-full bg-primary/10 font-semibold text-primary", small ? "size-8 text-xs" : "size-11 text-sm")}>{initials}</div>; }
 
 export default function EmployeeShell({ children }: { children: React.ReactNode }) {
