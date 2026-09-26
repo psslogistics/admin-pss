@@ -933,7 +933,7 @@ const worker = {
         const trackonWebhookConfigured = Boolean(env.TRACKON_WEBHOOK_SECRET);
         const xpressbeesConfigured = Boolean(env.XPRESSBEES_API_BASE_URL && env.XPRESSBEES_CREDENTIALS_JSON);
         const rivigoConfigured = Boolean(env.RIVIGO_API_BASE_URL && env.RIVIGO_CREDENTIALS_JSON && env.RIVIGO_AUTH_URL && env.RIVIGO_TRACKING_URL);
-        const recentRequests = await env.DB.prepare("SELECT provider, status, error_code, updated_at FROM integration_requests WHERE provider IN ('delhivery', 'ekart', 'trackon', 'xpressbees', 'rivigo') ORDER BY updated_at DESC LIMIT 100").all<{ provider: CourierProvider; status: string; error_code: string | null; updated_at: string | null }>();
+        const recentRequests = await env.DB.prepare("SELECT provider, status, error_code, updated_at FROM integration_requests WHERE provider IN ('delhivery', 'ekart', 'trackon', 'xpressbees', 'rivigo') ORDER BY updated_at DESC, CASE WHEN status = 'pending' THEN 1 ELSE 0 END ASC, id DESC LIMIT 100").all<{ provider: CourierProvider; status: string; error_code: string | null; updated_at: string | null }>();
         const providerHealth = (provider: CourierProvider) => {
           const latest = recentRequests.results.find((item) => item.provider === provider);
           const pendingAge = latest?.status === "pending" && latest.updated_at ? Date.now() - Date.parse(latest.updated_at) : 0;
