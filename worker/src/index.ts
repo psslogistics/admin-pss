@@ -847,20 +847,22 @@ const worker = {
       const providers: CourierProvider[] = requestedProvider && ["delhivery", "trackon", "xpressbees"].includes(requestedProvider)
         ? [requestedProvider as CourierProvider]
         : ["delhivery", "trackon", "xpressbees"];
-      const providerOutcomes: Array<{ provider: CourierProvider; status: string }> = [];
-      for (const provider of providers) {
+      const providerResults = await Promise.all(providers.map(async (provider) => {
         try {
           const providerResult = await providerRequest(env, provider, "tracking", { tracking_number: reference }, id);
-          providerOutcomes.push({ provider, status: String(providerResult.status) });
           const tracking = (providerResult as { tracking?: { status?: string; location?: string; description?: string; event_time?: string | null } }).tracking;
-          if (providerResult.status === "accepted" && tracking?.status) {
-            return json({ ok: true, data: { tracking_number: reference, provider, status: tracking.status, edd: null, delivered_at: tracking.status === "delivered" ? tracking.event_time ?? null : null, updated_at: tracking.event_time ?? null, events: [{ status: tracking.status, location: tracking.location ?? "", description: tracking.description ?? "", event_time: tracking.event_time ?? null }] }, request_id: id }, 200, withCors(request, env, { "cache-control": "private, no-store" }));
-          }
+          return { provider, status: String(providerResult.status), tracking };
         } catch (caught) {
-          providerOutcomes.push({ provider, status: "failed" });
           console.warn(JSON.stringify({ request_id: id, provider, public_tracking_error: caught instanceof Error ? caught.message : "provider_request_failed" }));
+          return { provider, status: "failed", tracking: undefined };
         }
+      }));
+      const match = providerResults.find(({ status, tracking }) => status === "accepted" && tracking?.status);
+      if (match?.tracking?.status) {
+        const tracking = match.tracking;
+        return json({ ok: true, data: { tracking_number: reference, provider: match.provider, status: tracking.status, edd: null, delivered_at: tracking.status === "delivered" ? tracking.event_time ?? null : null, updated_at: tracking.event_time ?? null, events: [{ status: tracking.status, location: tracking.location ?? "", description: tracking.description ?? "", event_time: tracking.event_time ?? null }] }, request_id: id }, 200, withCors(request, env, { "cache-control": "private, no-store" }));
       }
+      const providerOutcomes: Array<{ provider: CourierProvider; status: string }> = providerResults.map(({ provider, status }) => ({ provider, status }));
       const unavailableStatuses = new Set(["failed", "not_configured", "disabled", "safety_disabled"]);
       const allProvidersUnavailable = providerOutcomes.length > 0 && providerOutcomes.every(({ status }) => unavailableStatuses.has(status));
       return json({
