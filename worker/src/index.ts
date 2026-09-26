@@ -844,18 +844,30 @@ const worker = {
       const providers: CourierProvider[] = requestedProvider && ["delhivery", "trackon", "xpressbees"].includes(requestedProvider)
         ? [requestedProvider as CourierProvider]
         : ["delhivery", "trackon", "xpressbees"];
+      const providerOutcomes: Array<{ provider: CourierProvider; status: string }> = [];
       for (const provider of providers) {
         try {
           const providerResult = await providerRequest(env, provider, "tracking", { tracking_number: reference }, id);
+          providerOutcomes.push({ provider, status: String(providerResult.status) });
           const tracking = (providerResult as { tracking?: { status?: string; location?: string; description?: string; event_time?: string | null } }).tracking;
           if (providerResult.status === "accepted" && tracking?.status) {
             return json({ ok: true, data: { tracking_number: reference, provider, status: tracking.status, edd: null, delivered_at: tracking.status === "delivered" ? tracking.event_time ?? null : null, updated_at: tracking.event_time ?? null, events: [{ status: tracking.status, location: tracking.location ?? "", description: tracking.description ?? "", event_time: tracking.event_time ?? null }] }, request_id: id }, 200, withCors(request, env, { "cache-control": "private, no-store" }));
           }
         } catch (caught) {
+          providerOutcomes.push({ provider, status: "failed" });
           console.warn(JSON.stringify({ request_id: id, provider, public_tracking_error: caught instanceof Error ? caught.message : "provider_request_failed" }));
         }
       }
-      return json({ ok: true, data: null, request_id: id }, 200, withCors(request, env, { "cache-control": "private, no-store" }));
+      const unavailableStatuses = new Set(["failed", "not_configured", "disabled", "safety_disabled"]);
+      const allProvidersUnavailable = providerOutcomes.length > 0 && providerOutcomes.every(({ status }) => unavailableStatuses.has(status));
+      return json({
+        ok: true,
+        data: null,
+        status: allProvidersUnavailable ? "provider_unavailable" : "not_found",
+        providers_checked: providers,
+        provider_outcomes: providerOutcomes,
+        request_id: id,
+      }, 200, withCors(request, env, { "cache-control": "private, no-store" }));
     }
     if (url.pathname === "/v1/webhooks/delhivery/documents" && request.method === "POST") return handleDelhiveryDocumentWebhook(request, env, id, headers);
     const publicWebhook = url.pathname.match(/^\/v1\/webhooks\/(delhivery|ekart|trackon)$/);
