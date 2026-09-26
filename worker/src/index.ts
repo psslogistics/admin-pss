@@ -667,9 +667,12 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
             : JSON.stringify({ Appkey: trackon!.appKey, userId: trackon!.userId, password: trackon!.password, AWBNo: trackingNumber });
   if (provider === "delhivery" && operation === "shipments") headers["content-type"] = "application/x-www-form-urlencoded";
   let response: Response | null = null; let lastError = "provider_request_failed";
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+  const readOnlyProviderCall = operation === "tracking" || operation === "serviceability";
+  const maxAttempts = readOnlyProviderCall ? 1 : 3;
+  const attemptTimeoutMs = readOnlyProviderCall ? 5000 : 10000;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     await env.DB.prepare("UPDATE integration_requests SET attempt_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(attempt + 1, integrationId).run();
-    const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), 10000);
+    const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), attemptTimeoutMs);
     try {
       // XpressBees documents tracking as POST even though it is a read-only
       // lookup. Keep the generic GET behavior for Delhivery/Trackon tracking,
