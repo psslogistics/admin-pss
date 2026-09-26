@@ -31,6 +31,7 @@
     "DELHIVERY_ENABLE_SHIPMENT_CREATION": "true",
     "DELHIVERY_ENABLE_PICKUP_CREATION": "true",
     "EKART_API_BASE_URL": "https://api.ekartlogistics.com",
+    "EKART_ENABLE_PROVIDER_CALLS": "false",
     "TRACKON_API_BASE_URL": "http://trackon.in:5455",
     "TRACKON_TRACKING_URL": "http://trackoncourier.com:5455/CrmApi/t1/AWBTrackingCustomer",
     "TRACKON_BOOKING_URL": "http://trackon.in:5455/CrmApi/Crm/UploadPickupRequestWithoutDockNo",
