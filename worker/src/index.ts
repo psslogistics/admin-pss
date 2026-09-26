@@ -671,7 +671,10 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     await env.DB.prepare("UPDATE integration_requests SET attempt_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(attempt + 1, integrationId).run();
     const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), 10000);
     try {
-      const isGet = operation === "tracking" || operation === "serviceability" || (provider === "trackon" && operation === "labels");
+      // XpressBees documents tracking as POST even though it is a read-only
+      // lookup. Keep the generic GET behavior for Delhivery/Trackon tracking,
+      // but send the XpressBees AWB body with POST to avoid provider HTTP 405.
+      const isGet = (operation === "tracking" && provider !== "xpressbees") || operation === "serviceability" || (provider === "trackon" && operation === "labels");
       response = await fetch(url, { method: isGet ? "GET" : "POST", headers, body: isGet ? undefined : requestBody, signal: controller.signal });
       if (response.ok || (response.status >= 400 && response.status < 500 && response.status !== 429)) break;
       lastError = `provider_http_${response.status}`;
