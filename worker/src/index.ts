@@ -573,7 +573,20 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
           id: string; provider: CourierProvider; account_name: string; credential_secret_name: string;
           client_enabled: number; priority: number; confidence_score: number; rate_card_id: string | null;
         }>()
-    : null;
+    : await env.DB.prepare(`
+        SELECT pa.id, pa.provider, pa.account_name, pa.credential_secret_name,
+               1 AS client_enabled,
+               100 AS priority,
+               0 AS confidence_score,
+               NULL AS rate_card_id
+        FROM provider_accounts pa
+        WHERE pa.provider = ? AND pa.status = 'active' AND pa.client_id IS NULL
+          AND (? IS NULL OR pa.id = ?)
+        ORDER BY pa.created_at ASC
+        LIMIT 1`).bind(provider, requestedAccountId, requestedAccountId).first<{
+          id: string; provider: CourierProvider; account_name: string; credential_secret_name: string;
+          client_enabled: number; priority: number; confidence_score: number; rate_card_id: string | null;
+        }>();
   if (clientId && requestedAccountId && !account) return { enabled: false, status: "disabled" as const, reason: "The selected courier account is not enabled for this client" };
   const secretBag = env as unknown as Record<string, unknown>;
   const configuredCredential = provider === "delhivery" ? env.DELHIVERY_API_TOKEN : provider === "ekart" ? env.EKART_API_KEY : provider === "xpressbees" ? env.XPRESSBEES_CREDENTIALS_JSON : undefined;
@@ -662,9 +675,9 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   const responseBody = await response.text();
   await env.DB.prepare("UPDATE integration_requests SET status = ?, error_code = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(response.ok ? "succeeded" : "failed", response.ok ? null : `HTTP_${response.status}`, response.ok ? null : lastError, integrationId).run();
   let normalizedTracking: NormalizedProviderTracking | null = null;
-  if (response.ok && operation === "tracking" && clientId && typeof payload.shipment_id === "string") {
+  if (response.ok && operation === "tracking") {
     try { normalizedTracking = normalizeProviderTracking(JSON.parse(responseBody)); } catch { normalizedTracking = null; }
-    if (normalizedTracking) {
+    if (normalizedTracking && clientId && typeof payload.shipment_id === "string") {
       const current = await env.DB.prepare("SELECT status FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(payload.shipment_id, clientId).first<{ status: string }>();
       if (current && validShipmentTransition(String(current.status).toLowerCase(), normalizedTracking.status)) {
         const latest = await env.DB.prepare("SELECT status, location, description FROM tracking_events WHERE shipment_id = ? ORDER BY event_time DESC LIMIT 1").bind(payload.shipment_id).first<{ status: string; location: string | null; description: string | null }>();
@@ -705,7 +718,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     const createdTracking = providerReference ?? requestedReference ?? null;
     if (createdTracking) await env.DB.prepare("UPDATE shipments SET tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(provider_reference, ?), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(createdTracking, createdTracking, payload.shipment_id, clientId).run();
   }
-  return { enabled: true, status: response.ok ? "accepted" as const : "failed" as const, providerStatus: response.status, normalized_status: normalizedTracking?.status, amount: provider === "xpressbees" && operation === "quotes" ? findProviderAmount(parsedProviderBody) : undefined, provider_account_id: account?.id, account_name: account?.account_name, confidence_score: account?.confidence_score, priority: account?.priority, rate_card_id: account?.rate_card_id ?? undefined, error: response.ok ? undefined : lastError };
+  return { enabled: true, status: response.ok ? "accepted" as const : "failed" as const, providerStatus: response.status, normalized_status: normalizedTracking?.status, tracking: normalizedTracking ? { status: normalizedTracking.status, location: normalizedTracking.location, description: normalizedTracking.description, event_time: normalizedTracking.eventTime } : undefined, amount: provider === "xpressbees" && operation === "quotes" ? findProviderAmount(parsedProviderBody) : undefined, provider_account_id: account?.id, account_name: account?.account_name, confidence_score: account?.confidence_score, priority: account?.priority, rate_card_id: account?.rate_card_id ?? undefined, error: response.ok ? undefined : lastError };
 }
 async function verifyWebhook(request: Request, env: Env, provider: "delhivery" | "ekart" | "trackon", rawBody: string) {
   const secret = provider === "delhivery" ? env.DELHIVERY_WEBHOOK_SECRET : provider === "ekart" ? env.EKART_WEBHOOK_SECRET : (env as unknown as Record<string, unknown>).TRACKON_WEBHOOK_SECRET as string | undefined;
@@ -794,9 +807,26 @@ const worker = {
       const reference = url.searchParams.get("reference")?.trim();
       if (!reference || reference.length > 128) return error("VALIDATION_ERROR", "A tracking reference is required", 400, id, withCors(request, env));
       const shipment = await env.DB.prepare("SELECT id, tracking_number, status, edd, delivered_at, updated_at FROM shipments WHERE tracking_number = ? OR id = ? OR provider_reference = ? LIMIT 1").bind(reference, reference, reference).first<{ id: string; tracking_number: string | null; status: string; edd: string | null; delivered_at: string | null; updated_at: string | null }>();
-      if (!shipment) return json({ ok: true, data: null, request_id: id }, 200, withCors(request, env, { "cache-control": "private, no-store" }));
-      const events = await env.DB.prepare("SELECT status, location, description, event_time FROM tracking_events WHERE shipment_id = ? ORDER BY event_time ASC LIMIT 20").bind(shipment.id).all();
-      return json({ ok: true, data: { tracking_number: shipment.tracking_number, status: shipment.status, edd: shipment.edd, delivered_at: shipment.delivered_at, updated_at: shipment.updated_at, events: events.results }, request_id: id }, 200, withCors(request, env, { "cache-control": "private, no-store" }));
+      if (shipment) {
+        const events = await env.DB.prepare("SELECT status, location, description, event_time FROM tracking_events WHERE shipment_id = ? ORDER BY event_time ASC LIMIT 20").bind(shipment.id).all();
+        return json({ ok: true, data: { tracking_number: shipment.tracking_number, status: shipment.status, edd: shipment.edd, delivered_at: shipment.delivered_at, updated_at: shipment.updated_at, events: events.results }, request_id: id }, 200, withCors(request, env, { "cache-control": "private, no-store" }));
+      }
+
+      // A public AWB may belong to a courier shipment that has not yet been
+      // imported into PSS D1. Query only the explicitly supported tracking
+      // providers, normalize the response, and never return the raw payload.
+      const requestedProvider = url.searchParams.get("provider")?.trim().toLowerCase();
+      const providers: CourierProvider[] = requestedProvider && ["delhivery", "trackon", "xpressbees"].includes(requestedProvider)
+        ? [requestedProvider as CourierProvider]
+        : ["delhivery", "trackon", "xpressbees"];
+      for (const provider of providers) {
+        const providerResult = await providerRequest(env, provider, "tracking", { tracking_number: reference }, id);
+        const tracking = (providerResult as { tracking?: { status?: string; location?: string; description?: string; event_time?: string | null } }).tracking;
+        if (providerResult.status === "accepted" && tracking?.status) {
+          return json({ ok: true, data: { tracking_number: reference, provider, status: tracking.status, edd: null, delivered_at: tracking.status === "delivered" ? tracking.event_time ?? null : null, updated_at: tracking.event_time ?? null, events: [{ status: tracking.status, location: tracking.location ?? "", description: tracking.description ?? "", event_time: tracking.event_time ?? null }] }, request_id: id }, 200, withCors(request, env, { "cache-control": "private, no-store" }));
+        }
+      }
+      return json({ ok: true, data: null, request_id: id }, 200, withCors(request, env, { "cache-control": "private, no-store" }));
     }
     if (url.pathname === "/v1/webhooks/delhivery/documents" && request.method === "POST") return handleDelhiveryDocumentWebhook(request, env, id, headers);
     const publicWebhook = url.pathname.match(/^\/v1\/webhooks\/(delhivery|ekart|trackon)$/);
