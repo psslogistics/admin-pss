@@ -820,10 +820,14 @@ const worker = {
         ? [requestedProvider as CourierProvider]
         : ["delhivery", "trackon", "xpressbees"];
       for (const provider of providers) {
-        const providerResult = await providerRequest(env, provider, "tracking", { tracking_number: reference }, id);
-        const tracking = (providerResult as { tracking?: { status?: string; location?: string; description?: string; event_time?: string | null } }).tracking;
-        if (providerResult.status === "accepted" && tracking?.status) {
-          return json({ ok: true, data: { tracking_number: reference, provider, status: tracking.status, edd: null, delivered_at: tracking.status === "delivered" ? tracking.event_time ?? null : null, updated_at: tracking.event_time ?? null, events: [{ status: tracking.status, location: tracking.location ?? "", description: tracking.description ?? "", event_time: tracking.event_time ?? null }] }, request_id: id }, 200, withCors(request, env, { "cache-control": "private, no-store" }));
+        try {
+          const providerResult = await providerRequest(env, provider, "tracking", { tracking_number: reference }, id);
+          const tracking = (providerResult as { tracking?: { status?: string; location?: string; description?: string; event_time?: string | null } }).tracking;
+          if (providerResult.status === "accepted" && tracking?.status) {
+            return json({ ok: true, data: { tracking_number: reference, provider, status: tracking.status, edd: null, delivered_at: tracking.status === "delivered" ? tracking.event_time ?? null : null, updated_at: tracking.event_time ?? null, events: [{ status: tracking.status, location: tracking.location ?? "", description: tracking.description ?? "", event_time: tracking.event_time ?? null }] }, request_id: id }, 200, withCors(request, env, { "cache-control": "private, no-store" }));
+          }
+        } catch (caught) {
+          console.warn(JSON.stringify({ request_id: id, provider, public_tracking_error: caught instanceof Error ? caught.message : "provider_request_failed" }));
         }
       }
       return json({ ok: true, data: null, request_id: id }, 200, withCors(request, env, { "cache-control": "private, no-store" }));
