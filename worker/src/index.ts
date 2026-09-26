@@ -323,6 +323,19 @@ function delhiveryAddress(value: unknown, fallbackName: string) {
   return { line, city, state, pincode, name, phone, country: String(address.country ?? "India").trim() || "India" };
 }
 
+function shipmentAddress(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const address = value as Record<string, unknown>;
+  const line = String(address.line ?? address.address_line1 ?? address.address ?? "").trim();
+  const city = String(address.city ?? "").trim();
+  const state = String(address.state ?? "").trim();
+  const pincode = String(address.pincode ?? address.pin ?? "").trim();
+  const phone = String(address.phone ?? address.primary_contact_number ?? "").replace(/\D/g, "").slice(-10);
+  const name = String(address.name ?? "").trim();
+  if (!name || !line || !city || !state || !/^\d{6}$/.test(pincode) || !/^\d{10}$/.test(phone)) return null;
+  return { ...address, name, line, city, state, pincode, phone };
+}
+
 function delhiveryCreatePayload(env: Env, payload: Record<string, unknown>) {
   const origin = delhiveryAddress(payload.origin_address, String(payload.origin ?? "PSS Logistics"));
   const destination = delhiveryAddress(payload.destination_address, String(payload.consignee ?? "Consignee"));
@@ -771,7 +784,10 @@ async function handleProviderWebhook(request: Request, env: Env, provider: "delh
       await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, location, description, created_by_user_id, event_time, created_at) VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipment.id, status, location, description, `webhook:${provider}`, delhiveryDetails?.eventTime ?? null).run();
       await env.DB.prepare("UPDATE webhook_events SET status = 'processed', processed_at = CURRENT_TIMESTAMP WHERE provider = ? AND event_id = ?").bind(provider, eventId).run();
     } else {
-      await env.DB.prepare("UPDATE webhook_events SET status = 'ignored', processed_at = CURRENT_TIMESTAMP WHERE provider = ? AND event_id = ?").bind(provider, eventId).run();
+      // The event is authenticated and accepted, but cannot be applied until a
+      // matching local shipment exists. Keep it received for reconciliation.
+      await env.DB.prepare("UPDATE webhook_events SET status = 'received', processed_at = NULL WHERE provider = ? AND event_id = ?").bind(provider, eventId).run();
+      return json({ ok: true, accepted: true, matched: false, request_id: requestIdValue }, 202, headers);
     }
   }
   return json({ ok: true, accepted: true, request_id: requestIdValue }, 202, headers);
@@ -1021,10 +1037,13 @@ const worker = {
         const description = typeof payload.description === "string" ? payload.description.trim() : "";
         const origin = typeof payload.origin === "string" ? payload.origin.trim() : "";
         const destination = typeof payload.destination === "string" ? payload.destination.trim() : "";
+        const originAddress = shipmentAddress(payload.origin_address);
+        const destinationAddress = shipmentAddress(payload.destination_address);
         const weight = Number(payload.total_weight_kg);
         const pieces = Number(payload.pieces);
         const declaredValue = Number(payload.declared_value ?? 0);
         if (!description || description.length > 500 || !origin || origin.length > 500 || !destination || destination.length > 500) return error("VALIDATION_ERROR", "Description, origin, and destination are required", 400, id, headers);
+        if (!originAddress || !destinationAddress) return error("VALIDATION_ERROR", "Complete consignor and consignee addresses are required: name, address, city, state, six-digit pincode, and ten-digit phone", 400, id, headers);
         if (!Number.isFinite(weight) || weight <= 0 || weight > 100000) return error("VALIDATION_ERROR", "Weight must be greater than 0 and within the supported limit", 400, id, headers);
         if (!Number.isInteger(pieces) || pieces < 1 || pieces > 10000) return error("VALIDATION_ERROR", "Pieces must be a whole number between 1 and 10,000", 400, id, headers);
         if (!Number.isFinite(declaredValue) || declaredValue < 0) return error("VALIDATION_ERROR", "Declared value must be a non-negative number", 400, id, headers);
@@ -1036,7 +1055,7 @@ const worker = {
         if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
         const shipmentId = crypto.randomUUID();
         const provider = typeof payload.provider === "string" && ["delhivery", "ekart", "trackon", "xpressbees", "rivigo"].includes(payload.provider) ? payload.provider : null;
-        await env.DB.prepare("INSERT INTO shipments (id, client_id, created_by_user_id, provider, provider_account_id, status, description, origin, destination, origin_address_json, destination_address_json, consignee, total_weight_kg, declared_value, pieces, edd) VALUES (?, ?, ?, ?, NULL, 'booked', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(shipmentId, clientId, auth.userId ?? `api:${clientId}`, provider, description, origin, destination, JSON.stringify(payload.origin_address ?? null), JSON.stringify(payload.destination_address ?? null), String(payload.consignee ?? ""), weight, declaredValue, pieces, typeof payload.edd === "string" ? payload.edd : null).run();
+        await env.DB.prepare("INSERT INTO shipments (id, client_id, created_by_user_id, provider, provider_account_id, status, description, origin, destination, origin_address_json, destination_address_json, consignee, total_weight_kg, declared_value, pieces, edd) VALUES (?, ?, ?, ?, NULL, 'booked', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(shipmentId, clientId, auth.userId ?? `api:${clientId}`, provider, description, origin, destination, JSON.stringify(originAddress), JSON.stringify(destinationAddress), String(destinationAddress.name), weight, declaredValue, pieces, typeof payload.edd === "string" ? payload.edd : null).run();
         await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'booked', 'Shipment created', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipmentId, auth.userId ?? `api:${clientId}`).run();
         const providerResult = provider ? await providerRequest(env, provider as CourierProvider, "shipments", { shipment_id: shipmentId, ...payload }, id, clientId, key) : { enabled: false, status: "not_requested" as const };
         const selectedProviderAccountId = (providerResult as { provider_account_id?: string }).provider_account_id;
