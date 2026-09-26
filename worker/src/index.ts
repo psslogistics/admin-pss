@@ -933,9 +933,11 @@ const worker = {
         const recentRequests = await env.DB.prepare("SELECT provider, status, error_code, updated_at FROM integration_requests WHERE provider IN ('delhivery', 'ekart', 'trackon', 'xpressbees', 'rivigo') ORDER BY updated_at DESC LIMIT 100").all<{ provider: CourierProvider; status: string; error_code: string | null; updated_at: string | null }>();
         const providerHealth = (provider: CourierProvider) => {
           const latest = recentRequests.results.find((item) => item.provider === provider);
+          const pendingAge = latest?.status === "pending" && latest.updated_at ? Date.now() - Date.parse(latest.updated_at) : 0;
+          const pendingStale = latest?.status === "pending" && Number.isFinite(pendingAge) && pendingAge > 120_000;
           return {
-            health: latest?.status === "failed" ? "degraded" : latest?.status === "pending" ? "pending" : latest?.status === "succeeded" ? "healthy" : "unknown",
-            last_error_code: latest?.status === "failed" ? latest.error_code ?? "provider_request_failed" : null,
+            health: latest?.status === "failed" || pendingStale ? "degraded" : latest?.status === "pending" ? "pending" : latest?.status === "succeeded" ? "healthy" : "unknown",
+            last_error_code: latest?.status === "failed" ? latest.error_code ?? "provider_request_failed" : pendingStale ? "provider_request_stuck" : null,
             last_checked_at: latest?.updated_at ?? null,
           };
         };
