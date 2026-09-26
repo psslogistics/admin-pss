@@ -676,7 +676,13 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       // but send the XpressBees AWB body with POST to avoid provider HTTP 405.
       const isGet = (operation === "tracking" && provider !== "xpressbees") || operation === "serviceability" || (provider === "trackon" && operation === "labels");
       response = await fetch(url, { method: isGet ? "GET" : "POST", headers, body: isGet ? undefined : requestBody, signal: controller.signal });
-      if (response.ok || (response.status >= 400 && response.status < 500 && response.status !== 429)) break;
+      if (response.ok || (response.status >= 400 && response.status < 500 && response.status !== 429)) {
+        if (!response.ok) {
+          const allow = response.headers.get("allow")?.replace(/[^A-Za-z, ]/g, "").trim();
+          lastError = `provider_http_${response.status}${allow ? `_allow_${allow.replace(/\s+/g, "_")}` : ""}`;
+        }
+        break;
+      }
       lastError = `provider_http_${response.status}`;
     } catch (caught) { lastError = caught instanceof Error ? caught.name === "AbortError" ? "provider_timeout" : caught.message : "provider_request_failed"; }
     finally { clearTimeout(timeout); }
