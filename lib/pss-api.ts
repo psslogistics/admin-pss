@@ -1,8 +1,11 @@
 import { createClient } from "@/lib/supabase/client";
 
 const GET_CACHE_TTL_MS = 15_000;
+const SESSION_CACHE_TTL_MS = 5_000;
 const getCache = new Map<string, { expiresAt: number; value: unknown }>();
 const getInFlight = new Map<string, Promise<unknown>>();
+const isSessionCachedRead = (path: string) => path === "/v1/dashboard/summary" || path === "/v1/provider-capabilities" || path === "/v1/provider-account-policies";
+const sessionKey = (userId: string, path: string) => `pss-api:${userId}:${path}`;
 
 export async function pssApi<T>(path: string, init: RequestInit = {}): Promise<T> {
   const supabase = createClient();
@@ -15,6 +18,15 @@ export async function pssApi<T>(path: string, init: RequestInit = {}): Promise<T
   if (!mutating) {
     const cached = getCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) return cached.value as T;
+    if (isSessionCachedRead(path)) {
+      try {
+        const stored = JSON.parse(sessionStorage.getItem(sessionKey(session.user.id, path)) ?? "null") as { expiresAt?: number; value?: T } | null;
+        if (stored?.expiresAt && stored.expiresAt > Date.now() && stored.value !== undefined) {
+          getCache.set(cacheKey, { expiresAt: stored.expiresAt, value: stored.value });
+          return stored.value;
+        }
+      } catch { /* session storage is an optional acceleration layer */ }
+    }
     const pending = getInFlight.get(cacheKey);
     if (pending) return pending as Promise<T>;
   }
@@ -25,8 +37,13 @@ export async function pssApi<T>(path: string, init: RequestInit = {}): Promise<T
     const response = await fetch(`${baseUrl.replace(/\/$/, "")}${path}`, { ...init, signal: controller.signal, headers: { Authorization: `Bearer ${session.access_token}`, ...(init.body ? { "content-type": "application/json" } : {}), ...(mutating ? { "Idempotency-Key": crypto.randomUUID() } : {}), ...init.headers } });
     const payload = await response.json().catch(() => ({})) as T & { error?: { message?: string } };
     if (!response.ok) throw new Error(payload.error?.message || `Request failed (${response.status}).`);
-    if (!mutating) getCache.set(cacheKey, { expiresAt: Date.now() + GET_CACHE_TTL_MS, value: payload });
-    else getCache.clear();
+    if (!mutating) {
+      const expiresAt = Date.now() + GET_CACHE_TTL_MS;
+      getCache.set(cacheKey, { expiresAt, value: payload });
+      if (isSessionCachedRead(path)) {
+        try { const serialized = JSON.stringify({ expiresAt: Date.now() + SESSION_CACHE_TTL_MS, value: payload }); if (serialized.length <= 400_000) sessionStorage.setItem(sessionKey(session.user.id, path), serialized); } catch { /* ignore quota or privacy-mode failures */ }
+      }
+    } else { getCache.clear(); }
     return payload;
   } catch (caught) {
     if (caught instanceof DOMException && caught.name === "AbortError") throw new Error("The production API timed out. Check the Worker deployment and try again.");
