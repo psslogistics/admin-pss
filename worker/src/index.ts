@@ -527,10 +527,10 @@ function xpressbeesCredentials(raw?: string) {
   } catch { return null; }
 }
 
-async function xpressbeesToken(env: Env, credential: string, requestIdValue: string) {
+async function xpressbeesToken(env: Env, credential: string, requestIdValue: string, timeoutMs = 10000) {
   const account = xpressbeesCredentials(credential);
   if (!account || !env.XPRESSBEES_API_BASE_URL) return null;
-  const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), 10000);
+  const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(`${env.XPRESSBEES_API_BASE_URL.replace(/\/$/, "")}/users/franchise_login`, {
       method: "POST", headers: { "content-type": "application/json", "x-request-id": requestIdValue },
@@ -573,7 +573,7 @@ async function providerResponseText(response: Response, timeoutMs: number) {
   }
 }
 
-async function providerRequest(env: Env, provider: CourierProvider, operation: string, payload: Record<string, unknown>, requestIdValue: string, clientId?: string, idempotencyKey?: string) {
+async function providerRequest(env: Env, provider: CourierProvider, operation: string, payload: Record<string, unknown>, requestIdValue: string, clientId?: string, idempotencyKey?: string, timeoutMsOverride?: number) {
   if (String(env.ENABLE_PROVIDER_CALLS) !== "true") return { enabled: false, status: "disabled" as const };
   const trackingNumber = String(payload.tracking_number ?? payload.provider_reference ?? "").trim();
   if ((operation === "tracking" || operation === "labels") && !trackingNumber) return { enabled: false, status: "invalid_request" as const, reason: "A provider tracking reference is required" };
@@ -634,7 +634,8 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   const credential = account ? (typeof secretBag[account.credential_secret_name] === "string" ? String(secretBag[account.credential_secret_name]) : undefined) : configuredCredential;
   const trackon = provider === "trackon" ? trackonCredentials(env, credential) : null;
   if (!base || (provider === "trackon" ? !trackon : !credential)) return { enabled: false, status: "not_configured" as const };
-  const xpressToken = provider === "xpressbees" ? await xpressbeesToken(env, credential!, requestIdValue) : null;
+  const providerTimeoutMs = Math.min(timeoutMsOverride ?? 10000, 10000);
+  const xpressToken = provider === "xpressbees" ? await xpressbeesToken(env, credential!, requestIdValue, providerTimeoutMs) : null;
   if (provider === "xpressbees" && !xpressToken) return { enabled: true, status: "failed" as const, error: "XpressBees authentication failed" };
   const authorization = provider === "delhivery"
     ? `Token ${credential}`
@@ -701,7 +702,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   // longer than a browser request under normal network load. Keep a bounded
   // timeout so public tracking does not hang indefinitely while avoiding false
   // failures from a five-second cutoff.
-  const attemptTimeoutMs = 10000;
+  const attemptTimeoutMs = providerTimeoutMs;
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     await env.DB.prepare("UPDATE integration_requests SET attempt_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(attempt + 1, integrationId).run();
     try {
@@ -904,7 +905,10 @@ const worker = {
         : ["delhivery", "trackon", "xpressbees"];
       const providerResults = await Promise.all(providers.map(async (provider) => {
         try {
-          const providerResult = await providerRequest(env, provider, "tracking", { tracking_number: reference }, id);
+          // Public tracking must settle before the Hero client's 8-second
+          // request budget; authenticated operational lookups keep the
+          // normal provider timeout.
+          const providerResult = await providerRequest(env, provider, "tracking", { tracking_number: reference }, id, undefined, undefined, 5000);
           const tracking = (providerResult as { tracking?: { status?: string; location?: string; description?: string; event_time?: string | null } }).tracking;
           return { provider, status: String(providerResult.status), tracking };
         } catch (caught) {
