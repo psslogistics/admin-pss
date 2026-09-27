@@ -1,7 +1,8 @@
 import { redirect } from 'next/navigation'
+import { cache } from 'react'
 import { createClient } from '@/lib/supabase/server'
 
-export async function requireEmployeeAccess() {
+const getEmployeeAccess = cache(async () => {
   const supabase = await createClient(); const claimsResult = await supabase.auth.getClaims(); const userId = claimsResult.data?.claims?.sub;
   if (!userId) redirect('/sign-in');
   const { data, error: profileError } = await supabase.from('profiles').select('id,email,display_name,status,must_change_password').eq('id', userId).maybeSingle();
@@ -21,7 +22,9 @@ export async function requireEmployeeAccess() {
   }
   if (data.must_change_password === true) redirect('/reset-password?required=1');
   return { userId, profile: data, employee: employeeProfile, roles };
-}
+});
+
+export async function requireEmployeeAccess() { return getEmployeeAccess(); }
 
 export async function requireEmployeePermission(permission: string) {
   const actor = await requireEmployeeAccess();
