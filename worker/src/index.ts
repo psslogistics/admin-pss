@@ -834,8 +834,11 @@ async function handleProviderWebhook(request: Request, env: Env, provider: "delh
     if (shipment) {
       const current = await env.DB.prepare("SELECT status FROM shipments WHERE id = ? LIMIT 1").bind(shipment.id).first<{ status: string }>();
       if (!current || !validShipmentTransition(String(current.status).toLowerCase(), status)) {
-        await env.DB.prepare("UPDATE webhook_events SET status = 'ignored', processed_at = CURRENT_TIMESTAMP WHERE provider = ? AND event_id = ?").bind(provider, eventId).run();
-        return json({ ok: true, accepted: true, ignored: true, request_id: requestIdValue }, 202, headers);
+        // Provider events can arrive out of order. They are authenticated and
+        // matched, but must remain available for reconciliation rather than
+        // being presented as rejected or silently discarded.
+        await env.DB.prepare("UPDATE webhook_events SET status = 'received', processed_at = NULL WHERE provider = ? AND event_id = ?").bind(provider, eventId).run();
+        return json({ ok: true, accepted: true, matched: true, applied: false, request_id: requestIdValue }, 202, headers);
       }
       const deliveredAt = status.includes("deliver") ? new Date().toISOString() : null;
       await env.DB.prepare("UPDATE shipments SET provider = ?, provider_reference = COALESCE(?, provider_reference), status = ?, delivered_at = COALESCE(?, delivered_at), updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(provider, reference || null, status, deliveredAt, shipment.id).run();
