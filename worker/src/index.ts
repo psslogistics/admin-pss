@@ -1357,7 +1357,7 @@ const worker = {
           const placeholders = [...auth.clientIds].map(() => "?").join(",");
           return env.DB.prepare(`SELECT * FROM ${table} WHERE client_id IN (${placeholders}) ORDER BY ${order} LIMIT 100`).bind(...auth.clientIds).all<Record<string, unknown>>();
         };
-        const [shipments, pickups, billing, wallet, exceptions, ndr, activity] = await Promise.all([
+        const [shipments, pickups, billing, wallet, exceptions, ndr, activity, returns, tickets, notifications, tasks] = await Promise.all([
           collection("shipments", "created_at DESC", "shipments.read"),
           collection("pickup_requests", "requested_date DESC", "pickups.read"),
           collection("billing_records", "created_at DESC", "billing.read"),
@@ -1365,8 +1365,6 @@ const worker = {
           collection("exception_cases", "updated_at DESC", "cases.read"),
           collection("ndr_cases", "updated_at DESC", "cases.read"),
           collection("activity_events", "created_at DESC", "activity.read"),
-        ]);
-        const [returns, tickets, notifications, tasks] = await Promise.all([
           collection("return_shipments", "updated_at DESC", "cases.read"),
           collection("support_tickets", "updated_at DESC", "tickets.read"),
           hasScope(auth, "notifications.read")
