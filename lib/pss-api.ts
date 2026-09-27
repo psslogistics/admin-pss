@@ -4,12 +4,15 @@ const GET_CACHE_TTL_MS = 15_000;
 const SESSION_CACHE_TTL_MS = 15_000;
 const getCache = new Map<string, { expiresAt: number; value: unknown }>();
 const getInFlight = new Map<string, Promise<unknown>>();
+let sessionInFlight: ReturnType<ReturnType<typeof createClient>["auth"]["getSession"]> | null = null;
 const isSessionCachedRead = (path: string) => path === "/v1/dashboard/summary" || path === "/v1/provider-capabilities" || path === "/v1/provider-account-policies";
 const sessionKey = (userId: string, path: string) => `pss-api:${userId}:${path}`;
 
 export async function pssApi<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const supabase = createClient();
-  const { data: { session } } = await supabase.auth.getSession();
+  if (!sessionInFlight) {
+    sessionInFlight = createClient().auth.getSession().finally(() => { sessionInFlight = null; });
+  }
+  const { data: { session } } = await sessionInFlight;
   if (!session?.access_token) throw new Error("Your session has expired. Please sign in again.");
   const baseUrl = process.env.NEXT_PUBLIC_PSS_API_URL;
   if (!baseUrl) throw new Error("PSS API is not configured.");
