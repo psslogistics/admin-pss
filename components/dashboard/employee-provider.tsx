@@ -41,13 +41,12 @@ export function EmployeeProvider({ children, initialIdentity }: { children: Reac
       // These reads are independent after the authenticated user is known.
       // Start them together so the employee workspace is not serialized behind
       // unrelated operational panels.
-      const liveDataPromise = Promise.all([
-        // The Worker batches the independent employee dashboard collections in
-        // one authenticated D1 batch. Keep messages separate because they are
-        // only needed to enrich the support-ticket detail view.
-        pssApi<{ data: { tickets?: Array<Record<string, unknown>>; notifications?: Array<Record<string, unknown>>; shipments?: Array<Record<string, unknown>>; tasks?: Array<Record<string, unknown>>; activity?: Array<Record<string, unknown>>; preferences?: { email_notifications?: number | boolean; task_reminders?: number | boolean; compact_layout?: number | boolean } | null; permissions?: string[] } }>(window.location.pathname === "/dashboard" ? "/v1/dashboard/summary?collections=shipments,tickets,notifications,tasks,activity,preferences" : "/v1/dashboard/summary"),
-        pssApi<{ data: Array<Record<string, unknown>> }>("/v1/tickets/messages"),
-      ]);
+      // The Worker batches the independent employee dashboard collections in
+      // one authenticated D1 batch. Ticket messages are only needed after a
+      // ticket is opened, so start them in parallel but do not hold the first
+      // dashboard paint on the full message table.
+      const summaryPromise = pssApi<{ data: { tickets?: Array<Record<string, unknown>>; notifications?: Array<Record<string, unknown>>; shipments?: Array<Record<string, unknown>>; tasks?: Array<Record<string, unknown>>; activity?: Array<Record<string, unknown>>; preferences?: { email_notifications?: number | boolean; task_reminders?: number | boolean; compact_layout?: number | boolean } | null; permissions?: string[] } }>(window.location.pathname === "/dashboard" ? "/v1/dashboard/summary?collections=shipments,tickets,notifications,tasks,activity,preferences" : "/v1/dashboard/summary");
+      const ticketMessagesPromise = pssApi<{ data: Array<Record<string, unknown>> }>("/v1/tickets/messages");
       const [{ data: profile }, { data: employee }, { data: userRoles }, { data: assignments }, { data: catalogue }] = await Promise.all([
         supabase.from("profiles").select("id,email,display_name,phone,company_name").eq("id", user.id).maybeSingle(),
         supabase.from("employee_profiles").select("employee_code,workspace_slug,employment_status").eq("user_id", user.id).maybeSingle(),
@@ -58,10 +57,10 @@ export function EmployeeProvider({ children, initialIdentity }: { children: Reac
       const roles = (userRoles ?? []) as Array<{ role_id?: string; roles?: { name?: string } | { name?: string }[] }>;
       const roleNames = roles.flatMap((item) => Array.isArray(item.roles) ? item.roles.map((role) => role.name) : [item.roles?.name]).filter((name): name is string => Boolean(name));
       const roleIds = roles.map((item) => item.role_id).filter((id): id is string => Boolean(id));
-      const [{ data: rolePermissions }, { data: overrides }, [summaryResult, ticketMessageResult]] = await Promise.all([
+      const [{ data: rolePermissions }, { data: overrides }, summaryResult] = await Promise.all([
         roleIds.length ? supabase.from("role_permissions").select("role_id,permission_key").in("role_id", roleIds) : Promise.resolve({ data: [] }),
         supabase.from("employee_permission_overrides").select("permission_key,mode").eq("employee_user_id", user.id),
-        liveDataPromise,
+        summaryPromise,
       ]);
       const allowed = new Set((catalogue ?? []).map((item) => item.permission_key));
       const summaryPermissions = summaryResult.data?.permissions;
@@ -96,10 +95,7 @@ export function EmployeeProvider({ children, initialIdentity }: { children: Reac
         const shipmentRows = summary.shipments ?? [];
         const taskRows = summary.tasks ?? [];
         const activityRows = summary.activity ?? [];
-        const messagesByTicket = new Map<string, Array<Record<string, unknown>>>();
-        for (const message of ticketMessageResult.data) { const ticketId = String(message.ticket_id ?? ""); const messages = messagesByTicket.get(ticketId) ?? []; messages.push(message); messagesByTicket.set(ticketId, messages); }
-        const ticketMessages = ticketRows.map((row) => ({ data: messagesByTicket.get(String(row.id)) ?? [] }));
-        liveTickets = ticketRows.map((row, index) => ({ id: String(row.id), clientId: String(row.client_id), title: String(row.title ?? "Support ticket"), description: String(row.description ?? ""), status: String(row.status ?? "Open") as TicketStatus, priority: String(row.priority ?? "Normal") as DemoTicket["priority"], createdAt: String(row.created_at ?? new Date().toISOString()), messages: ticketMessages[index].data.map((message) => ({ id: String(message.id), author: String(message.author_user_id ?? "Production user"), body: String(message.message ?? ""), time: message.created_at ? new Date(String(message.created_at)).toLocaleString() : "" })) }));
+        liveTickets = ticketRows.map((row) => ({ id: String(row.id), clientId: String(row.client_id), title: String(row.title ?? "Support ticket"), description: String(row.description ?? ""), status: String(row.status ?? "Open") as TicketStatus, priority: String(row.priority ?? "Normal") as DemoTicket["priority"], createdAt: String(row.created_at ?? new Date().toISOString()), messages: [] }));
         liveNotifications = notificationRows.map((row) => ({ id: String(row.id), title: String(row.title ?? "Notification"), detail: String(row.message ?? ""), tone: row.type === "warning" ? "warning" : "info", read: Boolean(row.is_read) } as DemoNotification));
         liveShipments = shipmentRows.map((row) => ({ id: String(row.id), route: `${String(row.origin ?? "")} → ${String(row.destination ?? "")}`, status: String(row.status ?? "Booked"), eta: String(row.edd ?? "Pending"), clientId: String(row.client_id) }));
         liveTasks = taskRows.map((row) => ({ id: String(row.id), title: String(row.title ?? "Task"), context: String(row.description ?? ""), due: row.due_at ? new Date(String(row.due_at)).toLocaleDateString() : "No due date", dueAt: row.due_at ? String(row.due_at) : undefined, status: String(row.status ?? "pending").toLowerCase() === "completed" ? "Completed" : String(row.status ?? "pending").toLowerCase() === "in_progress" ? "In progress" : "Pending", priority: String(row.priority ?? "medium").toLowerCase() === "high" ? "High" : String(row.priority ?? "medium").toLowerCase() === "low" ? "Low" : "Medium", clientId: row.client_id ? String(row.client_id) : undefined }));
@@ -111,6 +107,17 @@ export function EmployeeProvider({ children, initialIdentity }: { children: Reac
         const name = profile?.display_name || user.user_metadata?.full_name || user.email?.split("@")[0] || emptyProfile.name;
         setState((current) => ({ ...current, employeeId: user.id, profile: { id: user.id, name, initials: initials(name), role: roleNames.join(" · ") || "Employee", email: profile?.email || user.email || "", employeeId: employee?.employee_code || "", workspace: employee?.workspace_slug || "", assignedClientIds, permissions: [...effectivePermissions], panelRole: "admin", phone: profile?.phone || "", companyName: profile?.company_name || "" }, tickets: liveTickets, notifications: liveNotifications, shipments: liveShipments, tasks: liveTasks, activity: liveActivity, settings: liveSettings }));
         setClients(loadedClients.map((client) => ({ ...client, shipments: liveShipments.filter((shipment) => shipment.clientId === client.id).length }))); setHydrated(true);
+        void ticketMessagesPromise.then(({ data }) => {
+          if (cancelled) return;
+          const messagesByTicket = new Map<string, DemoTicket["messages"]>();
+          for (const message of data) {
+            const ticketId = String(message.ticket_id ?? "");
+            const messages = messagesByTicket.get(ticketId) ?? [];
+            messages.push({ id: String(message.id), author: String(message.author_user_id ?? "Production user"), body: String(message.message ?? ""), time: message.created_at ? new Date(String(message.created_at)).toLocaleString() : "" });
+            messagesByTicket.set(ticketId, messages);
+          }
+          setState((current) => ({ ...current, tickets: current.tickets.map((ticket) => ({ ...ticket, messages: messagesByTicket.get(ticket.id) ?? ticket.messages })) }));
+        }).catch(() => undefined);
       }
     }
     void loadEmployee().catch(() => { if (!cancelled) setHydrated(true); });
