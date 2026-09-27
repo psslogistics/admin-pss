@@ -883,7 +883,13 @@ const worker = {
       if (await publicRateLimited(env, request, "/public/track")) return error("RATE_LIMITED", "Too many tracking requests", 429, id, withCors(request, env));
       const reference = url.searchParams.get("reference")?.trim();
       if (!reference || reference.length > 128) return error("VALIDATION_ERROR", "A tracking reference is required", 400, id, withCors(request, env));
-      const shipment = await env.DB.prepare("SELECT id, tracking_number, status, edd, delivered_at, updated_at FROM shipments WHERE tracking_number = ? OR id = ? OR provider_reference = ? LIMIT 1").bind(reference, reference, reference).first<{ id: string; tracking_number: string | null; status: string; edd: string | null; delivered_at: string | null; updated_at: string | null }>();
+      type PublicShipment = { id: string; tracking_number: string | null; status: string; edd: string | null; delivered_at: string | null; updated_at: string | null };
+      // Keep the lookup predicates separate. This avoids edge cases in D1's
+      // bound-parameter handling for nullable provider fields and ensures a
+      // direct PSS shipment ID always resolves before provider fallback.
+      const shipmentById = await env.DB.prepare("SELECT id, tracking_number, status, edd, delivered_at, updated_at FROM shipments WHERE id = ? LIMIT 1").bind(reference).first<PublicShipment>();
+      const shipmentByTracking = shipmentById ? null : await env.DB.prepare("SELECT id, tracking_number, status, edd, delivered_at, updated_at FROM shipments WHERE tracking_number = ? LIMIT 1").bind(reference).first<PublicShipment>();
+      const shipment = shipmentById ?? shipmentByTracking ?? await env.DB.prepare("SELECT id, tracking_number, status, edd, delivered_at, updated_at FROM shipments WHERE provider_reference = ? LIMIT 1").bind(reference).first<PublicShipment>();
       if (shipment) {
         const events = await env.DB.prepare("SELECT status, location, description, event_time FROM tracking_events WHERE shipment_id = ? ORDER BY event_time ASC LIMIT 20").bind(shipment.id).all();
         return json({ ok: true, data: { tracking_number: shipment.tracking_number, status: shipment.status, edd: shipment.edd, delivered_at: shipment.delivered_at, updated_at: shipment.updated_at, events: events.results }, request_id: id }, 200, withCors(request, env, { "cache-control": "private, no-store" }));
