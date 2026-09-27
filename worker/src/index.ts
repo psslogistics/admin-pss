@@ -863,7 +863,10 @@ async function handleDelhiveryDocumentWebhook(request: Request, env: Env, reques
   const stored = await env.DB.prepare("INSERT OR IGNORE INTO webhook_events (id, provider, event_id, event_type, payload, signature_valid, status) VALUES (?, 'delhivery', ?, ?, ?, 1, 'received')").bind(crypto.randomUUID(), eventId, String(payload.document_type ?? payload.type ?? "document"), rawBody).run();
   if (Number(stored.meta?.changes ?? 0) > 0) {
     const shipment = reference ? await env.DB.prepare("SELECT id FROM shipments WHERE id = ? OR tracking_number = ? OR provider_reference = ? LIMIT 1").bind(reference, reference, reference).first<{ id: string }>() : null;
-    await env.DB.prepare("UPDATE webhook_events SET status = ?, processed_at = CURRENT_TIMESTAMP WHERE provider = 'delhivery' AND event_id = ?").bind(shipment ? "processed" : "ignored", eventId).run();
+    // A valid provider document event can arrive before the shipment is
+    // imported into PSS. Keep it received for reconciliation instead of
+    // labelling it ignored; only duplicate or invalid events are rejected.
+    await env.DB.prepare("UPDATE webhook_events SET status = ?, processed_at = ? WHERE provider = 'delhivery' AND event_id = ?").bind(shipment ? "processed" : "received", shipment ? new Date().toISOString() : null, eventId).run();
   }
   return json({ ok: true, accepted: true, document_event: true, request_id: requestIdValue }, 202, headers);
 }
