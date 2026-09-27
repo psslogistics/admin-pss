@@ -5,12 +5,12 @@ import { createClient } from '@/lib/supabase/server'
 const getEmployeeAccess = cache(async () => {
   const supabase = await createClient(); const claimsResult = await supabase.auth.getClaims(); const userId = claimsResult.data?.claims?.sub;
   if (!userId) redirect('/sign-in');
-  const { data, error: profileError } = await supabase.from('profiles').select('id,email,display_name,status,must_change_password').eq('id', userId).maybeSingle();
-  if (profileError) redirect('/access-denied?reason=database');
-  const { data: employeeProfile, error: employeeProfileError } = await supabase.from('employee_profiles').select('employee_code,workspace_slug,employment_status').eq('user_id', userId).maybeSingle();
-  if (employeeProfileError) redirect('/access-denied?reason=database');
-  const { data: assignments, error: assignmentsError } = await supabase.from('user_roles').select('is_active,role_id').eq('user_id', userId);
-  if (assignmentsError) redirect('/access-denied?reason=database');
+  const [{ data, error: profileError }, { data: employeeProfile, error: employeeProfileError }, { data: assignments, error: assignmentsError }] = await Promise.all([
+    supabase.from('profiles').select('id,email,display_name,status,must_change_password').eq('id', userId).maybeSingle(),
+    supabase.from('employee_profiles').select('employee_code,workspace_slug,employment_status').eq('user_id', userId).maybeSingle(),
+    supabase.from('user_roles').select('is_active,role_id').eq('user_id', userId),
+  ]);
+  if (profileError || employeeProfileError || assignmentsError) redirect('/access-denied?reason=database');
   const roleIds = (assignments ?? []).map((item) => item.role_id);
   const { data: roleRows, error: rolesError } = roleIds.length ? await supabase.from('roles').select('id,role_code,scope').in('id', roleIds) : { data: [], error: null };
   if (rolesError) redirect('/access-denied?reason=database');
