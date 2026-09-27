@@ -14,6 +14,12 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       lang="en"
       className="h-full antialiased"
     >
+      <head>
+        <link rel="preconnect" href="https://pss-api.psslogisticsadmin.workers.dev" crossOrigin="anonymous" />
+        <link rel="dns-prefetch" href="//pss-api.psslogisticsadmin.workers.dev" />
+        <link rel="preconnect" href="https://qyelfkmafzspctqkrwxf.supabase.co" crossOrigin="anonymous" />
+        <link rel="dns-prefetch" href="//qyelfkmafzspctqkrwxf.supabase.co" />
+      </head>
       <body className="min-h-full flex flex-col">{children}</body>
     </html>
   );
