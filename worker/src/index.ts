@@ -989,7 +989,11 @@ const worker = {
         // Read-only provider probes must not remain pending forever. Reconcile
         // only tracking/serviceability rows older than the terminalization
         // window; shipment, pickup, billing, and webhook records are untouched.
-        await env.DB.prepare("UPDATE integration_requests SET status = 'failed', error_code = 'PROVIDER_TIMEOUT_STALE', error_message = 'Read-only provider request remained pending beyond the terminalization window' WHERE status = 'pending' AND operation IN ('tracking', 'serviceability') AND updated_at < datetime('now', '-2 minutes')").run();
+        // Health panels must not remain in a checking state after a read-only
+        // provider probe has exceeded the same bounded terminalization window
+        // used by the public tracker. Mutations and webhook records remain
+        // untouched by this reconciliation.
+        await env.DB.prepare("UPDATE integration_requests SET status = 'failed', error_code = 'PROVIDER_TIMEOUT_STALE', error_message = 'Read-only provider request remained pending beyond the terminalization window' WHERE status = 'pending' AND operation IN ('tracking', 'serviceability') AND updated_at < datetime('now', '-10 seconds')").run();
         const recentRequests = await env.DB.prepare("SELECT provider, status, error_code, updated_at FROM integration_requests WHERE provider IN ('delhivery', 'ekart', 'trackon', 'xpressbees', 'rivigo') ORDER BY updated_at DESC, CASE WHEN status = 'pending' THEN 1 ELSE 0 END ASC, id DESC LIMIT 100").all<{ provider: CourierProvider; status: string; error_code: string | null; updated_at: string | null }>();
         const providerHealth = (provider: CourierProvider) => {
           const latest = recentRequests.results.find((item) => item.provider === provider);
