@@ -1,7 +1,7 @@
 import { createClient } from "@/lib/supabase/client";
 
 const GET_CACHE_TTL_MS = 15_000;
-const SESSION_CACHE_TTL_MS = 5_000;
+const SESSION_CACHE_TTL_MS = 15_000;
 const getCache = new Map<string, { expiresAt: number; value: unknown }>();
 const getInFlight = new Map<string, Promise<unknown>>();
 const isSessionCachedRead = (path: string) => path === "/v1/dashboard/summary" || path === "/v1/provider-capabilities" || path === "/v1/provider-account-policies";
