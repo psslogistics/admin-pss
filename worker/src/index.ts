@@ -669,7 +669,11 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   let response: Response | null = null; let lastError = "provider_request_failed";
   const readOnlyProviderCall = operation === "tracking" || operation === "serviceability";
   const maxAttempts = readOnlyProviderCall ? 1 : 3;
-  const attemptTimeoutMs = readOnlyProviderCall ? 5000 : 10000;
+  // Courier tracking/serviceability are read-only, but provider APIs can take
+  // longer than a browser request under normal network load. Keep a bounded
+  // timeout so public tracking does not hang indefinitely while avoiding false
+  // failures from a five-second cutoff.
+  const attemptTimeoutMs = 10000;
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     await env.DB.prepare("UPDATE integration_requests SET attempt_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(attempt + 1, integrationId).run();
     const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), attemptTimeoutMs);
