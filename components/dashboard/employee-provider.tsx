@@ -31,6 +31,19 @@ export function EmployeeProvider({ children, initialIdentity }: { children: Reac
     async function loadEmployee() {
       const supabase = createClient(); const { data: auth } = await supabase.auth.getUser(); const user = auth.user;
       if (!user) { if (!cancelled) setHydrated(true); return; }
+      // These reads are independent after the authenticated user is known.
+      // Start them together so the employee workspace is not serialized behind
+      // unrelated operational panels.
+      const liveDataPromise = Promise.all([
+        pssApi<{ data: Array<Record<string, unknown>> }>("/v1/tickets"),
+        pssApi<{ data: Array<Record<string, unknown>> }>("/v1/notifications"),
+        pssApi<{ data: Array<Record<string, unknown>> }>("/v1/shipments"),
+        pssApi<{ data: Array<Record<string, unknown>> }>("/v1/tasks"),
+        pssApi<{ data: Array<Record<string, unknown>> }>("/v1/activity"),
+        pssApi<{ data: Array<Record<string, unknown>> }>("/v1/tickets/messages"),
+      ]);
+      const preferencesPromise = pssApi<{ data: { email_notifications?: boolean; task_reminders?: boolean; compact_layout?: boolean } }>("/v1/employee-preferences").catch(() => null);
+      const apiPermissionsPromise = pssApi<{ permissions?: string[] }>("/v1/me").catch(() => null);
       const [{ data: profile }, { data: employee }, { data: userRoles }, { data: assignments }, { data: catalogue }] = await Promise.all([
         supabase.from("profiles").select("id,email,display_name,phone,company_name").eq("id", user.id).maybeSingle(),
         supabase.from("employee_profiles").select("employee_code,workspace_slug,employment_status").eq("user_id", user.id).maybeSingle(),
@@ -46,13 +59,8 @@ export function EmployeeProvider({ children, initialIdentity }: { children: Reac
         supabase.from("employee_permission_overrides").select("permission_key,mode").eq("employee_user_id", user.id),
       ]);
       const allowed = new Set((catalogue ?? []).map((item) => item.permission_key));
-      let apiPermissions: string[] | null = null;
-      try {
-        const identity = await pssApi<{ permissions?: string[] }>("/v1/me");
-        if (Array.isArray(identity.permissions)) apiPermissions = identity.permissions;
-      } catch {
-        // Fall back to the Supabase permission query if the API identity check is unavailable.
-      }
+      const identity = await apiPermissionsPromise;
+      const apiPermissions = Array.isArray(identity?.permissions) ? identity.permissions : null;
       const roleBasedPermissions = permissionSet((rolePermissions ?? []) as Array<{ permission_key?: string }>, allowed);
       // The Worker is an additional production cross-check, not a reason to
       // erase permissions when a stale deployment or transient API response
@@ -77,14 +85,7 @@ export function EmployeeProvider({ children, initialIdentity }: { children: Reac
       let liveTickets: DemoTicket[] = []; let liveNotifications: DemoNotification[] = []; let liveShipments: DemoShipment[] = []; let liveTasks: EmployeeTask[] = []; let liveActivity: EmployeeActivity[] = [];
       let liveSettings: EmployeeSettings = initialSettings;
       try {
-        const [ticketResult, notificationResult, shipmentResult, taskResult, activityResult, ticketMessageResult] = await Promise.all([
-          pssApi<{ data: Array<Record<string, unknown>> }>("/v1/tickets"),
-          pssApi<{ data: Array<Record<string, unknown>> }>("/v1/notifications"),
-          pssApi<{ data: Array<Record<string, unknown>> }>("/v1/shipments"),
-          pssApi<{ data: Array<Record<string, unknown>> }>("/v1/tasks"),
-          pssApi<{ data: Array<Record<string, unknown>> }>("/v1/activity"),
-          pssApi<{ data: Array<Record<string, unknown>> }>("/v1/tickets/messages"),
-        ]);
+        const [ticketResult, notificationResult, shipmentResult, taskResult, activityResult, ticketMessageResult] = await liveDataPromise;
         const messagesByTicket = new Map<string, Array<Record<string, unknown>>>();
         for (const message of ticketMessageResult.data) { const ticketId = String(message.ticket_id ?? ""); const messages = messagesByTicket.get(ticketId) ?? []; messages.push(message); messagesByTicket.set(ticketId, messages); }
         const ticketMessages = ticketResult.data.map((row) => ({ data: messagesByTicket.get(String(row.id)) ?? [] }));
@@ -93,10 +94,8 @@ export function EmployeeProvider({ children, initialIdentity }: { children: Reac
         liveShipments = shipmentResult.data.map((row) => ({ id: String(row.id), route: `${String(row.origin ?? "")} → ${String(row.destination ?? "")}`, status: String(row.status ?? "Booked"), eta: String(row.edd ?? "Pending"), clientId: String(row.client_id) }));
         liveTasks = taskResult.data.map((row) => ({ id: String(row.id), title: String(row.title ?? "Task"), context: String(row.description ?? ""), due: row.due_at ? new Date(String(row.due_at)).toLocaleDateString() : "No due date", dueAt: row.due_at ? String(row.due_at) : undefined, status: String(row.status ?? "pending").toLowerCase() === "completed" ? "Completed" : String(row.status ?? "pending").toLowerCase() === "in_progress" ? "In progress" : "Pending", priority: String(row.priority ?? "medium").toLowerCase() === "high" ? "High" : String(row.priority ?? "medium").toLowerCase() === "low" ? "Low" : "Medium", clientId: row.client_id ? String(row.client_id) : undefined }));
         liveActivity = activityResult.data.map((row) => ({ id: String(row.id), title: String(row.action ?? "Activity"), detail: String(row.entity_type ?? "") + (row.entity_id ? ` · ${String(row.entity_id)}` : ""), time: row.created_at ? new Date(String(row.created_at)).toLocaleString() : "", tone: "blue" }));
-        try {
-          const preferences = await pssApi<{ data: { email_notifications?: boolean; task_reminders?: boolean; compact_layout?: boolean } }>("/v1/employee-preferences");
-          liveSettings = { emailNotifications: preferences.data.email_notifications ?? true, taskReminders: preferences.data.task_reminders ?? true, compactLayout: preferences.data.compact_layout ?? false };
-        } catch { /* first load uses secure defaults until preferences are available */ }
+        const preferences = await preferencesPromise;
+        if (preferences) liveSettings = { emailNotifications: preferences.data.email_notifications ?? true, taskReminders: preferences.data.task_reminders ?? true, compactLayout: preferences.data.compact_layout ?? false };
       } catch { /* the authenticated panel can still render identity while the API is unavailable */ }
       if (!cancelled) {
         const name = profile?.display_name || user.user_metadata?.full_name || user.email?.split("@")[0] || emptyProfile.name;
