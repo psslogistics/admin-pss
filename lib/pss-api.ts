@@ -2,6 +2,7 @@ import { createClient } from "@/lib/supabase/client";
 
 const GET_CACHE_TTL_MS = 15_000;
 const SESSION_CACHE_TTL_MS = 60_000;
+const MAX_SESSION_CACHE_BYTES = 1_500_000;
 const getCache = new Map<string, { expiresAt: number; value: unknown }>();
 const getInFlight = new Map<string, Promise<unknown>>();
 let sessionInFlight: ReturnType<ReturnType<typeof createClient>["auth"]["getSession"]> | null = null;
@@ -44,7 +45,7 @@ export async function pssApi<T>(path: string, init: RequestInit = {}): Promise<T
       const expiresAt = Date.now() + GET_CACHE_TTL_MS;
       getCache.set(cacheKey, { expiresAt, value: payload });
       if (isSessionCachedRead(path)) {
-        try { const serialized = JSON.stringify({ expiresAt: Date.now() + SESSION_CACHE_TTL_MS, value: payload }); if (serialized.length <= 400_000) sessionStorage.setItem(sessionKey(session.user.id, path), serialized); } catch { /* ignore quota or privacy-mode failures */ }
+        try { const serialized = JSON.stringify({ expiresAt: Date.now() + SESSION_CACHE_TTL_MS, value: payload }); if (serialized.length <= MAX_SESSION_CACHE_BYTES) sessionStorage.setItem(sessionKey(session.user.id, path), serialized); } catch { /* ignore quota or privacy-mode failures */ }
       }
     } else { getCache.clear(); }
     return payload;
