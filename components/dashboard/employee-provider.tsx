@@ -44,10 +44,9 @@ export function EmployeeProvider({ children, initialIdentity }: { children: Reac
         // The Worker batches the independent employee dashboard collections in
         // one authenticated D1 batch. Keep messages separate because they are
         // only needed to enrich the support-ticket detail view.
-        pssApi<{ data: { tickets?: Array<Record<string, unknown>>; notifications?: Array<Record<string, unknown>>; shipments?: Array<Record<string, unknown>>; tasks?: Array<Record<string, unknown>>; activity?: Array<Record<string, unknown>>; preferences?: { email_notifications?: number | boolean; task_reminders?: number | boolean; compact_layout?: number | boolean } | null } }>("/v1/dashboard/summary"),
+        pssApi<{ data: { tickets?: Array<Record<string, unknown>>; notifications?: Array<Record<string, unknown>>; shipments?: Array<Record<string, unknown>>; tasks?: Array<Record<string, unknown>>; activity?: Array<Record<string, unknown>>; preferences?: { email_notifications?: number | boolean; task_reminders?: number | boolean; compact_layout?: number | boolean } | null; permissions?: string[] } }>("/v1/dashboard/summary"),
         pssApi<{ data: Array<Record<string, unknown>> }>("/v1/tickets/messages"),
       ]);
-      const apiPermissionsPromise = pssApi<{ permissions?: string[] }>("/v1/me").catch(() => null);
       const [{ data: profile }, { data: employee }, { data: userRoles }, { data: assignments }, { data: catalogue }] = await Promise.all([
         supabase.from("profiles").select("id,email,display_name,phone,company_name").eq("id", user.id).maybeSingle(),
         supabase.from("employee_profiles").select("employee_code,workspace_slug,employment_status").eq("user_id", user.id).maybeSingle(),
@@ -58,13 +57,14 @@ export function EmployeeProvider({ children, initialIdentity }: { children: Reac
       const roles = (userRoles ?? []) as Array<{ role_id?: string; roles?: { name?: string } | { name?: string }[] }>;
       const roleNames = roles.flatMap((item) => Array.isArray(item.roles) ? item.roles.map((role) => role.name) : [item.roles?.name]).filter((name): name is string => Boolean(name));
       const roleIds = roles.map((item) => item.role_id).filter((id): id is string => Boolean(id));
-      const [{ data: rolePermissions }, { data: overrides }] = await Promise.all([
+      const [{ data: rolePermissions }, { data: overrides }, [summaryResult, ticketMessageResult]] = await Promise.all([
         roleIds.length ? supabase.from("role_permissions").select("role_id,permission_key").in("role_id", roleIds) : Promise.resolve({ data: [] }),
         supabase.from("employee_permission_overrides").select("permission_key,mode").eq("employee_user_id", user.id),
+        liveDataPromise,
       ]);
       const allowed = new Set((catalogue ?? []).map((item) => item.permission_key));
-      const identity = await apiPermissionsPromise;
-      const apiPermissions = Array.isArray(identity?.permissions) ? identity.permissions : null;
+      const summaryPermissions = summaryResult.data?.permissions;
+      const apiPermissions = Array.isArray(summaryPermissions) ? summaryPermissions : null;
       const roleBasedPermissions = permissionSet((rolePermissions ?? []) as Array<{ permission_key?: string }>, allowed);
       // The Worker is an additional production cross-check, not a reason to
       // erase permissions when a stale deployment or transient API response
@@ -89,7 +89,6 @@ export function EmployeeProvider({ children, initialIdentity }: { children: Reac
       let liveTickets: DemoTicket[] = []; let liveNotifications: DemoNotification[] = []; let liveShipments: DemoShipment[] = []; let liveTasks: EmployeeTask[] = []; let liveActivity: EmployeeActivity[] = [];
       let liveSettings: EmployeeSettings = initialSettings;
       try {
-        const [summaryResult, ticketMessageResult] = await liveDataPromise;
         const summary = summaryResult.data ?? {};
         const ticketRows = summary.tickets ?? [];
         const notificationRows = summary.notifications ?? [];
