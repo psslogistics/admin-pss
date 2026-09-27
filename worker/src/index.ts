@@ -45,6 +45,10 @@ const json = (body: unknown, status = 200, headers: HeadersInit = {}) => new Res
 const error = (code: string, message: string, status: number, requestId: string, headers: HeadersInit = {}) => json({ ok: false, error: { code, message }, request_id: requestId }, status, headers);
 const requestId = (request: Request) => request.headers.get("cf-ray") ?? crypto.randomUUID();
 const userAuthInFlight = new Map<string, Promise<Auth | null>>();
+const userAuthCache = new Map<string, { expiresAt: number; value: Auth | null }>();
+const dashboardSummaryCache = new Map<string, { expiresAt: number; data: Record<string, unknown> }>();
+const AUTH_CACHE_TTL_MS = 5_000;
+const SUMMARY_CACHE_TTL_MS = 3_000;
 
 function allowedOrigins(env: Env) { return new Set((env.ALLOWED_ORIGINS ?? "").split(",").map((value) => value.trim()).filter(Boolean)); }
 function originAllowed(request: Request, env: Env) { const origin = request.headers.get("Origin"); return !origin || allowedOrigins(env).has(origin); }
@@ -136,12 +140,16 @@ async function authenticate(request: Request, env: Env): Promise<Auth | null> {
   const token = header.slice(7).trim();
   if (!token || token.length > 8192) return null;
   const tokenKey = await sha256(token);
+  const cached = userAuthCache.get(tokenKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
   const pending = userAuthInFlight.get(tokenKey);
   if (pending) return pending;
   const validation = loadUserAuth(env, token);
   userAuthInFlight.set(tokenKey, validation);
   try {
-    return await validation;
+    const value = await validation;
+    userAuthCache.set(tokenKey, { expiresAt: Date.now() + AUTH_CACHE_TTL_MS, value });
+    return value;
   } finally {
     if (userAuthInFlight.get(tokenKey) === validation) userAuthInFlight.delete(tokenKey);
   }
@@ -1367,6 +1375,9 @@ const worker = {
       if (route === "/dashboard/summary" && request.method === "GET") {
         const requestedCollections = new Set((url.searchParams.get("collections") ?? "").split(",").map((value) => value.trim()).filter(Boolean));
         const includeCollection = (key: string) => requestedCollections.size === 0 || requestedCollections.has(key);
+        const scopeKey = `${auth.userId ?? auth.clientId ?? "anonymous"}:${auth.system ? "system" : [...auth.clientIds].sort().join(",")}:${[...requestedCollections].sort().join(",")}`;
+        const cachedSummary = dashboardSummaryCache.get(scopeKey);
+        if (cachedSummary && cachedSummary.expiresAt > Date.now()) return json({ ok: true, data: cachedSummary.data, request_id: id }, 200, headers);
         const summaryColumns: Record<string, string> = {
           shipments: "id, client_id, provider, provider_reference, status, origin, destination, consignee, total_weight_kg, pieces, edd, delivered_at, created_at",
           pickup_requests: "id, shipment_id, client_id, requested_date, requested_time_slot, pickup_address, status, created_at, updated_at",
@@ -1428,7 +1439,7 @@ const worker = {
         const notifications = rowsFor("notifications");
         const tasks = rowsFor("tasks");
         const preferences = rowsFor("preferences")[0] ?? null;
-        return json({ ok: true, data: {
+        const data = {
           shipments,
           pickups,
           billing,
@@ -1442,7 +1453,9 @@ const worker = {
           tasks,
           preferences,
           permissions: [...auth.permissions],
-        }, request_id: id }, 200, headers);
+        };
+        dashboardSummaryCache.set(scopeKey, { expiresAt: Date.now() + SUMMARY_CACHE_TTL_MS, data });
+        return json({ ok: true, data, request_id: id }, 200, headers);
       }
 
       if (route === "/reports/shipments" && request.method === "GET") {
