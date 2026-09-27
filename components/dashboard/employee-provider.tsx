@@ -45,7 +45,7 @@ export function EmployeeProvider({ children, initialIdentity }: { children: Reac
         // The Worker batches the independent employee dashboard collections in
         // one authenticated D1 batch. Keep messages separate because they are
         // only needed to enrich the support-ticket detail view.
-        pssApi<{ data: { tickets?: Array<Record<string, unknown>>; notifications?: Array<Record<string, unknown>>; shipments?: Array<Record<string, unknown>>; tasks?: Array<Record<string, unknown>>; activity?: Array<Record<string, unknown>>; preferences?: { email_notifications?: number | boolean; task_reminders?: number | boolean; compact_layout?: number | boolean } | null; permissions?: string[] } }>("/v1/dashboard/summary"),
+        pssApi<{ data: { tickets?: Array<Record<string, unknown>>; notifications?: Array<Record<string, unknown>>; shipments?: Array<Record<string, unknown>>; tasks?: Array<Record<string, unknown>>; activity?: Array<Record<string, unknown>>; preferences?: { email_notifications?: number | boolean; task_reminders?: number | boolean; compact_layout?: number | boolean } | null; permissions?: string[] } }>(window.location.pathname === "/dashboard" ? "/v1/dashboard/summary?collections=shipments,tickets,notifications,tasks,activity,preferences" : "/v1/dashboard/summary"),
         pssApi<{ data: Array<Record<string, unknown>> }>("/v1/tickets/messages"),
       ]);
       const [{ data: profile }, { data: employee }, { data: userRoles }, { data: assignments }, { data: catalogue }] = await Promise.all([
