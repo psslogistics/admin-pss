@@ -1365,6 +1365,8 @@ const worker = {
       }
 
       if (route === "/dashboard/summary" && request.method === "GET") {
+        const requestedCollections = new Set((url.searchParams.get("collections") ?? "").split(",").map((value) => value.trim()).filter(Boolean));
+        const includeCollection = (key: string) => requestedCollections.size === 0 || requestedCollections.has(key);
         const summaryColumns: Record<string, string> = {
           shipments: "id, client_id, provider, provider_reference, status, origin, destination, consignee, total_weight_kg, pieces, edd, delivered_at, created_at",
           pickup_requests: "id, shipment_id, client_id, requested_date, requested_time_slot, pickup_address, status, created_at, updated_at",
@@ -1381,7 +1383,7 @@ const worker = {
         type SummaryStatement = ReturnType<typeof env.DB.prepare>;
         const entries: Array<{ key: string; statement: SummaryStatement }> = [];
         const addCollection = (key: string, table: string, order: string, scope: string) => {
-          if (!hasScope(auth, scope)) return;
+          if (!includeCollection(key) || !hasScope(auth, scope)) return;
           const columns = summaryColumns[table] ?? "*";
           if (auth.system) {
             entries.push({ key, statement: env.DB.prepare(`SELECT ${columns} FROM ${table} ORDER BY ${order} LIMIT 100`) });
@@ -1400,15 +1402,15 @@ const worker = {
         addCollection("activity", "activity_events", "created_at DESC", "activity.read");
         addCollection("returns", "return_shipments", "updated_at DESC", "cases.read");
         addCollection("tickets", "support_tickets", "updated_at DESC", "tickets.read");
-        if (hasScope(auth, "notifications.read")) {
+        if (includeCollection("notifications") && hasScope(auth, "notifications.read")) {
           if (auth.system) entries.push({ key: "notifications", statement: env.DB.prepare("SELECT *, is_read, recipient_user_id FROM notifications ORDER BY created_at DESC LIMIT 100") });
           else if (auth.clientIds.size) entries.push({ key: "notifications", statement: env.DB.prepare(`SELECT *, is_read, recipient_user_id FROM notifications WHERE (client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) OR recipient_user_id = ?) ORDER BY created_at DESC LIMIT 100`).bind(...auth.clientIds, auth.userId ?? "") });
         }
-        if (hasScope(auth, "tasks.read")) {
+        if (includeCollection("tasks") && hasScope(auth, "tasks.read")) {
           if (auth.system) entries.push({ key: "tasks", statement: env.DB.prepare("SELECT * FROM tasks ORDER BY due_at ASC LIMIT 100") });
           else if (auth.clientIds.size) entries.push({ key: "tasks", statement: env.DB.prepare(`SELECT * FROM tasks WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) OR assigned_to_user_id = ? ORDER BY due_at ASC LIMIT 100`).bind(...auth.clientIds, auth.userId ?? "") });
         }
-        if (auth.userId) entries.push({ key: "preferences", statement: env.DB.prepare("SELECT email_notifications, task_reminders, compact_layout FROM employee_preferences WHERE user_id = ? LIMIT 1").bind(auth.userId) });
+        if (includeCollection("preferences") && auth.userId) entries.push({ key: "preferences", statement: env.DB.prepare("SELECT email_notifications, task_reminders, compact_layout FROM employee_preferences WHERE user_id = ? LIMIT 1").bind(auth.userId) });
         const batchResults = entries.length ? await env.DB.batch<Record<string, unknown>>(entries.map(({ statement }) => statement)) : [];
         const rowsFor = (key: string) => {
           const index = entries.findIndex((entry) => entry.key === key);
