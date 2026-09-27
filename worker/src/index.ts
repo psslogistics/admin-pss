@@ -86,41 +86,46 @@ async function supabaseGet<T>(env: Env, path: string, token: string): Promise<T[
   return Array.isArray(value) ? value as T[] : [];
 }
 
+async function supabaseRpc<T>(env: Env, functionName: string, token: string): Promise<T | null> {
+  const response = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/${functionName}`, {
+    method: "POST",
+    headers: { apikey: env.SUPABASE_PUBLISHABLE_KEY, Authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: "{}",
+  });
+  if (!response.ok) return null;
+  return await response.json() as T;
+}
+
 async function loadUserAuth(env: Env, token: string): Promise<Auth | null> {
-  const userResponse = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, { headers: { apikey: env.SUPABASE_PUBLISHABLE_KEY, Authorization: `Bearer ${token}` } });
-  if (!userResponse.ok) return null;
-  const user = await userResponse.json() as { id?: string };
-  if (!user.id) return null;
-  const [profiles, employeeProfiles, roleLinks, permissionOverrides, assignments, memberships] = await Promise.all([
-    supabaseGet<{ status?: string }>(env, `profiles?id=eq.${user.id}&select=status`, token),
-    supabaseGet<{ employment_status?: string }>(env, `employee_profiles?user_id=eq.${user.id}&select=employment_status`, token),
-    supabaseGet<{ role_id: string }>(env, `user_roles?user_id=eq.${user.id}&is_active=eq.true&select=role_id`, token),
-    supabaseGet<{ permission_key: string; mode: "grant" | "revoke" }>(env, `employee_permission_overrides?employee_user_id=eq.${encodeURIComponent(user.id)}&select=permission_key,mode`, token),
-    supabaseGet<{ client_id: string }>(env, `employee_client_assignments?employee_user_id=eq.${user.id}&is_active=eq.true&select=client_id`, token),
-    supabaseGet<{ client_id: string; membership_status?: string }>(env, `client_memberships?user_id=eq.${user.id}&select=client_id,membership_status`, token),
-  ]);
-  if (profiles[0]?.status && profiles[0].status !== "active") return null;
-  if (employeeProfiles[0]?.employment_status && employeeProfiles[0].employment_status !== "active") return null;
-  const roleIds = roleLinks.map((row) => row.role_id).filter(Boolean);
-  const requestedClientIds = [...new Set([...assignments, ...memberships.filter((row) => !row.membership_status || row.membership_status === "active")].map((row) => row.client_id).filter(Boolean))];
-  const [roles, rolePermissions, activeClients] = await Promise.all([
-    roleIds.length ? supabaseGet<Role>(env, `roles?id=in.(${roleIds.join(",")})&select=role_code,scope`, token) : Promise.resolve([] as Role[]),
-    roleIds.length ? supabaseGet<{ permission_key: string }>(env, `role_permissions?role_id=in.(${roleIds.join(",")})&select=permission_key`, token) : Promise.resolve([] as { permission_key: string }[]),
-    requestedClientIds.length ? supabaseGet<{ id: string }>(env, `client_accounts?id=in.(${requestedClientIds.join(",")})&status=eq.active&select=id`, token) : Promise.resolve([] as { id: string }[]),
-  ]);
-  const activeClientIds = new Set(activeClients.map((row) => row.id));
-  const clientIds = new Set(requestedClientIds.filter((clientId) => activeClientIds.has(clientId)));
+  type AuthContext = {
+    user_id?: string;
+    profile_status?: string | null;
+    employment_status?: string | null;
+    roles?: Role[];
+    permissions?: Array<{ permission_key?: string }>;
+    permission_overrides?: Array<{ permission_key?: string; mode?: "grant" | "revoke" }>;
+    assignments?: Array<{ client_id?: string }>;
+    memberships?: Array<{ client_id?: string; membership_status?: string }>;
+    active_client_ids?: string[];
+  };
+  const context = await supabaseRpc<AuthContext>(env, "get_auth_context", token);
+  if (!context?.user_id) return null;
+  if (context.profile_status && context.profile_status !== "active") return null;
+  if (context.employment_status && context.employment_status !== "active") return null;
+  const clientIds = new Set((context.active_client_ids ?? []).filter(Boolean));
   // Keep the concrete role codes for permission-specific checks, but also add
   // the canonical scope from Supabase. The production client role is
   // `client_user`, while Worker route checks use the shared `client` scope.
+  const roles = context.roles ?? [];
   const roleSet = new Set(roles.flatMap((role) => [role.role_code, role.scope]));
   const system = roles.some((role) => role.scope === "system" || role.role_code === "super_admin");
-  const permissions = new Set(rolePermissions.map((row) => row.permission_key).filter(Boolean));
-  for (const override of permissionOverrides) if (override.mode === "grant") permissions.add(override.permission_key);
+  const permissions = new Set((context.permissions ?? []).map((row) => row.permission_key).filter((value): value is string => Boolean(value)));
+  const permissionOverrides = context.permission_overrides ?? [];
+  for (const override of permissionOverrides) if (override.mode === "grant" && override.permission_key) permissions.add(override.permission_key);
   // Match the Supabase `has_permission` policy: an explicit revoke wins over
   // a grant, independent of the order returned by PostgREST.
-  for (const override of permissionOverrides) if (override.mode === "revoke") permissions.delete(override.permission_key);
-  return { kind: "user", userId: user.id, clientIds, roles: roleSet, system, scopes: new Set(["authenticated"]), permissions, accessToken: token };
+  for (const override of permissionOverrides) if (override.mode === "revoke" && override.permission_key) permissions.delete(override.permission_key);
+  return { kind: "user", userId: context.user_id, clientIds, roles: roleSet, system, scopes: new Set(["authenticated"]), permissions, accessToken: token };
 }
 
 async function authenticate(request: Request, env: Env): Promise<Auth | null> {
