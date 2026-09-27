@@ -1408,6 +1408,7 @@ const worker = {
           if (auth.system) entries.push({ key: "tasks", statement: env.DB.prepare("SELECT * FROM tasks ORDER BY due_at ASC LIMIT 100") });
           else if (auth.clientIds.size) entries.push({ key: "tasks", statement: env.DB.prepare(`SELECT * FROM tasks WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) OR assigned_to_user_id = ? ORDER BY due_at ASC LIMIT 100`).bind(...auth.clientIds, auth.userId ?? "") });
         }
+        if (auth.userId) entries.push({ key: "preferences", statement: env.DB.prepare("SELECT email_notifications, task_reminders, compact_layout FROM employee_preferences WHERE user_id = ? LIMIT 1").bind(auth.userId) });
         const batchResults = entries.length ? await env.DB.batch<Record<string, unknown>>(entries.map(({ statement }) => statement)) : [];
         const rowsFor = (key: string) => {
           const index = entries.findIndex((entry) => entry.key === key);
@@ -1424,6 +1425,7 @@ const worker = {
         const tickets = rowsFor("tickets");
         const notifications = rowsFor("notifications");
         const tasks = rowsFor("tasks");
+        const preferences = rowsFor("preferences")[0] ?? null;
         return json({ ok: true, data: {
           shipments,
           pickups,
@@ -1436,6 +1438,8 @@ const worker = {
           tickets,
           notifications,
           tasks,
+          preferences,
+          permissions: [...auth.permissions],
         }, request_id: id }, 200, headers);
       }
 

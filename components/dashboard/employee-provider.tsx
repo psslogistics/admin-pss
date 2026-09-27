@@ -44,10 +44,9 @@ export function EmployeeProvider({ children, initialIdentity }: { children: Reac
         // The Worker batches the independent employee dashboard collections in
         // one authenticated D1 batch. Keep messages separate because they are
         // only needed to enrich the support-ticket detail view.
-        pssApi<{ data: { tickets?: Array<Record<string, unknown>>; notifications?: Array<Record<string, unknown>>; shipments?: Array<Record<string, unknown>>; tasks?: Array<Record<string, unknown>>; activity?: Array<Record<string, unknown>> } }>("/v1/dashboard/summary"),
+        pssApi<{ data: { tickets?: Array<Record<string, unknown>>; notifications?: Array<Record<string, unknown>>; shipments?: Array<Record<string, unknown>>; tasks?: Array<Record<string, unknown>>; activity?: Array<Record<string, unknown>>; preferences?: { email_notifications?: number | boolean; task_reminders?: number | boolean; compact_layout?: number | boolean } | null } }>("/v1/dashboard/summary"),
         pssApi<{ data: Array<Record<string, unknown>> }>("/v1/tickets/messages"),
       ]);
-      const preferencesPromise = pssApi<{ data: { email_notifications?: boolean; task_reminders?: boolean; compact_layout?: boolean } }>("/v1/employee-preferences").catch(() => null);
       const apiPermissionsPromise = pssApi<{ permissions?: string[] }>("/v1/me").catch(() => null);
       const [{ data: profile }, { data: employee }, { data: userRoles }, { data: assignments }, { data: catalogue }] = await Promise.all([
         supabase.from("profiles").select("id,email,display_name,phone,company_name").eq("id", user.id).maybeSingle(),
@@ -105,8 +104,8 @@ export function EmployeeProvider({ children, initialIdentity }: { children: Reac
         liveShipments = shipmentRows.map((row) => ({ id: String(row.id), route: `${String(row.origin ?? "")} → ${String(row.destination ?? "")}`, status: String(row.status ?? "Booked"), eta: String(row.edd ?? "Pending"), clientId: String(row.client_id) }));
         liveTasks = taskRows.map((row) => ({ id: String(row.id), title: String(row.title ?? "Task"), context: String(row.description ?? ""), due: row.due_at ? new Date(String(row.due_at)).toLocaleDateString() : "No due date", dueAt: row.due_at ? String(row.due_at) : undefined, status: String(row.status ?? "pending").toLowerCase() === "completed" ? "Completed" : String(row.status ?? "pending").toLowerCase() === "in_progress" ? "In progress" : "Pending", priority: String(row.priority ?? "medium").toLowerCase() === "high" ? "High" : String(row.priority ?? "medium").toLowerCase() === "low" ? "Low" : "Medium", clientId: row.client_id ? String(row.client_id) : undefined }));
         liveActivity = activityRows.map((row) => ({ id: String(row.id), title: String(row.action ?? "Activity"), detail: String(row.entity_type ?? "") + (row.entity_id ? ` · ${String(row.entity_id)}` : ""), time: row.created_at ? new Date(String(row.created_at)).toLocaleString() : "", tone: "blue" }));
-        const preferences = await preferencesPromise;
-        if (preferences) liveSettings = { emailNotifications: preferences.data.email_notifications ?? true, taskReminders: preferences.data.task_reminders ?? true, compactLayout: preferences.data.compact_layout ?? false };
+        const preferences = summary.preferences;
+        if (preferences) liveSettings = { emailNotifications: Boolean(preferences.email_notifications ?? true), taskReminders: Boolean(preferences.task_reminders ?? true), compactLayout: Boolean(preferences.compact_layout ?? false) };
       } catch { /* the authenticated panel can still render identity while the API is unavailable */ }
       if (!cancelled) {
         const name = profile?.display_name || user.user_metadata?.full_name || user.email?.split("@")[0] || emptyProfile.name;
