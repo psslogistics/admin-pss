@@ -44,6 +44,7 @@ type Auth = {
 const json = (body: unknown, status = 200, headers: HeadersInit = {}) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...headers } });
 const error = (code: string, message: string, status: number, requestId: string, headers: HeadersInit = {}) => json({ ok: false, error: { code, message }, request_id: requestId }, status, headers);
 const requestId = (request: Request) => request.headers.get("cf-ray") ?? crypto.randomUUID();
+const userAuthInFlight = new Map<string, Promise<Auth | null>>();
 
 function allowedOrigins(env: Env) { return new Set((env.ALLOWED_ORIGINS ?? "").split(",").map((value) => value.trim()).filter(Boolean)); }
 function originAllowed(request: Request, env: Env) { const origin = request.headers.get("Origin"); return !origin || allowedOrigins(env).has(origin); }
@@ -132,7 +133,18 @@ async function authenticate(request: Request, env: Env): Promise<Auth | null> {
     return { kind: "api", clientId: row.client_id, clientIds: new Set([row.client_id]), roles: new Set(), system: false, scopes: new Set(scopes.results.map((item) => item.scope)), permissions: new Set(), apiKeyId: row.id };
   }
   if (!header.startsWith("Bearer ") || !env.SUPABASE_URL || !env.SUPABASE_PUBLISHABLE_KEY) return null;
-  return loadUserAuth(env, header.slice(7).trim());
+  const token = header.slice(7).trim();
+  if (!token || token.length > 8192) return null;
+  const tokenKey = await sha256(token);
+  const pending = userAuthInFlight.get(tokenKey);
+  if (pending) return pending;
+  const validation = loadUserAuth(env, token);
+  userAuthInFlight.set(tokenKey, validation);
+  try {
+    return await validation;
+  } finally {
+    if (userAuthInFlight.get(tokenKey) === validation) userAuthInFlight.delete(tokenKey);
+  }
 }
 
 function hasScope(auth: Auth, scope: string) {
