@@ -2,6 +2,7 @@ import { createClient } from "@/lib/supabase/client";
 
 const GET_CACHE_TTL_MS = 15_000;
 const SESSION_CACHE_TTL_MS = 60_000;
+const STALE_SESSION_CACHE_TTL_MS = 120_000;
 const MAX_SESSION_CACHE_BYTES = 1_500_000;
 const getCache = new Map<string, { expiresAt: number; value: unknown }>();
 const getInFlight = new Map<string, Promise<unknown>>();
@@ -19,6 +20,7 @@ export async function pssApi<T>(path: string, init: RequestInit = {}): Promise<T
   if (!baseUrl) throw new Error("PSS API is not configured.");
   const mutating = ["POST", "PUT", "PATCH", "DELETE"].includes((init.method ?? "GET").toUpperCase());
   const cacheKey = `${session.user.id}:${path}`;
+  let staleValue: T | undefined;
   if (!mutating) {
     const cached = getCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) return cached.value as T;
@@ -29,6 +31,7 @@ export async function pssApi<T>(path: string, init: RequestInit = {}): Promise<T
           getCache.set(cacheKey, { expiresAt: stored.expiresAt, value: stored.value });
           return stored.value;
         }
+        if (stored?.expiresAt && stored.value !== undefined && Date.now() - stored.expiresAt <= STALE_SESSION_CACHE_TTL_MS) staleValue = stored.value;
       } catch { /* session storage is an optional acceleration layer */ }
     }
     const pending = getInFlight.get(cacheKey);
@@ -57,6 +60,10 @@ export async function pssApi<T>(path: string, init: RequestInit = {}): Promise<T
   if (!mutating) {
     getInFlight.set(cacheKey, request);
     void request.finally(() => getInFlight.delete(cacheKey)).catch(() => undefined);
+  }
+  if (staleValue !== undefined) {
+    void request.catch(() => undefined);
+    return staleValue;
   }
   return request;
 }
