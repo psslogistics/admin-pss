@@ -1350,12 +1350,26 @@ const worker = {
       }
 
       if (route === "/dashboard/summary" && request.method === "GET") {
+        const summaryColumns: Record<string, string> = {
+          shipments: "id, client_id, provider, provider_reference, status, origin, destination, consignee, total_weight_kg, pieces, edd, delivered_at, created_at",
+          pickup_requests: "id, shipment_id, client_id, requested_date, requested_time_slot, pickup_address, status, created_at, updated_at",
+          billing_records: "id, client_id, shipment_id, invoice_number, amount, currency, status, due_date, created_at",
+          wallet_transactions: "id, client_id, type, amount, balance_after, reference, status, created_at",
+          exception_cases: "id, shipment_id, client_id, category, severity, title, details, status, assigned_to_user_id, created_at, updated_at",
+          ndr_cases: "id, shipment_id, client_id, reason, attempt, deadline, status, assigned_to_user_id, created_at, updated_at",
+          activity_events: "id, actor_user_id, client_id, shipment_id, action, entity_type, entity_id, created_at",
+          return_shipments: "id, shipment_id, client_id, reason, status, provider_reference, created_at, updated_at",
+          support_tickets: "id, client_id, shipment_id, assigned_to_user_id, title, description, priority, status, created_at, updated_at",
+          notifications: "id, recipient_user_id, client_id, shipment_id, category, title, message, type, is_read, created_at",
+          tasks: "id, client_id, shipment_id, title, description, priority, status, assigned_to_user_id, due_at, created_at, updated_at",
+        };
         const collection = async (table: string, order: string, scope: string) => {
           if (!hasScope(auth, scope)) return { results: [] as Record<string, unknown>[] };
-          if (auth.system) return env.DB.prepare(`SELECT * FROM ${table} ORDER BY ${order} LIMIT 100`).all<Record<string, unknown>>();
+          const columns = summaryColumns[table] ?? "*";
+          if (auth.system) return env.DB.prepare(`SELECT ${columns} FROM ${table} ORDER BY ${order} LIMIT 100`).all<Record<string, unknown>>();
           if (!auth.clientIds.size) return { results: [] as Record<string, unknown>[] };
           const placeholders = [...auth.clientIds].map(() => "?").join(",");
-          return env.DB.prepare(`SELECT * FROM ${table} WHERE client_id IN (${placeholders}) ORDER BY ${order} LIMIT 100`).bind(...auth.clientIds).all<Record<string, unknown>>();
+          return env.DB.prepare(`SELECT ${columns} FROM ${table} WHERE client_id IN (${placeholders}) ORDER BY ${order} LIMIT 100`).bind(...auth.clientIds).all<Record<string, unknown>>();
         };
         const [shipments, pickups, billing, wallet, exceptions, ndr, activity, returns, tickets, notifications, tasks] = await Promise.all([
           collection("shipments", "created_at DESC", "shipments.read"),
