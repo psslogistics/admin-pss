@@ -41,11 +41,10 @@ export function EmployeeProvider({ children, initialIdentity }: { children: Reac
       // Start them together so the employee workspace is not serialized behind
       // unrelated operational panels.
       const liveDataPromise = Promise.all([
-        pssApi<{ data: Array<Record<string, unknown>> }>("/v1/tickets"),
-        pssApi<{ data: Array<Record<string, unknown>> }>("/v1/notifications"),
-        pssApi<{ data: Array<Record<string, unknown>> }>("/v1/shipments"),
-        pssApi<{ data: Array<Record<string, unknown>> }>("/v1/tasks"),
-        pssApi<{ data: Array<Record<string, unknown>> }>("/v1/activity"),
+        // The Worker batches the independent employee dashboard collections in
+        // one authenticated D1 batch. Keep messages separate because they are
+        // only needed to enrich the support-ticket detail view.
+        pssApi<{ data: { tickets?: Array<Record<string, unknown>>; notifications?: Array<Record<string, unknown>>; shipments?: Array<Record<string, unknown>>; tasks?: Array<Record<string, unknown>>; activity?: Array<Record<string, unknown>> } }>("/v1/dashboard/summary"),
         pssApi<{ data: Array<Record<string, unknown>> }>("/v1/tickets/messages"),
       ]);
       const preferencesPromise = pssApi<{ data: { email_notifications?: boolean; task_reminders?: boolean; compact_layout?: boolean } }>("/v1/employee-preferences").catch(() => null);
@@ -91,15 +90,21 @@ export function EmployeeProvider({ children, initialIdentity }: { children: Reac
       let liveTickets: DemoTicket[] = []; let liveNotifications: DemoNotification[] = []; let liveShipments: DemoShipment[] = []; let liveTasks: EmployeeTask[] = []; let liveActivity: EmployeeActivity[] = [];
       let liveSettings: EmployeeSettings = initialSettings;
       try {
-        const [ticketResult, notificationResult, shipmentResult, taskResult, activityResult, ticketMessageResult] = await liveDataPromise;
+        const [summaryResult, ticketMessageResult] = await liveDataPromise;
+        const summary = summaryResult.data ?? {};
+        const ticketRows = summary.tickets ?? [];
+        const notificationRows = summary.notifications ?? [];
+        const shipmentRows = summary.shipments ?? [];
+        const taskRows = summary.tasks ?? [];
+        const activityRows = summary.activity ?? [];
         const messagesByTicket = new Map<string, Array<Record<string, unknown>>>();
         for (const message of ticketMessageResult.data) { const ticketId = String(message.ticket_id ?? ""); const messages = messagesByTicket.get(ticketId) ?? []; messages.push(message); messagesByTicket.set(ticketId, messages); }
-        const ticketMessages = ticketResult.data.map((row) => ({ data: messagesByTicket.get(String(row.id)) ?? [] }));
-        liveTickets = ticketResult.data.map((row, index) => ({ id: String(row.id), clientId: String(row.client_id), title: String(row.title ?? "Support ticket"), description: String(row.description ?? ""), status: String(row.status ?? "Open") as TicketStatus, priority: String(row.priority ?? "Normal") as DemoTicket["priority"], createdAt: String(row.created_at ?? new Date().toISOString()), messages: ticketMessages[index].data.map((message) => ({ id: String(message.id), author: String(message.author_user_id ?? "Production user"), body: String(message.message ?? ""), time: message.created_at ? new Date(String(message.created_at)).toLocaleString() : "" })) }));
-        liveNotifications = notificationResult.data.map((row) => ({ id: String(row.id), title: String(row.title ?? "Notification"), detail: String(row.message ?? ""), tone: row.type === "warning" ? "warning" : "info", read: Boolean(row.is_read) } as DemoNotification));
-        liveShipments = shipmentResult.data.map((row) => ({ id: String(row.id), route: `${String(row.origin ?? "")} → ${String(row.destination ?? "")}`, status: String(row.status ?? "Booked"), eta: String(row.edd ?? "Pending"), clientId: String(row.client_id) }));
-        liveTasks = taskResult.data.map((row) => ({ id: String(row.id), title: String(row.title ?? "Task"), context: String(row.description ?? ""), due: row.due_at ? new Date(String(row.due_at)).toLocaleDateString() : "No due date", dueAt: row.due_at ? String(row.due_at) : undefined, status: String(row.status ?? "pending").toLowerCase() === "completed" ? "Completed" : String(row.status ?? "pending").toLowerCase() === "in_progress" ? "In progress" : "Pending", priority: String(row.priority ?? "medium").toLowerCase() === "high" ? "High" : String(row.priority ?? "medium").toLowerCase() === "low" ? "Low" : "Medium", clientId: row.client_id ? String(row.client_id) : undefined }));
-        liveActivity = activityResult.data.map((row) => ({ id: String(row.id), title: String(row.action ?? "Activity"), detail: String(row.entity_type ?? "") + (row.entity_id ? ` · ${String(row.entity_id)}` : ""), time: row.created_at ? new Date(String(row.created_at)).toLocaleString() : "", tone: "blue" }));
+        const ticketMessages = ticketRows.map((row) => ({ data: messagesByTicket.get(String(row.id)) ?? [] }));
+        liveTickets = ticketRows.map((row, index) => ({ id: String(row.id), clientId: String(row.client_id), title: String(row.title ?? "Support ticket"), description: String(row.description ?? ""), status: String(row.status ?? "Open") as TicketStatus, priority: String(row.priority ?? "Normal") as DemoTicket["priority"], createdAt: String(row.created_at ?? new Date().toISOString()), messages: ticketMessages[index].data.map((message) => ({ id: String(message.id), author: String(message.author_user_id ?? "Production user"), body: String(message.message ?? ""), time: message.created_at ? new Date(String(message.created_at)).toLocaleString() : "" })) }));
+        liveNotifications = notificationRows.map((row) => ({ id: String(row.id), title: String(row.title ?? "Notification"), detail: String(row.message ?? ""), tone: row.type === "warning" ? "warning" : "info", read: Boolean(row.is_read) } as DemoNotification));
+        liveShipments = shipmentRows.map((row) => ({ id: String(row.id), route: `${String(row.origin ?? "")} → ${String(row.destination ?? "")}`, status: String(row.status ?? "Booked"), eta: String(row.edd ?? "Pending"), clientId: String(row.client_id) }));
+        liveTasks = taskRows.map((row) => ({ id: String(row.id), title: String(row.title ?? "Task"), context: String(row.description ?? ""), due: row.due_at ? new Date(String(row.due_at)).toLocaleDateString() : "No due date", dueAt: row.due_at ? String(row.due_at) : undefined, status: String(row.status ?? "pending").toLowerCase() === "completed" ? "Completed" : String(row.status ?? "pending").toLowerCase() === "in_progress" ? "In progress" : "Pending", priority: String(row.priority ?? "medium").toLowerCase() === "high" ? "High" : String(row.priority ?? "medium").toLowerCase() === "low" ? "Low" : "Medium", clientId: row.client_id ? String(row.client_id) : undefined }));
+        liveActivity = activityRows.map((row) => ({ id: String(row.id), title: String(row.action ?? "Activity"), detail: String(row.entity_type ?? "") + (row.entity_id ? ` · ${String(row.entity_id)}` : ""), time: row.created_at ? new Date(String(row.created_at)).toLocaleString() : "", tone: "blue" }));
         const preferences = await preferencesPromise;
         if (preferences) liveSettings = { emailNotifications: preferences.data.email_notifications ?? true, taskReminders: preferences.data.task_reminders ?? true, compactLayout: preferences.data.compact_layout ?? false };
       } catch { /* the authenticated panel can still render identity while the API is unavailable */ }
