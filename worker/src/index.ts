@@ -679,6 +679,15 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       // but send the XpressBees AWB body with POST to avoid provider HTTP 405.
       const isGet = (operation === "tracking" && provider !== "xpressbees") || operation === "serviceability" || (provider === "trackon" && operation === "labels");
       response = await fetch(url, { method: isGet ? "GET" : "POST", headers, body: isGet ? undefined : requestBody, signal: controller.signal });
+      // Some XpressBees accounts expose the tracking route as GET even though
+      // the franchise documentation describes the same route as POST. A 405
+      // is safe to retry because tracking is read-only; keep shipment and
+      // pickup operations on their configured methods.
+      if (provider === "xpressbees" && operation === "tracking" && response.status === 405) {
+        const fallbackUrl = new URL(url);
+        fallbackUrl.searchParams.set("awb_number", trackingNumber);
+        response = await fetch(fallbackUrl.toString(), { method: "GET", headers, signal: controller.signal });
+      }
       if (response.ok || (response.status >= 400 && response.status < 500 && response.status !== 429)) {
         if (!response.ok) {
           const allow = response.headers.get("allow")?.replace(/[^A-Za-z, ]/g, "").trim();
