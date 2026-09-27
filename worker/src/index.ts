@@ -545,6 +545,34 @@ async function xpressbeesToken(env: Env, credential: string, requestIdValue: str
 function xpressbeesTrackingUrl(endpoint: string) { return `${endpoint.replace(/\/$/, "")}/shipments/track_shipment`; }
 function xpressbeesTrackingBody(trackingNumber: string) { return JSON.stringify({ awb_number: trackingNumber }); }
 
+async function providerFetch(input: RequestInfo | URL, init: RequestInit, timeoutMs: number) {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error("provider_timeout"));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([fetch(input, { ...init, signal: controller.signal }), timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function providerResponseText(response: Response, timeoutMs: number) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error("provider_timeout")), timeoutMs);
+  });
+  try {
+    return await Promise.race([response.text(), timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function providerRequest(env: Env, provider: CourierProvider, operation: string, payload: Record<string, unknown>, requestIdValue: string, clientId?: string, idempotencyKey?: string) {
   if (String(env.ENABLE_PROVIDER_CALLS) !== "true") return { enabled: false, status: "disabled" as const };
   const trackingNumber = String(payload.tracking_number ?? payload.provider_reference ?? "").trim();
@@ -676,13 +704,12 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   const attemptTimeoutMs = 10000;
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     await env.DB.prepare("UPDATE integration_requests SET attempt_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(attempt + 1, integrationId).run();
-    const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), attemptTimeoutMs);
     try {
       // XpressBees documents tracking as POST even though it is a read-only
       // lookup. Keep the generic GET behavior for Delhivery/Trackon tracking,
       // but send the XpressBees AWB body with POST to avoid provider HTTP 405.
       const isGet = (operation === "tracking" && provider !== "xpressbees") || operation === "serviceability" || (provider === "trackon" && operation === "labels");
-      response = await fetch(url, { method: isGet ? "GET" : "POST", headers, body: isGet ? undefined : requestBody, signal: controller.signal });
+      response = await providerFetch(url, { method: isGet ? "GET" : "POST", headers, body: isGet ? undefined : requestBody }, attemptTimeoutMs);
       // Some XpressBees accounts expose the tracking route as GET even though
       // the franchise documentation describes the same route as POST. A 405
       // is safe to retry because tracking is read-only; keep shipment and
@@ -690,7 +717,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       if (provider === "xpressbees" && operation === "tracking" && response.status === 405) {
         const fallbackUrl = new URL(url);
         fallbackUrl.searchParams.set("awb_number", trackingNumber);
-        response = await fetch(fallbackUrl.toString(), { method: "GET", headers, signal: controller.signal });
+        response = await providerFetch(fallbackUrl.toString(), { method: "GET", headers }, attemptTimeoutMs);
       }
       if (response.ok || (response.status >= 400 && response.status < 500 && response.status !== 429)) {
         if (!response.ok) {
@@ -701,7 +728,6 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       }
       lastError = `provider_http_${response.status}`;
     } catch (caught) { lastError = caught instanceof Error ? caught.name === "AbortError" ? "provider_timeout" : caught.message : "provider_request_failed"; }
-    finally { clearTimeout(timeout); }
     const retryAfter = response?.headers.get("retry-after");
     const retryDelay = retryAfter && /^\d+$/.test(retryAfter) ? Math.min(Number(retryAfter) * 1000, 5000) : 200 * (attempt + 1);
     await new Promise((resolve) => setTimeout(resolve, retryDelay));
@@ -710,7 +736,14 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   // Consume the provider response without forwarding its raw body to browser clients.
   // Provider payloads can contain customer data or contract-specific fields; only a
   // normalized tracking event is persisted and returned to the internal caller.
-  const responseBody = await response.text();
+  let responseBody = "";
+  try {
+    responseBody = await providerResponseText(response, attemptTimeoutMs);
+  } catch (caught) {
+    const bodyError = caught instanceof Error ? caught.message : "provider_timeout";
+    await env.DB.prepare("UPDATE integration_requests SET status = 'failed', error_code = 'PROVIDER_REQUEST_FAILED', error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(bodyError, integrationId).run();
+    return { enabled: true, status: "failed" as const, providerStatus: response.status, error: bodyError };
+  }
   await env.DB.prepare("UPDATE integration_requests SET status = ?, error_code = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(response.ok ? "succeeded" : "failed", response.ok ? null : `HTTP_${response.status}`, response.ok ? null : lastError, integrationId).run();
   let normalizedTracking: NormalizedProviderTracking | null = null;
   if (response.ok && operation === "tracking") {
@@ -876,6 +909,11 @@ const worker = {
         return json({ ok: true, data: { tracking_number: reference, provider: match.provider, status: tracking.status, edd: null, delivered_at: tracking.status === "delivered" ? tracking.event_time ?? null : null, updated_at: tracking.event_time ?? null, events: [{ status: tracking.status, location: tracking.location ?? "", description: tracking.description ?? "", event_time: tracking.event_time ?? null }] }, request_id: id }, 200, withCors(request, env, { "cache-control": "private, no-store" }));
       }
       const providerOutcomes: Array<{ provider: CourierProvider; status: string }> = providerResults.map(({ provider, status }) => ({ provider, status }));
+      // A provider connection can outlive the public request in the edge
+      // runtime. Do not leave the Master health panels showing "pending"
+      // forever; only terminalize stale read-only checks, never mutations or
+      // webhook records.
+      await env.DB.prepare("UPDATE integration_requests SET status = 'failed', error_code = 'PROVIDER_TIMEOUT_STALE', error_message = 'Read-only provider request exceeded the terminalization window', updated_at = CURRENT_TIMESTAMP WHERE status = 'pending' AND operation IN ('tracking', 'serviceability') AND created_at <= datetime('now', '-10 seconds')").run();
       const unavailableStatuses = new Set(["failed", "not_configured", "disabled", "safety_disabled"]);
       const allProvidersUnavailable = providerOutcomes.length > 0 && providerOutcomes.every(({ status }) => unavailableStatuses.has(status));
       return json({
