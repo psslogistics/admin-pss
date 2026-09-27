@@ -34,8 +34,9 @@ export function EmployeeProvider({ children, initialIdentity }: { children: Reac
       // access check. Read the locally cached session here so the client
       // bootstrap does not add another Supabase network round-trip before its
       // parallel workspace reads begin.
-      const { data: sessionResult } = await supabase.auth.getSession();
-      const user = sessionResult.session?.user;
+      const user = initialIdentity?.id
+        ? { id: initialIdentity.id, email: initialIdentity.email, user_metadata: { full_name: initialIdentity.name } }
+        : (await supabase.auth.getSession()).data.session?.user;
       if (!user) { if (!cancelled) setHydrated(true); return; }
       // These reads are independent after the authenticated user is known.
       // Start them together so the employee workspace is not serialized behind
