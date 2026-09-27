@@ -29,7 +29,13 @@ export function EmployeeProvider({ children, initialIdentity }: { children: Reac
   useEffect(() => {
     let cancelled = false;
     async function loadEmployee() {
-      const supabase = createClient(); const { data: auth } = await supabase.auth.getUser(); const user = auth.user;
+      const supabase = createClient();
+      // The dashboard layout has already performed the trusted server-side
+      // access check. Read the locally cached session here so the client
+      // bootstrap does not add another Supabase network round-trip before its
+      // parallel workspace reads begin.
+      const { data: sessionResult } = await supabase.auth.getSession();
+      const user = sessionResult.session?.user;
       if (!user) { if (!cancelled) setHydrated(true); return; }
       // These reads are independent after the authenticated user is known.
       // Start them together so the employee workspace is not serialized behind
