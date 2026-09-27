@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Bell, ChevronRight, Menu, Moon, PanelLeftIcon, Search, Sun, X } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -16,6 +16,7 @@ function Avatar({ initials, small = false }: { initials: string; small?: boolean
 
 export default function EmployeeShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
+  const router = useRouter();
   const { profile, can, notifications, clients, tasks, activity } = useEmployee();
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
@@ -42,7 +43,7 @@ export default function EmployeeShell({ children }: { children: React.ReactNode 
     {sidebarOpen && <button aria-label="Close navigation" className="fixed inset-0 z-30 bg-black/30 backdrop-blur-[2px] md:hidden" onClick={() => setSidebarOpen(false)} />}
     <aside className={cn("fixed inset-y-0 left-0 z-40 flex w-64 flex-col border-r border-sidebar-border/70 bg-sidebar text-sidebar-foreground transition-[width,transform] duration-200 ease-linear motion-reduce:transition-none md:translate-x-0", collapsed && "md:w-12", sidebarOpen ? "translate-x-0" : "-translate-x-full")}>
       <div className={cn("flex h-14 items-center border-b border-sidebar-border/50 px-4", collapsed && "md:justify-center md:px-2")}><Brand compact={collapsed} /><button aria-label="Close navigation" className="ml-auto rounded-lg p-1.5 hover:bg-sidebar-accent md:hidden" onClick={() => setSidebarOpen(false)}><X className="size-4" /></button></div>
-      <nav className="flex-1 overflow-y-auto px-2 py-4">{visibleGroups.map((group) => <div key={group.label} className="mb-5"><p className={cn("mb-2 px-3 text-[10px] font-semibold uppercase tracking-[0.16em] text-sidebar-foreground/40", collapsed && "md:hidden")}>{group.label}</p><div className="space-y-1">{group.items.map((item) => { const active = pathname === item.href || (item.href === "/dashboard/myClients" && pathname.startsWith(item.href)); return <Link key={item.href} prefetch={false} href={item.href} onClick={() => setSidebarOpen(false)} title={collapsed ? item.title : undefined} className={cn("flex h-9 items-center gap-3 rounded-lg px-3 text-sm transition-colors", active ? "bg-sidebar-primary/10 font-medium text-sidebar-primary" : "text-sidebar-foreground/65 hover:bg-sidebar-accent hover:text-sidebar-foreground", collapsed && "md:justify-center md:px-0")}><PssIcon name={item.icon} size="md" className="shrink-0" /><span className={cn(collapsed && "md:hidden")}>{item.title}</span>{active && !collapsed && <ChevronRight className="ml-auto size-3.5 opacity-50" />}</Link>; })}</div></div>)}</nav>
+      <nav className="flex-1 overflow-y-auto px-2 py-4">{visibleGroups.map((group) => <div key={group.label} className="mb-5"><p className={cn("mb-2 px-3 text-[10px] font-semibold uppercase tracking-[0.16em] text-sidebar-foreground/40", collapsed && "md:hidden")}>{group.label}</p><div className="space-y-1">{group.items.map((item) => { const active = pathname === item.href || (item.href === "/dashboard/myClients" && pathname.startsWith(item.href)); return <Link key={item.href} prefetch={false} href={item.href} onMouseEnter={() => router.prefetch(item.href)} onClick={() => setSidebarOpen(false)} title={collapsed ? item.title : undefined} className={cn("flex h-9 items-center gap-3 rounded-lg px-3 text-sm transition-colors", active ? "bg-sidebar-primary/10 font-medium text-sidebar-primary" : "text-sidebar-foreground/65 hover:bg-sidebar-accent hover:text-sidebar-foreground", collapsed && "md:justify-center md:px-0")}><PssIcon name={item.icon} size="md" className="shrink-0" /><span className={cn(collapsed && "md:hidden")}>{item.title}</span>{active && !collapsed && <ChevronRight className="ml-auto size-3.5 opacity-50" />}</Link>; })}</div></div>)}</nav>
       <div className={cn("border-t border-sidebar-border/50 p-3", collapsed && "md:px-2")}><div className={cn("flex items-center gap-2.5 rounded-lg bg-sidebar-accent/60 p-2", collapsed && "md:justify-center md:bg-transparent md:p-0")}><Avatar initials={profile.initials} small /><div className={cn("min-w-0", collapsed && "md:hidden")}><p className="truncate text-xs font-medium">{profile.name}</p><p className="truncate text-[10px] text-sidebar-foreground/45">Authenticated employee</p></div></div></div>
     </aside>
     <div className={cn("min-h-svh transition-[padding] duration-200 md:pl-64", collapsed && "md:pl-12")}>
