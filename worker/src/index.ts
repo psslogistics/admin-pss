@@ -86,21 +86,23 @@ async function loadUserAuth(env: Env, token: string): Promise<Auth | null> {
   if (!userResponse.ok) return null;
   const user = await userResponse.json() as { id?: string };
   if (!user.id) return null;
-  const profiles = await supabaseGet<{ status?: string }>(env, `profiles?id=eq.${user.id}&select=status`, token);
+  const [profiles, employeeProfiles, roleLinks, permissionOverrides, assignments, memberships] = await Promise.all([
+    supabaseGet<{ status?: string }>(env, `profiles?id=eq.${user.id}&select=status`, token),
+    supabaseGet<{ employment_status?: string }>(env, `employee_profiles?user_id=eq.${user.id}&select=employment_status`, token),
+    supabaseGet<{ role_id: string }>(env, `user_roles?user_id=eq.${user.id}&is_active=eq.true&select=role_id`, token),
+    supabaseGet<{ permission_key: string; mode: "grant" | "revoke" }>(env, `employee_permission_overrides?employee_user_id=eq.${encodeURIComponent(user.id)}&select=permission_key,mode`, token),
+    supabaseGet<{ client_id: string }>(env, `employee_client_assignments?employee_user_id=eq.${user.id}&is_active=eq.true&select=client_id`, token),
+    supabaseGet<{ client_id: string; membership_status?: string }>(env, `client_memberships?user_id=eq.${user.id}&select=client_id,membership_status`, token),
+  ]);
   if (profiles[0]?.status && profiles[0].status !== "active") return null;
-  const employeeProfiles = await supabaseGet<{ employment_status?: string }>(env, `employee_profiles?user_id=eq.${user.id}&select=employment_status`, token);
   if (employeeProfiles[0]?.employment_status && employeeProfiles[0].employment_status !== "active") return null;
-  const roleLinks = await supabaseGet<{ role_id: string }>(env, `user_roles?user_id=eq.${user.id}&is_active=eq.true&select=role_id`, token);
   const roleIds = roleLinks.map((row) => row.role_id).filter(Boolean);
-  const roles = roleIds.length ? await supabaseGet<Role>(env, `roles?id=in.(${roleIds.join(",")})&select=role_code,scope`, token) : [];
-  const rolePermissions = roleIds.length ? await supabaseGet<{ permission_key: string }>(env, `role_permissions?role_id=in.(${roleIds.join(",")})&select=permission_key`, token) : [];
-  const permissionOverrides = await supabaseGet<{ permission_key: string; mode: "grant" | "revoke" }>(env, `employee_permission_overrides?employee_user_id=eq.${encodeURIComponent(user.id)}&select=permission_key,mode`, token);
-  const assignments = await supabaseGet<{ client_id: string }>(env, `employee_client_assignments?employee_user_id=eq.${user.id}&is_active=eq.true&select=client_id`, token);
-  const memberships = await supabaseGet<{ client_id: string; membership_status?: string }>(env, `client_memberships?user_id=eq.${user.id}&select=client_id,membership_status`, token);
   const requestedClientIds = [...new Set([...assignments, ...memberships.filter((row) => !row.membership_status || row.membership_status === "active")].map((row) => row.client_id).filter(Boolean))];
-  const activeClients = requestedClientIds.length
-    ? await supabaseGet<{ id: string }>(env, `client_accounts?id=in.(${requestedClientIds.join(",")})&status=eq.active&select=id`, token)
-    : [];
+  const [roles, rolePermissions, activeClients] = await Promise.all([
+    roleIds.length ? supabaseGet<Role>(env, `roles?id=in.(${roleIds.join(",")})&select=role_code,scope`, token) : Promise.resolve([] as Role[]),
+    roleIds.length ? supabaseGet<{ permission_key: string }>(env, `role_permissions?role_id=in.(${roleIds.join(",")})&select=permission_key`, token) : Promise.resolve([] as { permission_key: string }[]),
+    requestedClientIds.length ? supabaseGet<{ id: string }>(env, `client_accounts?id=in.(${requestedClientIds.join(",")})&status=eq.active&select=id`, token) : Promise.resolve([] as { id: string }[]),
+  ]);
   const activeClientIds = new Set(activeClients.map((row) => row.id));
   const clientIds = new Set(requestedClientIds.filter((clientId) => activeClientIds.has(clientId)));
   // Keep the concrete role codes for permission-specific checks, but also add
@@ -1364,51 +1366,64 @@ const worker = {
           notifications: "id, recipient_user_id, client_id, shipment_id, category, title, message, type, is_read, created_at",
           tasks: "id, client_id, shipment_id, title, description, priority, status, assigned_to_user_id, due_at, created_at, updated_at",
         };
-        const collection = async (table: string, order: string, scope: string) => {
-          if (!hasScope(auth, scope)) return { results: [] as Record<string, unknown>[] };
+        type SummaryStatement = ReturnType<typeof env.DB.prepare>;
+        const entries: Array<{ key: string; statement: SummaryStatement }> = [];
+        const addCollection = (key: string, table: string, order: string, scope: string) => {
+          if (!hasScope(auth, scope)) return;
           const columns = summaryColumns[table] ?? "*";
-          if (auth.system) return env.DB.prepare(`SELECT ${columns} FROM ${table} ORDER BY ${order} LIMIT 100`).all<Record<string, unknown>>();
-          if (!auth.clientIds.size) return { results: [] as Record<string, unknown>[] };
+          if (auth.system) {
+            entries.push({ key, statement: env.DB.prepare(`SELECT ${columns} FROM ${table} ORDER BY ${order} LIMIT 100`) });
+            return;
+          }
+          if (!auth.clientIds.size) return;
           const placeholders = [...auth.clientIds].map(() => "?").join(",");
-          return env.DB.prepare(`SELECT ${columns} FROM ${table} WHERE client_id IN (${placeholders}) ORDER BY ${order} LIMIT 100`).bind(...auth.clientIds).all<Record<string, unknown>>();
+          entries.push({ key, statement: env.DB.prepare(`SELECT ${columns} FROM ${table} WHERE client_id IN (${placeholders}) ORDER BY ${order} LIMIT 100`).bind(...auth.clientIds) });
         };
-        const [shipments, pickups, billing, wallet, exceptions, ndr, activity, returns, tickets, notifications, tasks] = await Promise.all([
-          collection("shipments", "created_at DESC", "shipments.read"),
-          collection("pickup_requests", "requested_date DESC", "pickups.read"),
-          collection("billing_records", "created_at DESC", "billing.read"),
-          collection("wallet_transactions", "created_at DESC", "wallet.read"),
-          collection("exception_cases", "updated_at DESC", "cases.read"),
-          collection("ndr_cases", "updated_at DESC", "cases.read"),
-          collection("activity_events", "created_at DESC", "activity.read"),
-          collection("return_shipments", "updated_at DESC", "cases.read"),
-          collection("support_tickets", "updated_at DESC", "tickets.read"),
-          hasScope(auth, "notifications.read")
-            ? (auth.system
-              ? env.DB.prepare("SELECT *, is_read, recipient_user_id FROM notifications ORDER BY created_at DESC LIMIT 100").all<Record<string, unknown>>()
-              : auth.clientIds.size
-                ? env.DB.prepare(`SELECT *, is_read, recipient_user_id FROM notifications WHERE (client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) OR recipient_user_id = ?) ORDER BY created_at DESC LIMIT 100`).bind(...auth.clientIds, auth.userId ?? "").all<Record<string, unknown>>()
-                : Promise.resolve({ results: [] as Record<string, unknown>[] }))
-            : Promise.resolve({ results: [] as Record<string, unknown>[] }),
-          hasScope(auth, "tasks.read")
-            ? (auth.system
-              ? env.DB.prepare("SELECT * FROM tasks ORDER BY due_at ASC LIMIT 100").all<Record<string, unknown>>()
-              : auth.clientIds.size
-                ? env.DB.prepare(`SELECT * FROM tasks WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) OR assigned_to_user_id = ? ORDER BY due_at ASC LIMIT 100`).bind(...auth.clientIds, auth.userId ?? "").all<Record<string, unknown>>()
-                : Promise.resolve({ results: [] as Record<string, unknown>[] }))
-            : Promise.resolve({ results: [] as Record<string, unknown>[] }),
-        ]);
+        addCollection("shipments", "shipments", "created_at DESC", "shipments.read");
+        addCollection("pickups", "pickup_requests", "requested_date DESC", "pickups.read");
+        addCollection("billing", "billing_records", "created_at DESC", "billing.read");
+        addCollection("wallet", "wallet_transactions", "created_at DESC", "wallet.read");
+        addCollection("exceptions", "exception_cases", "updated_at DESC", "cases.read");
+        addCollection("ndr", "ndr_cases", "updated_at DESC", "cases.read");
+        addCollection("activity", "activity_events", "created_at DESC", "activity.read");
+        addCollection("returns", "return_shipments", "updated_at DESC", "cases.read");
+        addCollection("tickets", "support_tickets", "updated_at DESC", "tickets.read");
+        if (hasScope(auth, "notifications.read")) {
+          if (auth.system) entries.push({ key: "notifications", statement: env.DB.prepare("SELECT *, is_read, recipient_user_id FROM notifications ORDER BY created_at DESC LIMIT 100") });
+          else if (auth.clientIds.size) entries.push({ key: "notifications", statement: env.DB.prepare(`SELECT *, is_read, recipient_user_id FROM notifications WHERE (client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) OR recipient_user_id = ?) ORDER BY created_at DESC LIMIT 100`).bind(...auth.clientIds, auth.userId ?? "") });
+        }
+        if (hasScope(auth, "tasks.read")) {
+          if (auth.system) entries.push({ key: "tasks", statement: env.DB.prepare("SELECT * FROM tasks ORDER BY due_at ASC LIMIT 100") });
+          else if (auth.clientIds.size) entries.push({ key: "tasks", statement: env.DB.prepare(`SELECT * FROM tasks WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) OR assigned_to_user_id = ? ORDER BY due_at ASC LIMIT 100`).bind(...auth.clientIds, auth.userId ?? "") });
+        }
+        const batchResults = entries.length ? await env.DB.batch<Record<string, unknown>>(entries.map(({ statement }) => statement)) : [];
+        const rowsFor = (key: string) => {
+          const index = entries.findIndex((entry) => entry.key === key);
+          return index < 0 ? [] : (batchResults[index]?.results ?? []) as Record<string, unknown>[];
+        };
+        const shipments = rowsFor("shipments");
+        const pickups = rowsFor("pickups");
+        const billing = rowsFor("billing");
+        const wallet = rowsFor("wallet");
+        const exceptions = rowsFor("exceptions");
+        const ndr = rowsFor("ndr");
+        const activity = rowsFor("activity");
+        const returns = rowsFor("returns");
+        const tickets = rowsFor("tickets");
+        const notifications = rowsFor("notifications");
+        const tasks = rowsFor("tasks");
         return json({ ok: true, data: {
-          shipments: shipments.results,
-          pickups: pickups.results,
-          billing: billing.results,
-          wallet: wallet.results,
-          exceptions: exceptions.results,
-          ndr: ndr.results,
-          activity: activity.results,
-          returns: returns.results,
-          tickets: tickets.results,
-          notifications: notifications.results,
-          tasks: tasks.results,
+          shipments,
+          pickups,
+          billing,
+          wallet,
+          exceptions,
+          ndr,
+          activity,
+          returns,
+          tickets,
+          notifications,
+          tasks,
         }, request_id: id }, 200, headers);
       }
 
@@ -1848,10 +1863,14 @@ const worker = {
         if (request.method === "GET") {
           const kind = url.searchParams.get("kind")?.trim();
           if (!kind || kind.length > 160) return error("VALIDATION_ERROR", "A record kind is required", 400, id, headers);
+          const requestedKinds = kind === "crm"
+            ? ["crm.prospect", "crm.contact", "crm.interaction", "crm.note", "crm.followup", "crm.health"]
+            : [kind];
+          const kindPlaceholders = requestedKinds.map(() => "?").join(",");
           const rows = auth.system
-            ? await env.DB.prepare("SELECT * FROM master_records WHERE kind = ? ORDER BY updated_at DESC LIMIT 200").bind(kind).all()
+            ? await env.DB.prepare(`SELECT * FROM master_records WHERE kind IN (${kindPlaceholders}) ORDER BY updated_at DESC LIMIT 1200`).bind(...requestedKinds).all()
             : auth.clientIds.size
-              ? await env.DB.prepare(`SELECT * FROM master_records WHERE kind = ? AND (client_id IS NULL OR client_id IN (${[...auth.clientIds].map(() => "?").join(",")})) ORDER BY updated_at DESC LIMIT 200`).bind(kind, ...auth.clientIds).all()
+              ? await env.DB.prepare(`SELECT * FROM master_records WHERE kind IN (${kindPlaceholders}) AND (client_id IS NULL OR client_id IN (${[...auth.clientIds].map(() => "?").join(",")})) ORDER BY updated_at DESC LIMIT 1200`).bind(...requestedKinds, ...auth.clientIds).all()
               : { results: [] };
           return json({ ok: true, data: rows.results }, 200, headers);
         }
