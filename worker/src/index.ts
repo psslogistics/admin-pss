@@ -940,8 +940,10 @@ const worker = {
           const latest = recentRequests.results.find((item) => item.provider === provider);
           const pendingAge = latest?.status === "pending" && latest.updated_at ? Date.now() - Date.parse(latest.updated_at) : 0;
           const pendingStale = latest?.status === "pending" && Number.isFinite(pendingAge) && pendingAge > 120_000;
+          const failureAge = latest?.status === "failed" && latest.updated_at ? Date.now() - Date.parse(latest.updated_at) : 0;
+          const failureStale = latest?.status === "failed" && Number.isFinite(failureAge) && failureAge > 15 * 60_000;
           return {
-            health: latest?.status === "failed" || pendingStale ? "degraded" : latest?.status === "pending" ? "pending" : latest?.status === "succeeded" ? "healthy" : "unknown",
+            health: latest?.status === "failed" ? (failureStale ? "stale" : "degraded") : pendingStale ? "degraded" : latest?.status === "pending" ? "pending" : latest?.status === "succeeded" ? "healthy" : "unknown",
             last_error_code: latest?.status === "failed" ? latest.error_code ?? "provider_request_failed" : pendingStale ? "provider_request_stuck" : null,
             last_checked_at: latest?.updated_at ?? null,
           };
