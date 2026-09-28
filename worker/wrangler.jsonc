@@ -12,7 +12,8 @@
     {
       "binding": "DB",
       "database_name": "psslogisticsdatabase",
-      "database_id": "798a571d-5e56-45a0-85f8-8d71bad284e9"
+      "database_id": "798a571d-5e56-45a0-85f8-8d71bad284e9",
+      "migrations_dir": "./migrations"
     }
   ],
   "r2_buckets": [
@@ -41,6 +42,9 @@
     "XPRESSBEES_API_BASE_URL": "https://ship.xpressbees.com/api",
     "XPRESSBEES_ENABLE_SHIPMENT_CREATION": "false",
     "XPRESSBEES_ENABLE_PICKUP_CREATION": "false",
+    "RIVIGO_API_BASE_URL": "https://client-integration-api.rivigo.com",
+    "RIVIGO_AUTH_URL": "https://client-integration-api.rivigo.com/oauth/token",
+    "RIVIGO_ENABLE_PROVIDER_CALLS": "false",
     "ENABLE_PROVIDER_CALLS": "true"
   }
 }

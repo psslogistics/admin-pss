@@ -1,4 +1,4 @@
-export interface Env extends Omit<Cloudflare.Env, "SUPABASE_PUBLISHABLE_KEY" | "API_KEY_PEPPER" | "DELHIVERY_API_TOKEN" | "DELHIVERY_WEBHOOK_SECRET" | "EKART_API_KEY" | "EKART_API_SECRET" | "EKART_WEBHOOK_SECRET" | "EKART_ENABLE_PROVIDER_CALLS" | "TRACKON_API_BASE_URL" | "TRACKON_CREDENTIALS_JSON" | "TRACKON_WEBHOOK_SECRET" | "TRACKON_BOOKING_URL" | "TRACKON_TRACKING_URL" | "TRACKON_LABEL_URL" | "TRACKON_ENABLE_SHIPMENT_CREATION" | "TRACKON_ENABLE_PICKUP_CREATION" | "XPRESSBEES_API_BASE_URL" | "XPRESSBEES_CREDENTIALS_JSON" | "XPRESSBEES_ENABLE_SHIPMENT_CREATION" | "XPRESSBEES_ENABLE_PICKUP_CREATION" | "RIVIGO_API_BASE_URL" | "RIVIGO_AUTH_URL" | "RIVIGO_TRACKING_URL" | "RIVIGO_CREDENTIALS_JSON"> {
+export interface Env extends Omit<Cloudflare.Env, "SUPABASE_PUBLISHABLE_KEY" | "API_KEY_PEPPER" | "DELHIVERY_API_TOKEN" | "DELHIVERY_WEBHOOK_SECRET" | "EKART_API_KEY" | "EKART_API_SECRET" | "EKART_WEBHOOK_SECRET" | "EKART_ENABLE_PROVIDER_CALLS" | "TRACKON_API_BASE_URL" | "TRACKON_CREDENTIALS_JSON" | "TRACKON_WEBHOOK_SECRET" | "TRACKON_BOOKING_URL" | "TRACKON_TRACKING_URL" | "TRACKON_LABEL_URL" | "TRACKON_ENABLE_SHIPMENT_CREATION" | "TRACKON_ENABLE_PICKUP_CREATION" | "XPRESSBEES_API_BASE_URL" | "XPRESSBEES_CREDENTIALS_JSON" | "XPRESSBEES_ENABLE_SHIPMENT_CREATION" | "XPRESSBEES_ENABLE_PICKUP_CREATION" | "RIVIGO_API_BASE_URL" | "RIVIGO_AUTH_URL" | "RIVIGO_TRACKING_URL" | "RIVIGO_CREDENTIALS_JSON" | "RIVIGO_ENABLE_PROVIDER_CALLS"> {
   SUPABASE_PUBLISHABLE_KEY: string;
   API_KEY_PEPPER?: string;
   DELHIVERY_API_TOKEN?: string;
@@ -23,6 +23,7 @@ export interface Env extends Omit<Cloudflare.Env, "SUPABASE_PUBLISHABLE_KEY" | "
   RIVIGO_AUTH_URL?: string;
   RIVIGO_TRACKING_URL?: string;
   RIVIGO_CREDENTIALS_JSON?: string;
+  RIVIGO_WEBHOOK_SECRET?: string;
 }
 
 type CourierProvider = "delhivery" | "ekart" | "trackon" | "xpressbees" | "rivigo";
@@ -434,6 +435,7 @@ function delhiveryPickupPayload(env: Env, payload: Record<string, unknown>) {
 
 function findProviderReference(value: unknown, keys: Set<string>, depth = 0): string | null {
   if (depth > 8 || value === null || value === undefined) return null;
+  const normalizedKeys = new Set([...keys].map((key) => key.toLowerCase()));
   if (Array.isArray(value)) {
     for (const item of value) { const found = findProviderReference(item, keys, depth + 1); if (found) return found; }
     return null;
@@ -441,7 +443,7 @@ function findProviderReference(value: unknown, keys: Set<string>, depth = 0): st
   if (typeof value !== "object") return null;
   const object = value as Record<string, unknown>;
   for (const [key, candidate] of Object.entries(object)) {
-    if (keys.has(key.toLowerCase()) && typeof candidate === "string" && candidate.trim()) return candidate.trim().slice(0, 160);
+    if (normalizedKeys.has(key.toLowerCase()) && (typeof candidate === "string" || typeof candidate === "number") && String(candidate).trim()) return String(candidate).trim().slice(0, 160);
   }
   for (const candidate of Object.values(object)) { const found = findProviderReference(candidate, keys, depth + 1); if (found) return found; }
   return null;
@@ -572,6 +574,73 @@ async function xpressbeesToken(env: Env, credential: string, requestIdValue: str
 function xpressbeesTrackingUrl(endpoint: string) { return `${endpoint.replace(/\/$/, "")}/shipments/track_shipment`; }
 function xpressbeesTrackingBody(trackingNumber: string) { return JSON.stringify({ awb_number: trackingNumber }); }
 
+type RivigoCredentials = { appUuid: string; appSecret: string; clientCode?: string };
+
+function rivigoCredentials(env: Env, credential?: string) {
+  const raw = credential ?? env.RIVIGO_CREDENTIALS_JSON;
+  if (typeof raw !== "string" || !raw.trim()) return null;
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const appUuid = String(parsed.appUuid ?? parsed.app_uuid ?? parsed.uuid ?? "").trim();
+    const appSecret = String(parsed.appSecret ?? parsed.app_secret ?? parsed.secret ?? "").trim();
+    const clientCode = String(parsed.clientCode ?? parsed.client_code ?? "").trim();
+    return appUuid && appSecret ? { appUuid, appSecret, ...(clientCode ? { clientCode } : {}) } : null;
+  } catch { return null; }
+}
+
+function rivigoAddress(value: unknown, fallbackName: string) {
+  const address = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const line = String(address.line ?? address.address_line1 ?? address.address ?? "").trim();
+  const city = String(address.city ?? "").trim();
+  const pincode = String(address.pincode ?? address.pin ?? "").trim();
+  const name = String(address.name ?? fallbackName).trim();
+  const phone = String(address.phone ?? address.primary_contact_number ?? "").replace(/\D/g, "").slice(-10);
+  const email = String(address.email ?? "").trim();
+  if (!line || !city || !/^\d{6}$/.test(pincode) || !name || !/^\d{10}$/.test(phone)) return null;
+  return { addressDetails: { detailedAddress: line, city, pincode }, callDetails: { name, phone, ...(email ? { email } : {}) } };
+}
+
+function rivigoBookingPayload(payload: Record<string, unknown>, credentials: RivigoCredentials) {
+  const origin = rivigoAddress(payload.origin_address, String(payload.origin ?? "PSS Logistics"));
+  const destination = rivigoAddress(payload.destination_address, String(payload.consignee ?? "Consignee"));
+  const weight = Number(payload.total_weight_kg ?? payload.weight ?? 0);
+  const boxes = Math.max(1, Number(payload.pieces ?? payload.boxes ?? 1));
+  const invoiceNo = String(payload.invoice_reference ?? payload.invoice_number ?? payload.order_id ?? payload.shipment_id ?? "PSS").trim();
+  const invoiceValue = Math.max(0, Number(payload.declared_value ?? payload.invoice_value ?? 0));
+  if (!origin || !destination || !Number.isFinite(weight) || weight <= 0 || !Number.isInteger(boxes) || boxes < 1) return null;
+  const dimensions = ["length", "width", "height"].map((key) => Number(payload[key] ?? 0));
+  const hasDimensions = dimensions.every((value) => Number.isFinite(value) && value > 0);
+  const loadDetails: Record<string, unknown> = {
+    totalBoxes: boxes,
+    weight,
+    paymentMode: String(payload.payment_mode ?? "prepaid").toLowerCase() === "to_pay" ? "TO_PAY" : "PAID",
+    contents: String(payload.description ?? "Shipment"),
+    invoicesList: [{ invoiceNo, invoiceValue }],
+  };
+  if (hasDimensions) loadDetails.boxTypesList = [{ length: dimensions[0], breadth: dimensions[1], height: dimensions[2], boxTypeCount: boxes }];
+  return {
+    scheduledBookingDateTime: typeof payload.scheduled_booking_datetime === "number" ? payload.scheduled_booking_datetime : Date.now(),
+    fromAddress: { ...origin, companyDetails: { companyName: String(payload.origin_company ?? origin.callDetails.name), ...(payload.origin_gstin ? { GSTIN: String(payload.origin_gstin) } : {}) } },
+    individualBookingList: [{
+      ...(payload.cnote ? { cnote: String(payload.cnote) } : {}),
+      toAddressList: [{ ...destination, companyDetails: { companyName: String(payload.destination_company ?? destination.callDetails.name), ...(payload.destination_gstin ? { GSTIN: String(payload.destination_gstin) } : {}) } }],
+      loadDetails,
+      ...(payload.order_id || payload.shipment_id ? { clientReferenceNumbers: [String(payload.order_id ?? payload.shipment_id)] } : {}),
+    }],
+    ...(credentials.clientCode ? { clientCode: credentials.clientCode } : payload.client_code ? { clientCode: String(payload.client_code) } : {}),
+  };
+}
+
+async function rivigoAccessToken(env: Env, credentials: RivigoCredentials, requestIdValue: string, timeoutMs: number) {
+  const authUrl = String(env.RIVIGO_AUTH_URL ?? `${env.RIVIGO_API_BASE_URL?.replace(/\/$/, "") ?? "https://client-integration-api.rivigo.com"}/oauth/token`).trim();
+  const basic = btoa(`${credentials.appUuid}:${credentials.appSecret}`);
+  const response = await providerFetch(authUrl, { method: "POST", headers: { accept: "application/json", "content-type": "application/json", authorization: `Basic ${basic}`, "x-request-id": requestIdValue }, body: "{}" }, timeoutMs);
+  const text = await providerResponseText(response, timeoutMs);
+  if (!response.ok) return null;
+  let body: unknown = null; try { body = JSON.parse(text); } catch { return null; }
+  return findProviderReference(body, new Set(["access_token", "accesstoken", "token", "jwt"])) ?? null;
+}
+
 async function providerFetch(input: RequestInfo | URL, init: RequestInit, timeoutMs: number) {
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -616,8 +685,9 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (provider === "xpressbees" && operation === "shipments" && String(env.XPRESSBEES_ENABLE_SHIPMENT_CREATION) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "XpressBees shipment creation is safety-disabled until live billing approval" };
   if (provider === "xpressbees" && operation === "pickups" && String(env.XPRESSBEES_ENABLE_PICKUP_CREATION) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "XpressBees pickup creation is safety-disabled until live operations approval" };
   if (provider === "xpressbees" && !new Set(["tracking", "shipments", "pickups", "quotes"]).has(operation)) return { enabled: false, status: "unsupported" as const, reason: "XpressBees operation is not enabled" };
-  if (provider === "rivigo") return { enabled: false, status: "not_configured" as const, reason: "Rivigo requires a developer-portal app UUID, one-time app secret, approved API endpoints, and production go-live approval" };
-  const base = provider === "delhivery" ? env.DELHIVERY_API_BASE_URL : provider === "ekart" ? env.EKART_API_BASE_URL : provider === "trackon" ? env.TRACKON_API_BASE_URL : env.XPRESSBEES_API_BASE_URL;
+  if (provider === "rivigo" && String((env as unknown as Record<string, unknown>).RIVIGO_ENABLE_PROVIDER_CALLS) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "Rivigo provider calls are disabled until the developer-portal app and go-live approval are verified" };
+  if (provider === "rivigo" && !new Set(["tracking", "shipments", "serviceability", "updates", "cancellations"]).has(operation)) return { enabled: false, status: "unsupported" as const, reason: "Rivigo operation is not supported" };
+  const base = provider === "delhivery" ? env.DELHIVERY_API_BASE_URL : provider === "ekart" ? env.EKART_API_BASE_URL : provider === "trackon" ? env.TRACKON_API_BASE_URL : provider === "xpressbees" ? env.XPRESSBEES_API_BASE_URL : env.RIVIGO_API_BASE_URL;
   const requestedAccountId = providerAccountId(payload);
   const account = clientId
     ? await env.DB.prepare(`
@@ -657,13 +727,16 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         }>();
   if (clientId && requestedAccountId && !account) return { enabled: false, status: "disabled" as const, reason: "The selected courier account is not enabled for this client" };
   const secretBag = env as unknown as Record<string, unknown>;
-  const configuredCredential = provider === "delhivery" ? env.DELHIVERY_API_TOKEN : provider === "ekart" ? env.EKART_API_KEY : provider === "xpressbees" ? env.XPRESSBEES_CREDENTIALS_JSON : undefined;
+  const configuredCredential = provider === "delhivery" ? env.DELHIVERY_API_TOKEN : provider === "ekart" ? env.EKART_API_KEY : provider === "xpressbees" ? env.XPRESSBEES_CREDENTIALS_JSON : provider === "rivigo" ? env.RIVIGO_CREDENTIALS_JSON : undefined;
   const credential = account ? (typeof secretBag[account.credential_secret_name] === "string" ? String(secretBag[account.credential_secret_name]) : undefined) : configuredCredential;
   const trackon = provider === "trackon" ? trackonCredentials(env, credential) : null;
-  if (!base || (provider === "trackon" ? !trackon : !credential)) return { enabled: false, status: "not_configured" as const };
+  const rivigo = provider === "rivigo" ? rivigoCredentials(env, credential) : null;
+  if (!base || (provider === "trackon" ? !trackon : provider === "rivigo" ? !rivigo : !credential)) return { enabled: false, status: "not_configured" as const };
   const providerTimeoutMs = Math.min(timeoutMsOverride ?? 10000, 10000);
   const xpressToken = provider === "xpressbees" ? await xpressbeesToken(env, credential!, requestIdValue, providerTimeoutMs) : null;
   if (provider === "xpressbees" && !xpressToken) return { enabled: true, status: "failed" as const, error: "XpressBees authentication failed" };
+  const rivigoToken = provider === "rivigo" ? await rivigoAccessToken(env, rivigo!, requestIdValue, providerTimeoutMs) : null;
+  if (provider === "rivigo" && !rivigoToken) return { enabled: true, status: "failed" as const, error: "Rivigo authentication failed" };
   const authorization = provider === "delhivery"
     ? `Token ${credential}`
     : provider === "ekart"
@@ -673,6 +746,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (authorization) headers.Authorization = authorization;
   if (provider === "trackon") headers["x-trackon-app-key"] = trackon!.appKey;
   if (provider === "xpressbees") headers.Authorization = `Bearer ${xpressToken}`;
+  if (provider === "rivigo") { headers.Authorization = `Bearer ${rivigoToken}`; headers.appUuid = rivigo!.appUuid; }
   const ekartCreate = provider === "ekart" && operation === "shipments" ? ekartCreatePayload(payload) : null;
   if (provider === "ekart" && operation === "shipments" && !ekartCreate) return { enabled: false, status: "invalid_request" as const, reason: "Origin and destination addresses require valid six-digit pincodes and ten-digit phone numbers" };
   const providerPayload = account?.provider === "delhivery" ? { ...payload, delhivery_client_name: account.account_name } : payload;
@@ -680,6 +754,8 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (provider === "delhivery" && operation === "shipments" && !delhiveryCreate) return { enabled: false, status: "invalid_request" as const, reason: "Delhivery requires valid origin/destination addresses, a registered client name, and a pickup location" };
   const delhiveryPickup = provider === "delhivery" && operation === "pickups" ? delhiveryPickupPayload(env, providerPayload) : null;
   if (provider === "delhivery" && operation === "pickups" && !delhiveryPickup) return { enabled: false, status: "invalid_request" as const, reason: "Delhivery requires a valid pickup date and registered pickup location" };
+  const rivigoCreate = provider === "rivigo" && operation === "shipments" ? rivigoBookingPayload(payload, rivigo!) : null;
+  if (provider === "rivigo" && operation === "shipments" && !rivigoCreate) return { enabled: false, status: "invalid_request" as const, reason: "Rivigo requires valid origin/destination addresses, positive weight, and at least one box" };
   const integrationId = crypto.randomUUID();
   await env.DB.prepare("INSERT INTO integration_requests (id, provider, client_id, operation, idempotency_key, provider_request_id, status, attempt_count) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0)").bind(integrationId, provider, clientId ?? null, operation, idempotencyKey ?? null, requestIdValue).run();
   const delhiveryOrigin = provider === "delhivery" ? new URL(base).origin : "";
@@ -707,6 +783,16 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         ? `${base.replace(/\/$/, "")}/shipments`
       : provider === "xpressbees" && operation === "pickups"
         ? `${base.replace(/\/$/, "")}/shipments/pickup`
+      : provider === "rivigo" && operation === "tracking"
+        ? `${base.replace(/\/$/, "")}/operations/tracking`
+      : provider === "rivigo" && operation === "shipments"
+        ? `${base.replace(/\/$/, "")}/operations/booking`
+      : provider === "rivigo" && operation === "serviceability"
+        ? `${base.replace(/\/$/, "")}/operations/serviceable/pincode?fromPinCode=${encodeURIComponent(String(payload.origin_pincode ?? payload.from_pincode ?? ""))}&toPinCode=${encodeURIComponent(String(payload.destination_pincode ?? payload.to_pincode ?? ""))}`
+      : provider === "rivigo" && operation === "updates"
+        ? `${base.replace(/\/$/, "")}/operations/booking`
+      : provider === "rivigo" && operation === "cancellations"
+        ? `${base.replace(/\/$/, "")}/operations/booking/cancel?bookingId=${encodeURIComponent(String(payload.booking_id ?? payload.provider_reference ?? ""))}`
       : trackonUrl!;
   const requestBody = provider === "delhivery" && operation === "shipments"
     ? `format=json&data=${encodeURIComponent(JSON.stringify(delhiveryCreate))}`
@@ -718,6 +804,10 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         : provider === "xpressbees" && operation === "tracking" ? xpressbeesTrackingBody(trackingNumber)
         : provider === "xpressbees" && operation === "quotes" ? JSON.stringify({ order_type_user: "B2C", origin: String(payload.origin_pincode ?? payload.origin ?? ""), destination: String(payload.destination_pincode ?? payload.destination ?? ""), weight: Number(payload.weight ?? 0), length: Number(payload.length ?? 0), height: Number(payload.height ?? 0), breadth: Number(payload.breadth ?? payload.width ?? 0), cod_amount: Number(payload.cod_amount ?? 0), cod: Boolean(payload.cod) })
         : provider === "xpressbees" ? JSON.stringify(payload)
+        : provider === "rivigo" && operation === "tracking" ? JSON.stringify({ entityList: [trackingNumber] })
+        : provider === "rivigo" && operation === "shipments" ? JSON.stringify(rivigoCreate)
+        : provider === "rivigo" && operation === "updates" ? JSON.stringify(payload)
+        : provider === "rivigo" && operation === "cancellations" ? JSON.stringify(payload.cnotes_list ? { cnotesList: payload.cnotes_list } : {})
         : operation === "tracking" ? JSON.stringify({ Appkey: trackon!.appKey, userId: trackon!.userId, password: trackon!.password, AWBNo: trackingNumber })
           : operation === "shipments" ? JSON.stringify(trackonPayload(payload, trackon!))
             : JSON.stringify({ Appkey: trackon!.appKey, userId: trackon!.userId, password: trackon!.password, AWBNo: trackingNumber });
@@ -736,8 +826,9 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       // XpressBees documents tracking as POST even though it is a read-only
       // lookup. Keep the generic GET behavior for Delhivery/Trackon tracking,
       // but send the XpressBees AWB body with POST to avoid provider HTTP 405.
-      const isGet = (operation === "tracking" && provider !== "xpressbees") || operation === "serviceability" || (provider === "trackon" && operation === "labels");
-      response = await providerFetch(url, { method: isGet ? "GET" : "POST", headers, body: isGet ? undefined : requestBody }, attemptTimeoutMs);
+      const isGet = (operation === "tracking" && provider !== "xpressbees" && provider !== "rivigo") || operation === "serviceability" || (provider === "trackon" && operation === "labels");
+      const method = provider === "rivigo" && operation === "cancellations" ? "DELETE" : provider === "rivigo" && operation === "updates" ? "PUT" : isGet ? "GET" : "POST";
+      response = await providerFetch(url, { method, headers, body: isGet ? undefined : requestBody }, attemptTimeoutMs);
       // Some XpressBees accounts expose the tracking route as GET even though
       // the franchise documentation describes the same route as POST. A 405
       // is safe to retry because tracking is read-only; keep shipment and
@@ -810,12 +901,25 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     const postal = code?.postal_code && typeof code.postal_code === "object" ? code.postal_code as Record<string, unknown> : null;
     return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable: Boolean(postal && (String(postal.pre_paid ?? "N").toUpperCase() === "Y" || String(postal.cash ?? "N").toUpperCase() === "Y")), prepaid: String(postal?.pre_paid ?? "N").toUpperCase() === "Y", cod: String(postal?.cash ?? "N").toUpperCase() === "Y", pickup: String(postal?.pickup ?? "N").toUpperCase() === "Y" };
   }
+  if (response.ok && provider === "rivigo" && operation === "serviceability") {
+    const payloadBody = parsedProviderBody && typeof parsedProviderBody === "object" ? (parsedProviderBody as Record<string, unknown>).payload : null;
+    const body = payloadBody && typeof payloadBody === "object" ? payloadBody as Record<string, unknown> : {};
+    const from = body.fromPincodeDTO && typeof body.fromPincodeDTO === "object" ? body.fromPincodeDTO as Record<string, unknown> : {};
+    const to = body.toPincodeDTO && typeof body.toPincodeDTO === "object" ? body.toPincodeDTO as Record<string, unknown> : {};
+    const fromServiceable = Object.keys(from).length > 0 && Boolean(from.deliveryServiceability ?? from.pickupServiceability);
+    const toServiceable = Object.keys(to).length > 0 && Boolean(to.deliveryServiceability ?? to.pickupServiceability);
+    return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable: fromServiceable && toServiceable, cod: Boolean(to.codDodAllowed), to_pay: Boolean(to.toPayAllowed), tat_days: Number(body.tat ?? 0) || null };
+  }
   if (response.ok && provider === "ekart" && operation === "shipments" && clientId && typeof payload.shipment_id === "string" && ekartCreate) {
     let providerReference: string | null = null;
     try { providerReference = findProviderReference(JSON.parse(responseBody), new Set(["tracking_id", "trackingid", "waybill", "awb", "shipment_id"])); } catch { providerReference = null; }
     const requestedReference = (ekartCreate.services[0]?.service_details[0]?.shipment as { tracking_id?: string } | undefined)?.tracking_id;
     const createdTracking = providerReference ?? requestedReference ?? null;
     if (createdTracking) await env.DB.prepare("UPDATE shipments SET tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(provider_reference, ?), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(createdTracking, createdTracking, payload.shipment_id, clientId).run();
+  }
+  if (response.ok && provider === "rivigo" && operation === "shipments" && clientId && typeof payload.shipment_id === "string") {
+    const createdReference = findProviderReference(parsedProviderBody, new Set(["cnote", "bookingId", "booking_id"]));
+    if (createdReference) await env.DB.prepare("UPDATE shipments SET tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(provider_reference, ?), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(createdReference, createdReference, payload.shipment_id, clientId).run();
   }
   return { enabled: true, status: response.ok ? "accepted" as const : "failed" as const, providerStatus: response.status, normalized_status: normalizedTracking?.status, tracking: normalizedTracking ? { status: normalizedTracking.status, location: normalizedTracking.location, description: normalizedTracking.description, event_time: normalizedTracking.eventTime } : undefined, amount: provider === "xpressbees" && operation === "quotes" ? findProviderAmount(parsedProviderBody) : undefined, provider_account_id: account?.id, account_name: account?.account_name, confidence_score: account?.confidence_score, priority: account?.priority, rate_card_id: account?.rate_card_id ?? undefined, error: response.ok ? undefined : lastError };
 }
@@ -827,6 +931,64 @@ async function verifyWebhook(request: Request, env: Env, provider: "delhivery" |
   const provided = request.headers.get("X-Webhook-Signature") ?? request.headers.get("X-Signature") ?? "";
   if (!provided) return false;
   return timingSafeEqual(provided.replace(/^sha256=/, ""), await hmac(secret, rawBody));
+}
+
+function rivigoWebhookCredentials(env: Env) {
+  if (!env.RIVIGO_CREDENTIALS_JSON) return null;
+  try {
+    const value = JSON.parse(env.RIVIGO_CREDENTIALS_JSON) as Record<string, unknown>;
+    const appUuid = String(value.appUuid ?? value.app_uuid ?? value.uuid ?? "").trim();
+    const appSecret = String(value.appSecret ?? value.app_secret ?? value.secret ?? "").trim();
+    return appUuid && appSecret ? { appUuid, appSecret } : null;
+  } catch { return null; }
+}
+
+async function verifyRivigoWebhook(request: Request, env: Env, rawBody: string, payload: Record<string, unknown>) {
+  const secret = env.RIVIGO_WEBHOOK_SECRET?.trim();
+  if (secret) {
+    const token = request.headers.get("X-Rivigo-Webhook-Token") ?? request.headers.get("X-Webhook-Token");
+    if (token && timingSafeEqual(token.trim(), secret)) return true;
+    const provided = request.headers.get("X-Webhook-Signature") ?? request.headers.get("X-Signature") ?? "";
+    if (provided && timingSafeEqual(provided.replace(/^sha256=/, ""), await hmac(secret, rawBody))) return true;
+    return false;
+  }
+  // Rivigo's portal form does not expose a signing-secret field. In that mode,
+  // accept only events addressed to the configured app UUID. A signing secret
+  // can still be added later when the provider or a proxy supports one.
+  const credentials = rivigoWebhookCredentials(env);
+  const appUuid = String(payload.AppUuid ?? payload.appUuid ?? payload.app_uuid ?? "").trim();
+  return Boolean(credentials?.appUuid && appUuid && timingSafeEqual(appUuid, credentials.appUuid));
+}
+
+function rivigoWebhookDetails(payload: Record<string, unknown>) {
+  const metadata = payload.Metadata && typeof payload.Metadata === "object" ? payload.Metadata as Record<string, unknown> : payload.metadata && typeof payload.metadata === "object" ? payload.metadata as Record<string, unknown> : {};
+  const eventName = String(payload.EventName ?? payload.eventName ?? payload.event_type ?? payload.type ?? "unknown").trim();
+  const event = eventName.toUpperCase();
+  const rawStatus = event.includes("CANCELL") ? "cancelled" : event.includes("UNDELIVER") || event.includes("FAILED") ? "exception" : event.includes("RTO") || event.includes("RETURN") ? "rto" : event.includes("DELIVER") && !event.includes("OUT_FOR") ? "delivered" : event.includes("OUT_FOR_DELIVERY") ? "out_for_delivery" : event.includes("PICKUP") && (event.includes("COMPLETE") || event.includes("SUCCESS")) ? "picked_up" : "in_transit";
+  const reference = String(metadata.Cnote ?? metadata.cnote ?? payload.Cnote ?? payload.cnote ?? payload.BookingId ?? payload.bookingId ?? payload.booking_id ?? "").trim();
+  const location = String(metadata.Location ?? metadata.location ?? metadata.City ?? metadata.city ?? payload.Location ?? payload.location ?? payload.City ?? payload.city ?? "").slice(0, 200);
+  const eventTimeValue = payload.EventTimestamp ?? payload.eventTimestamp ?? payload.event_time ?? payload.timestamp;
+  return { eventName, rawStatus, reference, location, eventTime: typeof eventTimeValue === "string" ? eventTimeValue : null, description: `Rivigo event ${eventName}`.slice(0, 500) };
+}
+
+async function handleRivigoWebhook(request: Request, env: Env, requestIdValue: string, headers: HeadersInit) {
+  const rawBody = await request.text();
+  if (rawBody.length > 1024 * 1024) return error("PAYLOAD_TOO_LARGE", "Webhook payload is too large", 413, requestIdValue, headers);
+  let payload: Record<string, unknown>;
+  try { payload = JSON.parse(rawBody) as Record<string, unknown>; } catch { return error("INVALID_JSON", "Webhook payload must be valid JSON", 400, requestIdValue, headers); }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return error("VALIDATION_ERROR", "Webhook payload must be an object", 400, requestIdValue, headers);
+  if (!await verifyRivigoWebhook(request, env, rawBody, payload)) return error("INVALID_SIGNATURE", "Webhook authentication is invalid", 401, requestIdValue, headers);
+  const details = rivigoWebhookDetails(payload);
+  const eventId = `rivigo:${String(payload.ReferenceId ?? payload.referenceId ?? details.reference ?? "unknown").trim()}:${await sha256(rawBody).then((value) => value.slice(0, 16))}`;
+  const stored = await env.DB.prepare("INSERT OR IGNORE INTO webhook_events (id, provider, event_id, event_type, payload, signature_valid, status) VALUES (?, 'rivigo', ?, ?, ?, 1, 'received')").bind(crypto.randomUUID(), eventId, details.eventName, rawBody).run();
+  if (Number(stored.meta?.changes ?? 0) === 0) return json({ ok: true, accepted: true, duplicate: true, request_id: requestIdValue }, 202, headers);
+  const shipment = details.reference ? await env.DB.prepare("SELECT id, status FROM shipments WHERE id = ? OR tracking_number = ? OR provider_reference = ? LIMIT 1").bind(details.reference, details.reference, details.reference).first<{ id: string; status: string }>() : null;
+  if (!shipment || !validShipmentTransition(String(shipment.status).toLowerCase(), details.rawStatus)) return json({ ok: true, accepted: true, matched: Boolean(shipment), applied: false, request_id: requestIdValue }, 202, headers);
+  const deliveredAt = details.rawStatus === "delivered" ? new Date().toISOString() : null;
+  await env.DB.prepare("UPDATE shipments SET provider = 'rivigo', provider_reference = COALESCE(?, provider_reference), status = ?, delivered_at = COALESCE(?, delivered_at), updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(details.reference || null, details.rawStatus, deliveredAt, shipment.id).run();
+  await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, location, description, created_by_user_id, event_time, created_at) VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipment.id, details.rawStatus, details.location, details.description, "webhook:rivigo", details.eventTime).run();
+  await env.DB.prepare("UPDATE webhook_events SET status = 'processed', processed_at = CURRENT_TIMESTAMP WHERE provider = 'rivigo' AND event_id = ?").bind(eventId).run();
+  return json({ ok: true, accepted: true, matched: true, applied: true, request_id: requestIdValue }, 202, headers);
 }
 
 function delhiveryWebhookDetails(payload: Record<string, unknown>) {
@@ -920,14 +1082,18 @@ const worker = {
       const shipment = await env.DB.prepare("SELECT id, tracking_number, status, edd, delivered_at, updated_at FROM shipments WHERE id = ? OR tracking_number = ? OR provider_reference = ? LIMIT 1").bind(reference, reference, reference).first<PublicShipment>();
       if (shipment) {
         const events = await env.DB.prepare("SELECT status, location, description, event_time FROM tracking_events WHERE shipment_id = ? ORDER BY event_time ASC LIMIT 20").bind(shipment.id).all();
-        return json({ ok: true, data: { tracking_number: shipment.tracking_number, status: shipment.status, edd: shipment.edd, delivered_at: shipment.delivered_at, updated_at: shipment.updated_at, events: events.results }, request_id: id }, 200, withCors(request, env, { "cache-control": "private, no-store" }));
+        // This is the intentionally restricted public projection (no client,
+        // address, consignee, document, or billing data), so a short edge
+        // cache safely removes repeat D1 reads without making operational
+        // authenticated data cacheable.
+        return json({ ok: true, data: { tracking_number: shipment.tracking_number, status: shipment.status, edd: shipment.edd, delivered_at: shipment.delivered_at, updated_at: shipment.updated_at, events: events.results }, request_id: id }, 200, withCors(request, env, { "cache-control": "public, max-age=15, s-maxage=15, stale-while-revalidate=60" }));
       }
 
       // A public AWB may belong to a courier shipment that has not yet been
       // imported into PSS D1. Query only the explicitly supported tracking
       // providers, normalize the response, and never return the raw payload.
       const requestedProvider = url.searchParams.get("provider")?.trim().toLowerCase();
-      const providers: CourierProvider[] = requestedProvider && ["delhivery", "trackon", "xpressbees"].includes(requestedProvider)
+      const providers: CourierProvider[] = requestedProvider && ["delhivery", "trackon", "xpressbees", "rivigo"].includes(requestedProvider)
         ? [requestedProvider as CourierProvider]
         : ["delhivery", "trackon", "xpressbees"];
       const providerResults = await Promise.all(providers.map(async (provider) => {
@@ -966,6 +1132,7 @@ const worker = {
       }, 200, withCors(request, env, { "cache-control": "private, no-store" }));
     }
     if (url.pathname === "/v1/webhooks/delhivery/documents" && request.method === "POST") return handleDelhiveryDocumentWebhook(request, env, id, headers);
+    if (url.pathname === "/v1/webhooks/rivigo" && request.method === "POST") return handleRivigoWebhook(request, env, id, headers);
     const publicWebhook = url.pathname.match(/^\/v1\/webhooks\/(delhivery|ekart|trackon)$/);
     if (publicWebhook && request.method === "POST") return handleProviderWebhook(request, env, publicWebhook[1] as "delhivery" | "ekart" | "trackon", id, headers);
     if (!url.pathname.startsWith("/v1/")) return error("NOT_FOUND", "Not found", 404, id, headers);
@@ -1025,7 +1192,9 @@ const worker = {
         const trackonConfigured = Boolean(env.TRACKON_API_BASE_URL && env.TRACKON_CREDENTIALS_JSON);
         const trackonWebhookConfigured = Boolean(env.TRACKON_WEBHOOK_SECRET);
         const xpressbeesConfigured = Boolean(env.XPRESSBEES_API_BASE_URL && env.XPRESSBEES_CREDENTIALS_JSON);
-        const rivigoConfigured = Boolean(env.RIVIGO_API_BASE_URL && env.RIVIGO_CREDENTIALS_JSON && env.RIVIGO_AUTH_URL && env.RIVIGO_TRACKING_URL);
+        const rivigoConfigured = Boolean(env.RIVIGO_API_BASE_URL && env.RIVIGO_CREDENTIALS_JSON);
+        const rivigoCallsEnabled = String((env as unknown as Record<string, unknown>).RIVIGO_ENABLE_PROVIDER_CALLS) === "true";
+        const rivigoWebhookConfigured = Boolean(env.RIVIGO_WEBHOOK_SECRET || rivigoWebhookCredentials(env)?.appUuid);
         // Read-only provider probes must not remain pending forever. Reconcile
         // only tracking/serviceability rows older than the terminalization
         // window; shipment, pickup, billing, and webhook records are untouched.
@@ -1052,7 +1221,7 @@ const worker = {
           ekart: { ...providerHealth("ekart"), configured: ekartConfigured, enabled: callsEnabled && ekartConfigured && ekartCallsEnabled, webhook_configured: ekartWebhookConfigured, activation_blockers: [...(!callsEnabled ? ["provider_calls_disabled"] : []), ...(!ekartConfigured ? ["provider_credentials_missing"] : []), ...(ekartCallsEnabled ? [] : ["disabled_by_agreed_scope"]), ...(!ekartWebhookConfigured ? ["webhook_secret_missing"] : [])], capabilities: ["tracking", "shipment_creation", ...(ekartWebhookConfigured ? ["webhooks"] : [])] },
           trackon: { ...providerHealth("trackon"), configured: trackonConfigured, enabled: callsEnabled && trackonConfigured, webhook_configured: trackonWebhookConfigured, activation_blockers: [...(!callsEnabled ? ["provider_calls_disabled"] : []), ...(!trackonConfigured ? ["provider_credentials_or_endpoint_missing"] : []), ...(!trackonWebhookConfigured ? ["webhook_secret_missing"] : [])], capabilities: ["tracking", "labels", ...(trackonWebhookConfigured ? ["webhooks"] : [])] },
           xpressbees: { ...providerHealth("xpressbees"), configured: xpressbeesConfigured, enabled: callsEnabled && xpressbeesConfigured, webhook_configured: false, activation_blockers: [...(!callsEnabled ? ["provider_calls_disabled"] : []), ...(!xpressbeesConfigured ? ["provider_credentials_or_endpoint_missing"] : [])], capabilities: ["tracking", "quotes"] },
-          rivigo: { ...providerHealth("rivigo"), configured: rivigoConfigured, enabled: false, webhook_configured: false, activation_blockers: ["developer_portal_app_required", "sandbox_or_production_endpoints_not_verified", "go_live_approval_required"], capabilities: ["tracking", "shipment_creation", "shipment_update", "shipment_cancellation"] },
+          rivigo: { ...providerHealth("rivigo"), configured: rivigoConfigured, enabled: callsEnabled && rivigoCallsEnabled && rivigoConfigured, webhook_configured: rivigoWebhookConfigured, activation_blockers: [...(!callsEnabled ? ["provider_calls_disabled"] : []), ...(!rivigoConfigured ? ["provider_credentials_or_endpoint_missing"] : []), ...(rivigoCallsEnabled ? [] : ["disabled_by_go_live_gate"]), ...(!rivigoWebhookConfigured ? ["webhook_app_identity_missing"] : [])], capabilities: ["tracking", "serviceability", "shipment_creation", "shipment_update", "shipment_cancellation", ...(rivigoWebhookConfigured ? ["event_webhooks"] : [])] },
         } }, 200, headers);
       }
       if (route === "/provider-account-policies" && request.method === "GET") {
@@ -1481,6 +1650,53 @@ const worker = {
         return json({ ok: true, data: summary.results, details: details.results }, 200, headers);
       }
 
+      // Serve the client report through one authenticated D1 batch. The
+      // previous UI fan-out made this view wait on seven independent calls.
+      if (route === "/reports/client-complete" && request.method === "GET") {
+        if (!hasScope(auth, "reports.read")) return error("FORBIDDEN", "Report read scope required", 403, id, headers);
+        const clientIds = [...auth.clientIds];
+        const columnsByTable: Record<string, string> = {
+          shipments: "id, client_id, tracking_number, status, provider, origin, destination, consignee, total_weight_kg, edd, delivered_at, created_at",
+          pickup_requests: "id, client_id, requested_date, requested_time_slot, pickup_address, status, notes, created_at",
+          billing_records: "id, client_id, shipment_id, amount, status, created_at",
+          ndr_cases: "id, client_id, shipment_id, reason, attempt, deadline, status, notes, created_at",
+          exception_cases: "id, client_id, shipment_id, category, severity, title, details, status, created_at",
+          weight_reconciliations: "id, client_id, shipment_id, measured_weight_kg, billable_weight_kg, status, updated_at, created_at",
+        };
+        const scoped = (table: string) => auth.system
+          ? env.DB.prepare(`SELECT ${columnsByTable[table] ?? "*"} FROM ${table} ORDER BY created_at DESC LIMIT 500`)
+          : clientIds.length
+            ? env.DB.prepare(`SELECT ${columnsByTable[table] ?? "*"} FROM ${table} WHERE client_id IN (${clientIds.map(() => "?").join(",")}) ORDER BY created_at DESC LIMIT 500`).bind(...clientIds)
+            : null;
+        const entries: Array<{ key: string; statement: ReturnType<typeof env.DB.prepare> }> = [];
+        const add = (key: string, table: string, scope: string) => {
+          if (!hasScope(auth, scope)) return;
+          const statement = scoped(table);
+          if (statement) entries.push({ key, statement });
+        };
+        add("shipments", "shipments", "shipments.read");
+        add("pickups", "pickup_requests", "pickups.read");
+        add("billing", "billing_records", "billing.read");
+        add("ndr", "ndr_cases", "cases.read");
+        add("exceptions", "exception_cases", "cases.read");
+        add("weights", "weight_reconciliations", "weight.read");
+        const results = entries.length ? await env.DB.batch<Record<string, unknown>>(entries.map(({ statement }) => statement)) : [];
+        const rowsFor = (key: string) => {
+          const index = entries.findIndex((entry) => entry.key === key);
+          return index < 0 ? [] : (results[index]?.results ?? []) as Record<string, unknown>[];
+        };
+        const shipments = rowsFor("shipments");
+        const details = shipments.map((row) => {
+          const edd = typeof row.edd === "string" ? row.edd : null;
+          const deliveredAt = typeof row.delivered_at === "string" ? row.delivered_at : null;
+          const end = new Date(deliveredAt ?? new Date().toISOString()).getTime();
+          const due = edd ? new Date(edd).getTime() : NaN;
+          const delayDays = Number.isFinite(due) && Number.isFinite(end) ? Math.max(0, Math.floor((end - due) / 86400000)) : 0;
+          return { id: row.id, client_id: row.client_id, tracking_number: row.tracking_number ?? null, status: row.status ?? null, edd, delivered_at: deliveredAt, delay_days: delayDays };
+        });
+        return json({ ok: true, data: { shipments, pickups: rowsFor("pickups"), billing: rowsFor("billing"), ndr: rowsFor("ndr"), exceptions: rowsFor("exceptions"), weights: rowsFor("weights"), shipment_report: { details } }, request_id: id }, 200, headers);
+      }
+
       if (route === "/tickets" && request.method === "GET") { if (!hasScope(auth, "tickets.read")) return error("FORBIDDEN", "Ticket read permission required", 403, id, headers); await refreshTicketEscalations(env); const rows = auth.system ? await env.DB.prepare("SELECT * FROM support_tickets ORDER BY updated_at DESC LIMIT 100").all() : auth.clientIds.size ? await env.DB.prepare(`SELECT * FROM support_tickets WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY updated_at DESC LIMIT 100`).bind(...auth.clientIds).all() : { results: [] }; return json({ ok: true, data: rows.results }, 200, headers); }
       if (route === "/notifications" && request.method === "GET") { if (!hasScope(auth, "notifications.read")) return error("FORBIDDEN", "Notification read permission required", 403, id, headers); const rows = auth.system ? await env.DB.prepare("SELECT *, is_read, recipient_user_id FROM notifications ORDER BY created_at DESC LIMIT 100").all() : auth.clientIds.size ? await env.DB.prepare(`SELECT *, is_read, recipient_user_id FROM notifications WHERE (client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) OR recipient_user_id = ?) ORDER BY created_at DESC LIMIT 100`).bind(...auth.clientIds, auth.userId ?? "").all() : { results: [] }; return json({ ok: true, data: rows.results }, 200, headers); }
       const collectionRoutes: Record<string, { table: string; scope: string; order: string }> = {
@@ -1686,7 +1902,7 @@ const worker = {
         if (!hasScope(auth, "quotes.create")) return error("FORBIDDEN", "Serviceability scope required", 403, id, headers);
         const payload = await bodyJson(request); const origin = String(payload.origin_pincode ?? ""); const destination = String(payload.destination_pincode ?? "");
         if (!/^\d{6}$/.test(origin) || !/^\d{6}$/.test(destination)) return error("VALIDATION_ERROR", "Valid origin and destination pincodes are required", 400, id, headers);
-        const configuredProviders = [env.DELHIVERY_API_BASE_URL && env.DELHIVERY_API_TOKEN ? "delhivery" : null, env.EKART_API_BASE_URL && env.EKART_API_KEY ? "ekart" : null].filter(Boolean).filter(() => String(env.ENABLE_PROVIDER_CALLS) === "true");
+        const configuredProviders = [env.DELHIVERY_API_BASE_URL && env.DELHIVERY_API_TOKEN ? "delhivery" : null, env.EKART_API_BASE_URL && env.EKART_API_KEY ? "ekart" : null, env.RIVIGO_API_BASE_URL && env.RIVIGO_CREDENTIALS_JSON && String((env as unknown as Record<string, unknown>).RIVIGO_ENABLE_PROVIDER_CALLS) === "true" ? "rivigo" : null].filter(Boolean).filter(() => String(env.ENABLE_PROVIDER_CALLS) === "true");
         if (configuredProviders.includes("delhivery")) {
           const [originResult, destinationResult] = await Promise.all([
             providerRequest(env, "delhivery", "serviceability", { destination_pincode: origin }, id, auth.clientId),
@@ -1695,6 +1911,10 @@ const worker = {
           const originServiceable = originResult.status === "accepted" && Boolean(originResult.serviceable);
           const destinationServiceable = destinationResult.status === "accepted" && Boolean(destinationResult.serviceable);
           return json({ ok: true, data: { origin_pincode: origin, destination_pincode: destination, serviceable: originServiceable && destinationServiceable, providers: originServiceable && destinationServiceable ? ["delhivery"] : [], configured_providers: configuredProviders, status: originResult.status === "accepted" && destinationResult.status === "accepted" ? "verified" : "provider_error", origin: originResult, destination: destinationResult } }, 200, headers);
+        }
+        if (configuredProviders.includes("rivigo")) {
+          const result = await providerRequest(env, "rivigo", "serviceability", { origin_pincode: origin, destination_pincode: destination }, id, auth.clientId);
+          return json({ ok: true, data: { origin_pincode: origin, destination_pincode: destination, serviceable: result.status === "accepted" && Boolean((result as { serviceable?: boolean }).serviceable), providers: result.status === "accepted" ? ["rivigo"] : [], configured_providers: configuredProviders, status: result.status === "accepted" ? "verified" : "provider_error", provider_result: result } }, 200, headers);
         }
         return json({ ok: true, data: { origin_pincode: origin, destination_pincode: destination, serviceable: false, providers: [], configured_providers: configuredProviders, status: configuredProviders.length > 0 ? "provider_contract_not_verified" : "provider_unavailable" } }, 200, headers);
       }
@@ -1875,7 +2095,13 @@ const worker = {
         const existing = await idempotentResponse(env, key, clientId, "POST /v1/api-keys", requestHash); if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
         const environment = payload.environment === undefined ? "live" : String(payload.environment).trim().toLowerCase(); if (environment !== "live" && environment !== "test") return error("VALIDATION_ERROR", "API key environment must be live or test", 400, id, headers);
         const expiresAt = payload.expires_at === undefined || payload.expires_at === null || payload.expires_at === "" ? null : typeof payload.expires_at === "string" && !Number.isNaN(Date.parse(payload.expires_at)) ? new Date(payload.expires_at).toISOString() : null; if (payload.expires_at !== undefined && payload.expires_at !== null && payload.expires_at !== "" && (!expiresAt || Date.parse(expiresAt) <= Date.now())) return error("VALIDATION_ERROR", "API key expiration must be a valid future date", 400, id, headers);
-        const raw = `pss_${environment}_${crypto.randomUUID().replaceAll("-", "")}`; const keyId = crypto.randomUUID(); const prefix = raw.slice(0, 16); const hash = await sha256(`${raw}${env.API_KEY_PEPPER ?? ""}`); const scopes = Array.isArray(payload.scopes) ? [...new Set(payload.scopes.filter((scope): scope is string => typeof scope === "string" && API_KEY_SCOPES.has(scope)))] : ["shipments.read"]; if (!scopes.length) return error("VALIDATION_ERROR", "At least one supported API scope is required", 400, id, headers);
+        if (payload.name.trim().length > 120) return error("VALIDATION_ERROR", "API key name must be 120 characters or fewer", 400, id, headers);
+        const requestedScopes = payload.scopes === undefined ? ["shipments.read"] : Array.isArray(payload.scopes) ? [...new Set(payload.scopes.filter((scope): scope is string => typeof scope === "string"))] : [];
+        const unsupportedScopes = requestedScopes.filter((scope) => !API_KEY_SCOPES.has(scope));
+        if (unsupportedScopes.length) return error("VALIDATION_ERROR", `Unsupported API scope: ${unsupportedScopes[0]}`, 400, id, headers);
+        const scopes = requestedScopes;
+        if (!scopes.length || scopes.length > 30) return error("VALIDATION_ERROR", "Choose between 1 and 30 API scopes", 400, id, headers);
+        const raw = `pss_${environment}_${crypto.randomUUID().replaceAll("-", "")}`; const keyId = crypto.randomUUID(); const prefix = raw.slice(0, 16); const hash = await sha256(`${raw}${env.API_KEY_PEPPER ?? ""}`);
         await env.DB.prepare("INSERT INTO api_keys (id, client_id, name, key_prefix, key_hash, environment, expires_at, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").bind(keyId, clientId, payload.name.trim(), prefix, hash, environment, expiresAt, auth.userId ?? `api:${clientId}`).run(); for (const scope of scopes) await env.DB.prepare("INSERT INTO api_key_scopes (api_key_id, scope) VALUES (?, ?)").bind(keyId, scope).run(); await env.DB.prepare("INSERT INTO api_key_events (id, api_key_id, client_id, event_type, actor_user_id, request_id) VALUES (?, ?, ?, 'created', ?, ?)").bind(crypto.randomUUID(), keyId, clientId, auth.userId ?? null, id).run(); const serialized = JSON.stringify({ ok: true, data: { id: keyId, name: payload.name.trim(), key_prefix: prefix, environment, expires_at: expiresAt, scopes, secret: raw }, request_id: id }); const stored = JSON.stringify({ ok: true, data: { id: keyId, name: payload.name.trim(), key_prefix: prefix, environment, expires_at: expiresAt, scopes, secret: null, secret_available_once: true }, request_id: id }); await saveIdempotent(env, key, clientId, "POST /v1/api-keys", 201, stored, requestHash); return new Response(serialized, { status: 201, headers: { ...headers, "content-type": "application/json" } });
       }
       const apiKeyMatch = route.match(/^\/api-keys\/([^/]+)$/);

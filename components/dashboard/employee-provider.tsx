@@ -46,7 +46,12 @@ export function EmployeeProvider({ children, initialIdentity }: { children: Reac
       // ticket is opened, so start them in parallel but do not hold the first
       // dashboard paint on the full message table.
       const summaryPromise = pssApi<{ data: { tickets?: Array<Record<string, unknown>>; notifications?: Array<Record<string, unknown>>; shipments?: Array<Record<string, unknown>>; tasks?: Array<Record<string, unknown>>; activity?: Array<Record<string, unknown>>; preferences?: { email_notifications?: number | boolean; task_reminders?: number | boolean; compact_layout?: number | boolean } | null; permissions?: string[] } }>(window.location.pathname === "/dashboard" ? "/v1/dashboard/summary?collections=shipments,tickets,notifications,tasks,activity,preferences" : "/v1/dashboard/summary");
-      const ticketMessagesPromise = pssApi<{ data: Array<Record<string, unknown>> }>("/v1/tickets/messages");
+      // Ticket messages are secondary detail data. Defer them so the first
+      // dashboard paint is not competing with a potentially large message
+      // table; the ticket list itself is already in the summary response.
+      const ticketMessagesPromise = new Promise<{ data: Array<Record<string, unknown>> }>((resolve, reject) => {
+        window.setTimeout(() => { void pssApi<{ data: Array<Record<string, unknown>> }>("/v1/tickets/messages").then(resolve, reject); }, 1200);
+      });
       const [{ data: profile }, { data: employee }, { data: userRoles }, { data: assignments }, { data: catalogue }] = await Promise.all([
         supabase.from("profiles").select("id,email,display_name,phone,company_name").eq("id", user.id).maybeSingle(),
         supabase.from("employee_profiles").select("employee_code,workspace_slug,employment_status").eq("user_id", user.id).maybeSingle(),
