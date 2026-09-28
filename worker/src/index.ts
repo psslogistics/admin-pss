@@ -1112,17 +1112,30 @@ const worker = {
       const providers: CourierProvider[] = requestedProvider && ["delhivery", "trackon", "xpressbees", "rivigo"].includes(requestedProvider)
         ? [requestedProvider as CourierProvider]
         : ["delhivery", "trackon", "xpressbees"];
-      const providerResults = await Promise.all(providers.map(async (provider) => {
+      const providerTargets: Array<{ provider: CourierProvider; providerAccountId?: string }> = [];
+      for (const provider of providers) {
+        if (provider === "delhivery") {
+          const accounts = await env.DB.prepare("SELECT id FROM provider_accounts WHERE provider = ? AND status = 'active' ORDER BY created_at ASC LIMIT 20").bind(provider).all<{ id: string }>();
+          if (accounts.results.length > 0) {
+            for (const account of accounts.results) providerTargets.push({ provider, providerAccountId: account.id });
+          } else {
+            providerTargets.push({ provider });
+          }
+        } else {
+          providerTargets.push({ provider });
+        }
+      }
+      const providerResults = await Promise.all(providerTargets.map(async ({ provider, providerAccountId }) => {
         try {
           // Public tracking must settle before the Hero client's 8-second
           // request budget; authenticated operational lookups keep the
           // normal provider timeout.
-          const providerResult = await safeProviderRequest(env, provider, "tracking", { tracking_number: reference }, id, undefined, undefined, 5000);
+          const providerResult = await safeProviderRequest(env, provider, "tracking", { tracking_number: reference, ...(providerAccountId ? { provider_account_id: providerAccountId } : {}) }, id, undefined, undefined, 5000);
           const tracking = (providerResult as { tracking?: { status?: string; location?: string; description?: string; event_time?: string | null } }).tracking;
-          return { provider, status: String(providerResult.status), tracking };
+          return { provider, provider_account_id: providerAccountId, status: String(providerResult.status), tracking };
         } catch (caught) {
           console.warn(JSON.stringify({ request_id: id, provider, public_tracking_error: caught instanceof Error ? caught.message : "provider_request_failed" }));
-          return { provider, status: "failed", tracking: undefined };
+          return { provider, provider_account_id: providerAccountId, status: "failed", tracking: undefined };
         }
       }));
       const match = providerResults.find(({ status, tracking }) => status === "accepted" && tracking?.status);
