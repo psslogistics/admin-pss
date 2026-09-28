@@ -1326,7 +1326,8 @@ const worker = {
       if (route === "/shipments" && request.method === "GET") {
         if (!hasScope(auth, "shipments.read")) return error("FORBIDDEN", "Shipment read scope required", 403, id, headers);
         const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 50), 1), 100);
-        const rows = auth.system ? await env.DB.prepare("SELECT * FROM shipments ORDER BY created_at DESC LIMIT ?").bind(limit).all() : auth.clientIds.size ? await env.DB.prepare(`SELECT * FROM shipments WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY created_at DESC LIMIT ?`).bind(...[...auth.clientIds], limit).all() : { results: [] };
+        const shipmentColumns = "id, client_id, created_by_user_id, tracking_number, status, provider, provider_account_id, description, origin, destination, origin_address_json, destination_address_json, consignee, total_weight_kg, declared_value, pieces, edd, delivered_at, created_at, updated_at";
+        const rows = auth.system ? await env.DB.prepare(`SELECT ${shipmentColumns} FROM shipments ORDER BY created_at DESC LIMIT ?`).bind(limit).all() : auth.clientIds.size ? await env.DB.prepare(`SELECT ${shipmentColumns} FROM shipments WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY created_at DESC LIMIT ?`).bind(...[...auth.clientIds], limit).all() : { results: [] };
         if (url.searchParams.get("include_tracking") === "1") {
           const data = await Promise.all((rows.results as Array<Record<string, unknown>>).map(async (shipment) => {
             const events = await env.DB.prepare("SELECT status, location, description, event_time FROM tracking_events WHERE shipment_id = ? ORDER BY event_time ASC LIMIT 20").bind(String(shipment.id)).all();
@@ -1452,7 +1453,8 @@ const worker = {
 
       if (route === "/pickups" && request.method === "GET") {
         if (!hasScope(auth, "pickups.read")) return error("FORBIDDEN", "Pickup read scope required", 403, id, headers);
-        const rows = auth.system ? await env.DB.prepare("SELECT * FROM pickup_requests ORDER BY requested_date DESC LIMIT 100").all() : auth.clientIds.size ? await env.DB.prepare(`SELECT * FROM pickup_requests WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY requested_date DESC LIMIT 100`).bind(...auth.clientIds).all() : { results: [] };
+        const pickupColumns = "id, client_id, shipment_id, requested_date, requested_time_slot, pickup_address, status, assigned_to_user_id, contact_name, contact_phone, notes, created_at, updated_at";
+        const rows = auth.system ? await env.DB.prepare(`SELECT ${pickupColumns} FROM pickup_requests ORDER BY requested_date DESC LIMIT 100`).all() : auth.clientIds.size ? await env.DB.prepare(`SELECT ${pickupColumns} FROM pickup_requests WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY requested_date DESC LIMIT 100`).bind(...auth.clientIds).all() : { results: [] };
         return json({ ok: true, data: rows.results }, 200, headers);
       }
 
