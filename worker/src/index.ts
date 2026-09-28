@@ -1913,18 +1913,25 @@ const worker = {
         if (!hasScope(auth, "quotes.create")) return error("FORBIDDEN", "Serviceability scope required", 403, id, headers);
         const payload = await bodyJson(request); const origin = String(payload.origin_pincode ?? ""); const destination = String(payload.destination_pincode ?? "");
         if (!/^\d{6}$/.test(origin) || !/^\d{6}$/.test(destination)) return error("VALIDATION_ERROR", "Valid origin and destination pincodes are required", 400, id, headers);
+        const serviceabilityClientId = requireClient(auth, payload.client_id) ?? auth.clientId;
         const configuredProviders = [env.DELHIVERY_API_BASE_URL && env.DELHIVERY_API_TOKEN ? "delhivery" : null, env.EKART_API_BASE_URL && env.EKART_API_KEY ? "ekart" : null, env.RIVIGO_API_BASE_URL && env.RIVIGO_CREDENTIALS_JSON && String((env as unknown as Record<string, unknown>).RIVIGO_ENABLE_PROVIDER_CALLS) === "true" ? "rivigo" : null].filter(Boolean).filter(() => String(env.ENABLE_PROVIDER_CALLS) === "true");
         if (configuredProviders.includes("delhivery")) {
-          const [originResult, destinationResult] = await Promise.all([
-            providerRequest(env, "delhivery", "serviceability", { destination_pincode: origin }, id, auth.clientId),
-            providerRequest(env, "delhivery", "serviceability", { destination_pincode: destination }, id, auth.clientId),
-          ]);
-          const originServiceable = originResult.status === "accepted" && Boolean(originResult.serviceable);
-          const destinationServiceable = destinationResult.status === "accepted" && Boolean(destinationResult.serviceable);
-          return json({ ok: true, data: { origin_pincode: origin, destination_pincode: destination, serviceable: originServiceable && destinationServiceable, providers: originServiceable && destinationServiceable ? ["delhivery"] : [], configured_providers: configuredProviders, status: originResult.status === "accepted" && destinationResult.status === "accepted" ? "verified" : "provider_error", origin: originResult, destination: destinationResult } }, 200, headers);
+          try {
+            const [originResult, destinationResult] = await Promise.all([
+              providerRequest(env, "delhivery", "serviceability", { destination_pincode: origin }, id, serviceabilityClientId),
+              providerRequest(env, "delhivery", "serviceability", { destination_pincode: destination }, id, serviceabilityClientId),
+            ]);
+            const originServiceable = originResult.status === "accepted" && Boolean(originResult.serviceable);
+            const destinationServiceable = destinationResult.status === "accepted" && Boolean(destinationResult.serviceable);
+            return json({ ok: true, data: { client_id: serviceabilityClientId, origin_pincode: origin, destination_pincode: destination, serviceable: originServiceable && destinationServiceable, providers: originServiceable && destinationServiceable ? ["delhivery"] : [], configured_providers: configuredProviders, status: originResult.status === "accepted" && destinationResult.status === "accepted" ? "verified" : "provider_error", origin: originResult, destination: destinationResult } }, 200, headers);
+          } catch (caught) {
+            const providerError = caught instanceof Error ? caught.message : "provider_request_failed";
+            console.error(JSON.stringify({ request_id: id, route: "/v1/serviceability", provider: "delhivery", error: providerError }));
+            return error("PROVIDER_ERROR", "Delhivery serviceability is temporarily unavailable", 502, id, headers);
+          }
         }
         if (configuredProviders.includes("rivigo")) {
-          const result = await providerRequest(env, "rivigo", "serviceability", { origin_pincode: origin, destination_pincode: destination }, id, auth.clientId);
+          const result = await providerRequest(env, "rivigo", "serviceability", { origin_pincode: origin, destination_pincode: destination }, id, serviceabilityClientId);
           return json({ ok: true, data: { origin_pincode: origin, destination_pincode: destination, serviceable: result.status === "accepted" && Boolean((result as { serviceable?: boolean }).serviceable), providers: result.status === "accepted" ? ["rivigo"] : [], configured_providers: configuredProviders, status: result.status === "accepted" ? "verified" : "provider_error", provider_result: result } }, 200, headers);
         }
         return json({ ok: true, data: { origin_pincode: origin, destination_pincode: destination, serviceable: false, providers: [], configured_providers: configuredProviders, status: configuredProviders.length > 0 ? "provider_contract_not_verified" : "provider_unavailable" } }, 200, headers);
