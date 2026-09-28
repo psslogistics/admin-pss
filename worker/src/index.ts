@@ -1329,10 +1329,19 @@ const worker = {
         const shipmentColumns = "id, client_id, created_by_user_id, tracking_number, status, provider, provider_account_id, description, origin, destination, origin_address_json, destination_address_json, consignee, total_weight_kg, declared_value, pieces, edd, delivered_at, created_at, updated_at";
         const rows = auth.system ? await env.DB.prepare(`SELECT ${shipmentColumns} FROM shipments ORDER BY created_at DESC LIMIT ?`).bind(limit).all() : auth.clientIds.size ? await env.DB.prepare(`SELECT ${shipmentColumns} FROM shipments WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY created_at DESC LIMIT ?`).bind(...[...auth.clientIds], limit).all() : { results: [] };
         if (url.searchParams.get("include_tracking") === "1") {
-          const data = await Promise.all((rows.results as Array<Record<string, unknown>>).map(async (shipment) => {
-            const events = await env.DB.prepare("SELECT status, location, description, event_time FROM tracking_events WHERE shipment_id = ? ORDER BY event_time ASC LIMIT 20").bind(String(shipment.id)).all();
-            return { ...shipment, tracking_events: events.results };
-          }));
+          const shipments = rows.results as Array<Record<string, unknown>>;
+          const shipmentIds = shipments.map((shipment) => String(shipment.id));
+          const events = shipmentIds.length
+            ? await env.DB.prepare(`SELECT shipment_id, status, location, description, event_time FROM tracking_events WHERE shipment_id IN (${shipmentIds.map(() => "?").join(",")}) ORDER BY event_time ASC`).bind(...shipmentIds).all()
+            : { results: [] };
+          const eventsByShipment = new Map<string, Array<Record<string, unknown>>>();
+          for (const event of events.results as Array<Record<string, unknown>>) {
+            const shipmentId = String(event.shipment_id);
+            const current = eventsByShipment.get(shipmentId) ?? [];
+            if (current.length < 20) current.push(event);
+            eventsByShipment.set(shipmentId, current);
+          }
+          const data = shipments.map((shipment) => ({ ...shipment, tracking_events: eventsByShipment.get(String(shipment.id)) ?? [] }));
           return json({ ok: true, data }, 200, headers);
         }
         return json({ ok: true, data: rows.results }, 200, headers);
