@@ -808,6 +808,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         : provider === "rivigo" && operation === "shipments" ? JSON.stringify(rivigoCreate)
         : provider === "rivigo" && operation === "updates" ? JSON.stringify(payload)
         : provider === "rivigo" && operation === "cancellations" ? JSON.stringify(payload.cnotes_list ? { cnotesList: payload.cnotes_list } : {})
+        : provider === "delhivery" && operation === "serviceability" ? ""
         : operation === "tracking" ? JSON.stringify({ Appkey: trackon!.appKey, userId: trackon!.userId, password: trackon!.password, AWBNo: trackingNumber })
           : operation === "shipments" ? JSON.stringify(trackonPayload(payload, trackon!))
             : JSON.stringify({ Appkey: trackon!.appKey, userId: trackon!.userId, password: trackon!.password, AWBNo: trackingNumber });
@@ -922,6 +923,21 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     if (createdReference) await env.DB.prepare("UPDATE shipments SET tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(provider_reference, ?), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(createdReference, createdReference, payload.shipment_id, clientId).run();
   }
   return { enabled: true, status: response.ok ? "accepted" as const : "failed" as const, providerStatus: response.status, normalized_status: normalizedTracking?.status, tracking: normalizedTracking ? { status: normalizedTracking.status, location: normalizedTracking.location, description: normalizedTracking.description, event_time: normalizedTracking.eventTime } : undefined, amount: provider === "xpressbees" && operation === "quotes" ? findProviderAmount(parsedProviderBody) : undefined, provider_account_id: account?.id, account_name: account?.account_name, confidence_score: account?.confidence_score, priority: account?.priority, rate_card_id: account?.rate_card_id ?? undefined, error: response.ok ? undefined : lastError };
+}
+
+async function safeProviderRequest(env: Env, provider: CourierProvider, operation: string, payload: Record<string, unknown>, requestIdValue: string, clientId?: string, idempotencyKey?: string, timeoutMsOverride?: number) {
+  try {
+    return await providerRequest(env, provider, operation, payload, requestIdValue, clientId, idempotencyKey, timeoutMsOverride);
+  } catch (caught) {
+    const message = caught instanceof Error ? caught.message.slice(0, 500) : "provider_request_failed";
+    try {
+      await env.DB.prepare("UPDATE integration_requests SET status = 'failed', error_code = 'PROVIDER_EXCEPTION', error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE provider_request_id = ? AND provider = ? AND operation = ? AND status = 'pending'").bind(message, requestIdValue, provider, operation).run();
+    } catch (recordingError) {
+      console.error(JSON.stringify({ request_id: requestIdValue, route: "/v1/provider-request", provider, operation, error: "failed_to_record_provider_exception", detail: recordingError instanceof Error ? recordingError.message.slice(0, 200) : "unknown" }));
+    }
+    console.error(JSON.stringify({ request_id: requestIdValue, route: "/v1/provider-request", provider, operation, error: message }));
+    return { enabled: true, status: "failed" as const, providerStatus: 0, error: "provider_request_failed" };
+  }
 }
 async function verifyWebhook(request: Request, env: Env, provider: "delhivery" | "ekart" | "trackon", rawBody: string) {
   const secret = provider === "delhivery" ? env.DELHIVERY_WEBHOOK_SECRET : provider === "ekart" ? env.EKART_WEBHOOK_SECRET : (env as unknown as Record<string, unknown>).TRACKON_WEBHOOK_SECRET as string | undefined;
@@ -1918,8 +1934,8 @@ const worker = {
         if (configuredProviders.includes("delhivery")) {
           try {
             const [originResult, destinationResult] = await Promise.all([
-              providerRequest(env, "delhivery", "serviceability", { destination_pincode: origin }, id, serviceabilityClientId),
-              providerRequest(env, "delhivery", "serviceability", { destination_pincode: destination }, id, serviceabilityClientId),
+              safeProviderRequest(env, "delhivery", "serviceability", { destination_pincode: origin }, id, serviceabilityClientId),
+              safeProviderRequest(env, "delhivery", "serviceability", { destination_pincode: destination }, id, serviceabilityClientId),
             ]);
             const originServiceable = originResult.status === "accepted" && Boolean(originResult.serviceable);
             const destinationServiceable = destinationResult.status === "accepted" && Boolean(destinationResult.serviceable);
