@@ -55,7 +55,7 @@ function allowedOrigins(env: Env) { return new Set((env.ALLOWED_ORIGINS ?? "").s
 function originAllowed(request: Request, env: Env) { const origin = request.headers.get("Origin"); return !origin || allowedOrigins(env).has(origin); }
 function corsHeaders(request: Request, env: Env): HeadersInit {
   const origin = request.headers.get("Origin");
-  const headers: Record<string, string> = { "access-control-allow-headers": "Authorization, Content-Type, Idempotency-Key, X-Webhook-Signature", "access-control-allow-methods": "GET, POST, PATCH, PUT, DELETE, OPTIONS", "access-control-max-age": "86400", "x-content-type-options": "nosniff", "x-frame-options": "DENY", "referrer-policy": "no-referrer", vary: "Origin" };
+  const headers: Record<string, string> = { "access-control-allow-headers": "Authorization, Content-Type, Idempotency-Key, X-Webhook-Signature, X-Delhivery-Webhook-Token", "access-control-allow-methods": "GET, POST, PATCH, PUT, DELETE, OPTIONS", "access-control-max-age": "86400", "x-content-type-options": "nosniff", "x-frame-options": "DENY", "referrer-policy": "no-referrer", vary: "Origin" };
   if (origin && allowedOrigins(env).has(origin)) headers["access-control-allow-origin"] = origin;
   return headers;
 }
@@ -669,6 +669,56 @@ async function providerResponseText(response: Response, timeoutMs: number) {
   }
 }
 
+async function providerResponseBytes(response: Response, maxBytes: number) {
+  const declaredLength = Number(response.headers.get("content-length") ?? 0);
+  if (declaredLength > maxBytes) throw new Error("provider_response_too_large");
+  if (!response.body) {
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.byteLength > maxBytes) throw new Error("provider_response_too_large");
+    return bytes;
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const part = await reader.read();
+      if (part.done) break;
+      total += part.value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel("provider_response_too_large");
+        throw new Error("provider_response_too_large");
+      }
+      chunks.push(part.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  return bytes;
+}
+
+function providerBooleanFlag(value: unknown): boolean | null {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value === 1 ? true : value === 0 ? false : null;
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().toLowerCase();
+  if (["y", "yes", "true", "1", "oda"].includes(normalized)) return true;
+  if (["n", "no", "false", "0", "non-oda", "non_oda"].includes(normalized)) return false;
+  return null;
+}
+
+function providerOdaFlag(value: Record<string, unknown> | null | undefined): boolean | null {
+  if (!value) return null;
+  for (const key of ["is_oda", "oda", "oda_available", "oda_flag", "isODA", "odaApplicable", "oda_applicable"]) {
+    const parsed = providerBooleanFlag(value[key]);
+    if (parsed !== null) return parsed;
+  }
+  return null;
+}
+
 async function providerRequest(env: Env, provider: CourierProvider, operation: string, payload: Record<string, unknown>, requestIdValue: string, clientId?: string, idempotencyKey?: string, timeoutMsOverride?: number) {
   if (String(env.ENABLE_PROVIDER_CALLS) !== "true") return { enabled: false, status: "disabled" as const };
   const trackingNumber = String(payload.tracking_number ?? payload.provider_reference ?? "").trim();
@@ -689,6 +739,17 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (provider === "rivigo" && !new Set(["tracking", "shipments", "serviceability", "updates", "cancellations"]).has(operation)) return { enabled: false, status: "unsupported" as const, reason: "Rivigo operation is not supported" };
   const base = provider === "delhivery" ? env.DELHIVERY_API_BASE_URL : provider === "ekart" ? env.EKART_API_BASE_URL : provider === "trackon" ? env.TRACKON_API_BASE_URL : provider === "xpressbees" ? env.XPRESSBEES_API_BASE_URL : env.RIVIGO_API_BASE_URL;
   const requestedAccountId = providerAccountId(payload);
+  // Delhivery has multiple registered account names. Never fall back to the
+  // first row in creation order: that can route a shipment through the wrong
+  // billing/account configuration. The panel's explicit account id wins; if
+  // it is omitted, only the configured safe default account is eligible.
+  const defaultDelhiveryAccountName = String((env as unknown as Record<string, unknown>).DELHIVERY_DEFAULT_ACCOUNT_NAME ?? "").trim();
+  const accountConstraint = provider === "delhivery"
+    ? requestedAccountId ? "AND pa.id = ?" : "AND pa.account_name = ?"
+    : "AND (? IS NULL OR pa.id = ?)";
+  const accountConstraintBinds = provider === "delhivery"
+    ? [requestedAccountId ?? defaultDelhiveryAccountName]
+    : [requestedAccountId, requestedAccountId];
   const account = clientId
     ? await env.DB.prepare(`
         SELECT pa.id, pa.provider, pa.account_name, pa.credential_secret_name,
@@ -701,13 +762,13 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
           ON p.provider_account_id = pa.id AND p.client_id = ?
         WHERE pa.provider = ? AND pa.status = 'active'
           AND (pa.client_id = ? OR pa.client_id IS NULL)
-          AND (? IS NULL OR pa.id = ?)
+          ${accountConstraint}
           AND (p.provider_account_id IS NULL OR p.enabled = 1)
         ORDER BY CASE WHEN p.provider_account_id IS NOT NULL THEN 0 ELSE 1 END,
                  COALESCE(p.priority, 100) ASC,
                  COALESCE(p.confidence_score, 0) DESC,
                  pa.created_at ASC
-        LIMIT 1`).bind(clientId, provider, clientId, requestedAccountId, requestedAccountId).first<{
+         LIMIT 1`).bind(clientId, provider, clientId, ...accountConstraintBinds).first<{
           id: string; provider: CourierProvider; account_name: string; credential_secret_name: string;
           client_enabled: number; priority: number; confidence_score: number; rate_card_id: string | null;
         }>()
@@ -719,13 +780,14 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
                NULL AS rate_card_id
         FROM provider_accounts pa
         WHERE pa.provider = ? AND pa.status = 'active' AND pa.client_id IS NULL
-          AND (? IS NULL OR pa.id = ?)
+          ${accountConstraint}
         ORDER BY pa.created_at ASC
-        LIMIT 1`).bind(provider, requestedAccountId, requestedAccountId).first<{
+        LIMIT 1`).bind(provider, ...accountConstraintBinds).first<{
           id: string; provider: CourierProvider; account_name: string; credential_secret_name: string;
           client_enabled: number; priority: number; confidence_score: number; rate_card_id: string | null;
         }>();
   if (clientId && requestedAccountId && !account) return { enabled: false, status: "disabled" as const, reason: "The selected courier account is not enabled for this client" };
+  if (provider === "delhivery" && !account) return { enabled: false, status: "not_configured" as const, reason: defaultDelhiveryAccountName ? `The configured Delhivery account '${defaultDelhiveryAccountName}' is not active` : "A Delhivery account must be selected before booking" };
   const secretBag = env as unknown as Record<string, unknown>;
   const configuredCredential = provider === "delhivery" ? env.DELHIVERY_API_TOKEN : provider === "ekart" ? env.EKART_API_KEY : provider === "xpressbees" ? env.XPRESSBEES_CREDENTIALS_JSON : provider === "rivigo" ? env.RIVIGO_CREDENTIALS_JSON : undefined;
   const credential = account ? (typeof secretBag[account.credential_secret_name] === "string" ? String(secretBag[account.credential_secret_name]) : undefined) : configuredCredential;
@@ -900,7 +962,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (response.ok && provider === "delhivery" && operation === "serviceability") {
     const code = Array.isArray((parsedProviderBody as Record<string, unknown> | null)?.delivery_codes) ? (parsedProviderBody as { delivery_codes: Array<Record<string, unknown>> }).delivery_codes[0] : null;
     const postal = code?.postal_code && typeof code.postal_code === "object" ? code.postal_code as Record<string, unknown> : null;
-    return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable: Boolean(postal && (String(postal.pre_paid ?? "N").toUpperCase() === "Y" || String(postal.cash ?? "N").toUpperCase() === "Y")), prepaid: String(postal?.pre_paid ?? "N").toUpperCase() === "Y", cod: String(postal?.cash ?? "N").toUpperCase() === "Y", pickup: String(postal?.pickup ?? "N").toUpperCase() === "Y" };
+    return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable: Boolean(postal && (String(postal.pre_paid ?? "N").toUpperCase() === "Y" || String(postal.cash ?? "N").toUpperCase() === "Y")), prepaid: String(postal?.pre_paid ?? "N").toUpperCase() === "Y", cod: String(postal?.cash ?? "N").toUpperCase() === "Y", pickup: String(postal?.pickup ?? "N").toUpperCase() === "Y", oda: providerOdaFlag(postal) };
   }
   if (response.ok && provider === "rivigo" && operation === "serviceability") {
     const payloadBody = parsedProviderBody && typeof parsedProviderBody === "object" ? (parsedProviderBody as Record<string, unknown>).payload : null;
@@ -909,7 +971,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     const to = body.toPincodeDTO && typeof body.toPincodeDTO === "object" ? body.toPincodeDTO as Record<string, unknown> : {};
     const fromServiceable = Object.keys(from).length > 0 && Boolean(from.deliveryServiceability ?? from.pickupServiceability);
     const toServiceable = Object.keys(to).length > 0 && Boolean(to.deliveryServiceability ?? to.pickupServiceability);
-    return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable: fromServiceable && toServiceable, cod: Boolean(to.codDodAllowed), to_pay: Boolean(to.toPayAllowed), tat_days: Number(body.tat ?? 0) || null };
+    return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable: fromServiceable && toServiceable, cod: Boolean(to.codDodAllowed), to_pay: Boolean(to.toPayAllowed), tat_days: Number(body.tat ?? 0) || null, origin_oda: providerOdaFlag(from), destination_oda: providerOdaFlag(to) };
   }
   if (response.ok && provider === "ekart" && operation === "shipments" && clientId && typeof payload.shipment_id === "string" && ekartCreate) {
     let providerReference: string | null = null;
@@ -1021,6 +1083,22 @@ function delhiveryWebhookDetails(payload: Record<string, unknown>) {
   };
 }
 
+function delhiveryDocumentUrl(payload: Record<string, unknown>) {
+  const value = payload.DocumentUrl ?? payload.DocumentURL ?? payload.document_url ?? payload.documentUrl ?? (payload.Document && typeof payload.Document === "object" ? (payload.Document as Record<string, unknown>).url : undefined);
+  return typeof value === "string" && /^https:\/\//i.test(value.trim()) ? value.trim() : null;
+}
+
+function delhiveryDocumentContentType(url: URL, response: Response) {
+  const responseType = (response.headers.get("content-type") ?? "").split(";", 1)[0].trim().toLowerCase();
+  if (responseType === "application/pdf" || responseType === "image/jpeg" || responseType === "image/png" || responseType === "image/webp") return responseType;
+  const pathname = url.pathname.toLowerCase();
+  if (pathname.endsWith(".pdf")) return "application/pdf";
+  if (pathname.endsWith(".jpg") || pathname.endsWith(".jpeg")) return "image/jpeg";
+  if (pathname.endsWith(".png")) return "image/png";
+  if (pathname.endsWith(".webp")) return "image/webp";
+  return null;
+}
+
 async function handleProviderWebhook(request: Request, env: Env, provider: "delhivery" | "ekart" | "trackon", requestIdValue: string, headers: HeadersInit) {
   const rawBody = await request.text();
   if (rawBody.length > 1024 * 1024) return error("PAYLOAD_TOO_LARGE", "Webhook payload is too large", 413, requestIdValue, headers);
@@ -1070,14 +1148,41 @@ async function handleDelhiveryDocumentWebhook(request: Request, env: Env, reques
   const reference = String(payload.AWB ?? payload.awb ?? payload.Waybill ?? payload.waybill ?? payload.tracking_number ?? payload.provider_reference ?? payload.shipment_id ?? "").trim();
   const eventId = `delhivery:document:${reference || "unknown"}:${await sha256(rawBody).then((value) => value.slice(0, 16))}`;
   const stored = await env.DB.prepare("INSERT OR IGNORE INTO webhook_events (id, provider, event_id, event_type, payload, signature_valid, status) VALUES (?, 'delhivery', ?, ?, ?, 1, 'received')").bind(crypto.randomUUID(), eventId, String(payload.document_type ?? payload.type ?? "document"), rawBody).run();
+  let documentStored = false;
   if (Number(stored.meta?.changes ?? 0) > 0) {
-    const shipment = reference ? await env.DB.prepare("SELECT id FROM shipments WHERE id = ? OR tracking_number = ? OR provider_reference = ? LIMIT 1").bind(reference, reference, reference).first<{ id: string }>() : null;
+    const shipment = reference ? await env.DB.prepare("SELECT id, client_id FROM shipments WHERE id = ? OR tracking_number = ? OR provider_reference = ? LIMIT 1").bind(reference, reference, reference).first<{ id: string; client_id: string }>() : null;
+    const documentUrl = delhiveryDocumentUrl(payload);
+    if (shipment && documentUrl) {
+      try {
+        const parsedUrl = new URL(documentUrl);
+        const allowedHost = parsedUrl.hostname === "delhivery.com" || parsedUrl.hostname.endsWith(".delhivery.com") || parsedUrl.hostname.endsWith(".delhivery.co.in") || parsedUrl.hostname.endsWith(".delhivery.net");
+        if (!allowedHost) throw new Error("document_host_not_allowed");
+        const response = await providerFetch(parsedUrl, { method: "GET", headers: { accept: "application/pdf,image/*", ...(env.DELHIVERY_API_TOKEN ? { Authorization: `Token ${env.DELHIVERY_API_TOKEN}` } : {}) } }, 8000);
+        if (!response.ok) throw new Error(`document_fetch_failed_${response.status}`);
+        const bytes = await providerResponseBytes(response, 10 * 1024 * 1024);
+        const contentType = delhiveryDocumentContentType(parsedUrl, response);
+        if (!contentType || !documentSignatureMatches(contentType, bytes)) throw new Error("document_type_or_signature_invalid");
+        const documentId = crypto.randomUUID();
+        const extension = contentType === "application/pdf" ? "pdf" : contentType === "image/png" ? "png" : contentType === "image/webp" ? "webp" : "jpg";
+        const objectKey = `clients/${shipment.client_id}/shipments/${shipment.id}/${documentId}-delhivery-pod.${extension}`;
+        await env.FILES.put(objectKey, bytes, { httpMetadata: { contentType } });
+        try {
+          await env.DB.prepare("INSERT INTO shipment_documents (id, shipment_id, client_id, object_key, original_filename, content_type, file_size_bytes, uploaded_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").bind(documentId, shipment.id, shipment.client_id, objectKey, `delhivery-pod-${reference || shipment.id}.${extension}`, contentType, bytes.byteLength, "webhook:delhivery").run();
+        } catch (caught) {
+          await env.FILES.delete(objectKey).catch(() => undefined);
+          throw caught;
+        }
+        documentStored = true;
+      } catch (caught) {
+        console.error(JSON.stringify({ request_id: requestIdValue, route: "/v1/webhooks/delhivery/documents", provider: "delhivery", error: caught instanceof Error ? caught.message.slice(0, 200) : "document_store_failed" }));
+      }
+    }
     // A valid provider document event can arrive before the shipment is
     // imported into PSS. Keep it received for reconciliation instead of
     // labelling it ignored; only duplicate or invalid events are rejected.
-    await env.DB.prepare("UPDATE webhook_events SET status = ?, processed_at = ? WHERE provider = 'delhivery' AND event_id = ?").bind(shipment ? "processed" : "received", shipment ? new Date().toISOString() : null, eventId).run();
+    await env.DB.prepare("UPDATE webhook_events SET status = ?, processed_at = ? WHERE provider = 'delhivery' AND event_id = ?").bind(shipment && (!documentUrl || documentStored) ? "processed" : "received", shipment && (!documentUrl || documentStored) ? new Date().toISOString() : null, eventId).run();
   }
-  return json({ ok: true, accepted: true, document_event: true, request_id: requestIdValue }, 202, headers);
+  return json({ ok: true, accepted: true, document_event: true, document_stored: documentStored, request_id: requestIdValue }, 202, headers);
 }
 
 const worker = {
@@ -1260,7 +1365,7 @@ const worker = {
         if (!clientId || !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
         const rows = await env.DB.prepare(`
           SELECT pa.id, pa.provider, pa.account_name, pa.account_type, pa.client_id,
-                 pa.capabilities_json, pa.status,
+                  pa.capabilities_json, pa.credential_secret_name, pa.status,
                  CASE WHEN p.provider_account_id IS NULL THEN CASE WHEN pa.status = 'active' THEN 1 ELSE 0 END ELSE p.enabled END AS enabled,
                  CASE WHEN p.provider_account_id IS NULL THEN 100 ELSE p.priority END AS priority,
                  CASE WHEN p.provider_account_id IS NULL THEN 0 ELSE p.confidence_score END AS confidence_score,
@@ -1271,7 +1376,17 @@ const worker = {
             ON p.provider_account_id = pa.id AND p.client_id = ?
           WHERE pa.status = 'active' AND (pa.client_id = ? OR pa.client_id IS NULL)
           ORDER BY pa.provider, enabled DESC, priority ASC, confidence_score DESC, pa.account_name`).bind(clientId, clientId).all();
-        return json({ ok: true, data: rows.results.map((row) => ({ ...row, capabilities: (() => { try { return JSON.parse(String((row as Record<string, unknown>).capabilities_json ?? "[]")); } catch { return []; } })(), enabled: Boolean(Number((row as Record<string, unknown>).enabled)), explicitly_configured: Boolean(Number((row as Record<string, unknown>).explicitly_configured)) })) }, 200, headers);
+        const secretBag = env as unknown as Record<string, unknown>;
+        const configured = (row: Record<string, unknown>) => {
+          const secretName = String(row.credential_secret_name ?? "");
+          return Boolean(secretName && typeof secretBag[secretName] === "string" && String(secretBag[secretName]).trim().length > 0);
+        };
+        return json({ ok: true, data: rows.results.map((row) => {
+          const record = row as Record<string, unknown>;
+          const isConfigured = configured(record);
+          const { credential_secret_name: _credentialSecretName, ...safeRow } = record;
+          return { ...safeRow, capabilities: (() => { try { return JSON.parse(String(record.capabilities_json ?? "[]")); } catch { return []; } })(), configured: isConfigured, enabled: Boolean(Number(record.enabled)) && isConfigured, explicitly_configured: Boolean(Number(record.explicitly_configured)) };
+        }) }, 200, headers);
       }
       const providerPolicyMatch = route.match(/^\/provider-account-policies\/([^/]+)$/);
       if (providerPolicyMatch && request.method === "PUT") {
@@ -1335,7 +1450,7 @@ const worker = {
       const providerAccountMatch = route.match(/^\/provider-accounts\/([^/]+)$/);
       if (providerAccountMatch && request.method === "PATCH") {
         if (!hasScope(auth, "provider_accounts.manage") || !hasRole(auth, ["admin", "super_admin"])) return error("FORBIDDEN", "Provider account management permission required", 403, id, headers);
-        const account = await env.DB.prepare("SELECT id, client_id FROM provider_accounts WHERE id = ? LIMIT 1").bind(providerAccountMatch[1]).first<{ id: string; client_id: string | null }>(); if (!account) return error("NOT_FOUND", "Provider account not found", 404, id, headers); if (!auth.system && (!account.client_id || !canAccessClient(auth, account.client_id))) return error("NOT_FOUND", "Provider account not found", 404, id, headers); const payload = await bodyJson(request); const status = payload.status === undefined ? undefined : String(payload.status); if (status !== undefined && !new Set(["active", "disabled"]).has(status)) return error("VALIDATION_ERROR", "Invalid provider account status", 400, id, headers); const idempotencyKey = request.headers.get("Idempotency-Key"); if (!idempotencyKey) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers); const requestHash = await payloadFingerprint(payload); const endpoint = `PATCH /v1/provider-accounts/${account.id}`; const existing = await idempotentResponse(env, idempotencyKey, auth.userId ?? "system", endpoint, requestHash); if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } }); if (status !== undefined) await env.DB.prepare("UPDATE provider_accounts SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(status, account.id).run(); await audit(env, ctx, auth, id, "provider_account.updated", "provider_account", account.id, { status }); const serialized = JSON.stringify({ ok: true, data: { id: account.id, ...(status ? { status } : {}) }, request_id: id }); await saveIdempotent(env, idempotencyKey, auth.userId ?? "system", endpoint, 200, serialized, requestHash); return new Response(serialized, { status: 200, headers: { ...headers, "content-type": "application/json" } });
+        const account = await env.DB.prepare("SELECT id, client_id, credential_secret_name FROM provider_accounts WHERE id = ? LIMIT 1").bind(providerAccountMatch[1]).first<{ id: string; client_id: string | null; credential_secret_name: string }>(); if (!account) return error("NOT_FOUND", "Provider account not found", 404, id, headers); if (!auth.system && (!account.client_id || !canAccessClient(auth, account.client_id))) return error("NOT_FOUND", "Provider account not found", 404, id, headers); const payload = await bodyJson(request); const status = payload.status === undefined ? undefined : String(payload.status); if (status !== undefined && !new Set(["active", "disabled"]).has(status)) return error("VALIDATION_ERROR", "Invalid provider account status", 400, id, headers); if (status === "active") { const secretValue = (env as unknown as Record<string, unknown>)[account.credential_secret_name]; if (typeof secretValue !== "string" || !secretValue.trim()) return error("PROVIDER_CREDENTIAL_MISSING", "Add the matching Worker secret before activating this provider account", 409, id, headers); } const idempotencyKey = request.headers.get("Idempotency-Key"); if (!idempotencyKey) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers); const requestHash = await payloadFingerprint(payload); const endpoint = `PATCH /v1/provider-accounts/${account.id}`; const existing = await idempotentResponse(env, idempotencyKey, auth.userId ?? "system", endpoint, requestHash); if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } }); if (status !== undefined) await env.DB.prepare("UPDATE provider_accounts SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(status, account.id).run(); await audit(env, ctx, auth, id, "provider_account.updated", "provider_account", account.id, { status }); const serialized = JSON.stringify({ ok: true, data: { id: account.id, ...(status ? { status } : {}) }, request_id: id }); await saveIdempotent(env, idempotencyKey, auth.userId ?? "system", endpoint, 200, serialized, requestHash); return new Response(serialized, { status: 200, headers: { ...headers, "content-type": "application/json" } });
       }
       if (route === "/integration-requests" && request.method === "GET") {
         if (!hasScope(auth, "integrations.read")) return error("FORBIDDEN", "Integration visibility permission required", 403, id, headers);
@@ -1406,6 +1521,15 @@ const worker = {
         const providerResult = provider ? await safeProviderRequest(env, provider as CourierProvider, "shipments", { shipment_id: shipmentId, ...payload }, id, clientId, key) : { enabled: false, status: "not_requested" as const };
         const selectedProviderAccountId = (providerResult as { provider_account_id?: string }).provider_account_id;
         if (selectedProviderAccountId) await env.DB.prepare("UPDATE shipments SET provider_account_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(selectedProviderAccountId, shipmentId, clientId).run();
+        if (provider && providerResult.status !== "accepted") {
+          const failureReason = String((providerResult as { error?: string; reason?: string }).error ?? (providerResult as { reason?: string }).reason ?? `The ${provider} shipment was not accepted`).slice(0, 500);
+          await env.DB.prepare("UPDATE shipments SET status = 'exception', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(shipmentId, clientId).run();
+          await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'exception', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipmentId, `Provider booking failed: ${failureReason}`, auth.userId ?? `api:${clientId}`).run();
+          const failedResponse = JSON.stringify({ ok: false, error: { code: "PROVIDER_REQUEST_FAILED", message: failureReason }, data: { id: shipmentId, client_id: clientId, status: "exception", provider, provider_result: providerResult }, request_id: id });
+          await saveIdempotent(env, key, clientId, "POST /v1/shipments", 502, failedResponse, requestHash);
+          await audit(env, ctx, auth, id, "shipment.provider_failed", "shipment", shipmentId, { client_id: clientId, provider, reason: failureReason });
+          return new Response(failedResponse, { status: 502, headers: { ...headers, "content-type": "application/json" } });
+        }
         const serialized = JSON.stringify({ ok: true, data: { id: shipmentId, client_id: clientId, status: "booked", provider, provider_result: providerResult }, request_id: id });
         await saveIdempotent(env, key, clientId, "POST /v1/shipments", 201, serialized, requestHash);
         await audit(env, ctx, auth, id, "shipment.created", "shipment", shipmentId, { client_id: clientId, provider });
@@ -1510,6 +1634,14 @@ const worker = {
         const requestedProvider = ["delhivery", "ekart", "trackon", "xpressbees", "rivigo"].includes(String(payload.provider)) ? payload.provider as CourierProvider : null;
         const provider = requestedProvider ?? (["delhivery", "ekart", "trackon", "xpressbees", "rivigo"].includes(String(shipment?.provider)) ? shipment?.provider as CourierProvider : null);
         const providerResult = provider ? await safeProviderRequest(env, provider, "pickups", { pickup_id: pickupId, shipment_id: payload.shipment_id, tracking_number: shipment?.tracking_number, provider_reference: shipment?.provider_reference, ...payload }, id, clientId, key) : { enabled: false, status: "not_requested" as const };
+        if (provider && providerResult.status !== "accepted") {
+          const failureReason = String((providerResult as { error?: string; reason?: string }).error ?? (providerResult as { reason?: string }).reason ?? `The ${provider} pickup request was not accepted`).slice(0, 500);
+          await env.DB.prepare("UPDATE pickup_requests SET status = 'failed', failure_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(failureReason, pickupId, clientId).run();
+          const failedResponse = JSON.stringify({ ok: false, error: { code: "PROVIDER_REQUEST_FAILED", message: failureReason }, data: { id: pickupId, client_id: clientId, status: "failed", provider, provider_result: providerResult }, request_id: id });
+          await saveIdempotent(env, key, clientId, "POST /v1/pickups", 502, failedResponse, requestHash);
+          await audit(env, ctx, auth, id, "pickup.provider_failed", "pickup", pickupId, { client_id: clientId, provider, reason: failureReason });
+          return new Response(failedResponse, { status: 502, headers: { ...headers, "content-type": "application/json" } });
+        }
         const serialized = JSON.stringify({ ok: true, data: { id: pickupId, client_id: clientId, status: "scheduled", provider, provider_result: providerResult }, request_id: id });
         await saveIdempotent(env, key, clientId, "POST /v1/pickups", 201, serialized, requestHash); await audit(env, ctx, auth, id, "pickup.created", "pickup", pickupId, { client_id: clientId });
         return new Response(serialized, { status: 201, headers: { ...headers, "content-type": "application/json" } });
@@ -1950,9 +2082,14 @@ const worker = {
               safeProviderRequest(env, "delhivery", "serviceability", { destination_pincode: origin }, id, serviceabilityClientId),
               safeProviderRequest(env, "delhivery", "serviceability", { destination_pincode: destination }, id, serviceabilityClientId),
             ]);
-            const originServiceable = originResult.status === "accepted" && Boolean(originResult.serviceable);
+            const originServiceable = originResult.status === "accepted" && Boolean((originResult as { pickup?: boolean; serviceable?: boolean }).pickup ?? (originResult as { serviceable?: boolean }).serviceable);
             const destinationServiceable = destinationResult.status === "accepted" && Boolean(destinationResult.serviceable);
-            return json({ ok: true, data: { client_id: serviceabilityClientId, origin_pincode: origin, destination_pincode: destination, serviceable: originServiceable && destinationServiceable, providers: originServiceable && destinationServiceable ? ["delhivery"] : [], configured_providers: configuredProviders, status: originResult.status === "accepted" && destinationResult.status === "accepted" ? "verified" : "provider_error", origin: originResult, destination: destinationResult } }, 200, headers);
+            const providerStatus = originResult.status === "accepted" && destinationResult.status === "accepted" ? "verified" : "provider_error";
+            const serviceabilityRows = [
+              { pincode: origin, provider: "Delhivery", status: originResult.status === "accepted" ? originServiceable ? "Available" : "Unavailable" : "Provider error", oda: (originResult as { oda?: boolean | null }).oda ?? null },
+              { pincode: destination, provider: "Delhivery", status: destinationResult.status === "accepted" ? destinationServiceable ? "Available" : "Unavailable" : "Provider error", oda: (destinationResult as { oda?: boolean | null }).oda ?? null },
+            ];
+            return json({ ok: true, data: { client_id: serviceabilityClientId, origin_pincode: origin, destination_pincode: destination, serviceable: originServiceable && destinationServiceable, providers: originServiceable && destinationServiceable ? ["delhivery"] : [], configured_providers: configuredProviders, status: providerStatus, serviceability_rows: serviceabilityRows, origin: originResult, destination: destinationResult } }, 200, headers);
           } catch (caught) {
             const providerError = caught instanceof Error ? caught.message : "provider_request_failed";
             console.error(JSON.stringify({ request_id: id, route: "/v1/serviceability", provider: "delhivery", error: providerError }));
@@ -1961,9 +2098,18 @@ const worker = {
         }
         if (configuredProviders.includes("rivigo")) {
           const result = await safeProviderRequest(env, "rivigo", "serviceability", { origin_pincode: origin, destination_pincode: destination }, id, serviceabilityClientId);
-          return json({ ok: true, data: { origin_pincode: origin, destination_pincode: destination, serviceable: result.status === "accepted" && Boolean((result as { serviceable?: boolean }).serviceable), providers: result.status === "accepted" ? ["rivigo"] : [], configured_providers: configuredProviders, status: result.status === "accepted" ? "verified" : "provider_error", provider_result: result } }, 200, headers);
+          const accepted = result.status === "accepted";
+          const routeServiceable = accepted && Boolean((result as { serviceable?: boolean }).serviceable);
+          const rivigoResult = result as { origin_oda?: boolean | null; destination_oda?: boolean | null };
+          return json({ ok: true, data: { origin_pincode: origin, destination_pincode: destination, serviceable: routeServiceable, providers: routeServiceable ? ["rivigo"] : [], configured_providers: configuredProviders, status: accepted ? "verified" : "provider_error", serviceability_rows: [
+            { pincode: origin, provider: "Rivigo", status: accepted ? routeServiceable ? "Available" : "Unavailable" : "Provider error", oda: rivigoResult.origin_oda ?? null },
+            { pincode: destination, provider: "Rivigo", status: accepted ? routeServiceable ? "Available" : "Unavailable" : "Provider error", oda: rivigoResult.destination_oda ?? null },
+          ], provider_result: result } }, 200, headers);
         }
-        return json({ ok: true, data: { origin_pincode: origin, destination_pincode: destination, serviceable: false, providers: [], configured_providers: configuredProviders, status: configuredProviders.length > 0 ? "provider_contract_not_verified" : "provider_unavailable" } }, 200, headers);
+        return json({ ok: true, data: { origin_pincode: origin, destination_pincode: destination, serviceable: false, providers: [], configured_providers: configuredProviders, status: configuredProviders.length > 0 ? "provider_contract_not_verified" : "provider_unavailable", serviceability_rows: [
+          { pincode: origin, provider: "Configured courier", status: "Unavailable", oda: null },
+          { pincode: destination, provider: "Configured courier", status: "Unavailable", oda: null },
+        ] } }, 200, headers);
       }
       if (route === "/departments" && request.method === "GET") {
         if (!hasScope(auth, "departments.read")) return error("FORBIDDEN", "Department read scope required", 403, id, headers);
