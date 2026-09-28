@@ -808,7 +808,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         : provider === "rivigo" && operation === "shipments" ? JSON.stringify(rivigoCreate)
         : provider === "rivigo" && operation === "updates" ? JSON.stringify(payload)
         : provider === "rivigo" && operation === "cancellations" ? JSON.stringify(payload.cnotes_list ? { cnotesList: payload.cnotes_list } : {})
-        : provider === "delhivery" && operation === "serviceability" ? ""
+        : provider === "delhivery" && (operation === "tracking" || operation === "serviceability") ? ""
         : operation === "tracking" ? JSON.stringify({ Appkey: trackon!.appKey, userId: trackon!.userId, password: trackon!.password, AWBNo: trackingNumber })
           : operation === "shipments" ? JSON.stringify(trackonPayload(payload, trackon!))
             : JSON.stringify({ Appkey: trackon!.appKey, userId: trackon!.userId, password: trackon!.password, AWBNo: trackingNumber });
@@ -1117,7 +1117,7 @@ const worker = {
           // Public tracking must settle before the Hero client's 8-second
           // request budget; authenticated operational lookups keep the
           // normal provider timeout.
-          const providerResult = await providerRequest(env, provider, "tracking", { tracking_number: reference }, id, undefined, undefined, 5000);
+          const providerResult = await safeProviderRequest(env, provider, "tracking", { tracking_number: reference }, id, undefined, undefined, 5000);
           const tracking = (providerResult as { tracking?: { status?: string; location?: string; description?: string; event_time?: string | null } }).tracking;
           return { provider, status: String(providerResult.status), tracking };
         } catch (caught) {
@@ -1390,7 +1390,7 @@ const worker = {
         const provider = typeof payload.provider === "string" && ["delhivery", "ekart", "trackon", "xpressbees", "rivigo"].includes(payload.provider) ? payload.provider : null;
         await env.DB.prepare("INSERT INTO shipments (id, client_id, created_by_user_id, provider, provider_account_id, status, description, origin, destination, origin_address_json, destination_address_json, consignee, total_weight_kg, declared_value, pieces, edd) VALUES (?, ?, ?, ?, NULL, 'booked', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(shipmentId, clientId, auth.userId ?? `api:${clientId}`, provider, description, origin, destination, JSON.stringify(originAddress), JSON.stringify(destinationAddress), String(destinationAddress.name), weight, declaredValue, pieces, typeof payload.edd === "string" ? payload.edd : null).run();
         await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'booked', 'Shipment created', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipmentId, auth.userId ?? `api:${clientId}`).run();
-        const providerResult = provider ? await providerRequest(env, provider as CourierProvider, "shipments", { shipment_id: shipmentId, ...payload }, id, clientId, key) : { enabled: false, status: "not_requested" as const };
+        const providerResult = provider ? await safeProviderRequest(env, provider as CourierProvider, "shipments", { shipment_id: shipmentId, ...payload }, id, clientId, key) : { enabled: false, status: "not_requested" as const };
         const selectedProviderAccountId = (providerResult as { provider_account_id?: string }).provider_account_id;
         if (selectedProviderAccountId) await env.DB.prepare("UPDATE shipments SET provider_account_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(selectedProviderAccountId, shipmentId, clientId).run();
         const serialized = JSON.stringify({ ok: true, data: { id: shipmentId, client_id: clientId, status: "booked", provider, provider_result: providerResult }, request_id: id });
@@ -1458,7 +1458,7 @@ const worker = {
         const shipment = await env.DB.prepare("SELECT id, client_id, provider, tracking_number, provider_reference FROM shipments WHERE id = ? LIMIT 1").bind(shipmentLabel[1]).first<{ id: string; client_id: string; provider: string | null; tracking_number: string | null; provider_reference: string | null }>();
         if (!shipment || !canAccessClient(auth, shipment.client_id)) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
         if (shipment.provider !== "trackon") return error("UNSUPPORTED_PROVIDER_OPERATION", "Label generation is currently available only for Trackon", 409, id, headers);
-        const providerResult = await providerRequest(env, "trackon", "labels", { shipment_id: shipment.id, tracking_number: shipment.tracking_number, provider_reference: shipment.provider_reference }, id, shipment.client_id);
+        const providerResult = await safeProviderRequest(env, "trackon", "labels", { shipment_id: shipment.id, tracking_number: shipment.tracking_number, provider_reference: shipment.provider_reference }, id, shipment.client_id);
         return json({ ok: true, data: providerResult }, 200, headers);
       }
 
@@ -1470,7 +1470,7 @@ const worker = {
         if (route.endsWith("/tracking")) {
           const events = await env.DB.prepare("SELECT * FROM tracking_events WHERE shipment_id = ? ORDER BY event_time ASC LIMIT 100").bind(shipmentGet[1]).all();
           const provider = ["delhivery", "ekart", "trackon", "xpressbees", "rivigo"].includes(String(shipment.provider)) ? shipment.provider as CourierProvider : null;
-          const providerResult = provider ? await providerRequest(env, provider, "tracking", { shipment_id: shipmentGet[1], tracking_number: shipment.tracking_number, provider_reference: shipment.provider_reference }, id, shipment.client_id) : { enabled: false, status: "not_requested" as const };
+          const providerResult = provider ? await safeProviderRequest(env, provider, "tracking", { shipment_id: shipmentGet[1], tracking_number: shipment.tracking_number, provider_reference: shipment.provider_reference }, id, shipment.client_id) : { enabled: false, status: "not_requested" as const };
           return json({ ok: true, data: events.results, provider_result: providerResult }, 200, headers);
         }
         return json({ ok: true, data: shipment }, 200, headers);
@@ -1496,7 +1496,7 @@ const worker = {
         const shipment = typeof payload.shipment_id === "string" ? await env.DB.prepare("SELECT provider, tracking_number, provider_reference FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(payload.shipment_id, clientId).first<{ provider: string | null; tracking_number: string | null; provider_reference: string | null }>() : null;
         const requestedProvider = ["delhivery", "ekart", "trackon", "xpressbees", "rivigo"].includes(String(payload.provider)) ? payload.provider as CourierProvider : null;
         const provider = requestedProvider ?? (["delhivery", "ekart", "trackon", "xpressbees", "rivigo"].includes(String(shipment?.provider)) ? shipment?.provider as CourierProvider : null);
-        const providerResult = provider ? await providerRequest(env, provider, "pickups", { pickup_id: pickupId, shipment_id: payload.shipment_id, tracking_number: shipment?.tracking_number, provider_reference: shipment?.provider_reference, ...payload }, id, clientId, key) : { enabled: false, status: "not_requested" as const };
+        const providerResult = provider ? await safeProviderRequest(env, provider, "pickups", { pickup_id: pickupId, shipment_id: payload.shipment_id, tracking_number: shipment?.tracking_number, provider_reference: shipment?.provider_reference, ...payload }, id, clientId, key) : { enabled: false, status: "not_requested" as const };
         const serialized = JSON.stringify({ ok: true, data: { id: pickupId, client_id: clientId, status: "scheduled", provider, provider_result: providerResult }, request_id: id });
         await saveIdempotent(env, key, clientId, "POST /v1/pickups", 201, serialized, requestHash); await audit(env, ctx, auth, id, "pickup.created", "pickup", pickupId, { client_id: clientId });
         return new Response(serialized, { status: 201, headers: { ...headers, "content-type": "application/json" } });
@@ -1920,7 +1920,7 @@ const worker = {
           ORDER BY priority ASC, confidence_score DESC, pa.created_at ASC`).bind(clientId, provider, clientId, requestedAccountId, requestedAccountId).all<{ id: string; account_name: string; enabled: number; priority: number; confidence_score: number; rate_card_id: string | null }>();
         const candidates = accounts.results.length ? accounts.results : [null];
         const quotes = await Promise.all(candidates.map(async (account) => {
-          const result = await providerRequest(env, "xpressbees", "quotes", { ...payload, origin_pincode: origin, destination_pincode: destination, ...(account ? { provider_account_id: account.id } : {}) }, id, clientId);
+          const result = await safeProviderRequest(env, "xpressbees", "quotes", { ...payload, origin_pincode: origin, destination_pincode: destination, ...(account ? { provider_account_id: account.id } : {}) }, id, clientId);
           return { provider, provider_account_id: account?.id ?? (result as { provider_account_id?: string }).provider_account_id, account_name: account?.account_name ?? (result as { account_name?: string }).account_name, confidence_score: account?.confidence_score ?? (result as { confidence_score?: number }).confidence_score ?? 0, priority: account?.priority ?? (result as { priority?: number }).priority ?? 100, rate_card_id: account?.rate_card_id ?? (result as { rate_card_id?: string }).rate_card_id, amount: (result as { amount?: number | null }).amount ?? null, provider_result: result };
         }));
         return json({ ok: true, data: { client_id: clientId, origin_pincode: origin, destination_pincode: destination, quotes } }, 200, headers);
@@ -1947,7 +1947,7 @@ const worker = {
           }
         }
         if (configuredProviders.includes("rivigo")) {
-          const result = await providerRequest(env, "rivigo", "serviceability", { origin_pincode: origin, destination_pincode: destination }, id, serviceabilityClientId);
+          const result = await safeProviderRequest(env, "rivigo", "serviceability", { origin_pincode: origin, destination_pincode: destination }, id, serviceabilityClientId);
           return json({ ok: true, data: { origin_pincode: origin, destination_pincode: destination, serviceable: result.status === "accepted" && Boolean((result as { serviceable?: boolean }).serviceable), providers: result.status === "accepted" ? ["rivigo"] : [], configured_providers: configuredProviders, status: result.status === "accepted" ? "verified" : "provider_error", provider_result: result } }, 200, headers);
         }
         return json({ ok: true, data: { origin_pincode: origin, destination_pincode: destination, serviceable: false, providers: [], configured_providers: configuredProviders, status: configuredProviders.length > 0 ? "provider_contract_not_verified" : "provider_unavailable" } }, 200, headers);
