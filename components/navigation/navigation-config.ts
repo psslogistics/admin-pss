@@ -37,7 +37,7 @@ export const navigationGroups: NavigationGroup[] = [
     ],
   },
   {
-    label: "Account",
+    label: "Account & Integrations",
     items: [
       { title: "Notifications", href: "/dashboard/notifications", icon: "notifications", permission: "admin.notifications.view" },
       { title: "Support", href: "/dashboard/support", icon: "support", permission: "admin.support.view" },
