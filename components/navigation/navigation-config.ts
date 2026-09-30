@@ -34,6 +34,7 @@ export const navigationGroups: NavigationGroup[] = [
       { title: "Pickup", href: "/dashboard/pickup", icon: "pickups", permission: "admin.pickup.view" },
       { title: "Reports", href: "/dashboard/reports", icon: "reports", permission: "admin.reports.view" },
       { title: "Rate Cards", href: "/dashboard/rate-cards", icon: "reports", permission: "admin.rate_cards.view" },
+      { title: "Weight Reconciliation", href: "/dashboard/weight-reconciliation", icon: "reports", permission: "admin.reports.view" },
     ],
   },
   {

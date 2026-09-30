@@ -1,3 +1,5 @@
+import { calculatePssRate, defaultRateRows, type ChargeRule, type PricingAccount } from "./pricing-engine";
+
 export interface Env extends Omit<Cloudflare.Env, "SUPABASE_PUBLISHABLE_KEY" | "API_KEY_PEPPER" | "DELHIVERY_API_TOKEN" | "DELHIVERY_WEBHOOK_SECRET" | "EKART_API_KEY" | "EKART_API_SECRET" | "EKART_WEBHOOK_SECRET" | "EKART_ENABLE_PROVIDER_CALLS" | "TRACKON_API_BASE_URL" | "TRACKON_CREDENTIALS_JSON" | "TRACKON_WEBHOOK_SECRET" | "TRACKON_BOOKING_URL" | "TRACKON_TRACKING_URL" | "TRACKON_LABEL_URL" | "TRACKON_ENABLE_SHIPMENT_CREATION" | "TRACKON_ENABLE_PICKUP_CREATION" | "XPRESSBEES_API_BASE_URL" | "XPRESSBEES_CREDENTIALS_JSON" | "XPRESSBEES_ENABLE_SHIPMENT_CREATION" | "XPRESSBEES_ENABLE_PICKUP_CREATION" | "RIVIGO_API_BASE_URL" | "RIVIGO_AUTH_URL" | "RIVIGO_TRACKING_URL" | "RIVIGO_CREDENTIALS_JSON" | "RIVIGO_ENABLE_PROVIDER_CALLS"> {
   SUPABASE_PUBLISHABLE_KEY: string;
   API_KEY_PEPPER?: string;
@@ -181,6 +183,12 @@ function hasScope(auth: Auth, scope: string) {
     "activity.read": ["activity.read", "employee_activity.view", "admin.activity.view"],
     "integrations.read": ["integrations.view", "admin.integrations.view"], "webhooks.read": ["api_keys.view", "integrations.view", "admin.api_keys.view"],
     "provider_accounts.read": ["integrations.view", "admin.integrations.view"], "provider_accounts.manage": ["integrations.manage", "admin.integrations.manage"],
+    "pricing.read": ["pricing.view", "admin.pricing.view", "rate_cards.manage", "admin.rate_cards.view", "admin.rate_cards.manage"],
+    "pricing.manage": ["pricing.manage", "admin.pricing.manage", "rate_cards.manage", "admin.rate_cards.manage"],
+    "pricing.publish": ["pricing.publish", "admin.pricing.publish", "rate_cards.manage", "admin.rate_cards.manage"],
+    "pricing.override": ["pricing.override", "admin.pricing.override", "rate_cards.manage", "admin.rate_cards.manage"],
+    "provider_cost.view": ["provider_cost.view", "admin.provider_cost.view"],
+    "weight_dispute.resolve": ["weight_dispute.resolve", "admin.weight_dispute.resolve"],
   };
   if (permissionMap[scope]?.some((permission) => auth.permissions.has(permission))) return true;
   if (auth.roles.has("employee")) return false;
@@ -192,6 +200,7 @@ function hasScope(auth: Auth, scope: string) {
   if (scope === "provider_accounts.read") return roles.has("admin") || roles.has("super_admin");
   if (scope === "provider_accounts.manage") return roles.has("admin") || roles.has("super_admin");
   if (["billing.manage", "wallet.manage", "cod.manage", "weight.manage"].includes(scope)) return roles.has("admin") || roles.has("super_admin");
+  if (scope === "weight_dispute.resolve") return roles.has("admin") || roles.has("super_admin");
   if (["api_keys.read", "api_keys.manage", "integrations.read", "webhooks.read"].includes(scope)) return roles.has("admin");
   return false;
 }
@@ -227,6 +236,9 @@ function canAccessClient(auth: Auth, clientId: string) { return auth.system || a
 function providerAccountId(payload: Record<string, unknown>) {
   const value = payload.provider_account_id;
   return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+function delhiveryPricingAccountFromName(accountName: string): PricingAccount {
+  return /(^|\D)04(\D|$)/.test(accountName) ? "04" : /(^|\D)08(\D|$)/.test(accountName) ? "08" : "other";
 }
 function requireClient(auth: Auth, requested: unknown) {
   const requestedId = typeof requested === "string" ? requested.trim() : "";
@@ -364,6 +376,92 @@ function shipmentAddress(value: unknown) {
   return { ...address, name, line, city, state, pincode, phone };
 }
 
+function providerAmount(value: unknown) {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  for (const key of ["amount", "shipping_charge", "freight", "total_amount", "billing_amount"]) { const amount = Number(record[key]); if (Number.isFinite(amount) && amount >= 0) return amount; }
+  return null;
+}
+
+function volumetricWeightFromPayload(payload: Record<string, unknown>) {
+  const explicit = Number(payload.volumetric_weight_kg);
+  if (Number.isFinite(explicit) && explicit >= 0) return explicit;
+  const groups = Array.isArray(payload.dimensions) ? payload.dimensions : [];
+  const calculated = groups.reduce((sum, item) => {
+    if (!item || typeof item !== "object") return sum;
+    const group = item as Record<string, unknown>; const length = Number(group.length); const width = Number(group.width); const height = Number(group.height); const quantity = Number(group.quantity ?? group.boxCount ?? group.box_count ?? 1);
+    return Number.isFinite(length) && Number.isFinite(width) && Number.isFinite(height) && length > 0 && width > 0 && height > 0 && Number.isFinite(quantity) && quantity > 0 ? sum + (length * width * height * quantity) / 5000 : sum;
+  }, 0);
+  if (calculated > 0) return calculated;
+  const length = Number(payload.length); const width = Number(payload.width); const height = Number(payload.height); const quantity = Number(payload.pieces ?? 1);
+  return Number.isFinite(length) && Number.isFinite(width) && Number.isFinite(height) && length > 0 && width > 0 && height > 0 ? (length * width * height * Math.max(quantity, 1)) / 5000 : 0;
+}
+
+type PricingQuoteRecord = { id: string; version_id: string; account_scope: string; origin_zone: string; destination_zone: string; chargeable_weight_kg: number; client_breakdown_json: string };
+function billingLineItemStatements(env: Env, billingId: string, shipmentId: string, clientId: string, breakdownJson: string) {
+  let lines: Array<{ code?: unknown; label?: unknown; amount?: unknown; marker?: unknown }> = [];
+  try {
+    const parsed = JSON.parse(breakdownJson) as { lines?: unknown };
+    lines = Array.isArray(parsed.lines) ? parsed.lines.filter((line): line is Record<string, unknown> => Boolean(line && typeof line === "object")) : [];
+  } catch {
+    return [];
+  }
+  return lines.flatMap((line, displayOrder) => {
+    const code = String(line.code ?? "").trim();
+    const label = String(line.label ?? code).trim();
+    const amount = Number(line.amount);
+    if (!code || !label || !Number.isFinite(amount)) return [];
+    return [env.DB.prepare("INSERT INTO billing_line_items (id, billing_id, shipment_id, client_id, code, label, amount, marker, display_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(crypto.randomUUID(), billingId, shipmentId, clientId, code, label, amount, line.marker === "*" ? "*" : null, displayOrder)];
+  });
+}
+async function pricingPincode(env: Env, pincode: string) {
+  if (!/^\d{6}$/.test(pincode)) return null;
+  return env.DB.prepare("SELECT pincode, facility_city, facility_state, oda FROM delhivery_b2b_pincode_zones WHERE pincode = ? LIMIT 1").bind(pincode).first<{ pincode: string; facility_city: string; facility_state: string; oda: number }>();
+}
+async function createShipmentPricingQuote(env: Env, clientId: string, payload: Record<string, unknown>, createdByUserId: string, versionIdOverride?: string): Promise<PricingQuoteRecord> {
+  const origin = shipmentAddress(payload.origin_address); const destination = shipmentAddress(payload.destination_address);
+  if (!origin || !destination) throw new Error("PRICING_ADDRESS_REQUIRED");
+  let accountValue = String(payload.account_code ?? "").trim().toLowerCase();
+  if (!accountValue && typeof payload.provider_account_id === "string") {
+    const providerAccount = await env.DB.prepare("SELECT account_name FROM provider_accounts WHERE id = ? AND provider = 'delhivery' LIMIT 1").bind(payload.provider_account_id).first<{ account_name: string }>();
+    const accountName = String(providerAccount?.account_name ?? ""); accountValue = delhiveryPricingAccountFromName(accountName);
+  }
+  if (!accountValue) accountValue = "other";
+  // Only the supplied 04 and 08 cards have dedicated matrices. Every other
+  // Delhivery B2B account code intentionally uses the Namo B2B matrix.
+  if (accountValue !== "04" && accountValue !== "08" && accountValue !== "other") accountValue = "other";
+  const rto = payload.rto === true;
+  const rtoSourceId = typeof payload.rto_of_shipment_id === "string" ? payload.rto_of_shipment_id.trim() : typeof payload.original_shipment_id === "string" ? payload.original_shipment_id.trim() : "";
+  const rtoSource = rto ? await env.DB.prepare("SELECT account_scope, origin_zone, destination_zone, chargeable_weight_kg, client_breakdown_json FROM pricing_shipment_snapshots WHERE shipment_id = ? AND client_id = ? LIMIT 1").bind(rtoSourceId, clientId).first<{ account_scope: PricingAccount; origin_zone: string; destination_zone: string; chargeable_weight_kg: number; client_breakdown_json: string }>() : null;
+  if (rto && !rtoSourceId) throw new Error("RTO_SOURCE_REQUIRED");
+  if (rto && !rtoSource) throw new Error("RTO_SOURCE_NOT_FOUND");
+  const account = (rtoSource?.account_scope ?? accountValue) as PricingAccount;
+  const actualWeightKg = Number(payload.total_weight_kg); const volumetricWeightKg = volumetricWeightFromPayload(payload); const invoiceValue = Number(payload.declared_value ?? 0);
+  if (!Number.isFinite(actualWeightKg) || actualWeightKg <= 0 || !Number.isFinite(volumetricWeightKg) || volumetricWeightKg < 0 || !Number.isFinite(invoiceValue) || invoiceValue < 0) throw new Error("PRICING_WEIGHT_INVALID");
+  const version = versionIdOverride
+    ? await env.DB.prepare("SELECT id, minimum_weight_kg, gst_percent FROM pricing_versions WHERE id = ? AND client_id = ? AND provider = 'delhivery' AND service_level = 'b2b' LIMIT 1").bind(versionIdOverride, clientId).first<{ id: string; minimum_weight_kg: number; gst_percent: number }>()
+    : await env.DB.prepare("SELECT id, minimum_weight_kg, gst_percent FROM pricing_versions WHERE client_id = ? AND provider = 'delhivery' AND service_level = 'b2b' AND status = 'active' AND datetime(effective_at) <= CURRENT_TIMESTAMP ORDER BY datetime(effective_at) DESC LIMIT 1").bind(clientId).first<{ id: string; minimum_weight_kg: number; gst_percent: number }>();
+  if (!version) throw new Error("PRICING_NOT_CONFIGURED");
+  const rules = await env.DB.prepare("SELECT code, label, calculation_type, value, basis, minimum_value, maximum_value, enabled, marker, condition, display_order FROM pricing_charge_rules WHERE version_id = ? ORDER BY display_order ASC, code ASC").bind(version.id).all<{ code: string; label: string; calculation_type: ChargeRule["kind"]; value: number; basis: ChargeRule["basis"]; minimum_value: number | null; maximum_value: number | null; enabled: number; marker: "*" | null; condition: "oda_or_opa" | null; display_order: number }>();
+  const matrixRows = await env.DB.prepare("SELECT origin_zone, destination_zone, rate_per_kg FROM pricing_rate_matrix WHERE version_id = ? AND account_scope = ?").bind(version.id, account).all<{ origin_zone: string; destination_zone: string; rate_per_kg: number }>();
+  const [originPin, destinationPin] = await Promise.all([pricingPincode(env, origin.pincode), pricingPincode(env, destination.pincode)]);
+  const originCity = originPin?.facility_city ?? origin.city; const destinationCity = destinationPin?.facility_city ?? destination.city;
+  const originState = originPin?.facility_state ?? origin.state; const destinationState = destinationPin?.facility_state ?? destination.state;
+  let forwardRatePerKg: number | undefined;
+  if (rtoSource) {
+    try {
+      const originalBreakdown = JSON.parse(rtoSource.client_breakdown_json) as { lines?: Array<{ code?: string; amount?: number }> };
+      const originalFreight = originalBreakdown.lines?.find((line) => line.code === "freight")?.amount;
+      if (Number.isFinite(Number(originalFreight)) && Number(rtoSource.chargeable_weight_kg) > 0) forwardRatePerKg = Number(originalFreight) / Number(rtoSource.chargeable_weight_kg);
+    } catch { throw new Error("RTO_SOURCE_INVALID"); }
+    if (forwardRatePerKg === undefined) throw new Error("RTO_SOURCE_INVALID");
+  }
+  const result = calculatePssRate({ account, originCity, destinationCity, originState, destinationState, actualWeightKg, volumetricWeightKg, invoiceValue, rto, forwardRatePerKg, forwardOriginZoneOverride: rtoSource?.origin_zone, forwardDestinationZoneOverride: rtoSource?.destination_zone, minimumWeightKg: Number(version.minimum_weight_kg ?? 20), gstPercent: Number(version.gst_percent ?? 18), versionId: version.id, oda: Boolean(destinationPin?.oda), opa: Boolean(originPin?.oda), rateMatrix: Object.fromEntries(matrixRows.results.map((row) => [`${row.origin_zone}->${row.destination_zone}`, Number(row.rate_per_kg)])), chargeRules: rules.results.map((rule) => ({ code: rule.code, label: rule.label, kind: rule.calculation_type, value: Number(rule.value), basis: rule.basis, minimum: rule.minimum_value === null ? undefined : Number(rule.minimum_value), maximum: rule.maximum_value === null ? undefined : Number(rule.maximum_value), enabled: Boolean(rule.enabled), marker: rule.marker ?? undefined, condition: rule.condition ?? undefined, displayOrder: Number(rule.display_order ?? 0) })) });
+  const quoteId = crypto.randomUUID(); const breakdown = JSON.stringify(result);
+  await env.DB.prepare("INSERT INTO pricing_quotes (id, client_id, version_id, account_scope, origin_zone, destination_zone, chargeable_weight_kg, client_breakdown_json, expires_at, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+15 minutes'), ?)").bind(quoteId, clientId, version.id, account, result.originZone, result.destinationZone, result.chargeableWeightKg, breakdown, createdByUserId).run();
+  return { id: quoteId, version_id: version.id, account_scope: account, origin_zone: result.originZone, destination_zone: result.destinationZone, chargeable_weight_kg: result.chargeableWeightKg, client_breakdown_json: breakdown };
+}
+
 function delhiveryCreatePayload(env: Env, payload: Record<string, unknown>) {
   const origin = delhiveryAddress(payload.origin_address, String(payload.origin ?? "PSS Logistics"));
   const destination = delhiveryAddress(payload.destination_address, String(payload.consignee ?? "Consignee"));
@@ -379,7 +477,7 @@ function delhiveryCreatePayload(env: Env, payload: Record<string, unknown>) {
     client,
     order: orderId,
     order_date: String(payload.order_date ?? new Date().toISOString().slice(0, 10)),
-    product_type: String(payload.product_type ?? "B2C"),
+    product_type: String(payload.product_type ?? "B2B"),
     name: destination.name,
     add: destination.line,
     city: destination.city,
@@ -1279,10 +1377,31 @@ const worker = {
       ]).then(() => undefined).catch(() => undefined));
     }
     // Strip only the `/v1` prefix and preserve the leading slash expected by route matchers.
-    const route = url.pathname.slice(3);
+    let route = url.pathname.slice(3);
     try {
       if (await rateLimited(env, request, auth, route)) return new Response(JSON.stringify({ ok: false, error: { code: "RATE_LIMITED", message: "Too many requests" }, request_id: id }), { status: 429, headers: { ...headers, "content-type": "application/json", "retry-after": "60" } });
       if (route === "/me" && request.method === "GET") return json({ ok: true, authenticated: true, user_id: auth.userId, client_id: auth.clientId, client_ids: [...auth.clientIds], roles: [...auth.roles], permissions: [...auth.permissions], system: auth.system }, 200, withCors(request, env));
+      // Fujiyama receives a stable PSS contract. It never receives Delhivery
+      // credentials or calls Delhivery directly. Tracking accepts an AWB
+      // before a PSS shipment exists; booking delegates to the canonical
+      // shipment path below so pricing, wallet, idempotency, audit, and
+      // provider-account selection remain identical to panel bookings.
+      if (route === "/fujiyama/tracking" && request.method === "GET") {
+        if (!hasScope(auth, "tracking.read")) return error("FORBIDDEN", "Tracking read scope required", 403, id, headers);
+        const awb = url.searchParams.get("awb")?.trim() || url.searchParams.get("tracking_number")?.trim();
+        const trackingType = url.searchParams.get("trackingType")?.trim() || "VENDOR-AWB";
+        if (!awb || awb.length > 128) return error("VALIDATION_ERROR", "A valid AWB is required", 400, id, headers);
+        if (trackingType !== "VENDOR-AWB") return error("VALIDATION_ERROR", "trackingType must be VENDOR-AWB", 400, id, headers);
+        const providerAccountId = url.searchParams.get("provider_account_id")?.trim() || undefined;
+        const result = await safeProviderRequest(env, "delhivery", "tracking", { tracking_number: awb, ...(providerAccountId ? { provider_account_id: providerAccountId } : {}) }, id, auth.clientId, undefined, 10000);
+        const tracking = (result as { tracking?: { status?: string; location?: string; description?: string; event_time?: string | null } }).tracking;
+        if (result.status !== "accepted" || !tracking?.status) return error("TRACKING_UNAVAILABLE", "The shipment could not be resolved by Delhivery", 502, id, headers);
+        return json({ ok: true, data: { tracking_type: trackingType, awb, status: tracking.status, location: tracking.location ?? "", description: tracking.description ?? "", event_time: tracking.event_time ?? null, provider: "delhivery" }, request_id: id }, 200, headers);
+      }
+      if (route === "/fujiyama/bookings" && request.method === "POST") {
+        if (!hasScope(auth, "shipments.create")) return error("FORBIDDEN", "Shipment creation scope required", 403, id, headers);
+        route = "/shipments";
+      }
       if (route === "/preferences" && (request.method === "GET" || request.method === "PUT")) {
         const clientId = requireClient(auth, url.searchParams.get("client_id"));
         if (!clientId || !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
@@ -1431,11 +1550,11 @@ const worker = {
       if (route === "/provider-accounts" && request.method === "GET") {
         if (!hasScope(auth, "provider_accounts.read")) return error("FORBIDDEN", "Provider account visibility permission required", 403, id, headers);
         const rows = auth.system
-          ? await env.DB.prepare("SELECT id, provider, account_name, account_type, credential_secret_name, client_id, capabilities_json, status, created_by_user_id, created_at, updated_at FROM provider_accounts ORDER BY provider, account_name LIMIT 100").all()
+          ? await env.DB.prepare("SELECT id, provider, account_name, account_type, client_id, capabilities_json, status, created_by_user_id, created_at, updated_at FROM provider_accounts ORDER BY provider, account_name LIMIT 100").all()
           : auth.clientIds.size
-            ? await env.DB.prepare(`SELECT id, provider, account_name, account_type, credential_secret_name, client_id, capabilities_json, status, created_by_user_id, created_at, updated_at FROM provider_accounts WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY provider, account_name LIMIT 100`).bind(...auth.clientIds).all()
+            ? await env.DB.prepare(`SELECT id, provider, account_name, account_type, client_id, capabilities_json, status, created_by_user_id, created_at, updated_at FROM provider_accounts WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY provider, account_name LIMIT 100`).bind(...auth.clientIds).all()
             : { results: [] };
-        return json({ ok: true, data: rows.results.map((row) => { const value = row as Record<string, unknown>; let capabilities: unknown[] = []; try { capabilities = JSON.parse(String(value.capabilities_json ?? "[]")); } catch { capabilities = []; } return { ...value, capabilities }; }) }, 200, headers);
+        return json({ ok: true, data: rows.results.map((row) => { const value = row as Record<string, unknown>; let capabilities: unknown[] = []; try { capabilities = JSON.parse(String(value.capabilities_json ?? "[]")); } catch { capabilities = []; } const { capabilities_json: _capabilitiesJson, ...safe } = value; return { ...safe, capabilities }; }) }, 200, headers);
       }
       if (route === "/provider-accounts" && request.method === "POST") {
         if (!hasScope(auth, "provider_accounts.manage") || !hasRole(auth, ["admin", "super_admin"])) return error("FORBIDDEN", "Provider account management permission required", 403, id, headers);
@@ -1445,7 +1564,7 @@ const worker = {
         if (clientId) { const client = await supabaseGet<{ id: string; status: string }>(env, `client_accounts?id=eq.${encodeURIComponent(clientId)}&status=eq.active&select=id,status`, auth.accessToken ?? ""); if (!client.length) return error("NOT_FOUND", "Client account not found", 404, id, headers); }
         const duplicate = await env.DB.prepare("SELECT id FROM provider_accounts WHERE provider = ? AND account_name = ? LIMIT 1").bind(provider, accountName).first<{ id: string }>(); if (duplicate) return error("CONFLICT", "Provider account name already exists", 409, id, headers);
         const idempotencyKey = request.headers.get("Idempotency-Key"); if (!idempotencyKey) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers); const requestHash = await payloadFingerprint(payload); const endpoint = "POST /v1/provider-accounts"; const existing = await idempotentResponse(env, idempotencyKey, auth.userId ?? "system", endpoint, requestHash); if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
-        const accountId = crypto.randomUUID(); const capabilities = Array.isArray(payload.capabilities) ? payload.capabilities.filter((value): value is string => typeof value === "string").slice(0, 20) : []; await env.DB.prepare("INSERT INTO provider_accounts (id, provider, account_name, account_type, credential_secret_name, client_id, capabilities_json, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").bind(accountId, provider, accountName, accountType, secretName, clientId, JSON.stringify(capabilities), auth.userId ?? "system").run(); await audit(env, ctx, auth, id, "provider_account.created", "provider_account", accountId, { provider, account_name: accountName, client_id: clientId, credential_secret_name: secretName }); const serialized = JSON.stringify({ ok: true, data: { id: accountId, provider, account_name: accountName, account_type: accountType, credential_secret_name: secretName, client_id: clientId, capabilities, status: "active" }, request_id: id }); await saveIdempotent(env, idempotencyKey, auth.userId ?? "system", endpoint, 201, serialized, requestHash); return new Response(serialized, { status: 201, headers: { ...headers, "content-type": "application/json" } });
+        const accountId = crypto.randomUUID(); const capabilities = Array.isArray(payload.capabilities) ? payload.capabilities.filter((value): value is string => typeof value === "string").slice(0, 20) : []; await env.DB.prepare("INSERT INTO provider_accounts (id, provider, account_name, account_type, credential_secret_name, client_id, capabilities_json, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").bind(accountId, provider, accountName, accountType, secretName, clientId, JSON.stringify(capabilities), auth.userId ?? "system").run(); await audit(env, ctx, auth, id, "provider_account.created", "provider_account", accountId, { provider, account_name: accountName, client_id: clientId, credential_secret_name: secretName }); const serialized = JSON.stringify({ ok: true, data: { id: accountId, provider, account_name: accountName, account_type: accountType, client_id: clientId, capabilities, status: "active" }, request_id: id }); await saveIdempotent(env, idempotencyKey, auth.userId ?? "system", endpoint, 201, serialized, requestHash); return new Response(serialized, { status: 201, headers: { ...headers, "content-type": "application/json" } });
       }
       const providerAccountMatch = route.match(/^\/provider-accounts\/([^/]+)$/);
       if (providerAccountMatch && request.method === "PATCH") {
@@ -1470,7 +1589,10 @@ const worker = {
       if (route === "/shipments" && request.method === "GET") {
         if (!hasScope(auth, "shipments.read")) return error("FORBIDDEN", "Shipment read scope required", 403, id, headers);
         const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 50), 1), 100);
-        const shipmentColumns = "id, client_id, created_by_user_id, tracking_number, status, provider, provider_account_id, description, origin, destination, origin_address_json, destination_address_json, consignee, total_weight_kg, declared_value, pieces, edd, delivered_at, created_at, updated_at";
+        const internalShipmentView = hasRole(auth, ["employee", "admin", "super_admin"]) || auth.system;
+        const shipmentColumns = internalShipmentView
+          ? "id, client_id, created_by_user_id, tracking_number, status, provider, provider_account_id, provider_reference, description, origin, destination, origin_address_json, destination_address_json, consignee, total_weight_kg, declared_value, pieces, edd, delivered_at, created_at, updated_at"
+          : "id, client_id, created_by_user_id, tracking_number, status, provider, description, origin, destination, origin_address_json, destination_address_json, consignee, total_weight_kg, declared_value, pieces, edd, delivered_at, created_at, updated_at";
         const rows = auth.system ? await env.DB.prepare(`SELECT ${shipmentColumns} FROM shipments ORDER BY created_at DESC LIMIT ?`).bind(limit).all() : auth.clientIds.size ? await env.DB.prepare(`SELECT ${shipmentColumns} FROM shipments WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY created_at DESC LIMIT ?`).bind(...[...auth.clientIds], limit).all() : { results: [] };
         if (url.searchParams.get("include_tracking") === "1") {
           const shipments = rows.results as Array<Record<string, unknown>>;
@@ -1514,23 +1636,65 @@ const worker = {
         if (!key) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
         const existing = await idempotentResponse(env, key, clientId, "POST /v1/shipments", requestHash);
         if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
+        const provider = typeof payload.provider === "string" && ["delhivery", "ekart", "trackon", "xpressbees", "rivigo"].includes(payload.provider) ? payload.provider : (hasRole(auth, ["employee", "admin", "super_admin"]) ? "delhivery" : null);
+        if ((auth.kind === "api" || hasRole(auth, ["client"])) && provider !== "delhivery") return error("DELHIVERY_B2B_ONLY", "Client shipment booking is currently limited to Delhivery B2B", 409, id, headers);
+        const pricingQuoteId = typeof payload.pricing_quote_id === "string" ? payload.pricing_quote_id.trim() : "";
+        const submittedPricingQuote = pricingQuoteId ? await env.DB.prepare("SELECT id, version_id, account_scope, origin_zone, destination_zone, chargeable_weight_kg, client_breakdown_json, expires_at FROM pricing_quotes WHERE id = ? AND client_id = ? LIMIT 1").bind(pricingQuoteId, clientId).first<PricingQuoteRecord & { expires_at: string }>() : null;
+        if (pricingQuoteId && !submittedPricingQuote) return error("PRICING_QUOTE_NOT_FOUND", "The submitted PSS quote was not found for this client. Request a fresh quote before booking.", 409, id, headers);
+        if (pricingQuoteId && submittedPricingQuote && Date.parse(`${submittedPricingQuote.expires_at.replace(" ", "T")}Z`) <= Date.now()) return error("PRICING_QUOTE_EXPIRED", "The submitted PSS quote has expired. Request a fresh quote before booking.", 409, id, headers);
+        let pricingQuote: PricingQuoteRecord | null = null;
+        if (provider === "delhivery") {
+          try {
+            const recalculatedQuote = await createShipmentPricingQuote(env, clientId, payload, auth.userId ?? `api:${clientId}`);
+            if (submittedPricingQuote) {
+              const submittedTotal = Number((JSON.parse(submittedPricingQuote.client_breakdown_json) as { total?: number }).total ?? NaN);
+              const recalculatedTotal = Number((JSON.parse(recalculatedQuote.client_breakdown_json) as { total?: number }).total ?? NaN);
+              const quoteMatches = submittedPricingQuote.version_id === recalculatedQuote.version_id && submittedPricingQuote.account_scope === recalculatedQuote.account_scope && submittedPricingQuote.origin_zone === recalculatedQuote.origin_zone && submittedPricingQuote.destination_zone === recalculatedQuote.destination_zone && Math.abs(Number(submittedPricingQuote.chargeable_weight_kg) - Number(recalculatedQuote.chargeable_weight_kg)) < 0.0001 && Math.abs(submittedTotal - recalculatedTotal) < 0.01;
+              if (!quoteMatches) return error("PRICING_QUOTE_STALE", "The PSS quote changed or no longer matches this shipment. Request a fresh quote before booking.", 409, id, headers);
+            }
+            pricingQuote = recalculatedQuote;
+          } catch (caught) { const reason = caught instanceof Error ? caught.message : "PRICING_FAILED"; const knownCodes = new Set(["PRICING_NOT_CONFIGURED", "PRICING_ADDRESS_REQUIRED", "INVALID_ACCOUNT_CODE", "RTO_SOURCE_REQUIRED", "RTO_SOURCE_NOT_FOUND", "RTO_SOURCE_INVALID"]); const code = knownCodes.has(reason) ? reason : "PRICING_INVALID"; return error(code, code === "PRICING_NOT_CONFIGURED" ? "A published Delhivery B2B PSS rate card is not configured for this client" : code === "RTO_SOURCE_REQUIRED" ? "An original shipment is required to price an RTO" : code === "RTO_SOURCE_NOT_FOUND" ? "The original shipment pricing snapshot could not be found" : "The shipment could not be priced using the client PSS rate card", 409, id, headers); }
+        }
+        const pricingAmount = pricingQuote ? Number((JSON.parse(pricingQuote.client_breakdown_json) as { total?: number }).total ?? 0) : 0;
+        if (pricingQuote && pricingAmount <= 0) return error("PRICING_INVALID", "The PSS pricing snapshot is invalid", 409, id, headers);
+        if (pricingQuote) {
+          const wallet = await env.DB.prepare("SELECT COALESCE(SUM(CASE WHEN lower(COALESCE(type, '')) IN ('debit', 'charge', 'withdrawal') THEN -ABS(amount) ELSE ABS(amount) END), 0) AS balance FROM wallet_transactions WHERE client_id = ? AND status IN ('posted', 'approved')").bind(clientId).first<{ balance: number }>();
+          if (Number(wallet?.balance ?? 0) < pricingAmount) return error("INSUFFICIENT_WALLET_BALANCE", "The client wallet does not have enough balance for this PSS booking", 409, id, headers);
+        }
         const shipmentId = crypto.randomUUID();
-        const provider = typeof payload.provider === "string" && ["delhivery", "ekart", "trackon", "xpressbees", "rivigo"].includes(payload.provider) ? payload.provider : null;
         await env.DB.prepare("INSERT INTO shipments (id, client_id, created_by_user_id, provider, provider_account_id, status, description, origin, destination, origin_address_json, destination_address_json, consignee, total_weight_kg, declared_value, pieces, edd) VALUES (?, ?, ?, ?, NULL, 'booked', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(shipmentId, clientId, auth.userId ?? `api:${clientId}`, provider, description, origin, destination, JSON.stringify(originAddress), JSON.stringify(destinationAddress), String(destinationAddress.name), weight, declaredValue, pieces, typeof payload.edd === "string" ? payload.edd : null).run();
         await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'booked', 'Shipment created', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipmentId, auth.userId ?? `api:${clientId}`).run();
+        if (pricingQuote) await env.DB.prepare("INSERT INTO weight_reconciliations (id, client_id, shipment_id, declared_weight_kg, declared_volumetric_weight_kg, initial_billable_weight_kg, measured_weight_kg, billable_weight_kg, client_dispute_deadline_at, status) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, NULL, 'pending')").bind(crypto.randomUUID(), clientId, shipmentId, weight, volumetricWeightFromPayload(payload), pricingQuote.chargeable_weight_kg, pricingQuote.chargeable_weight_kg).run();
+        if (pricingQuote) {
+          const billingId = crypto.randomUUID(); const walletId = crypto.randomUUID();
+          await env.DB.batch([
+            env.DB.prepare("INSERT INTO pricing_shipment_snapshots (id, shipment_id, client_id, quote_id, version_id, account_scope, origin_zone, destination_zone, chargeable_weight_kg, client_breakdown_json, original_client_breakdown_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(crypto.randomUUID(), shipmentId, clientId, pricingQuote.id, pricingQuote.version_id, pricingQuote.account_scope, pricingQuote.origin_zone, pricingQuote.destination_zone, pricingQuote.chargeable_weight_kg, pricingQuote.client_breakdown_json, pricingQuote.client_breakdown_json),
+            env.DB.prepare("INSERT INTO billing_records (id, client_id, shipment_id, invoice_number, amount, status, paid_at) VALUES (?, ?, ?, ?, ?, 'paid', CURRENT_TIMESTAMP)").bind(billingId, clientId, shipmentId, `INV-${billingId.slice(0, 8).toUpperCase()}`, pricingAmount),
+            env.DB.prepare("INSERT INTO wallet_transactions (id, client_id, type, amount, reference, status, balance_after) VALUES (?, ?, 'debit', ?, ?, 'posted', 0)").bind(walletId, clientId, pricingAmount, `SHIPMENT-${shipmentId}`),
+            ...billingLineItemStatements(env, billingId, shipmentId, clientId, pricingQuote.client_breakdown_json),
+          ]);
+          await recalculateWalletBalances(env, clientId);
+        }
         const providerResult = provider ? await safeProviderRequest(env, provider as CourierProvider, "shipments", { shipment_id: shipmentId, ...payload }, id, clientId, key) : { enabled: false, status: "not_requested" as const };
         const selectedProviderAccountId = (providerResult as { provider_account_id?: string }).provider_account_id;
         if (selectedProviderAccountId) await env.DB.prepare("UPDATE shipments SET provider_account_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(selectedProviderAccountId, shipmentId, clientId).run();
+        if (provider === "delhivery") await env.DB.prepare("INSERT OR REPLACE INTO pricing_provider_costs (id, shipment_id, client_id, provider, provider_account_id, provider_amount, provider_status) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(crypto.randomUUID(), shipmentId, clientId, provider, selectedProviderAccountId ?? null, providerAmount(providerResult), providerResult.status).run();
         if (provider && providerResult.status !== "accepted") {
           const failureReason = String((providerResult as { error?: string; reason?: string }).error ?? (providerResult as { reason?: string }).reason ?? `The ${provider} shipment was not accepted`).slice(0, 500);
           await env.DB.prepare("UPDATE shipments SET status = 'exception', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(shipmentId, clientId).run();
           await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'exception', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipmentId, `Provider booking failed: ${failureReason}`, auth.userId ?? `api:${clientId}`).run();
-          const failedResponse = JSON.stringify({ ok: false, error: { code: "PROVIDER_REQUEST_FAILED", message: failureReason }, data: { id: shipmentId, client_id: clientId, status: "exception", provider, provider_result: providerResult }, request_id: id });
+          if (pricingQuote) { await env.DB.prepare("INSERT INTO wallet_transactions (id, client_id, type, amount, reference, status, balance_after) VALUES (?, ?, 'credit', ?, ?, 'posted', 0)").bind(crypto.randomUUID(), clientId, pricingAmount, `REVERSAL-${shipmentId}`).run(); await env.DB.prepare("UPDATE billing_records SET status = 'void', updated_at = CURRENT_TIMESTAMP WHERE shipment_id = ? AND client_id = ?").bind(shipmentId, clientId).run(); await recalculateWalletBalances(env, clientId); }
+          const failedResponse = JSON.stringify({ ok: false, error: { code: "PROVIDER_REQUEST_FAILED", message: failureReason }, data: { id: shipmentId, client_id: clientId, status: "exception", provider, pricing_amount: pricingAmount || null }, request_id: id });
           await saveIdempotent(env, key, clientId, "POST /v1/shipments", 502, failedResponse, requestHash);
           await audit(env, ctx, auth, id, "shipment.provider_failed", "shipment", shipmentId, { client_id: clientId, provider, reason: failureReason });
           return new Response(failedResponse, { status: 502, headers: { ...headers, "content-type": "application/json" } });
         }
-        const serialized = JSON.stringify({ ok: true, data: { id: shipmentId, client_id: clientId, status: "booked", provider, provider_result: providerResult }, request_id: id });
+        // Return the PSS-owned identifiers after the provider call. Delhivery may
+        // assign the AWB asynchronously, so read the persisted values instead of
+        // trusting an unnormalized provider response. These are the only booking
+        // references Fujiyama needs for its follow-up tracking calls.
+        const bookedShipment = await env.DB.prepare("SELECT tracking_number, provider_reference FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(shipmentId, clientId).first<{ tracking_number: string | null; provider_reference: string | null }>();
+        const serialized = JSON.stringify({ ok: true, data: { id: shipmentId, client_id: clientId, status: "booked", provider, tracking_number: bookedShipment?.tracking_number ?? null, provider_reference: bookedShipment?.provider_reference ?? null, pricing_amount: pricingAmount || null, provider_status: providerResult.status }, request_id: id });
         await saveIdempotent(env, key, clientId, "POST /v1/shipments", 201, serialized, requestHash);
         await audit(env, ctx, auth, id, "shipment.created", "shipment", shipmentId, { client_id: clientId, provider });
         return new Response(serialized, { status: 201, headers: { ...headers, "content-type": "application/json" } });
@@ -1591,6 +1755,7 @@ const worker = {
 
       const shipmentLabel = route.match(/^\/shipments\/([^/]+)\/label$/);
       if (shipmentLabel && request.method === "GET") {
+        if (!hasRole(auth, ["employee", "admin", "super_admin"]) && !auth.system) return error("FORBIDDEN", "Provider label operations are not available to client users", 403, id, headers);
         if (!hasScope(auth, "tracking.read")) return error("FORBIDDEN", "Tracking read scope required", 403, id, headers);
         const shipment = await env.DB.prepare("SELECT id, client_id, provider, tracking_number, provider_reference FROM shipments WHERE id = ? LIMIT 1").bind(shipmentLabel[1]).first<{ id: string; client_id: string; provider: string | null; tracking_number: string | null; provider_reference: string | null }>();
         if (!shipment || !canAccessClient(auth, shipment.client_id)) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
@@ -1602,13 +1767,14 @@ const worker = {
       const shipmentGet = route.match(/^\/shipments\/([^/]+)(?:\/tracking)?$/);
       if (shipmentGet && request.method === "GET") {
         if (!hasScope(auth, route.endsWith("/tracking") ? "tracking.read" : "shipments.read")) return error("FORBIDDEN", "Shipment read scope required", 403, id, headers);
-        const shipment = await env.DB.prepare("SELECT * FROM shipments WHERE id = ? LIMIT 1").bind(shipmentGet[1]).first<{ client_id: string; provider: string | null; tracking_number: string | null; provider_reference: string | null }>();
+        const internalShipmentView = hasRole(auth, ["employee", "admin", "super_admin"]) || auth.system;
+        const shipment = await env.DB.prepare(`SELECT id, client_id, created_by_user_id, tracking_number, status, provider, ${internalShipmentView ? "provider_account_id, provider_reference," : ""} description, origin, destination, origin_address_json, destination_address_json, consignee, total_weight_kg, declared_value, pieces, edd, delivered_at, created_at, updated_at FROM shipments WHERE id = ? LIMIT 1`).bind(shipmentGet[1]).first<Record<string, unknown> & { client_id: string; provider: string | null; tracking_number: string | null; provider_reference?: string | null }>();
         if (!shipment || !canAccessClient(auth, shipment.client_id)) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
         if (route.endsWith("/tracking")) {
           const events = await env.DB.prepare("SELECT * FROM tracking_events WHERE shipment_id = ? ORDER BY event_time ASC LIMIT 100").bind(shipmentGet[1]).all();
           const provider = ["delhivery", "ekart", "trackon", "xpressbees", "rivigo"].includes(String(shipment.provider)) ? shipment.provider as CourierProvider : null;
           const providerResult = provider ? await safeProviderRequest(env, provider, "tracking", { shipment_id: shipmentGet[1], tracking_number: shipment.tracking_number, provider_reference: shipment.provider_reference }, id, shipment.client_id) : { enabled: false, status: "not_requested" as const };
-          return json({ ok: true, data: events.results, provider_result: providerResult }, 200, headers);
+          return json({ ok: true, data: events.results, provider_status: providerResult.status }, 200, headers);
         }
         return json({ ok: true, data: shipment }, 200, headers);
       }
@@ -1637,12 +1803,12 @@ const worker = {
         if (provider && providerResult.status !== "accepted") {
           const failureReason = String((providerResult as { error?: string; reason?: string }).error ?? (providerResult as { reason?: string }).reason ?? `The ${provider} pickup request was not accepted`).slice(0, 500);
           await env.DB.prepare("UPDATE pickup_requests SET status = 'failed', failure_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(failureReason, pickupId, clientId).run();
-          const failedResponse = JSON.stringify({ ok: false, error: { code: "PROVIDER_REQUEST_FAILED", message: failureReason }, data: { id: pickupId, client_id: clientId, status: "failed", provider, provider_result: providerResult }, request_id: id });
+          const failedResponse = JSON.stringify({ ok: false, error: { code: "PROVIDER_REQUEST_FAILED", message: failureReason }, data: { id: pickupId, client_id: clientId, status: "failed", provider, provider_status: providerResult.status }, request_id: id });
           await saveIdempotent(env, key, clientId, "POST /v1/pickups", 502, failedResponse, requestHash);
           await audit(env, ctx, auth, id, "pickup.provider_failed", "pickup", pickupId, { client_id: clientId, provider, reason: failureReason });
           return new Response(failedResponse, { status: 502, headers: { ...headers, "content-type": "application/json" } });
         }
-        const serialized = JSON.stringify({ ok: true, data: { id: pickupId, client_id: clientId, status: "scheduled", provider, provider_result: providerResult }, request_id: id });
+        const serialized = JSON.stringify({ ok: true, data: { id: pickupId, client_id: clientId, status: "scheduled", provider, provider_status: providerResult.status }, request_id: id });
         await saveIdempotent(env, key, clientId, "POST /v1/pickups", 201, serialized, requestHash); await audit(env, ctx, auth, id, "pickup.created", "pickup", pickupId, { client_id: clientId });
         return new Response(serialized, { status: 201, headers: { ...headers, "content-type": "application/json" } });
       }
@@ -1650,7 +1816,8 @@ const worker = {
       const pickupMatch = route.match(/^\/pickups\/([^/]+)$/);
       if (pickupMatch && request.method === "GET") {
         if (!hasScope(auth, "pickups.read")) return error("FORBIDDEN", "Pickup read scope required", 403, id, headers);
-        const pickup = await env.DB.prepare("SELECT * FROM pickup_requests WHERE id = ? LIMIT 1").bind(pickupMatch[1]).first<{ client_id: string }>();
+        const internalPickupView = hasRole(auth, ["employee", "admin", "super_admin"]) || auth.system;
+        const pickup = await env.DB.prepare(`SELECT id, client_id, shipment_id, requested_date, requested_time_slot, pickup_address, status, assigned_to_user_id, contact_name, contact_phone, notes, ${internalPickupView ? "provider, provider_reference, failure_reason," : ""} created_at, updated_at FROM pickup_requests WHERE id = ? LIMIT 1`).bind(pickupMatch[1]).first<{ client_id: string }>();
         if (!pickup || !canAccessClient(auth, pickup.client_id)) return error("NOT_FOUND", "Pickup not found", 404, id, headers);
         return json({ ok: true, data: pickup }, 200, headers);
       }
@@ -1724,15 +1891,16 @@ const worker = {
         const scopeKey = `${auth.userId ?? auth.clientId ?? "anonymous"}:${auth.system ? "system" : [...auth.clientIds].sort().join(",")}:${[...requestedCollections].sort().join(",")}`;
         const cachedSummary = dashboardSummaryCache.get(scopeKey);
         if (cachedSummary && cachedSummary.expiresAt > Date.now()) return json({ ok: true, data: cachedSummary.data, request_id: id }, 200, headers);
+        const internalSummaryView = hasRole(auth, ["employee", "admin", "super_admin"]) || auth.system;
         const summaryColumns: Record<string, string> = {
-          shipments: "id, client_id, provider, provider_reference, status, origin, destination, consignee, total_weight_kg, pieces, edd, delivered_at, created_at",
+          shipments: internalSummaryView ? "id, client_id, provider, provider_reference, status, origin, destination, consignee, total_weight_kg, pieces, edd, delivered_at, created_at" : "id, client_id, provider, status, origin, destination, consignee, total_weight_kg, pieces, edd, delivered_at, created_at",
           pickup_requests: "id, shipment_id, client_id, requested_date, requested_time_slot, pickup_address, status, created_at, updated_at",
           billing_records: "id, client_id, shipment_id, invoice_number, amount, currency, status, due_date, created_at",
           wallet_transactions: "id, client_id, type, amount, balance_after, reference, status, created_at",
           exception_cases: "id, shipment_id, client_id, category, severity, title, details, status, assigned_to_user_id, created_at, updated_at",
           ndr_cases: "id, shipment_id, client_id, reason, attempt, deadline, status, assigned_to_user_id, created_at, updated_at",
           activity_events: "id, actor_user_id, client_id, shipment_id, action, entity_type, entity_id, created_at",
-          return_shipments: "id, shipment_id, client_id, reason, status, provider_reference, created_at, updated_at",
+          return_shipments: internalSummaryView ? "id, shipment_id, client_id, reason, status, provider_reference, created_at, updated_at" : "id, shipment_id, client_id, reason, status, created_at, updated_at",
           support_tickets: "id, client_id, shipment_id, assigned_to_user_id, title, description, priority, status, created_at, updated_at",
           notifications: "id, recipient_user_id, client_id, shipment_id, category, title, message, type, is_read, created_at",
           tasks: "id, client_id, shipment_id, title, description, priority, status, assigned_to_user_id, due_at, created_at, updated_at",
@@ -1884,10 +2052,29 @@ const worker = {
         "/cod-remittances": { table: "cod_remittances", scope: "cod.read", order: "created_at DESC" },
         "/weight-reconciliation": { table: "weight_reconciliations", scope: "weight.read", order: "updated_at DESC" },
       };
+      if (route === "/billing" && request.method === "GET") {
+        if (!hasScope(auth, "billing.read")) return error("FORBIDDEN", "Permission required", 403, id, headers);
+        const rows = auth.system ? await env.DB.prepare("SELECT b.*, s.account_scope, s.origin_zone, s.destination_zone, s.chargeable_weight_kg, s.client_breakdown_json, w.provider_weight_received_at, w.client_dispute_deadline_at FROM billing_records b LEFT JOIN pricing_shipment_snapshots s ON s.shipment_id = b.shipment_id LEFT JOIN weight_reconciliations w ON w.shipment_id = b.shipment_id ORDER BY b.created_at DESC LIMIT 100").all() : auth.clientIds.size ? await env.DB.prepare(`SELECT b.*, s.account_scope, s.origin_zone, s.destination_zone, s.chargeable_weight_kg, s.client_breakdown_json, w.provider_weight_received_at, w.client_dispute_deadline_at FROM billing_records b LEFT JOIN pricing_shipment_snapshots s ON s.shipment_id = b.shipment_id LEFT JOIN weight_reconciliations w ON w.shipment_id = b.shipment_id WHERE b.client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY b.created_at DESC LIMIT 100`).bind(...auth.clientIds).all() : { results: [] };
+        const data = await Promise.all(rows.results.map(async (row) => { const record = row as Record<string, unknown>; let pricing: unknown = null; if (typeof record.client_breakdown_json === "string") { try { pricing = JSON.parse(record.client_breakdown_json); } catch { pricing = null; } } const adjustments = record.shipment_id ? await env.DB.prepare("SELECT component_code, previous_amount, new_amount, reason, actor_user_id, created_at FROM pricing_overrides WHERE shipment_id = ? ORDER BY created_at ASC").bind(record.shipment_id).all() : { results: [] }; const amendments = record.shipment_id ? await env.DB.prepare("SELECT id, amendment_type, previous_amount, new_amount, reason, weight_received_at, ticket_deadline_at, actor_user_id, created_at FROM billing_amendments WHERE shipment_id = ? ORDER BY created_at ASC").bind(record.shipment_id).all() : { results: [] }; const lineItems = record.id ? await env.DB.prepare("SELECT id, code, label, amount, marker, display_order, created_at FROM billing_line_items WHERE billing_id = ? ORDER BY display_order ASC, code ASC").bind(record.id).all() : { results: [] }; const safe = { ...record }; delete safe.client_breakdown_json; return { ...safe, pricing, line_items: lineItems.results, adjustments: adjustments.results, amendments: amendments.results }; }));
+        return json({ ok: true, data }, 200, headers);
+      }
+      if (route === "/weight-reconciliation" && request.method === "GET") {
+        if (!hasScope(auth, "weight.read")) return error("FORBIDDEN", "Permission required", 403, id, headers);
+        const clientColumns = "w.id, w.client_id, w.shipment_id, w.declared_weight_kg, w.declared_volumetric_weight_kg, w.initial_billable_weight_kg, w.measured_weight_kg, w.courier_billed_weight_kg, w.billable_weight_kg, w.status, w.provider_weight_received_at, w.client_dispute_deadline_at, w.created_at, w.updated_at, w.client_dispute_deadline_at AS ticket_deadline_at, t.id AS ticket_id, t.status AS ticket_status, t.reason AS ticket_reason";
+        const employeeColumns = `${clientColumns}, w.provider_dispute_status`;
+        const internalColumns = `${employeeColumns}, w.provider_recovery_amount, w.retained_recovery_amount, t.client_credit_amount`;
+        const columns = hasScope(auth, "provider_cost.view") || hasScope(auth, "weight_dispute.resolve") ? internalColumns : hasRole(auth, ["employee", "admin", "super_admin"]) ? employeeColumns : clientColumns;
+        const rows = auth.system ? await env.DB.prepare(`SELECT ${columns} FROM weight_reconciliations w LEFT JOIN weight_reconciliation_tickets t ON t.reconciliation_id = w.id ORDER BY w.updated_at DESC LIMIT 100`).all() : auth.clientIds.size ? await env.DB.prepare(`SELECT ${columns} FROM weight_reconciliations w LEFT JOIN weight_reconciliation_tickets t ON t.reconciliation_id = w.id WHERE w.client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY w.updated_at DESC LIMIT 100`).bind(...auth.clientIds).all() : { results: [] };
+        return json({ ok: true, data: rows.results }, 200, headers);
+      }
       const collection = collectionRoutes[route];
       if (collection && request.method === "GET") {
         if (!hasScope(auth, collection.scope)) return error("FORBIDDEN", "Permission required", 403, id, headers);
-        const rows = auth.system ? await env.DB.prepare(`SELECT * FROM ${collection.table} ORDER BY ${collection.order} LIMIT 100`).all() : auth.clientIds.size ? await env.DB.prepare(`SELECT * FROM ${collection.table} WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY ${collection.order} LIMIT 100`).bind(...auth.clientIds).all() : { results: [] };
+        const internalCollectionView = hasRole(auth, ["employee", "admin", "super_admin"]) || auth.system;
+        const select = collection.table === "return_shipments" && !internalCollectionView
+          ? "id, shipment_id, client_id, reason, status, created_at, updated_at"
+          : "*";
+        const rows = auth.system ? await env.DB.prepare(`SELECT ${select} FROM ${collection.table} ORDER BY ${collection.order} LIMIT 100`).all() : auth.clientIds.size ? await env.DB.prepare(`SELECT ${select} FROM ${collection.table} WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY ${collection.order} LIMIT 100`).bind(...auth.clientIds).all() : { results: [] };
         return json({ ok: true, data: rows.results }, 200, headers);
       }
       if ((route === "/billing" || route === "/wallet") && request.method === "POST") {
@@ -2010,6 +2197,128 @@ const worker = {
         return new Response(serialized, { status: 201, headers: { ...headers, "content-type": "application/json" } });
       }
 
+      const weightTicket = route.match(/^\/weight-reconciliation\/([^/]+)\/ticket$/);
+      if (weightTicket && request.method === "POST") {
+        if (!hasScope(auth, "tickets.create")) return error("FORBIDDEN", "Weight ticket permission required", 403, id, headers);
+        const reconciliation = await env.DB.prepare("SELECT id, client_id, shipment_id, client_dispute_deadline_at FROM weight_reconciliations WHERE id = ? LIMIT 1").bind(weightTicket[1]).first<{ id: string; client_id: string; shipment_id: string; client_dispute_deadline_at: string | null }>();
+        if (!reconciliation || !canAccessClient(auth, reconciliation.client_id)) return error("NOT_FOUND", "Weight reconciliation record not found", 404, id, headers);
+        const openTicket = await env.DB.prepare("SELECT id, status, deadline_at FROM weight_reconciliation_tickets WHERE reconciliation_id = ? LIMIT 1").bind(reconciliation.id).first<{ id: string; status: string; deadline_at: string }>();
+        if (openTicket) return json({ ok: true, data: openTicket }, 200, headers);
+        const payload = await bodyJson(request); const reason = typeof payload.reason === "string" ? payload.reason.trim() : "";
+        if (!reason) return error("VALIDATION_ERROR", "A reason is required for a weight ticket", 400, id, headers);
+        const deadline = reconciliation.client_dispute_deadline_at ? { deadline_at: reconciliation.client_dispute_deadline_at } : null;
+        if (!deadline?.deadline_at) return error("WEIGHT_TICKET_NOT_AVAILABLE", "The courier weight has not been received yet", 409, id, headers);
+        if (Date.parse(`${deadline.deadline_at.replace(" ", "T")}Z`) <= Date.now()) return error("WEIGHT_TICKET_WINDOW_CLOSED", "The 24-hour weight-ticket window has closed", 409, id, headers);
+        const key = request.headers.get("Idempotency-Key"); if (!key) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
+        const requestHash = await payloadFingerprint(payload); const endpoint = `POST /v1/weight-reconciliation/${reconciliation.id}/ticket`; const existing = await idempotentResponse(env, key, reconciliation.client_id, endpoint, requestHash); if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
+        const ticketId = crypto.randomUUID(); await env.DB.prepare("INSERT INTO weight_reconciliation_tickets (id, reconciliation_id, shipment_id, client_id, reason, deadline_at, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(ticketId, reconciliation.id, reconciliation.shipment_id, reconciliation.client_id, reason, deadline.deadline_at, auth.userId ?? `api:${reconciliation.client_id}`).run();
+        const serialized = JSON.stringify({ ok: true, data: { id: ticketId, reconciliation_id: reconciliation.id, shipment_id: reconciliation.shipment_id, status: "open", deadline_at: deadline.deadline_at }, request_id: id }); await saveIdempotent(env, key, reconciliation.client_id, endpoint, 201, serialized, requestHash); await audit(env, ctx, auth, id, "weight_ticket.created", "weight_reconciliation", reconciliation.id, { client_id: reconciliation.client_id, ticket_id: ticketId, reason }); return new Response(serialized, { status: 201, headers: { ...headers, "content-type": "application/json" } });
+      }
+
+      const weightResolution = route.match(/^\/weight-reconciliation\/([^/]+)\/resolve$/);
+      const providerWeightUpdate = route.match(/^\/weight-reconciliation\/([^/]+)\/provider-update$/);
+      if (providerWeightUpdate && request.method === "POST") {
+        if (!hasScope(auth, "weight.manage")) return error("FORBIDDEN", "Provider weight access required", 403, id, headers);
+        const reconciliation = await env.DB.prepare("SELECT id, client_id, shipment_id FROM weight_reconciliations WHERE id = ? LIMIT 1").bind(providerWeightUpdate[1]).first<{ id: string; client_id: string; shipment_id: string }>();
+        if (!reconciliation || !canAccessClient(auth, reconciliation.client_id)) return error("NOT_FOUND", "Weight reconciliation not found", 404, id, headers);
+        const payload = await bodyJson(request); const measured = Number(payload.measured_weight_kg); const courierBilled = payload.courier_billed_weight_kg === undefined ? measured : Number(payload.courier_billed_weight_kg); const reason = typeof payload.reason === "string" ? payload.reason.trim() : "Courier weight update";
+        if (!Number.isFinite(measured) || measured <= 0 || !Number.isFinite(courierBilled) || courierBilled <= 0 || !reason) return error("VALIDATION_ERROR", "Measured and courier billed weights plus a reason are required", 400, id, headers);
+        const providerStatus = payload.raise_provider_dispute === true ? "dispute_pending" : "received"; const actor = auth.userId ?? `api:${reconciliation.client_id}`;
+        let invoiceAdjustment = 0;
+        let amendedInvoiceAmount: number | null = null;
+        let repricedQuote: PricingQuoteRecord | null = null;
+        const currentBilling = await env.DB.prepare("SELECT id, amount FROM billing_records WHERE shipment_id = ? AND client_id = ? ORDER BY created_at ASC LIMIT 1").bind(reconciliation.shipment_id, reconciliation.client_id).first<{ id: string; amount: number }>();
+        const currentSnapshot = await env.DB.prepare("SELECT id, version_id, account_scope FROM pricing_shipment_snapshots WHERE shipment_id = ? AND client_id = ? LIMIT 1").bind(reconciliation.shipment_id, reconciliation.client_id).first<{ id: string; version_id: string; account_scope: PricingAccount }>();
+        if (currentBilling && currentSnapshot) {
+          const shipment = await env.DB.prepare("SELECT origin_address_json, destination_address_json, declared_value, provider_account_id FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(reconciliation.shipment_id, reconciliation.client_id).first<{ origin_address_json: string; destination_address_json: string; declared_value: number; provider_account_id: string | null }>();
+          if (shipment) {
+            try {
+              const originAddress = JSON.parse(shipment.origin_address_json) as Record<string, unknown>;
+              const destinationAddress = JSON.parse(shipment.destination_address_json) as Record<string, unknown>;
+              repricedQuote = await createShipmentPricingQuote(env, reconciliation.client_id, { origin_address: originAddress, destination_address: destinationAddress, total_weight_kg: courierBilled, declared_value: Number(shipment.declared_value ?? 0), account_code: currentSnapshot.account_scope, provider_account_id: shipment.provider_account_id ?? undefined }, `weight-reconciliation:${reconciliation.id}`, currentSnapshot.version_id);
+              const recalculatedAmount = Number((JSON.parse(repricedQuote.client_breakdown_json) as { total?: number }).total ?? 0);
+              const currentAmount = Number(currentBilling.amount ?? 0);
+              amendedInvoiceAmount = Math.max(currentAmount, recalculatedAmount);
+              invoiceAdjustment = Math.max(amendedInvoiceAmount - currentAmount, 0);
+            } catch {
+              repricedQuote = null;
+            }
+          }
+        }
+        const statements = [env.DB.prepare("UPDATE weight_reconciliations SET measured_weight_kg = ?, courier_billed_weight_kg = ?, provider_weight_received_at = CURRENT_TIMESTAMP, client_dispute_deadline_at = datetime(CURRENT_TIMESTAMP, '+24 hours'), provider_dispute_status = ?, status = CASE WHEN status = 'resolved' THEN status ELSE 'measured' END, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(measured, courierBilled, providerStatus, reconciliation.id)];
+        if (invoiceAdjustment > 0 && currentBilling && currentSnapshot && repricedQuote && amendedInvoiceAmount !== null) {
+          statements.push(
+            env.DB.prepare("UPDATE billing_records SET amount = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(amendedInvoiceAmount, currentBilling.id),
+            env.DB.prepare("UPDATE pricing_shipment_snapshots SET client_breakdown_json = ? WHERE id = ?").bind(repricedQuote.client_breakdown_json, currentSnapshot.id),
+            env.DB.prepare("DELETE FROM billing_line_items WHERE billing_id = ?").bind(currentBilling.id),
+            ...billingLineItemStatements(env, currentBilling.id, reconciliation.shipment_id, reconciliation.client_id, repricedQuote.client_breakdown_json),
+            env.DB.prepare("INSERT INTO pricing_overrides (id, shipment_id, client_id, billing_id, component_code, previous_amount, new_amount, reason, actor_user_id) VALUES (?, ?, ?, ?, 'weight_reconciliation_debit', ?, ?, ?, ?)").bind(crypto.randomUUID(), reconciliation.shipment_id, reconciliation.client_id, currentBilling.id, Number(currentBilling.amount), amendedInvoiceAmount, reason, actor),
+            env.DB.prepare("INSERT INTO billing_amendments (id, billing_id, shipment_id, client_id, amendment_type, previous_amount, new_amount, reason, weight_received_at, ticket_deadline_at, actor_user_id) VALUES (?, ?, ?, ?, 'courier_weight_debit', ?, ?, ?, CURRENT_TIMESTAMP, datetime(CURRENT_TIMESTAMP, '+24 hours'), ?)").bind(crypto.randomUUID(), currentBilling.id, reconciliation.shipment_id, reconciliation.client_id, Number(currentBilling.amount), amendedInvoiceAmount, reason, actor),
+            env.DB.prepare("INSERT INTO wallet_transactions (id, client_id, type, amount, reference, status, balance_after) VALUES (?, ?, 'debit', ?, ?, 'posted', 0)").bind(crypto.randomUUID(), reconciliation.client_id, invoiceAdjustment, `WEIGHT-DEBIT-${reconciliation.shipment_id}`),
+          );
+        }
+        await env.DB.batch(statements);
+        if (invoiceAdjustment > 0) await recalculateWalletBalances(env, reconciliation.client_id);
+        if (repricedQuote) await env.DB.prepare("DELETE FROM pricing_quotes WHERE id = ?").bind(repricedQuote.id).run();
+        await audit(env, ctx, auth, id, "provider_weight.updated", "weight_reconciliation", reconciliation.id, { client_id: reconciliation.client_id, shipment_id: reconciliation.shipment_id, measured_weight_kg: measured, courier_billed_weight_kg: courierBilled, provider_dispute_status: providerStatus, reason, actor_user_id: actor });
+        return json({ ok: true, data: { reconciliation_id: reconciliation.id, shipment_id: reconciliation.shipment_id, measured_weight_kg: measured, courier_billed_weight_kg: courierBilled, provider_weight_received_at: new Date().toISOString(), client_dispute_deadline_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(), provider_dispute_status: providerStatus, invoice_adjustment_amount: invoiceAdjustment, invoice_amount: amendedInvoiceAmount, status: "measured" } }, 200, headers);
+      }
+      if (weightResolution && request.method === "POST") {
+        if (!hasScope(auth, "weight_dispute.resolve")) return error("FORBIDDEN", "Weight resolution permission required", 403, id, headers);
+        const reconciliation = await env.DB.prepare("SELECT id, client_id, shipment_id, status, provider_dispute_status, provider_recovery_amount FROM weight_reconciliations WHERE id = ? LIMIT 1").bind(weightResolution[1]).first<{ id: string; client_id: string; shipment_id: string; status: string; provider_dispute_status: string | null; provider_recovery_amount: number | null }>();
+        if (!reconciliation || !canAccessClient(auth, reconciliation.client_id)) return error("NOT_FOUND", "Weight reconciliation not found", 404, id, headers);
+        if (reconciliation.status === "resolved") return error("CONFLICT", "This weight reconciliation has already been resolved", 409, id, headers);
+        const ticket = await env.DB.prepare("SELECT id, status FROM weight_reconciliation_tickets WHERE reconciliation_id = ? LIMIT 1").bind(reconciliation.id).first<{ id: string; status: string }>();
+        if (ticket && ticket.status !== "open") return error("CONFLICT", "This client weight ticket has already been resolved", 409, id, headers);
+        if (!ticket && reconciliation.provider_dispute_status === "recovered") return error("CONFLICT", "Provider recovery has already been recorded for this reconciliation", 409, id, headers);
+        const payload = await bodyJson(request); const reason = typeof payload.reason === "string" ? payload.reason.trim() : ""; const measured = Number(payload.measured_weight_kg); const clientCredit = Number(payload.client_credit_amount ?? 0); const providerRecovery = Number(payload.provider_recovery_amount ?? 0);
+        if (!reason || !Number.isFinite(measured) || measured <= 0 || !Number.isFinite(clientCredit) || clientCredit < 0 || !Number.isFinite(providerRecovery) || providerRecovery < 0) return error("VALIDATION_ERROR", "Measured weight, non-negative amounts, and a resolution reason are required", 400, id, headers);
+        if (!ticket && clientCredit > 0) return error("CONFLICT", "A client weight ticket is required before issuing a client credit", 409, id, headers);
+        if (!ticket && providerRecovery <= 0) return error("CONFLICT", "Record a provider recovery or open a client weight ticket before resolving this record", 409, id, headers);
+        // Client billing resolution and provider recovery are independent decisions.
+        // A valid client ticket may be credited even while Delhivery recovery is
+        // pending or unavailable; any recovered amount not credited to the client
+        // remains PSS-retained.
+        const effectiveProviderRecovery = Math.max(providerRecovery, Number(reconciliation.provider_recovery_amount ?? 0));
+        const retained = Math.max(effectiveProviderRecovery - clientCredit, 0); const actor = auth.userId ?? `api:${reconciliation.client_id}`;
+        const billing = clientCredit > 0 ? await env.DB.prepare("SELECT id, amount FROM billing_records WHERE shipment_id = ? AND client_id = ? ORDER BY created_at ASC LIMIT 1").bind(reconciliation.shipment_id, reconciliation.client_id).first<{ id: string; amount: number }>() : null;
+        if (clientCredit > 0 && !billing) return error("NOT_FOUND", "Invoice not found for the weight credit", 404, id, headers);
+        const adjustedBillingAmount = billing ? Math.max(Number(billing.amount) - clientCredit, 0) : null;
+        const snapshot = clientCredit > 0 ? await env.DB.prepare("SELECT id, client_breakdown_json FROM pricing_shipment_snapshots WHERE shipment_id = ? AND client_id = ? LIMIT 1").bind(reconciliation.shipment_id, reconciliation.client_id).first<{ id: string; client_breakdown_json: string }>() : null;
+        if (clientCredit > 0 && !snapshot) return error("NOT_FOUND", "Pricing snapshot not found for the weight credit", 404, id, headers);
+        let adjustedSnapshotJson: string | null = null;
+        if (snapshot) {
+          try {
+            const breakdown = JSON.parse(snapshot.client_breakdown_json) as { lines?: Array<{ code: string; label: string; amount: number; marker?: "*" }>; subtotal?: number; total?: number };
+            const lines = Array.isArray(breakdown.lines) ? breakdown.lines : [];
+            lines.push({ code: "weight_reconciliation_credit", label: "Weight reconciliation credit", amount: -clientCredit });
+            breakdown.lines = lines;
+            breakdown.subtotal = Math.max(Math.round((Number(breakdown.subtotal ?? 0) - clientCredit) * 100) / 100, 0);
+            breakdown.total = Math.max(Math.round((Number(breakdown.total ?? billing?.amount ?? 0) - clientCredit) * 100) / 100, 0);
+            adjustedSnapshotJson = JSON.stringify(breakdown);
+          } catch { return error("CONFLICT", "The pricing snapshot is invalid", 409, id, headers); }
+        }
+        await env.DB.batch([
+          env.DB.prepare("UPDATE weight_reconciliations SET measured_weight_kg = ?, billable_weight_kg = ?, provider_recovery_amount = ?, retained_recovery_amount = ?, provider_dispute_status = CASE WHEN ? > 0 THEN 'recovered' ELSE provider_dispute_status END, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(measured, measured, effectiveProviderRecovery, retained, effectiveProviderRecovery, ticket ? "resolved" : "measured", reconciliation.id),
+          ...(ticket ? [env.DB.prepare("UPDATE weight_reconciliation_tickets SET status = 'resolved', resolved_by_user_id = ?, resolution_reason = ?, client_credit_amount = ?, updated_at = CURRENT_TIMESTAMP WHERE reconciliation_id = ?").bind(actor, reason, clientCredit, reconciliation.id)] : []),
+          ...(billing && adjustedBillingAmount !== null ? [
+            env.DB.prepare("UPDATE billing_records SET amount = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(adjustedBillingAmount, billing.id),
+            env.DB.prepare("INSERT INTO pricing_overrides (id, shipment_id, client_id, billing_id, component_code, previous_amount, new_amount, reason, actor_user_id) VALUES (?, ?, ?, ?, 'weight_reconciliation_credit', ?, ?, ?, ?)").bind(crypto.randomUUID(), reconciliation.shipment_id, reconciliation.client_id, billing.id, Number(billing.amount), adjustedBillingAmount, reason, actor),
+            env.DB.prepare("INSERT INTO billing_amendments (id, billing_id, shipment_id, client_id, amendment_type, previous_amount, new_amount, reason, actor_user_id) VALUES (?, ?, ?, ?, 'client_weight_credit', ?, ?, ?, ?)").bind(crypto.randomUUID(), billing.id, reconciliation.shipment_id, reconciliation.client_id, Number(billing.amount), adjustedBillingAmount, reason, actor),
+          ] : []),
+          ...(snapshot && adjustedSnapshotJson && billing ? [
+            env.DB.prepare("UPDATE pricing_shipment_snapshots SET client_breakdown_json = ? WHERE id = ?").bind(adjustedSnapshotJson, snapshot.id),
+            env.DB.prepare("DELETE FROM billing_line_items WHERE billing_id = ?").bind(billing.id),
+            ...billingLineItemStatements(env, billing.id, reconciliation.shipment_id, reconciliation.client_id, adjustedSnapshotJson),
+          ] : []),
+          ...(clientCredit > 0 ? [env.DB.prepare("INSERT INTO wallet_transactions (id, client_id, type, amount, reference, status, balance_after) VALUES (?, ?, 'credit', ?, ?, 'posted', 0)").bind(crypto.randomUUID(), reconciliation.client_id, clientCredit, `WEIGHT-CREDIT-${reconciliation.shipment_id}`)] : []),
+          ...(providerRecovery > 0 ? [env.DB.prepare("INSERT INTO pricing_provider_recoveries (id, shipment_id, client_id, reconciliation_id, provider, recovered_amount, client_credit_amount, retained_amount, reason, actor_user_id) VALUES (?, ?, ?, ?, 'delhivery', ?, ?, ?, ?, ?)").bind(crypto.randomUUID(), reconciliation.shipment_id, reconciliation.client_id, reconciliation.id, providerRecovery, clientCredit, retained, reason, actor)] : []),
+        ]);
+        if (clientCredit > 0) await recalculateWalletBalances(env, reconciliation.client_id);
+        await audit(env, ctx, auth, id, ticket ? "weight_ticket.resolved" : "provider_weight.recovered", "weight_reconciliation", reconciliation.id, { client_id: reconciliation.client_id, shipment_id: reconciliation.shipment_id, measured_weight_kg: measured, client_credit_amount: clientCredit, provider_recovery_amount: effectiveProviderRecovery, retained_amount: retained, client_ticket: Boolean(ticket), reason });
+        return json({ ok: true, data: { reconciliation_id: reconciliation.id, shipment_id: reconciliation.shipment_id, status: ticket ? "resolved" : "measured", measured_weight_kg: measured, client_credit_amount: clientCredit, provider_recovery_amount: effectiveProviderRecovery, retained_amount: retained } }, 200, headers);
+      }
+
       const entityUpdate = route.match(/^\/(tickets|ndr|exceptions|returns|warehouses|addresses|billing|wallet|cod-remittances|weight-reconciliation)\/([^/]+)$/);
       if (entityUpdate && request.method === "PATCH") {
         const map: Record<string, string> = { tickets: "support_tickets", ndr: "ndr_cases", exceptions: "exception_cases", returns: "return_shipments", warehouses: "warehouses", addresses: "client_addresses", billing: "billing_records", wallet: "wallet_transactions", "cod-remittances": "cod_remittances", "weight-reconciliation": "weight_reconciliations" };
@@ -2017,7 +2326,7 @@ const worker = {
         const table = map[entityUpdate[1]]; const current = await env.DB.prepare(`SELECT client_id FROM ${table} WHERE id = ? LIMIT 1`).bind(entityUpdate[2]).first<{ client_id: string }>();
         const scopeByEntity: Record<string, string> = { billing: "billing.manage", wallet: "wallet.manage", "cod-remittances": "cod.manage", "weight-reconciliation": "weight.manage" };
         if (!current || !canAccessClient(auth, current.client_id) || (scopeByEntity[entityUpdate[1]] && !hasScope(auth, scopeByEntity[entityUpdate[1]])) || (!scopeByEntity[entityUpdate[1]] && entityUpdate[1] !== "warehouses" && entityUpdate[1] !== "addresses" && !hasRole(auth, ["employee", "admin", "super_admin"]))) return error("NOT_FOUND", "Record not found", 404, id, headers);
-        const payload = await bodyJson(request); const financeStatuses: Record<string, string[]> = { billing: ["pending", "approved", "paid", "void", "cancelled"], wallet: ["pending", "approved", "posted", "rejected", "void"] }; const requestedStatus = payload.status === undefined ? undefined : String(payload.status); if (requestedStatus !== undefined && financeStatuses[entityUpdate[1]] && !financeStatuses[entityUpdate[1]].includes(requestedStatus)) return error("VALIDATION_ERROR", "Invalid finance record status", 400, id, headers); const requestHash = await payloadFingerprint(payload); const allowedFields = entityUpdate[1] === "warehouses" ? ["name", "address", "city", "pincode", "contact"] : entityUpdate[1] === "addresses" ? ["label", "address_kind", "contact_name", "phone", "address", "city", "state", "pincode"] : entityUpdate[1] === "weight-reconciliation" ? ["status", "measured_weight_kg", "billable_weight_kg"] : entityUpdate[1] === "wallet" ? ["status"] : entityUpdate[1] === "cod-remittances" ? ["status", "settled_at"] : entityUpdate[1] === "ndr" ? ["status", "assigned_to_user_id", "deadline", "notes", "attempt"] : entityUpdate[1] === "exceptions" ? ["status", "assigned_to_user_id", "severity", "details"] : entityUpdate[1] === "returns" ? ["status", "provider_reference"] : ["status", "assigned_to_user_id", "priority"]; if ((entityUpdate[1] === "ndr" || entityUpdate[1] === "exceptions" || entityUpdate[1] === "tickets") && payload.assigned_to_user_id !== undefined && !(await employeeCanBeAssigned(env, auth, payload.assigned_to_user_id, current.client_id))) return error("FORBIDDEN", "Assigned employee is not active or is outside the client scope", 403, id, headers); const updates = allowedFields.filter((field) => typeof payload[field] === "string" || typeof payload[field] === "number").map((field) => ({ field, value: field === "address_kind" && payload[field] !== "consignee" ? "consignor" : payload[field] }));
+        const payload = await bodyJson(request); const financeStatuses: Record<string, string[]> = { billing: ["pending", "approved", "paid", "void", "cancelled"], wallet: ["pending", "approved", "posted", "rejected", "void"] }; const requestedStatus = payload.status === undefined ? undefined : String(payload.status); if (requestedStatus !== undefined && financeStatuses[entityUpdate[1]] && !financeStatuses[entityUpdate[1]].includes(requestedStatus)) return error("VALIDATION_ERROR", "Invalid finance record status", 400, id, headers); if (entityUpdate[1] === "weight-reconciliation" && (typeof payload.reason !== "string" || !payload.reason.trim())) return error("VALIDATION_ERROR", "A reason is required for weight-record changes", 400, id, headers); const requestHash = await payloadFingerprint(payload); const allowedFields = entityUpdate[1] === "warehouses" ? ["name", "address", "city", "pincode", "contact"] : entityUpdate[1] === "addresses" ? ["label", "address_kind", "contact_name", "phone", "address", "city", "state", "pincode"] : entityUpdate[1] === "weight-reconciliation" ? ["status", "measured_weight_kg", "billable_weight_kg"] : entityUpdate[1] === "wallet" ? ["status"] : entityUpdate[1] === "cod-remittances" ? ["status", "settled_at"] : entityUpdate[1] === "ndr" ? ["status", "assigned_to_user_id", "deadline", "notes", "attempt"] : entityUpdate[1] === "exceptions" ? ["status", "assigned_to_user_id", "severity", "details"] : entityUpdate[1] === "returns" ? ["status", "provider_reference"] : ["status", "assigned_to_user_id", "priority"]; if ((entityUpdate[1] === "ndr" || entityUpdate[1] === "exceptions" || entityUpdate[1] === "tickets") && payload.assigned_to_user_id !== undefined && !(await employeeCanBeAssigned(env, auth, payload.assigned_to_user_id, current.client_id))) return error("FORBIDDEN", "Assigned employee is not active or is outside the client scope", 403, id, headers); const updates = allowedFields.filter((field) => typeof payload[field] === "string" || typeof payload[field] === "number").map((field) => ({ field, value: field === "address_kind" && payload[field] !== "consignee" ? "consignor" : payload[field] }));
         if (!updates.length) return error("VALIDATION_ERROR", "A supported update is required", 400, id, headers);
         const idempotencyKey = request.headers.get("Idempotency-Key"); if (!idempotencyKey) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
         const endpoint = `PATCH /v1/${entityUpdate[1]}/${entityUpdate[2]}`; const existing = await idempotentResponse(env, idempotencyKey, current.client_id, endpoint, requestHash); if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
@@ -2043,32 +2352,275 @@ const worker = {
       }
 
       if (route === "/rate-quotes" && request.method === "POST") {
+        return error("LEGACY_PROVIDER_QUOTES_DISABLED", "Courier/provider rates are not exposed. Use the PSS Delhivery B2B pricing endpoint.", 410, id, headers);
+      }
+      if (route === "/pricing/quotes" && request.method === "POST") {
         if (!hasScope(auth, "quotes.create")) return error("FORBIDDEN", "Quote scope required", 403, id, headers);
         const payload = await bodyJson(request);
-        const provider = String(payload.provider ?? "xpressbees").toLowerCase();
-        if (provider !== "xpressbees") return error("PROVIDER_UNAVAILABLE", "Live rate quotes are currently available only for the configured XpressBees quote contract", 503, id, headers);
-        const origin = String(payload.origin_pincode ?? payload.origin ?? ""); const destination = String(payload.destination_pincode ?? payload.destination ?? "");
-        if (!/^\d{6}$/.test(origin) || !/^\d{6}$/.test(destination)) return error("VALIDATION_ERROR", "Valid origin and destination pincodes are required", 400, id, headers);
         const clientId = requireClient(auth, payload.client_id);
         if (!clientId || !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
-        const requestedAccountId = providerAccountId(payload);
-        const accounts = await env.DB.prepare(`
-          SELECT pa.id, pa.account_name,
-                 COALESCE(p.enabled, 1) AS enabled,
-                 COALESCE(p.priority, 100) AS priority,
-                 COALESCE(p.confidence_score, 0) AS confidence_score,
-                 p.rate_card_id
-          FROM provider_accounts pa
-          LEFT JOIN provider_account_client_policies p ON p.provider_account_id = pa.id AND p.client_id = ?
-          WHERE pa.provider = ? AND pa.status = 'active' AND (pa.client_id = ? OR pa.client_id IS NULL)
-            AND (? IS NULL OR pa.id = ?) AND (p.provider_account_id IS NULL OR p.enabled = 1)
-          ORDER BY priority ASC, confidence_score DESC, pa.created_at ASC`).bind(clientId, provider, clientId, requestedAccountId, requestedAccountId).all<{ id: string; account_name: string; enabled: number; priority: number; confidence_score: number; rate_card_id: string | null }>();
-        const candidates = accounts.results.length ? accounts.results : [null];
-        const quotes = await Promise.all(candidates.map(async (account) => {
-          const result = await safeProviderRequest(env, "xpressbees", "quotes", { ...payload, origin_pincode: origin, destination_pincode: destination, ...(account ? { provider_account_id: account.id } : {}) }, id, clientId);
-          return { provider, provider_account_id: account?.id ?? (result as { provider_account_id?: string }).provider_account_id, account_name: account?.account_name ?? (result as { account_name?: string }).account_name, confidence_score: account?.confidence_score ?? (result as { confidence_score?: number }).confidence_score ?? 0, priority: account?.priority ?? (result as { priority?: number }).priority ?? 100, rate_card_id: account?.rate_card_id ?? (result as { rate_card_id?: string }).rate_card_id, amount: (result as { amount?: number | null }).amount ?? null, provider_result: result };
+        let accountValue = String(payload.account_code ?? "").trim().toLowerCase();
+        if (!accountValue && typeof payload.provider_account_id === "string") {
+          const providerAccount = await env.DB.prepare("SELECT account_name FROM provider_accounts WHERE id = ? AND provider = 'delhivery' AND status = 'active' AND (client_id = ? OR client_id IS NULL) LIMIT 1").bind(payload.provider_account_id, clientId).first<{ account_name: string }>();
+          const accountName = String(providerAccount?.account_name ?? "");
+          accountValue = delhiveryPricingAccountFromName(accountName);
+        }
+        if (!accountValue) accountValue = "other";
+        if (!["04", "08", "other"].includes(accountValue)) return error("VALIDATION_ERROR", "Delhivery B2B account must be 04, 08, or other", 400, id, headers);
+        const rto = payload.rto === true;
+        const rtoSourceId = typeof payload.rto_of_shipment_id === "string" ? payload.rto_of_shipment_id.trim() : typeof payload.original_shipment_id === "string" ? payload.original_shipment_id.trim() : "";
+        const rtoSource = rto ? await env.DB.prepare("SELECT account_scope, origin_zone, destination_zone, chargeable_weight_kg, client_breakdown_json FROM pricing_shipment_snapshots WHERE shipment_id = ? AND client_id = ? LIMIT 1").bind(rtoSourceId, clientId).first<{ account_scope: PricingAccount; origin_zone: string; destination_zone: string; chargeable_weight_kg: number; client_breakdown_json: string }>() : null;
+        if (rto && !rtoSourceId) return error("RTO_SOURCE_REQUIRED", "An original shipment is required to price an RTO", 409, id, headers);
+        if (rto && !rtoSource) return error("RTO_SOURCE_NOT_FOUND", "The original shipment pricing snapshot could not be found", 409, id, headers);
+        const account: PricingAccount = (rtoSource?.account_scope ?? accountValue) as PricingAccount;
+        const originCity = typeof payload.origin_city === "string" ? payload.origin_city.trim() : "";
+        const destinationCity = typeof payload.destination_city === "string" ? payload.destination_city.trim() : "";
+        const originState = typeof payload.origin_state === "string" ? payload.origin_state.trim() : "";
+        const destinationState = typeof payload.destination_state === "string" ? payload.destination_state.trim() : "";
+        if (!originCity || !destinationCity || !originState || !destinationState) return error("VALIDATION_ERROR", "Origin and destination city and state are required for B2B zone calculation", 400, id, headers);
+        const actualWeightKg = Number(payload.actual_weight_kg);
+        const volumetricWeightKg = payload.volumetric_weight_kg === undefined ? 0 : Number(payload.volumetric_weight_kg);
+        const invoiceValue = payload.invoice_value === undefined ? 0 : Number(payload.invoice_value);
+        if (!Number.isFinite(actualWeightKg) || actualWeightKg <= 0 || !Number.isFinite(volumetricWeightKg) || volumetricWeightKg < 0 || !Number.isFinite(invoiceValue) || invoiceValue < 0) return error("VALIDATION_ERROR", "Valid weight and invoice values are required", 400, id, headers);
+        const version = await env.DB.prepare("SELECT id, minimum_weight_kg, gst_percent FROM pricing_versions WHERE client_id = ? AND provider = 'delhivery' AND service_level = 'b2b' AND status = 'active' AND datetime(effective_at) <= CURRENT_TIMESTAMP ORDER BY datetime(effective_at) DESC LIMIT 1").bind(clientId).first<{ id: string; minimum_weight_kg: number; gst_percent: number }>();
+        if (!version) return error("PRICING_NOT_CONFIGURED", "A published Delhivery B2B PSS rate card is not configured for this client", 409, id, headers);
+        const rules = await env.DB.prepare("SELECT code, label, calculation_type, value, basis, minimum_value, maximum_value, enabled, marker, condition, display_order FROM pricing_charge_rules WHERE version_id = ? ORDER BY display_order ASC, code ASC").bind(version.id).all<{ code: string; label: string; calculation_type: ChargeRule["kind"]; value: number; basis: ChargeRule["basis"]; minimum_value: number | null; maximum_value: number | null; enabled: number; marker: "*" | null; condition: "oda_or_opa" | null; display_order: number }>();
+        const matrixRows = await env.DB.prepare("SELECT origin_zone, destination_zone, rate_per_kg FROM pricing_rate_matrix WHERE version_id = ? AND account_scope = ?").bind(version.id, account).all<{ origin_zone: string; destination_zone: string; rate_per_kg: number }>();
+        const rateMatrix = Object.fromEntries(matrixRows.results.map((row) => [`${row.origin_zone}->${row.destination_zone}`, Number(row.rate_per_kg)]));
+        const [originPin, destinationPin] = await Promise.all([pricingPincode(env, String(payload.origin_pincode ?? "")), pricingPincode(env, String(payload.destination_pincode ?? ""))]);
+        let forwardRatePerKg: number | undefined;
+        if (rtoSource) {
+          try {
+            const originalBreakdown = JSON.parse(rtoSource.client_breakdown_json) as { lines?: Array<{ code?: string; amount?: number }> };
+            const originalFreight = originalBreakdown.lines?.find((line) => line.code === "freight")?.amount;
+            if (Number.isFinite(Number(originalFreight)) && Number(rtoSource.chargeable_weight_kg) > 0) forwardRatePerKg = Number(originalFreight) / Number(rtoSource.chargeable_weight_kg);
+          } catch { return error("RTO_SOURCE_INVALID", "The original shipment pricing snapshot is invalid", 409, id, headers); }
+          if (forwardRatePerKg === undefined) return error("RTO_SOURCE_INVALID", "The original shipment pricing snapshot is invalid", 409, id, headers);
+        }
+        const result = calculatePssRate({ account, originCity: originPin?.facility_city ?? originCity, destinationCity: destinationPin?.facility_city ?? destinationCity, originState: originPin?.facility_state ?? originState, destinationState: destinationPin?.facility_state ?? destinationState, actualWeightKg, volumetricWeightKg, invoiceValue, rto, forwardRatePerKg, forwardOriginZoneOverride: rtoSource?.origin_zone, forwardDestinationZoneOverride: rtoSource?.destination_zone, minimumWeightKg: Number(version.minimum_weight_kg ?? 20), gstPercent: Number(version.gst_percent ?? 18), versionId: version.id, oda: Boolean(destinationPin?.oda), opa: Boolean(originPin?.oda), rateMatrix, chargeRules: rules.results.map((rule) => ({ code: rule.code, label: rule.label, kind: rule.calculation_type, value: Number(rule.value), basis: rule.basis, minimum: rule.minimum_value === null ? undefined : Number(rule.minimum_value), maximum: rule.maximum_value === null ? undefined : Number(rule.maximum_value), enabled: Boolean(rule.enabled), marker: rule.marker ?? undefined, condition: rule.condition ?? undefined, displayOrder: Number(rule.display_order ?? 0) })) });
+        const quoteId = crypto.randomUUID();
+        await env.DB.prepare("INSERT INTO pricing_quotes (id, client_id, version_id, account_scope, origin_zone, destination_zone, chargeable_weight_kg, client_breakdown_json, expires_at, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+15 minutes'), ?)").bind(quoteId, clientId, version.id, account, result.originZone, result.destinationZone, result.chargeableWeightKg, JSON.stringify(result), auth.userId ?? `api:${clientId}`).run();
+        return json({ ok: true, data: { quote_id: quoteId, provider: "delhivery", service_level: "b2b", client_id: clientId, ...result } }, 200, headers);
+      }
+      if (route === "/pricing/versions" && request.method === "GET") {
+        if (!hasScope(auth, "pricing.read")) return error("FORBIDDEN", "Pricing view permission required", 403, id, headers);
+        const clientId = requireClient(auth, url.searchParams.get("client_id"));
+        if (!clientId) return error("VALIDATION_ERROR", "A client is required", 400, id, headers);
+        const rows = await env.DB.prepare("SELECT id, client_id, provider, service_level, status, effective_at, minimum_weight_kg, volumetric_divisor, gst_percent, source_rate_card_id, source_rate_card_ids_json, source_rate_card_object_path, source_rate_card_filename, source_rate_card_uploaded_at, created_by_user_id, published_by_user_id, created_at, updated_at FROM pricing_versions WHERE client_id = ? ORDER BY datetime(created_at) DESC LIMIT 100").bind(clientId).all();
+        return json({ ok: true, data: rows.results }, 200, headers);
+      }
+      const pincodeDatasetDetail = route.match(new RegExp("^/pricing/pincode-datasets/([^/]+)$"));
+      const pincodeDatasetSource = route.match(new RegExp("^/pricing/pincode-datasets/([^/]+)/source$"));
+      const pincodeDatasetChunks = route.match(new RegExp("^/pricing/pincode-datasets/([^/]+)/chunks$"));
+      const pincodeDatasetPublish = route.match(new RegExp("^/pricing/pincode-datasets/([^/]+)/publish$"));
+      if (route === "/pricing/pincode-datasets" && request.method === "GET") {
+        if (!hasRole(auth, ["super_admin"]) || !hasScope(auth, "pricing.read")) return error("FORBIDDEN", "Pricing view permission required", 403, id, headers);
+        const datasets = await env.DB.prepare("SELECT id, source_filename, source_object_key, source_sha256, expected_row_count, imported_row_count, status, error_message, uploaded_by_user_id, published_by_user_id, created_at, updated_at, published_at FROM delhivery_b2b_pincode_datasets ORDER BY created_at DESC LIMIT 50").all();
+        const active = await env.DB.prepare("SELECT COUNT(*) AS row_count, COALESCE(SUM(oda), 0) AS oda_count FROM delhivery_b2b_pincode_zones").first<{ row_count: number; oda_count: number }>();
+        return json({ ok: true, data: { datasets: datasets.results, active: { row_count: Number(active?.row_count ?? 0), oda_count: Number(active?.oda_count ?? 0) } } }, 200, headers);
+      }
+      if (route === "/pricing/pincode-datasets" && request.method === "POST") {
+        if (!hasRole(auth, ["super_admin"]) || !hasScope(auth, "pricing.manage")) return error("FORBIDDEN", "Pricing management permission required", 403, id, headers);
+        const payload = await bodyJson(request); const filename = String(payload.source_filename ?? "").trim(); const expected = Number(payload.expected_row_count); const sourceSha256 = String(payload.source_sha256 ?? "").trim();
+        if (!filename || filename.length > 255 || !Number.isInteger(expected) || expected < 1 || expected > 1000000 || (sourceSha256 && !/^[a-f0-9]{64}$/i.test(sourceSha256))) return error("VALIDATION_ERROR", "A valid filename, row count, and optional SHA-256 checksum are required", 400, id, headers);
+        const datasetId = crypto.randomUUID();
+        await env.DB.prepare("INSERT INTO delhivery_b2b_pincode_datasets (id, source_filename, source_sha256, expected_row_count, uploaded_by_user_id) VALUES (?, ?, ?, ?, ?)").bind(datasetId, filename, sourceSha256 || null, expected, auth.userId ?? "system").run();
+        await audit(env, ctx, auth, id, "pricing.pincode_dataset_created", "pincode_dataset", datasetId, { source_filename: filename, expected_row_count: expected });
+        return json({ ok: true, data: { id: datasetId, status: "staging", expected_row_count: expected } }, 201, headers);
+      }
+      if (pincodeDatasetSource && request.method === "PUT") {
+        if (!hasRole(auth, ["super_admin"]) || !hasScope(auth, "pricing.manage")) return error("FORBIDDEN", "Pricing management permission required", 403, id, headers);
+        const dataset = await env.DB.prepare("SELECT id, source_filename, status FROM delhivery_b2b_pincode_datasets WHERE id = ? LIMIT 1").bind(pincodeDatasetSource[1]).first<{ id: string; source_filename: string; status: string }>();
+        if (!dataset || dataset.status !== "staging") return error("NOT_FOUND", "Staging pincode dataset not found", 404, id, headers);
+        const contentType = request.headers.get("content-type") ?? "text/csv"; const contentLength = Number(request.headers.get("content-length") ?? 0);
+        if (contentLength > 25 * 1024 * 1024) return error("PAYLOAD_TOO_LARGE", "The source file must be 25 MB or smaller", 413, id, headers);
+        const safeFilename = dataset.source_filename.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-160) || "source.csv"; const objectKey = `data-imports/delhivery-b2b-pincode/${dataset.id}/${safeFilename}`;
+        await env.FILES.put(objectKey, request.body, { httpMetadata: { contentType }, customMetadata: { datasetId: dataset.id, uploadedBy: auth.userId ?? "system" } });
+        await env.DB.prepare("UPDATE delhivery_b2b_pincode_datasets SET source_object_key = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(objectKey, dataset.id).run();
+        return json({ ok: true, data: { id: dataset.id, source_object_key: objectKey } }, 200, headers);
+      }
+      if (pincodeDatasetChunks && request.method === "POST") {
+        if (!hasRole(auth, ["super_admin"]) || !hasScope(auth, "pricing.manage")) return error("FORBIDDEN", "Pricing management permission required", 403, id, headers);
+        const dataset = await env.DB.prepare("SELECT id, status FROM delhivery_b2b_pincode_datasets WHERE id = ? LIMIT 1").bind(pincodeDatasetChunks[1]).first<{ id: string; status: string }>();
+        if (!dataset || dataset.status !== "staging") return error("NOT_FOUND", "Staging pincode dataset not found", 404, id, headers);
+        const payload = await bodyJson(request, 768 * 1024); const rows = Array.isArray(payload.rows) ? payload.rows as Array<Record<string, unknown>> : [];
+        if (!rows.length || rows.length > 500) return error("VALIDATION_ERROR", "Each import chunk must contain between 1 and 500 rows", 400, id, headers);
+        const seen = new Set<string>(); const statements: D1PreparedStatement[] = [];
+        for (const row of rows) {
+          const pincode = String(row.pincode ?? "").trim(); const city = String(row.facility_city ?? "").trim(); const state = String(row.facility_state ?? "").trim(); const oda = row.oda === true || row.oda === 1 || String(row.oda).toLowerCase() === "true" || String(row.oda) === "1" ? 1 : 0;
+          if (!/^\d{6}$/.test(pincode) || !city || city.length > 200 || !state || state.length > 120 || seen.has(pincode)) return error("VALIDATION_ERROR", "Every row needs a unique six-digit pincode, facility city, and facility state", 400, id, headers);
+          seen.add(pincode); statements.push(env.DB.prepare("INSERT OR REPLACE INTO delhivery_b2b_pincode_dataset_rows (dataset_id, pincode, facility_city, facility_state, oda) VALUES (?, ?, ?, ?, ?)").bind(dataset.id, pincode, city, state, oda));
+        }
+        await env.DB.batch(statements);
+        const count = await env.DB.prepare("SELECT COUNT(*) AS row_count FROM delhivery_b2b_pincode_dataset_rows WHERE dataset_id = ?").bind(dataset.id).first<{ row_count: number }>();
+        await env.DB.prepare("UPDATE delhivery_b2b_pincode_datasets SET imported_row_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(Number(count?.row_count ?? 0), dataset.id).run();
+        return json({ ok: true, data: { id: dataset.id, imported_row_count: Number(count?.row_count ?? 0) } }, 200, headers);
+      }
+      if (pincodeDatasetPublish && request.method === "POST") {
+        if (!hasRole(auth, ["super_admin"]) || !hasScope(auth, "pricing.publish")) return error("FORBIDDEN", "Pricing publication permission required", 403, id, headers);
+        const dataset = await env.DB.prepare("SELECT id, source_filename, source_object_key, expected_row_count, status FROM delhivery_b2b_pincode_datasets WHERE id = ? LIMIT 1").bind(pincodeDatasetPublish[1]).first<{ id: string; source_filename: string; source_object_key: string | null; expected_row_count: number; status: string }>();
+        if (!dataset || dataset.status !== "staging" || !dataset.source_object_key) return error("CONFLICT", "The dataset must have an uploaded source file before publication", 409, id, headers);
+        const count = await env.DB.prepare("SELECT COUNT(*) AS row_count, COUNT(DISTINCT pincode) AS distinct_count, COALESCE(SUM(CASE WHEN oda NOT IN (0, 1) THEN 1 ELSE 0 END), 0) AS invalid_oda FROM delhivery_b2b_pincode_dataset_rows WHERE dataset_id = ?").bind(dataset.id).first<{ row_count: number; distinct_count: number; invalid_oda: number }>();
+        const rowCount = Number(count?.row_count ?? 0); const distinctCount = Number(count?.distinct_count ?? 0);
+        if (rowCount !== Number(dataset.expected_row_count) || distinctCount !== rowCount || Number(count?.invalid_oda ?? 0) > 0) { await env.DB.prepare("UPDATE delhivery_b2b_pincode_datasets SET status = 'failed', imported_row_count = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(rowCount, `Validation failed: expected ${dataset.expected_row_count} unique rows, received ${rowCount}`, dataset.id).run(); return error("VALIDATION_FAILED", "The pincode dataset failed count or uniqueness validation", 409, id, headers); }
+        await env.DB.batch([
+          env.DB.prepare("UPDATE delhivery_b2b_pincode_datasets SET status = 'retired', updated_at = CURRENT_TIMESTAMP WHERE status = 'active'"),
+          env.DB.prepare("DELETE FROM delhivery_b2b_pincode_zones"),
+          env.DB.prepare("INSERT INTO delhivery_b2b_pincode_zones (pincode, facility_city, facility_state, oda, source_filename, updated_at) SELECT pincode, facility_city, facility_state, oda, ?, CURRENT_TIMESTAMP FROM delhivery_b2b_pincode_dataset_rows WHERE dataset_id = ?").bind(dataset.source_filename, dataset.id),
+          env.DB.prepare("UPDATE delhivery_b2b_pincode_datasets SET status = 'active', published_by_user_id = ?, published_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, imported_row_count = ? WHERE id = ?").bind(auth.userId ?? "system", rowCount, dataset.id),
+        ]);
+        await audit(env, ctx, auth, id, "pricing.pincode_dataset_published", "pincode_dataset", dataset.id, { source_filename: dataset.source_filename, row_count: rowCount });
+        return json({ ok: true, data: { id: dataset.id, status: "active", row_count: rowCount } }, 200, headers);
+      }
+      const pricingVersionDetail = route.match(new RegExp("^/pricing/versions/([^/]+)$"));
+      if (pricingVersionDetail && request.method === "GET") {
+        if (!hasScope(auth, "pricing.read")) return error("FORBIDDEN", "Pricing view permission required", 403, id, headers);
+        const version = await env.DB.prepare("SELECT id, client_id, provider, service_level, status, effective_at, minimum_weight_kg, volumetric_divisor, gst_percent, source_rate_card_id, source_rate_card_ids_json, source_rate_card_object_path, source_rate_card_filename, source_rate_card_uploaded_at, created_by_user_id, published_by_user_id, created_at, updated_at FROM pricing_versions WHERE id = ? AND provider = 'delhivery' AND service_level = 'b2b' LIMIT 1").bind(pricingVersionDetail[1]).first();
+        if (!version || !canAccessClient(auth, String((version as Record<string, unknown>).client_id ?? ""))) return error("NOT_FOUND", "Pricing version not found", 404, id, headers);
+        const [matrixRows, chargeRules] = await Promise.all([
+          env.DB.prepare("SELECT account_scope, origin_zone, destination_zone, rate_per_kg FROM pricing_rate_matrix WHERE version_id = ? ORDER BY account_scope, origin_zone, destination_zone").bind(pricingVersionDetail[1]).all(),
+          env.DB.prepare("SELECT code, label, calculation_type, value, basis, minimum_value, maximum_value, enabled, marker, condition, display_order FROM pricing_charge_rules WHERE version_id = ? ORDER BY display_order, code").bind(pricingVersionDetail[1]).all(),
+        ]);
+        const rate_matrices: Record<string, unknown[]> = { "04": [], "08": [], other: [] };
+        for (const row of matrixRows.results as Array<Record<string, unknown>>) (rate_matrices[String(row.account_scope)] ??= []).push({ origin_zone: row.origin_zone, destination_zone: row.destination_zone, rate_per_kg: Number(row.rate_per_kg) });
+        return json({ ok: true, data: { version, rate_matrices, charge_rules: chargeRules.results } }, 200, headers);
+      }
+      const pricingVersionPublish = route.match(new RegExp("^/pricing/versions/([^/]+)/publish$"));
+      if (pricingVersionPublish && request.method === "POST") {
+        if (!hasRole(auth, ["super_admin"]) || !hasScope(auth, "pricing.publish")) return error("FORBIDDEN", "Pricing publication permission required", 403, id, headers);
+        const version = await env.DB.prepare("SELECT id, client_id, status FROM pricing_versions WHERE id = ? AND provider = 'delhivery' AND service_level = 'b2b' LIMIT 1").bind(pricingVersionPublish[1]).first<{ id: string; client_id: string; status: string }>();
+        if (!version || !canAccessClient(auth, version.client_id)) return error("NOT_FOUND", "Pricing version not found", 404, id, headers);
+        if (version.status === "active") return json({ ok: true, data: { id: version.id, client_id: version.client_id, status: "active" } }, 200, headers);
+        if (version.status !== "draft") return error("CONFLICT", "Only a draft pricing version can be published", 409, id, headers);
+        const idempotencyKey = request.headers.get("Idempotency-Key"); if (!idempotencyKey) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
+        const requestHash = await payloadFingerprint(await bodyJson(request)); const endpoint = `POST /v1/pricing/versions/${version.id}/publish`; const existing = await idempotentResponse(env, idempotencyKey, auth.userId ?? "system", endpoint, requestHash);
+        if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
+        await env.DB.batch([
+          env.DB.prepare("UPDATE pricing_versions SET status = 'retired', updated_at = CURRENT_TIMESTAMP WHERE client_id = ? AND provider = 'delhivery' AND service_level = 'b2b' AND status = 'active'").bind(version.client_id),
+          env.DB.prepare("UPDATE pricing_versions SET status = 'active', published_by_user_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(auth.userId ?? "system", version.id),
+        ]);
+        const serialized = JSON.stringify({ ok: true, data: { id: version.id, client_id: version.client_id, status: "active" }, request_id: id });
+        await saveIdempotent(env, idempotencyKey, auth.userId ?? "system", endpoint, 200, serialized, requestHash);
+        await audit(env, ctx, auth, id, "pricing.version_published", "pricing_version", version.id, { client_id: version.client_id });
+        return new Response(serialized, { status: 200, headers: { ...headers, "content-type": "application/json" } });
+      }
+      if (route === "/pricing/default-matrices" && request.method === "GET") {
+        if (!hasScope(auth, "pricing.read")) return error("FORBIDDEN", "Pricing view permission required", 403, id, headers);
+        return json({ ok: true, data: { "04": defaultRateRows("04"), "08": defaultRateRows("08"), other: defaultRateRows("other") } }, 200, headers);
+      }
+      if (route === "/pricing/versions" && request.method === "POST") {
+        if (!hasRole(auth, ["super_admin"]) || !hasScope(auth, "pricing.manage")) return error("FORBIDDEN", "Pricing management permission required", 403, id, headers);
+        const payload = await bodyJson(request, 2 * 1024 * 1024); const clientId = requireClient(auth, payload.client_id);
+        if (!clientId) return error("VALIDATION_ERROR", "A client is required", 400, id, headers);
+        const legacySourceRateCardId = typeof payload.source_rate_card_id === "string" ? payload.source_rate_card_id.trim() : "";
+        const suppliedSourceIds = payload.source_rate_card_ids && typeof payload.source_rate_card_ids === "object" ? payload.source_rate_card_ids as Record<string, unknown> : {};
+        const sourceRateCardIds = Object.fromEntries(["04", "08", "other"].map((account) => [account, String(suppliedSourceIds[account] ?? (account === "other" ? legacySourceRateCardId : "")).trim()]).filter(([, value]) => Boolean(value)));
+        if (["04", "08", "other"].some((account) => !sourceRateCardIds[account])) return error("VALIDATION_ERROR", "A source rate card is required for Delhivery accounts 04, 08, and other/Namo before publishing pricing", 400, id, headers);
+        if (!auth.accessToken) return error("FORBIDDEN", "An authenticated Super Admin session is required to validate the source rate card", 403, id, headers);
+        const sourceCardEntries = await Promise.all(["04", "08", "other"].map(async (account) => {
+          const sourceId = sourceRateCardIds[account];
+          const rows = await supabaseGet<{ id: string; account_code: string; object_path: string; original_filename: string; updated_at: string }>(env, `rate_cards?id=eq.${encodeURIComponent(sourceId)}&client_id=eq.${encodeURIComponent(clientId)}&account_code=eq.${encodeURIComponent(account)}&select=id,account_code,object_path,original_filename,updated_at`, auth.accessToken!);
+          return [account, rows[0] ?? null] as const;
         }));
-        return json({ ok: true, data: { client_id: clientId, origin_pincode: origin, destination_pincode: destination, quotes } }, 200, headers);
+        if (sourceCardEntries.some(([, card]) => !card)) return error("NOT_FOUND", "Each selected source rate card must belong to this client and its mapped Delhivery account", 404, id, headers);
+        const sourceCards = Object.fromEntries(sourceCardEntries) as Record<string, { id: string; account_code: string; object_path: string; original_filename: string; updated_at: string }>;
+        const sourceRateCard = sourceCards.other;
+        const rateMatrices = payload.rate_matrices && typeof payload.rate_matrices === "object" ? payload.rate_matrices as Record<string, unknown> : {};
+        const chargeRules = Array.isArray(payload.charge_rules) ? payload.charge_rules : [];
+        if (!chargeRules.length) return error("VALIDATION_ERROR", "At least one client pricing charge rule is required", 400, id, headers);
+        const allowedBases = new Set(["freight", "freight_plus_docket", "invoice_value", "chargeable_weight", "subtotal"]);
+        const ruleCodes = new Set<string>();
+        for (const rule of chargeRules as Array<Record<string, unknown>>) {
+          const code = String(rule.code ?? "").trim(); const kind = String(rule.calculation_type ?? rule.kind ?? "fixed"); const basis = String(rule.basis ?? "freight"); const value = Number(rule.value ?? 0); const minimum = rule.minimum === undefined ? null : Number(rule.minimum); const maximum = rule.maximum === undefined ? null : Number(rule.maximum);
+          if (!code || ruleCodes.has(code) || !["fixed", "percent", "per_kg", "minimum", "maximum"].includes(kind) || !allowedBases.has(basis) || !Number.isFinite(value) || (minimum !== null && (!Number.isFinite(minimum) || minimum < 0)) || (maximum !== null && (!Number.isFinite(maximum) || maximum < 0))) return error("VALIDATION_ERROR", "Charge rules must have unique codes, supported types/bases, and finite values", 400, id, headers);
+          ruleCodes.add(code);
+        }
+        const minimumWeight = Number(payload.minimum_weight_kg ?? 20); const volumetricDivisor = Number(payload.volumetric_divisor ?? 5000); const gstPercent = Number(payload.gst_percent ?? 18);
+        if (!Number.isFinite(minimumWeight) || minimumWeight <= 0 || !Number.isFinite(volumetricDivisor) || volumetricDivisor <= 0 || !Number.isFinite(gstPercent) || gstPercent < 0 || gstPercent > 100) return error("VALIDATION_ERROR", "Minimum weight, volumetric divisor, and GST must be valid positive values", 400, id, headers);
+        const requestedStatus = payload.status === "draft" ? "draft" : payload.status === undefined || payload.status === "active" ? "active" : "invalid";
+        if (requestedStatus === "invalid") return error("VALIDATION_ERROR", "Pricing version status must be draft or active", 400, id, headers);
+        const validAccounts = ["04", "08", "other"]; const versionId = crypto.randomUUID(); const now = new Date().toISOString();
+        const statements = [ ...(requestedStatus === "active" ? [env.DB.prepare("UPDATE pricing_versions SET status = 'retired', updated_at = CURRENT_TIMESTAMP WHERE client_id = ? AND provider = 'delhivery' AND service_level = 'b2b' AND status = 'active'").bind(clientId)] : []), env.DB.prepare("INSERT INTO pricing_versions (id, client_id, provider, service_level, status, effective_at, source_rate_card_id, source_rate_card_ids_json, source_rate_card_object_path, source_rate_card_filename, source_rate_card_uploaded_at, minimum_weight_kg, volumetric_divisor, gst_percent, created_by_user_id, published_by_user_id) VALUES (?, ?, 'delhivery', 'b2b', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(versionId, clientId, requestedStatus, now, sourceRateCardIds.other, JSON.stringify(sourceCards), sourceRateCard.object_path, sourceRateCard.original_filename, sourceRateCard.updated_at, minimumWeight, volumetricDivisor, gstPercent, auth.userId ?? "system", requestedStatus === "active" ? auth.userId ?? "system" : null)];
+        for (const account of validAccounts) {
+          const suppliedRows = Array.isArray(rateMatrices[account]) ? rateMatrices[account] as Array<Record<string, unknown>> : [];
+          const rows = suppliedRows.length ? suppliedRows : defaultRateRows(account as PricingAccount).map((row) => ({ origin_zone: row.origin_zone, destination_zone: row.destination_zone, rate_per_kg: row.rate_per_kg }));
+          const expectedRows = defaultRateRows(account as PricingAccount);
+          if (rows.length !== expectedRows.length) return error("VALIDATION_ERROR", `The ${account} rate matrix must contain ${expectedRows.length} rows`, 400, id, headers);
+          const expectedKeys = new Set(expectedRows.map((row) => `${row.origin_zone}->${row.destination_zone}`));
+          const suppliedKeys = new Set<string>();
+          for (const row of rows) {
+            const origin = String(row.origin_zone ?? "").trim(); const destination = String(row.destination_zone ?? "").trim(); const rate = Number(row.rate_per_kg);
+            if (!origin || !destination || !Number.isFinite(rate) || rate < 0) return error("VALIDATION_ERROR", "Every rate matrix row needs valid origin, destination, and per-kg rate", 400, id, headers);
+            const key = `${origin}->${destination}`;
+            if (!expectedKeys.has(key) || suppliedKeys.has(key)) return error("VALIDATION_ERROR", `The ${account} rate matrix contains an invalid or duplicate lane`, 400, id, headers);
+            suppliedKeys.add(key);
+            statements.push(env.DB.prepare("INSERT INTO pricing_rate_matrix (id, version_id, account_scope, origin_zone, destination_zone, rate_per_kg) VALUES (?, ?, ?, ?, ?, ?)").bind(crypto.randomUUID(), versionId, account, origin, destination, rate));
+          }
+        }
+        for (const rule of chargeRules as Array<Record<string, unknown>>) {
+          const code = String(rule.code ?? "").trim(); const label = String(rule.label ?? code).trim(); const kind = String(rule.calculation_type ?? rule.kind ?? "fixed"); const value = Number(rule.value ?? 0);
+          if (!code || !label || !["fixed", "percent", "per_kg", "minimum", "maximum"].includes(kind) || !Number.isFinite(value)) return error("VALIDATION_ERROR", "Every charge rule needs a valid code, label, type, and value", 400, id, headers);
+          const condition = rule.condition === "oda_or_opa" || rule.condition === "rto" ? rule.condition : null;
+          statements.push(env.DB.prepare("INSERT INTO pricing_charge_rules (id, version_id, code, label, calculation_type, value, basis, minimum_value, maximum_value, enabled, marker, condition, display_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(crypto.randomUUID(), versionId, code, label, kind, value, String(rule.basis ?? "freight"), rule.minimum === undefined ? null : Number(rule.minimum), rule.maximum === undefined ? null : Number(rule.maximum), rule.enabled === false ? 0 : 1, rule.marker === "*" ? "*" : null, condition, Number(rule.display_order ?? 0)));
+        }
+        await env.DB.batch(statements);
+        await audit(env, ctx, auth, id, requestedStatus === "active" ? "pricing.version_published" : "pricing.version_drafted", "pricing_version", versionId, { client_id: clientId, account_scopes: validAccounts, charge_rule_count: chargeRules.length });
+        return json({ ok: true, data: { id: versionId, client_id: clientId, provider: "delhivery", service_level: "b2b", status: requestedStatus, effective_at: now } }, 201, headers);
+      }
+      if (route === "/pricing/overrides" && request.method === "POST") {
+        if (!hasRole(auth, ["admin", "super_admin"]) || !hasScope(auth, "pricing.override")) return error("FORBIDDEN", "Pricing override permission required", 403, id, headers);
+        const payload = await bodyJson(request); const shipmentId = typeof payload.shipment_id === "string" ? payload.shipment_id.trim() : ""; const component = typeof payload.component_code === "string" ? payload.component_code.trim() : ""; const reason = typeof payload.reason === "string" ? payload.reason.trim() : ""; const nextAmount = Number(payload.new_amount);
+        if (!shipmentId || !component || !reason || !Number.isFinite(nextAmount) || nextAmount < 0) return error("VALIDATION_ERROR", "Shipment, component, non-negative amount, and reason are required", 400, id, headers);
+        const snapshot = await env.DB.prepare("SELECT id, client_id, client_breakdown_json FROM pricing_shipment_snapshots WHERE shipment_id = ? LIMIT 1").bind(shipmentId).first<{ id: string; client_id: string; client_breakdown_json: string }>();
+        if (!snapshot || !canAccessClient(auth, snapshot.client_id)) return error("NOT_FOUND", "Pricing snapshot not found", 404, id, headers);
+        const billing = await env.DB.prepare("SELECT id, amount FROM billing_records WHERE shipment_id = ? AND client_id = ? ORDER BY created_at ASC LIMIT 1").bind(shipmentId, snapshot.client_id).first<{ id: string; amount: number }>();
+        if (!billing) return error("NOT_FOUND", "Invoice not found", 404, id, headers);
+        let breakdown: { lines?: Array<{ code: string; label: string; amount: number; marker?: "*" }>; total?: number; subtotal?: number; gst?: number };
+        try { breakdown = JSON.parse(snapshot.client_breakdown_json) as typeof breakdown; } catch { return error("CONFLICT", "Pricing snapshot is invalid", 409, id, headers); }
+        const line = breakdown.lines?.find((item) => item.code === component); if (!line) return error("NOT_FOUND", "Pricing component not found", 404, id, headers);
+        const previous = Number(line.amount);
+        const previousTotal = Number(breakdown.total ?? billing.amount);
+        const delta = Math.round((nextAmount - previous) * 100) / 100;
+        line.amount = Math.round(nextAmount * 100) / 100;
+        const previousSubtotal = Number(breakdown.subtotal ?? 0);
+        if (component === "gst") {
+          breakdown.gst = line.amount;
+        } else {
+          breakdown.subtotal = Math.round((previousSubtotal + delta) * 100) / 100;
+          const gstLine = breakdown.lines?.find((item) => item.code === "gst");
+          const previousGst = Number(breakdown.gst ?? gstLine?.amount ?? 0);
+          const gstPercent = previousSubtotal > 0 ? previousGst / previousSubtotal * 100 : 0;
+          breakdown.gst = Math.round((Number(breakdown.subtotal) * gstPercent / 100 + Number.EPSILON) * 100) / 100;
+          if (gstLine) {
+            gstLine.amount = breakdown.gst;
+          }
+        }
+        breakdown.total = Math.round((Number(breakdown.subtotal ?? previousSubtotal) + Number(breakdown.gst ?? 0)) * 100) / 100;
+        const totalDelta = Math.round((Number(breakdown.total) - previousTotal) * 100) / 100;
+        if (totalDelta > 0) {
+          const wallet = await env.DB.prepare("SELECT COALESCE(SUM(CASE WHEN lower(COALESCE(type, '')) IN ('debit', 'charge', 'withdrawal') THEN -ABS(amount) ELSE ABS(amount) END), 0) AS balance FROM wallet_transactions WHERE client_id = ? AND status IN ('posted', 'approved')").bind(snapshot.client_id).first<{ balance: number }>();
+          if (Number(wallet?.balance ?? 0) < totalDelta) return error("INSUFFICIENT_WALLET_BALANCE", "The client wallet does not have enough balance for this pricing increase", 409, id, headers);
+        }
+        const overrideId = crypto.randomUUID(); const actor = auth.userId ?? `api:${snapshot.client_id}`;
+        const walletAdjustment = totalDelta > 0 ? env.DB.prepare("INSERT INTO wallet_transactions (id, client_id, type, amount, reference, status, balance_after) VALUES (?, ?, 'debit', ?, ?, 'posted', 0)").bind(crypto.randomUUID(), snapshot.client_id, totalDelta, `PRICING-OVERRIDE-${overrideId}`) : totalDelta < 0 ? env.DB.prepare("INSERT INTO wallet_transactions (id, client_id, type, amount, reference, status, balance_after) VALUES (?, ?, 'credit', ?, ?, 'posted', 0)").bind(crypto.randomUUID(), snapshot.client_id, Math.abs(totalDelta), `PRICING-OVERRIDE-${overrideId}`) : null;
+        await env.DB.batch([
+          env.DB.prepare("UPDATE pricing_shipment_snapshots SET client_breakdown_json = ? WHERE id = ?").bind(JSON.stringify(breakdown), snapshot.id),
+          env.DB.prepare("UPDATE billing_records SET amount = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(breakdown.total, billing.id),
+          env.DB.prepare("DELETE FROM billing_line_items WHERE billing_id = ?").bind(billing.id),
+          ...billingLineItemStatements(env, billing.id, shipmentId, snapshot.client_id, JSON.stringify(breakdown)),
+          env.DB.prepare("INSERT INTO pricing_overrides (id, shipment_id, client_id, billing_id, component_code, previous_amount, new_amount, reason, actor_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(overrideId, shipmentId, snapshot.client_id, billing.id, component, previous, line.amount, reason, actor),
+          env.DB.prepare("INSERT INTO billing_amendments (id, billing_id, shipment_id, client_id, amendment_type, previous_amount, new_amount, reason, actor_user_id) VALUES (?, ?, ?, ?, 'component_override', ?, ?, ?, ?)").bind(crypto.randomUUID(), billing.id, shipmentId, snapshot.client_id, Number(billing.amount), Number(breakdown.total), reason, actor),
+          ...(walletAdjustment ? [walletAdjustment] : []),
+        ]);
+        if (walletAdjustment) await recalculateWalletBalances(env, snapshot.client_id);
+        await audit(env, ctx, auth, id, "pricing.override_applied", "pricing_snapshot", snapshot.id, { client_id: snapshot.client_id, shipment_id: shipmentId, component_code: component, previous_amount: previous, new_amount: line.amount, reason });
+        return json({ ok: true, data: { id: overrideId, shipment_id: shipmentId, component_code: component, amount: line.amount, total: breakdown.total, reason } }, 200, headers);
+      }
+      if (route === "/pricing/internal/margins" && request.method === "GET") {
+        if (!hasRole(auth, ["super_admin"]) || !hasScope(auth, "provider_cost.view")) return error("FORBIDDEN", "Internal pricing access required", 403, id, headers);
+        const clientId = requireClient(auth, url.searchParams.get("client_id")); if (!clientId) return error("VALIDATION_ERROR", "A client is required", 400, id, headers);
+        const rows = await env.DB.prepare("SELECT b.id AS billing_id, b.shipment_id, b.invoice_number, b.amount AS pss_amount, b.created_at, c.provider, c.provider_account_id, c.provider_amount, c.provider_status, CASE WHEN c.provider_amount IS NULL THEN NULL ELSE b.amount - c.provider_amount END AS margin FROM billing_records b LEFT JOIN pricing_provider_costs c ON c.shipment_id = b.shipment_id WHERE b.client_id = ? ORDER BY b.created_at DESC LIMIT 200").bind(clientId).all();
+        return json({ ok: true, data: rows.results }, 200, headers);
       }
       if (route === "/serviceability" && request.method === "POST") {
         if (!hasScope(auth, "quotes.create")) return error("FORBIDDEN", "Serviceability scope required", 403, id, headers);
@@ -2104,7 +2656,7 @@ const worker = {
           return json({ ok: true, data: { origin_pincode: origin, destination_pincode: destination, serviceable: routeServiceable, providers: routeServiceable ? ["rivigo"] : [], configured_providers: configuredProviders, status: accepted ? "verified" : "provider_error", serviceability_rows: [
             { pincode: origin, provider: "Rivigo", status: accepted ? routeServiceable ? "Available" : "Unavailable" : "Provider error", oda: rivigoResult.origin_oda ?? null },
             { pincode: destination, provider: "Rivigo", status: accepted ? routeServiceable ? "Available" : "Unavailable" : "Provider error", oda: rivigoResult.destination_oda ?? null },
-          ], provider_result: result } }, 200, headers);
+          ], provider_status: result.status } }, 200, headers);
         }
         return json({ ok: true, data: { origin_pincode: origin, destination_pincode: destination, serviceable: false, providers: [], configured_providers: configuredProviders, status: configuredProviders.length > 0 ? "provider_contract_not_verified" : "provider_unavailable", serviceability_rows: [
           { pincode: origin, provider: "Configured courier", status: "Unavailable", oda: null },

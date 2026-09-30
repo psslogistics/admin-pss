@@ -1,1 +1,3 @@
-ALTER TABLE notifications ADD COLUMN category TEXT NOT NULL DEFAULT 'general';
+-- category is part of the canonical worker/schema.sql baseline. This
+-- migration intentionally remains a no-op for fresh databases created from
+-- that baseline and preserves the historical migration slot.

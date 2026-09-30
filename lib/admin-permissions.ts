@@ -3,6 +3,7 @@ export type PermissionKey =
   | "admin.activity.view" | "admin.booking.view" | "admin.booking.create" | "admin.tracking.view"
   | "admin.tracking.update" | "admin.pickup.view" | "admin.pickup.create" | "admin.pickup.assign"
   | "admin.reports.view" | "admin.reports.export" | "admin.rate_cards.view" | "admin.rate_cards.manage"
+  | "admin.pricing.view" | "admin.pricing.manage" | "admin.pricing.publish" | "admin.pricing.override" | "admin.provider_cost.view"
   | "admin.support.view" | "admin.tickets.create" | "admin.tickets.reply" | "admin.tickets.close" | "admin.tickets.reassign"
   | "admin.notifications.view" | "admin.profile.view" | "admin.profile.edit" | "admin.settings.view";
 
@@ -12,7 +13,8 @@ export const ADMIN_PERMISSION_KEYS = new Set<string>([
   "admin.pickup.view", "admin.pickup.create", "admin.pickup.assign", "admin.reports.view", "admin.reports.export",
   "admin.rate_cards.view", "admin.rate_cards.manage", "admin.support.view", "admin.tickets.create", "admin.tickets.reply",
   "admin.tickets.close", "admin.tickets.reassign", "admin.notifications.view", "admin.profile.view",
-  "admin.profile.edit", "admin.settings.view",
+  "admin.profile.edit", "admin.settings.view", "admin.pricing.view", "admin.pricing.manage",
+  "admin.pricing.publish", "admin.pricing.override", "admin.provider_cost.view",
 ]);
 
 export function isAdminPermission(value: string): value is PermissionKey {

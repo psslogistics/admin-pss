@@ -1,0 +1,1 @@
+ALTER TABLE weight_reconciliations ADD COLUMN provider_weight_received_at TEXT;

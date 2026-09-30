@@ -1,0 +1,4 @@
+ALTER TABLE pricing_shipment_snapshots ADD COLUMN original_client_breakdown_json TEXT;
+UPDATE pricing_shipment_snapshots
+SET original_client_breakdown_json = client_breakdown_json
+WHERE original_client_breakdown_json IS NULL;

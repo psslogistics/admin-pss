@@ -1,2 +1,1 @@
-ALTER TABLE shipments ADD COLUMN origin_address_json TEXT;
-ALTER TABLE shipments ADD COLUMN destination_address_json TEXT;
+-- These columns are part of the canonical worker/schema.sql baseline.

@@ -4,6 +4,7 @@ CREATE TABLE IF NOT EXISTS shipments (
   created_by_user_id TEXT,
   provider TEXT,
   provider_reference TEXT,
+  tracking_number TEXT,
   status TEXT NOT NULL DEFAULT 'booked',
   description TEXT NOT NULL DEFAULT '',
   origin TEXT,

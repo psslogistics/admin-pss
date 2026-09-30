@@ -1,5 +1,7 @@
-ALTER TABLE support_tickets ADD COLUMN sla_due_at TEXT;
-ALTER TABLE support_tickets ADD COLUMN escalation_state TEXT NOT NULL DEFAULT 'normal';
+-- These columns are part of the canonical worker/schema.sql baseline. Keep
+-- this migration data-safe for databases created from that baseline; older
+-- installations that already ran the original ALTER statements remain
+-- compatible because the migration is tracked by Wrangler.
 
 UPDATE support_tickets
 SET sla_due_at = datetime(
