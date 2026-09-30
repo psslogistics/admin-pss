@@ -150,7 +150,10 @@ export function calculatePssRate(input: PricingInput): PricingResult {
   const laneOrigin = input.rto ? input.forwardOriginZoneOverride ?? originZone : originZone;
   const laneDestination = input.rto ? input.forwardDestinationZoneOverride ?? destinationZone : destinationZone;
   const chargeableWeightKg = Math.max(input.actualWeightKg, input.volumetricWeightKg ?? 0, input.minimumWeightKg ?? 20);
-  const rate = input.rto && input.forwardRatePerKg !== undefined ? input.forwardRatePerKg : input.rateMatrix?.[`${laneOrigin}->${laneDestination}`] ?? rateFor(input.account, laneOrigin, laneDestination);
+  const configuredRate = input.rateMatrix?.[`${laneOrigin}->${laneDestination}`];
+  // A missing/zero imported matrix value must never turn freight into a free shipment.
+  // Fall back to the account's published default matrix until the rate-card row is repaired.
+  const rate = input.rto && input.forwardRatePerKg !== undefined ? input.forwardRatePerKg : configuredRate !== undefined && configuredRate > 0 ? configuredRate : rateFor(input.account, laneOrigin, laneDestination);
   const lines: PricingLine[] = [{ code: "freight", label: "Freight", amount: roundMoney(chargeableWeightKg * rate) }];
   const context: Record<string, number> = { freight: lines[0].amount, freight_plus_docket: lines[0].amount, invoice_value: input.invoiceValue ?? 0, chargeable_weight: chargeableWeightKg, subtotal: lines[0].amount };
   for (const rule of input.chargeRules.filter((item) => item.enabled !== false).sort((a, b) => (a.displayOrder ?? 0) - (b.displayOrder ?? 0) || a.code.localeCompare(b.code))) {
