@@ -2368,11 +2368,13 @@ const worker = {
         // the shared Namo/other client matrix. Internal pricing previews may
         // still select 04 or 08 for verification.
         const internalPricingRequest = auth.system || hasRole(auth, ["employee", "admin", "super_admin"]);
+        let selectedProviderAccountName = "";
         let accountValue = internalPricingRequest ? String(payload.account_code ?? "").trim().toLowerCase() : "other";
-        if (internalPricingRequest && !accountValue && typeof payload.provider_account_id === "string") {
-          const providerAccount = await env.DB.prepare("SELECT account_name FROM provider_accounts WHERE id = ? AND provider = 'delhivery' AND status = 'active' AND (client_id = ? OR client_id IS NULL) LIMIT 1").bind(payload.provider_account_id, clientId).first<{ account_name: string }>();
-          const accountName = String(providerAccount?.account_name ?? "");
-          accountValue = delhiveryPricingAccountFromName(accountName);
+        if (typeof payload.provider_account_id === "string" && payload.provider_account_id.trim()) {
+          const providerAccount = await env.DB.prepare(`SELECT pa.account_name FROM provider_accounts pa LEFT JOIN provider_account_client_policies p ON p.provider_account_id = pa.id AND p.client_id = ? WHERE pa.id = ? AND pa.provider = 'delhivery' AND pa.status = 'active' AND (pa.client_id = ? OR (p.enabled = 1 AND p.client_id = ?)) LIMIT 1`).bind(clientId, payload.provider_account_id.trim(), clientId, clientId).first<{ account_name: string }>();
+          if (!providerAccount) return error("PROVIDER_ACCOUNT_NOT_ASSIGNED", "This Delhivery account is not assigned to the client", 403, id, headers);
+          selectedProviderAccountName = String(providerAccount.account_name ?? "");
+          accountValue = delhiveryPricingAccountFromName(selectedProviderAccountName);
         }
         if (!accountValue) accountValue = "other";
         if (!["04", "08", "other"].includes(accountValue)) return error("VALIDATION_ERROR", "Delhivery B2B account must be 04, 08, or other", 400, id, headers);
@@ -2407,7 +2409,7 @@ const worker = {
           if (forwardRatePerKg === undefined) return error("RTO_SOURCE_INVALID", "The original shipment pricing snapshot is invalid", 409, id, headers);
         }
         const result = calculatePssRate({ account, originCity: originPin.facility_city, destinationCity: destinationPin.facility_city, originState: originPin.facility_state, destinationState: destinationPin.facility_state, actualWeightKg, volumetricWeightKg, invoiceValue, rto, forwardRatePerKg, forwardOriginZoneOverride: rtoSource?.origin_zone, forwardDestinationZoneOverride: rtoSource?.destination_zone, minimumWeightKg: Number(version.minimum_weight_kg ?? 20), gstPercent: Number(version.gst_percent ?? 18), versionId: version.id, oda: false, opa: false, rateMatrix, chargeRules: rules.results.map((rule) => ({ code: rule.code, label: rule.label, kind: rule.calculation_type, value: Number(rule.value), basis: rule.basis, minimum: rule.minimum_value === null ? undefined : Number(rule.minimum_value), maximum: rule.maximum_value === null ? undefined : Number(rule.maximum_value), enabled: Boolean(rule.enabled), marker: rule.marker ?? undefined, condition: rule.condition ?? undefined, displayOrder: Number(rule.display_order ?? 0) })) });
-        if (previewOnly) return json({ ok: true, data: { quote_id: null, provider: "delhivery", service_level: "b2b", client_id: clientId, ...result } }, 200, headers);
+        if (previewOnly) return json({ ok: true, data: { quote_id: null, provider: "delhivery", service_level: "b2b", client_id: clientId, provider_account_id: typeof payload.provider_account_id === "string" ? payload.provider_account_id : null, provider_account_name: selectedProviderAccountName || null, account_code: account, ...result } }, 200, headers);
         const quoteId = crypto.randomUUID();
         await env.DB.prepare("INSERT INTO pricing_quotes (id, client_id, version_id, account_scope, origin_zone, destination_zone, chargeable_weight_kg, client_breakdown_json, expires_at, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+15 minutes'), ?)").bind(quoteId, clientId, version.id, account, result.originZone, result.destinationZone, result.chargeableWeightKg, JSON.stringify(result), auth.userId ?? `api:${clientId}`).run();
         return json({ ok: true, data: { quote_id: quoteId, provider: "delhivery", service_level: "b2b", client_id: clientId, ...result } }, 200, headers);
