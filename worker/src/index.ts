@@ -1497,7 +1497,7 @@ const worker = {
           FROM provider_accounts pa
           LEFT JOIN provider_account_client_policies p
             ON p.provider_account_id = pa.id AND p.client_id = ?
-          WHERE pa.status = 'active' AND (pa.client_id = ? OR pa.client_id IS NULL)
+          WHERE (pa.status = 'active' OR p.enabled = 1) AND (pa.client_id = ? OR pa.client_id IS NULL)
           ORDER BY pa.provider, enabled DESC, priority ASC, confidence_score DESC, pa.account_name`).bind(clientId, clientId).all();
         const secretBag = env as unknown as Record<string, unknown>;
         const configured = (row: Record<string, unknown>) => {
@@ -2371,7 +2371,7 @@ const worker = {
         let selectedProviderAccountName = "";
         let accountValue = internalPricingRequest ? String(payload.account_code ?? "").trim().toLowerCase() : "other";
         if (typeof payload.provider_account_id === "string" && payload.provider_account_id.trim()) {
-          const providerAccount = await env.DB.prepare(`SELECT pa.account_name FROM provider_accounts pa LEFT JOIN provider_account_client_policies p ON p.provider_account_id = pa.id AND p.client_id = ? WHERE pa.id = ? AND pa.provider = 'delhivery' AND pa.status = 'active' AND (pa.client_id = ? OR (p.enabled = 1 AND p.client_id = ?)) LIMIT 1`).bind(clientId, payload.provider_account_id.trim(), clientId, clientId).first<{ account_name: string }>();
+          const providerAccount = await env.DB.prepare(`SELECT pa.account_name FROM provider_accounts pa LEFT JOIN provider_account_client_policies p ON p.provider_account_id = pa.id AND p.client_id = ? WHERE pa.id = ? AND pa.provider = 'delhivery' AND (pa.status = 'active' OR p.enabled = 1) AND (pa.client_id = ? OR (p.enabled = 1 AND p.client_id = ?)) LIMIT 1`).bind(clientId, payload.provider_account_id.trim(), clientId, clientId).first<{ account_name: string }>();
           if (!providerAccount) return error("PROVIDER_ACCOUNT_NOT_ASSIGNED", "This Delhivery account is not assigned to the client", 403, id, headers);
           selectedProviderAccountName = String(providerAccount.account_name ?? "");
           accountValue = delhiveryPricingAccountFromName(selectedProviderAccountName);
