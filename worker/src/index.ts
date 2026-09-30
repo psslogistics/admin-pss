@@ -165,6 +165,10 @@ async function authenticate(request: Request, env: Env): Promise<Auth | null> {
 
 function hasScope(auth: Auth, scope: string) {
   if (auth.kind === "api") return auth.scopes.has(scope);
+  // System identities (including Super Admin) are the organization-level
+  // control plane and must be able to manage scoped integration credentials.
+  // Keep API-key identities on their explicit scopes above; this branch only
+  // applies to authenticated first-party system users.
   if (auth.system) return true;
   const permissionMap: Record<string, string[]> = {
     "shipments.read": ["shipments.read", "shipments.view", "admin.tracking.view"], "tracking.read": ["tracking.read", "tracking.view", "admin.tracking.view"],
@@ -2359,8 +2363,13 @@ const worker = {
         const payload = await bodyJson(request);
         const clientId = requireClient(auth, payload.client_id);
         if (!clientId || !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
-        let accountValue = String(payload.account_code ?? "").trim().toLowerCase();
-        if (!accountValue && typeof payload.provider_account_id === "string") {
+        // Client users never choose a courier account. The account is an
+        // internal routing concern; all non-04/non-08 Delhivery accounts use
+        // the shared Namo/other client matrix. Internal pricing previews may
+        // still select 04 or 08 for verification.
+        const internalPricingRequest = auth.system || hasRole(auth, ["employee", "admin", "super_admin"]);
+        let accountValue = internalPricingRequest ? String(payload.account_code ?? "").trim().toLowerCase() : "other";
+        if (internalPricingRequest && !accountValue && typeof payload.provider_account_id === "string") {
           const providerAccount = await env.DB.prepare("SELECT account_name FROM provider_accounts WHERE id = ? AND provider = 'delhivery' AND status = 'active' AND (client_id = ? OR client_id IS NULL) LIMIT 1").bind(payload.provider_account_id, clientId).first<{ account_name: string }>();
           const accountName = String(providerAccount?.account_name ?? "");
           accountValue = delhiveryPricingAccountFromName(accountName);
@@ -2373,11 +2382,9 @@ const worker = {
         if (rto && !rtoSourceId) return error("RTO_SOURCE_REQUIRED", "An original shipment is required to price an RTO", 409, id, headers);
         if (rto && !rtoSource) return error("RTO_SOURCE_NOT_FOUND", "The original shipment pricing snapshot could not be found", 409, id, headers);
         const account: PricingAccount = (rtoSource?.account_scope ?? accountValue) as PricingAccount;
-        const originCity = typeof payload.origin_city === "string" ? payload.origin_city.trim() : "";
-        const destinationCity = typeof payload.destination_city === "string" ? payload.destination_city.trim() : "";
-        const originState = typeof payload.origin_state === "string" ? payload.origin_state.trim() : "";
-        const destinationState = typeof payload.destination_state === "string" ? payload.destination_state.trim() : "";
-        if (!originCity || !destinationCity || !originState || !destinationState) return error("VALIDATION_ERROR", "Origin and destination city and state are required for B2B zone calculation", 400, id, headers);
+        const originPincode = String(payload.origin_pincode ?? "").trim();
+        const destinationPincode = String(payload.destination_pincode ?? "").trim();
+        if (!/^\d{6}$/.test(originPincode) || !/^\d{6}$/.test(destinationPincode)) return error("VALIDATION_ERROR", "Pickup and delivery pincodes must be six digits", 400, id, headers);
         const actualWeightKg = Number(payload.actual_weight_kg);
         const volumetricWeightKg = payload.volumetric_weight_kg === undefined ? 0 : Number(payload.volumetric_weight_kg);
         const invoiceValue = payload.invoice_value === undefined ? 0 : Number(payload.invoice_value);
@@ -2387,7 +2394,8 @@ const worker = {
         const rules = await env.DB.prepare("SELECT code, label, calculation_type, value, basis, minimum_value, maximum_value, enabled, marker, condition, display_order FROM pricing_charge_rules WHERE version_id = ? ORDER BY display_order ASC, code ASC").bind(version.id).all<{ code: string; label: string; calculation_type: ChargeRule["kind"]; value: number; basis: ChargeRule["basis"]; minimum_value: number | null; maximum_value: number | null; enabled: number; marker: "*" | null; condition: "oda_or_opa" | null; display_order: number }>();
         const matrixRows = await env.DB.prepare("SELECT origin_zone, destination_zone, rate_per_kg FROM pricing_rate_matrix WHERE version_id = ? AND account_scope = ?").bind(version.id, account).all<{ origin_zone: string; destination_zone: string; rate_per_kg: number }>();
         const rateMatrix = Object.fromEntries(matrixRows.results.map((row) => [`${row.origin_zone}->${row.destination_zone}`, Number(row.rate_per_kg)]));
-        const [originPin, destinationPin] = await Promise.all([pricingPincode(env, String(payload.origin_pincode ?? "")), pricingPincode(env, String(payload.destination_pincode ?? ""))]);
+        const [originPin, destinationPin] = await Promise.all([pricingPincode(env, originPincode), pricingPincode(env, destinationPincode)]);
+        if (!originPin || !destinationPin) return error("PINCODE_NOT_FOUND", "One or both pincodes are not present in the active Delhivery B2B dataset", 404, id, headers);
         let forwardRatePerKg: number | undefined;
         if (rtoSource) {
           try {
@@ -2397,7 +2405,7 @@ const worker = {
           } catch { return error("RTO_SOURCE_INVALID", "The original shipment pricing snapshot is invalid", 409, id, headers); }
           if (forwardRatePerKg === undefined) return error("RTO_SOURCE_INVALID", "The original shipment pricing snapshot is invalid", 409, id, headers);
         }
-        const result = calculatePssRate({ account, originCity: originPin?.facility_city ?? originCity, destinationCity: destinationPin?.facility_city ?? destinationCity, originState: originPin?.facility_state ?? originState, destinationState: destinationPin?.facility_state ?? destinationState, actualWeightKg, volumetricWeightKg, invoiceValue, rto, forwardRatePerKg, forwardOriginZoneOverride: rtoSource?.origin_zone, forwardDestinationZoneOverride: rtoSource?.destination_zone, minimumWeightKg: Number(version.minimum_weight_kg ?? 20), gstPercent: Number(version.gst_percent ?? 18), versionId: version.id, oda: Boolean(destinationPin?.oda), opa: Boolean(originPin?.oda), rateMatrix, chargeRules: rules.results.map((rule) => ({ code: rule.code, label: rule.label, kind: rule.calculation_type, value: Number(rule.value), basis: rule.basis, minimum: rule.minimum_value === null ? undefined : Number(rule.minimum_value), maximum: rule.maximum_value === null ? undefined : Number(rule.maximum_value), enabled: Boolean(rule.enabled), marker: rule.marker ?? undefined, condition: rule.condition ?? undefined, displayOrder: Number(rule.display_order ?? 0) })) });
+        const result = calculatePssRate({ account, originCity: originPin.facility_city, destinationCity: destinationPin.facility_city, originState: originPin.facility_state, destinationState: destinationPin.facility_state, actualWeightKg, volumetricWeightKg, invoiceValue, rto, forwardRatePerKg, forwardOriginZoneOverride: rtoSource?.origin_zone, forwardDestinationZoneOverride: rtoSource?.destination_zone, minimumWeightKg: Number(version.minimum_weight_kg ?? 20), gstPercent: Number(version.gst_percent ?? 18), versionId: version.id, oda: Boolean(destinationPin.oda), opa: Boolean(originPin.oda), rateMatrix, chargeRules: rules.results.map((rule) => ({ code: rule.code, label: rule.label, kind: rule.calculation_type, value: Number(rule.value), basis: rule.basis, minimum: rule.minimum_value === null ? undefined : Number(rule.minimum_value), maximum: rule.maximum_value === null ? undefined : Number(rule.maximum_value), enabled: Boolean(rule.enabled), marker: rule.marker ?? undefined, condition: rule.condition ?? undefined, displayOrder: Number(rule.display_order ?? 0) })) });
         const quoteId = crypto.randomUUID();
         await env.DB.prepare("INSERT INTO pricing_quotes (id, client_id, version_id, account_scope, origin_zone, destination_zone, chargeable_weight_kg, client_breakdown_json, expires_at, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+15 minutes'), ?)").bind(quoteId, clientId, version.id, account, result.originZone, result.destinationZone, result.chargeableWeightKg, JSON.stringify(result), auth.userId ?? `api:${clientId}`).run();
         return json({ ok: true, data: { quote_id: quoteId, provider: "delhivery", service_level: "b2b", client_id: clientId, ...result } }, 200, headers);
