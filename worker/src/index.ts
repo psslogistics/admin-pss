@@ -323,6 +323,16 @@ async function rateLimited(env: Env, request: Request, auth: Auth, route: string
   const key = await sha256(`${identity}:${route}`);
   return rateLimitExceeded(env, key, 120);
 }
+const pricingPreviewBuckets = new Map<string, { windowStart: number; count: number }>();
+function pricingPreviewRateLimited(request: Request, auth: Auth, limit = 30) {
+  const identity = auth.userId ?? auth.clientId ?? request.headers.get("CF-Connecting-IP") ?? "anonymous";
+  const windowStart = Math.floor(Date.now() / 60000);
+  const bucket = pricingPreviewBuckets.get(identity);
+  const next = !bucket || bucket.windowStart !== windowStart ? { windowStart, count: 1 } : { windowStart, count: bucket.count + 1 };
+  pricingPreviewBuckets.set(identity, next);
+  if (pricingPreviewBuckets.size > 10000) for (const [key, value] of pricingPreviewBuckets) if (value.windowStart !== windowStart) pricingPreviewBuckets.delete(key);
+  return next.count > limit;
+}
 async function publicRateLimited(env: Env, request: Request, route: string, limit = 30) {
   const identity = request.headers.get("CF-Connecting-IP") ?? request.headers.get("X-Forwarded-For")?.split(",")[0]?.trim() ?? "anonymous";
   const key = await sha256(`public:${identity}:${route}`);
@@ -1383,7 +1393,8 @@ const worker = {
     // Strip only the `/v1` prefix and preserve the leading slash expected by route matchers.
     let route = url.pathname.slice(3);
     try {
-      if (await rateLimited(env, request, auth, route)) return new Response(JSON.stringify({ ok: false, error: { code: "RATE_LIMITED", message: "Too many requests" }, request_id: id }), { status: 429, headers: { ...headers, "content-type": "application/json", "retry-after": "60" } });
+      const limited = route === "/pricing/quotes" && request.method === "POST" ? pricingPreviewRateLimited(request, auth) : await rateLimited(env, request, auth, route);
+      if (limited) return new Response(JSON.stringify({ ok: false, error: { code: "RATE_LIMITED", message: "Too many requests" }, request_id: id }), { status: 429, headers: { ...headers, "content-type": "application/json", "retry-after": "60" } });
       if (route === "/me" && request.method === "GET") return json({ ok: true, authenticated: true, user_id: auth.userId, client_id: auth.clientId, client_ids: [...auth.clientIds], roles: [...auth.roles], permissions: [...auth.permissions], system: auth.system }, 200, withCors(request, env));
       // Fujiyama receives a stable PSS contract. It never receives Delhivery
       // credentials or calls Delhivery directly. Tracking accepts an AWB
