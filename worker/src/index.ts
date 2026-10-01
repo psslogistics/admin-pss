@@ -537,7 +537,7 @@ function delhiveryCreatePayload(env: Env, payload: Record<string, unknown>) {
 }
 
 function delhiveryPickupPayload(env: Env, payload: Record<string, unknown>) {
-  const pickupLocation = String(payload.delhivery_pickup_location ?? payload.pickup_location ?? env.DELHIVERY_DEFAULT_PICKUP_LOCATION ?? "").trim();
+  const pickupLocation = String(payload.delhivery_pickup_location ?? payload.pickup_location ?? payload.delhivery_client_name ?? env.DELHIVERY_DEFAULT_PICKUP_LOCATION ?? "").trim();
   const pickupDate = String(payload.scheduled_date ?? "").trim();
   const rawWindow = String(payload.window ?? payload.pickup_time ?? "10:00:00").trim();
   const pickupTime = (rawWindow.match(/\b\d{1,2}:\d{2}(?::\d{2})?\b/)?.[0] ?? "10:00:00").split(":").map((part) => part.padStart(2, "0"));
