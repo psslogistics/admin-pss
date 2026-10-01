@@ -1396,6 +1396,14 @@ const worker = {
       const limited = route === "/pricing/quotes" && request.method === "POST" ? pricingPreviewRateLimited(request, auth) : await rateLimited(env, request, auth, route);
       if (limited) return new Response(JSON.stringify({ ok: false, error: { code: "RATE_LIMITED", message: "Too many requests" }, request_id: id }), { status: 429, headers: { ...headers, "content-type": "application/json", "retry-after": "60" } });
       if (route === "/me" && request.method === "GET") return json({ ok: true, authenticated: true, user_id: auth.userId, client_id: auth.clientId, client_ids: [...auth.clientIds], roles: [...auth.roles], permissions: [...auth.permissions], system: auth.system }, 200, withCors(request, env));
+      const pincodeLookup = route.match(/^\/pincodes\/(\d{6})$/);
+      if (pincodeLookup && request.method === "GET") {
+        if (!hasScope(auth, "quotes.create") && !hasScope(auth, "serviceability.read")) return error("FORBIDDEN", "Pincode lookup permission required", 403, id, headers);
+        const pincode = pincodeLookup[1];
+        const location = await pricingPincode(env, pincode);
+        if (!location) return error("PINCODE_NOT_FOUND", "Pincode is not present in the active PSS dataset", 404, id, headers);
+        return json({ ok: true, data: { pincode, city: location.facility_city, state: location.facility_state, oda: Boolean(location.oda) }, request_id: id }, 200, headers);
+      }
       // Fujiyama receives a stable PSS contract. It never receives Delhivery
       // credentials or calls Delhivery directly. Tracking accepts an AWB
       // before a PSS shipment exists; booking delegates to the canonical
