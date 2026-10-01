@@ -2650,41 +2650,88 @@ const worker = {
         const payload = await bodyJson(request); const origin = String(payload.origin_pincode ?? ""); const destination = String(payload.destination_pincode ?? "");
         if (!/^\d{6}$/.test(origin) || !/^\d{6}$/.test(destination)) return error("VALIDATION_ERROR", "Valid origin and destination pincodes are required", 400, id, headers);
         const serviceabilityClientId = requireClient(auth, payload.client_id) ?? auth.clientId;
-        const configuredProviders = [env.DELHIVERY_API_BASE_URL && env.DELHIVERY_API_TOKEN ? "delhivery" : null, env.EKART_API_BASE_URL && env.EKART_API_KEY ? "ekart" : null, env.RIVIGO_API_BASE_URL && env.RIVIGO_CREDENTIALS_JSON && String((env as unknown as Record<string, unknown>).RIVIGO_ENABLE_PROVIDER_CALLS) === "true" ? "rivigo" : null].filter(Boolean).filter(() => String(env.ENABLE_PROVIDER_CALLS) === "true");
-        if (configuredProviders.includes("delhivery")) {
+        const providerAccounts = serviceabilityClientId
+          ? await env.DB.prepare(`
+              SELECT pa.id, pa.provider, pa.account_name,
+                     CASE WHEN p.provider_account_id IS NULL THEN 1 ELSE p.enabled END AS enabled,
+                     CASE WHEN p.provider_account_id IS NULL THEN 100 ELSE p.priority END AS priority,
+                     CASE WHEN p.provider_account_id IS NULL THEN 0 ELSE p.confidence_score END AS confidence_score
+              FROM provider_accounts pa
+              LEFT JOIN provider_account_client_policies p
+                ON p.provider_account_id = pa.id AND p.client_id = ?
+              WHERE pa.status = 'active'
+                AND (pa.client_id = ? OR pa.client_id IS NULL)
+                AND (p.provider_account_id IS NULL OR p.enabled = 1)
+              ORDER BY pa.provider, priority ASC, confidence_score DESC, pa.account_name ASC
+              LIMIT 100`).bind(serviceabilityClientId, serviceabilityClientId).all<{
+                id: string; provider: CourierProvider; account_name: string; enabled: number; priority: number; confidence_score: number;
+              }>()
+          : { results: [] as Array<{ id: string; provider: CourierProvider; account_name: string; enabled: number; priority: number; confidence_score: number }> };
+        const accountRows = providerAccounts.results.filter((account) => Number(account.enabled) === 1);
+        const configuredProviders = [...new Set(accountRows.map((account) => account.provider))];
+        const providerLabel = (provider: CourierProvider) => provider === "delhivery" ? "Delhivery" : provider === "xpressbees" ? "XpressBees" : provider[0].toUpperCase() + provider.slice(1);
+        const supportedProviders = new Set<CourierProvider>(["delhivery", "rivigo"]);
+        const serviceabilityRows: Array<{ pincode: string; provider: string; status: string; oda: boolean | null; account_id: string; account_name: string; confidence_score: number; priority: number }> = [];
+        const routeResults: Array<{ provider: CourierProvider; accountId: string; accountName: string; confidenceScore: number; priority: number; origin: Record<string, unknown>; destination: Record<string, unknown>; routeServiceable: boolean }> = [];
+        for (const account of accountRows) {
+          const label = `${providerLabel(account.provider)} · ${account.account_name}`;
+          if (!supportedProviders.has(account.provider)) {
+            serviceabilityRows.push(
+              { pincode: origin, provider: label, status: "Serviceability not supported", oda: null, account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100) },
+              { pincode: destination, provider: label, status: "Serviceability not supported", oda: null, account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100) },
+            );
+            continue;
+          }
           try {
-            const [originResult, destinationResult] = await Promise.all([
-              safeProviderRequest(env, "delhivery", "serviceability", { destination_pincode: origin }, id, serviceabilityClientId),
-              safeProviderRequest(env, "delhivery", "serviceability", { destination_pincode: destination }, id, serviceabilityClientId),
-            ]);
-            const originServiceable = originResult.status === "accepted" && Boolean((originResult as { pickup?: boolean; serviceable?: boolean }).pickup ?? (originResult as { serviceable?: boolean }).serviceable);
-            const destinationServiceable = destinationResult.status === "accepted" && Boolean(destinationResult.serviceable);
-            const providerStatus = originResult.status === "accepted" && destinationResult.status === "accepted" ? "verified" : "provider_error";
-            const serviceabilityRows = [
-              { pincode: origin, provider: "Delhivery", status: originResult.status === "accepted" ? originServiceable ? "Available" : "Unavailable" : "Provider error", oda: (originResult as { oda?: boolean | null }).oda ?? null },
-              { pincode: destination, provider: "Delhivery", status: destinationResult.status === "accepted" ? destinationServiceable ? "Available" : "Unavailable" : "Provider error", oda: (destinationResult as { oda?: boolean | null }).oda ?? null },
-            ];
-            return json({ ok: true, data: { client_id: serviceabilityClientId, origin_pincode: origin, destination_pincode: destination, serviceable: originServiceable && destinationServiceable, providers: originServiceable && destinationServiceable ? ["delhivery"] : [], configured_providers: configuredProviders, status: providerStatus, serviceability_rows: serviceabilityRows, origin: originResult, destination: destinationResult } }, 200, headers);
+            const [originResult, destinationResult] = account.provider === "delhivery"
+              ? await Promise.all([
+                  safeProviderRequest(env, account.provider, "serviceability", { destination_pincode: origin, provider_account_id: account.id }, id, serviceabilityClientId),
+                  safeProviderRequest(env, account.provider, "serviceability", { destination_pincode: destination, provider_account_id: account.id }, id, serviceabilityClientId),
+                ])
+              : [await safeProviderRequest(env, account.provider, "serviceability", { origin_pincode: origin, destination_pincode: destination, provider_account_id: account.id }, id, serviceabilityClientId), null];
+            const originRecord = originResult as Record<string, unknown>;
+            const destinationRecord = (destinationResult ?? originResult) as Record<string, unknown>;
+            const originServiceable = account.provider === "delhivery"
+              ? originResult.status === "accepted" && Boolean((originResult as { pickup?: boolean; serviceable?: boolean }).pickup ?? (originResult as { serviceable?: boolean }).serviceable)
+              : originResult.status === "accepted" && Boolean((originResult as { serviceable?: boolean }).serviceable);
+            const destinationServiceable = account.provider === "delhivery"
+              ? destinationResult?.status === "accepted" && Boolean((destinationResult as { serviceable?: boolean }).serviceable)
+              : originServiceable;
+            const accountStatus = originResult.status === "accepted" && destinationRecord.status === "accepted"
+              ? originServiceable && destinationServiceable ? "Available" : "Unavailable"
+              : originResult.status === "not_configured" || destinationRecord.status === "not_configured" ? "Not configured" : "Provider error";
+            const originOda = account.provider === "delhivery" ? (originResult as { oda?: boolean | null }).oda ?? null : (originResult as { origin_oda?: boolean | null }).origin_oda ?? null;
+            const destinationOda = account.provider === "delhivery" ? (destinationResult as { oda?: boolean | null } | null)?.oda ?? null : (originResult as { destination_oda?: boolean | null }).destination_oda ?? null;
+            serviceabilityRows.push(
+              { pincode: origin, provider: label, status: accountStatus, oda: originOda, account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100) },
+              { pincode: destination, provider: label, status: accountStatus, oda: destinationOda, account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100) },
+            );
+            routeResults.push({ provider: account.provider, accountId: account.id, accountName: account.account_name, confidenceScore: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), origin: originRecord, destination: destinationRecord, routeServiceable: originServiceable && destinationServiceable });
           } catch (caught) {
             const providerError = caught instanceof Error ? caught.message : "provider_request_failed";
-            console.error(JSON.stringify({ request_id: id, route: "/v1/serviceability", provider: "delhivery", error: providerError }));
-            return error("PROVIDER_ERROR", "Delhivery serviceability is temporarily unavailable", 502, id, headers);
+            console.error(JSON.stringify({ request_id: id, route: "/v1/serviceability", provider: account.provider, account_id: account.id, error: providerError }));
+            serviceabilityRows.push(
+              { pincode: origin, provider: label, status: "Provider error", oda: null, account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100) },
+              { pincode: destination, provider: label, status: "Provider error", oda: null, account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100) },
+            );
           }
         }
-        if (configuredProviders.includes("rivigo")) {
-          const result = await safeProviderRequest(env, "rivigo", "serviceability", { origin_pincode: origin, destination_pincode: destination }, id, serviceabilityClientId);
-          const accepted = result.status === "accepted";
-          const routeServiceable = accepted && Boolean((result as { serviceable?: boolean }).serviceable);
-          const rivigoResult = result as { origin_oda?: boolean | null; destination_oda?: boolean | null };
-          return json({ ok: true, data: { origin_pincode: origin, destination_pincode: destination, serviceable: routeServiceable, providers: routeServiceable ? ["rivigo"] : [], configured_providers: configuredProviders, status: accepted ? "verified" : "provider_error", serviceability_rows: [
-            { pincode: origin, provider: "Rivigo", status: accepted ? routeServiceable ? "Available" : "Unavailable" : "Provider error", oda: rivigoResult.origin_oda ?? null },
-            { pincode: destination, provider: "Rivigo", status: accepted ? routeServiceable ? "Available" : "Unavailable" : "Provider error", oda: rivigoResult.destination_oda ?? null },
-          ], provider_status: result.status } }, 200, headers);
-        }
-        return json({ ok: true, data: { origin_pincode: origin, destination_pincode: destination, serviceable: false, providers: [], configured_providers: configuredProviders, status: configuredProviders.length > 0 ? "provider_contract_not_verified" : "provider_unavailable", serviceability_rows: [
-          { pincode: origin, provider: "Configured courier", status: "Unavailable", oda: null },
-          { pincode: destination, provider: "Configured courier", status: "Unavailable", oda: null },
-        ] } }, 200, headers);
+        const routeServiceable = routeResults.some((result) => result.routeServiceable);
+        const acceptedResult = routeResults.some((result) => result.origin.status === "accepted" && result.destination.status === "accepted");
+        const failedResult = serviceabilityRows.some((row) => row.status === "Provider error" || row.status === "Not configured");
+        const providerStatus = routeServiceable || acceptedResult ? "verified" : failedResult ? "provider_error" : configuredProviders.length ? "provider_contract_not_verified" : "provider_unavailable";
+        return json({ ok: true, data: {
+          client_id: serviceabilityClientId,
+          origin_pincode: origin,
+          destination_pincode: destination,
+          serviceable: routeServiceable,
+          providers: [...new Set(routeResults.filter((result) => result.routeServiceable).map((result) => result.provider))],
+          configured_providers: configuredProviders,
+          assigned_accounts: accountRows.map((account) => ({ id: account.id, provider: account.provider, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100) })),
+          status: providerStatus,
+          serviceability_rows: serviceabilityRows,
+          provider_results: routeResults,
+        } }, 200, headers);
       }
       if (route === "/departments" && request.method === "GET") {
         if (!hasScope(auth, "departments.read")) return error("FORBIDDEN", "Department read scope required", 403, id, headers);
