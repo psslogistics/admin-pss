@@ -2679,7 +2679,7 @@ const worker = {
         const configuredProviders = [...new Set(accountRows.map((account) => account.provider))];
         const providerLabel = (provider: CourierProvider) => provider === "delhivery" ? "Delhivery" : provider === "xpressbees" ? "XpressBees" : provider[0].toUpperCase() + provider.slice(1);
         const supportedProviders = new Set<CourierProvider>(["delhivery", "rivigo"]);
-        const serviceabilityRows: Array<{ pincode: string; provider: string; status: string; oda: boolean | null; account_id: string; account_name: string; confidence_score: number; priority: number }> = [];
+        const serviceabilityRows: Array<{ pincode: string; provider: string; status: string; oda: boolean | null; account_id: string; account_name: string; confidence_score: number; priority: number; source?: string }> = [];
         const routeResults: Array<{ provider: CourierProvider; accountId: string; accountName: string; confidenceScore: number; priority: number; origin: Record<string, unknown>; destination: Record<string, unknown>; routeServiceable: boolean }> = [];
         for (const account of accountRows) {
           const label = `${providerLabel(account.provider)} · ${account.account_name}`;
@@ -2699,6 +2699,22 @@ const worker = {
               : [await safeProviderRequest(env, account.provider, "serviceability", { origin_pincode: origin, destination_pincode: destination, provider_account_id: account.id }, id, serviceabilityClientId), null];
             const originRecord = originResult as Record<string, unknown>;
             const destinationRecord = (destinationResult ?? originResult) as Record<string, unknown>;
+            const datasetFallback = account.provider === "delhivery"
+              && [originResult, destinationResult].some((item) => item?.status === "failed")
+              ? await Promise.all([pricingPincode(env, origin), pricingPincode(env, destination)])
+              : [null, null] as const;
+            if (account.provider === "delhivery" && datasetFallback[0] && datasetFallback[1]) {
+              const datasetOrigin = datasetFallback[0];
+              const datasetDestination = datasetFallback[1];
+              const datasetOriginRecord = { status: "accepted", pickup: true, serviceable: true, source: "delhivery_b2b_pincode_dataset" };
+              const datasetDestinationRecord = { status: "accepted", serviceable: true, source: "delhivery_b2b_pincode_dataset" };
+              serviceabilityRows.push(
+                { pincode: origin, provider: label, status: "Available", oda: Boolean(datasetOrigin.oda), account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), source: "Delhivery pincode dataset" },
+                { pincode: destination, provider: label, status: "Available", oda: Boolean(datasetDestination.oda), account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), source: "Delhivery pincode dataset" },
+              );
+              routeResults.push({ provider: account.provider, accountId: account.id, accountName: account.account_name, confidenceScore: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), origin: datasetOriginRecord, destination: datasetDestinationRecord, routeServiceable: true });
+              continue;
+            }
             const originServiceable = account.provider === "delhivery"
               ? originResult.status === "accepted" && Boolean((originResult as { pickup?: boolean; serviceable?: boolean }).pickup ?? (originResult as { serviceable?: boolean }).serviceable)
               : originResult.status === "accepted" && Boolean((originResult as { serviceable?: boolean }).serviceable);
