@@ -1,9 +1,10 @@
 import { calculatePssRate, defaultRateRows, type ChargeRule, type PricingAccount } from "./pricing-engine";
 
-export interface Env extends Omit<Cloudflare.Env, "SUPABASE_PUBLISHABLE_KEY" | "API_KEY_PEPPER" | "DELHIVERY_API_TOKEN" | "DELHIVERY_WEBHOOK_SECRET" | "EKART_API_KEY" | "EKART_API_SECRET" | "EKART_WEBHOOK_SECRET" | "EKART_ENABLE_PROVIDER_CALLS" | "TRACKON_API_BASE_URL" | "TRACKON_CREDENTIALS_JSON" | "TRACKON_WEBHOOK_SECRET" | "TRACKON_BOOKING_URL" | "TRACKON_TRACKING_URL" | "TRACKON_LABEL_URL" | "TRACKON_ENABLE_SHIPMENT_CREATION" | "TRACKON_ENABLE_PICKUP_CREATION" | "XPRESSBEES_API_BASE_URL" | "XPRESSBEES_CREDENTIALS_JSON" | "XPRESSBEES_ENABLE_SHIPMENT_CREATION" | "XPRESSBEES_ENABLE_PICKUP_CREATION" | "RIVIGO_API_BASE_URL" | "RIVIGO_AUTH_URL" | "RIVIGO_TRACKING_URL" | "RIVIGO_CREDENTIALS_JSON" | "RIVIGO_ENABLE_PROVIDER_CALLS"> {
+export interface Env extends Omit<Cloudflare.Env, "SUPABASE_PUBLISHABLE_KEY" | "API_KEY_PEPPER" | "DELHIVERY_API_TOKEN" | "DELHIVERY_B2B_API_BASE_URL" | "DELHIVERY_WEBHOOK_SECRET" | "EKART_API_KEY" | "EKART_API_SECRET" | "EKART_WEBHOOK_SECRET" | "EKART_ENABLE_PROVIDER_CALLS" | "TRACKON_API_BASE_URL" | "TRACKON_CREDENTIALS_JSON" | "TRACKON_WEBHOOK_SECRET" | "TRACKON_BOOKING_URL" | "TRACKON_TRACKING_URL" | "TRACKON_LABEL_URL" | "TRACKON_ENABLE_SHIPMENT_CREATION" | "TRACKON_ENABLE_PICKUP_CREATION" | "XPRESSBEES_API_BASE_URL" | "XPRESSBEES_CREDENTIALS_JSON" | "XPRESSBEES_ENABLE_SHIPMENT_CREATION" | "XPRESSBEES_ENABLE_PICKUP_CREATION" | "RIVIGO_API_BASE_URL" | "RIVIGO_AUTH_URL" | "RIVIGO_TRACKING_URL" | "RIVIGO_CREDENTIALS_JSON" | "RIVIGO_ENABLE_PROVIDER_CALLS"> {
   SUPABASE_PUBLISHABLE_KEY: string;
   API_KEY_PEPPER?: string;
   DELHIVERY_API_TOKEN?: string;
+  DELHIVERY_B2B_API_BASE_URL?: string;
   DELHIVERY_WEBHOOK_SECRET?: string;
   EKART_API_KEY?: string;
   EKART_API_SECRET?: string;
@@ -18,6 +19,7 @@ export interface Env extends Omit<Cloudflare.Env, "SUPABASE_PUBLISHABLE_KEY" | "
   TRACKON_ENABLE_SHIPMENT_CREATION?: string;
   TRACKON_ENABLE_PICKUP_CREATION?: string;
   XPRESSBEES_API_BASE_URL?: string;
+  XPRESSBEES_SERVICEABILITY_URL?: string;
   XPRESSBEES_CREDENTIALS_JSON?: string;
   XPRESSBEES_ENABLE_SHIPMENT_CREATION?: string;
   XPRESSBEES_ENABLE_PICKUP_CREATION?: string;
@@ -470,10 +472,83 @@ async function createShipmentPricingQuote(env: Env, clientId: string, payload: R
     } catch { throw new Error("RTO_SOURCE_INVALID"); }
     if (forwardRatePerKg === undefined) throw new Error("RTO_SOURCE_INVALID");
   }
-  const result = calculatePssRate({ account, originCity, destinationCity, originState, destinationState, actualWeightKg, volumetricWeightKg, invoiceValue, rto, forwardRatePerKg, forwardOriginZoneOverride: rtoSource?.origin_zone, forwardDestinationZoneOverride: rtoSource?.destination_zone, minimumWeightKg: Number(version.minimum_weight_kg ?? 20), gstPercent: Number(version.gst_percent ?? 18), versionId: version.id, oda: false, opa: false, rateMatrix: Object.fromEntries(matrixRows.results.map((row) => [`${row.origin_zone}->${row.destination_zone}`, Number(row.rate_per_kg)])), chargeRules: rules.results.map((rule) => ({ code: rule.code, label: rule.label, kind: rule.calculation_type, value: Number(rule.value), basis: rule.basis, minimum: rule.minimum_value === null ? undefined : Number(rule.minimum_value), maximum: rule.maximum_value === null ? undefined : Number(rule.maximum_value), enabled: Boolean(rule.enabled), marker: rule.marker ?? undefined, condition: rule.condition ?? undefined, displayOrder: Number(rule.display_order ?? 0) })) });
+  const oda = Boolean(originPin?.oda || destinationPin?.oda);
+  const result = calculatePssRate({ account, originCity, destinationCity, originState, destinationState, actualWeightKg, volumetricWeightKg, invoiceValue, rto, forwardRatePerKg, forwardOriginZoneOverride: rtoSource?.origin_zone, forwardDestinationZoneOverride: rtoSource?.destination_zone, minimumWeightKg: Number(version.minimum_weight_kg ?? 20), gstPercent: Number(version.gst_percent ?? 18), versionId: version.id, oda, opa: false, rateMatrix: Object.fromEntries(matrixRows.results.map((row) => [`${row.origin_zone}->${row.destination_zone}`, Number(row.rate_per_kg)])), chargeRules: rules.results.map((rule) => ({ code: rule.code, label: rule.label, kind: rule.calculation_type, value: Number(rule.value), basis: rule.basis, minimum: rule.minimum_value === null ? undefined : Number(rule.minimum_value), maximum: rule.maximum_value === null ? undefined : Number(rule.maximum_value), enabled: Boolean(rule.enabled), marker: rule.marker ?? undefined, condition: rule.condition ?? undefined, displayOrder: Number(rule.display_order ?? 0) })) });
   const quoteId = crypto.randomUUID(); const breakdown = JSON.stringify(result);
   await env.DB.prepare("INSERT INTO pricing_quotes (id, client_id, version_id, account_scope, origin_zone, destination_zone, chargeable_weight_kg, client_breakdown_json, expires_at, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+15 minutes'), ?)").bind(quoteId, clientId, version.id, account, result.originZone, result.destinationZone, result.chargeableWeightKg, breakdown, createdByUserId).run();
   return { id: quoteId, version_id: version.id, account_scope: account, origin_zone: result.originZone, destination_zone: result.destinationZone, chargeable_weight_kg: result.chargeableWeightKg, client_breakdown_json: breakdown };
+}
+
+type DelhiveryB2bCredential = { username?: string; password?: string; token?: string; jwt?: string };
+
+function delhiveryB2bCredential(value: string | undefined): DelhiveryB2bCredential | null {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (parsed && typeof parsed === "object") return {
+      username: typeof parsed.username === "string" ? parsed.username.trim() : undefined,
+      password: typeof parsed.password === "string" ? parsed.password : undefined,
+      token: typeof parsed.token === "string" ? parsed.token.trim() : undefined,
+      jwt: typeof parsed.jwt === "string" ? parsed.jwt.trim() : undefined,
+    };
+  } catch { /* A raw value may be a previously issued bearer token. */ }
+  return { token: raw };
+}
+
+function delhiveryAccountIsB2b(accountName: string) {
+  return /(^|[^a-z])b2b(c)?([^a-z]|$)/i.test(accountName) || /^PSS\s+B2B$/i.test(accountName.trim());
+}
+
+async function delhiveryB2bBearer(env: Env, credentialValue: string | undefined, requestIdValue: string, timeoutMs: number) {
+  const credential = delhiveryB2bCredential(credentialValue);
+  if (!credential) return null;
+  if (credential.jwt || credential.token) return credential.jwt ?? credential.token ?? null;
+  if (!credential.username || !credential.password) return null;
+  const base = String(env.DELHIVERY_B2B_API_BASE_URL ?? "https://btob.api.delhivery.com").replace(/\/$/, "");
+  try {
+    const response = await providerFetch(`${base}/ums/login/`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-request-id": requestIdValue },
+      body: JSON.stringify({ username: credential.username, password: credential.password }),
+    }, timeoutMs);
+    if (!response.ok) return null;
+    const body = JSON.parse(await providerResponseText(response, timeoutMs)) as Record<string, unknown>;
+    return findProviderReference(body, new Set(["jwt", "token", "access_token", "bearer_token"]));
+  } catch { return null; }
+}
+
+function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>) {
+  const origin = delhiveryAddress(payload.origin_address, String(payload.origin ?? "PSS Logistics"));
+  const destination = delhiveryAddress(payload.destination_address, String(payload.consignee ?? "Consignee"));
+  const pickupLocation = String(payload.delhivery_pickup_location ?? payload.pickup_location ?? payload.delhivery_client_name ?? env.DELHIVERY_DEFAULT_PICKUP_LOCATION ?? "").trim();
+  const orderId = String(payload.order_id ?? payload.shipment_id ?? crypto.randomUUID()).trim().slice(0, 80);
+  const invoiceNumber = String(payload.invoice_reference ?? payload.invoice_number ?? "").trim();
+  const declaredValue = Number(payload.declared_value ?? 0);
+  const weightKg = Number(payload.total_weight_kg ?? 0);
+  const pieces = Number(payload.pieces ?? 1);
+  const length = Number(payload.length ?? payload.shipment_length ?? 0);
+  const width = Number(payload.width ?? payload.shipment_width ?? 0);
+  const height = Number(payload.height ?? payload.shipment_height ?? 0);
+  if (!origin || !destination || !pickupLocation || !invoiceNumber || !Number.isFinite(declaredValue) || declaredValue < 0 || !Number.isFinite(weightKg) || weightKg <= 0 || !Number.isInteger(pieces) || pieces < 1) return null;
+  const paymentMode = String(payload.payment_mode ?? "prepaid").trim().toLowerCase() === "cod" ? "COD" : "Prepaid";
+  const address = (value: ReturnType<typeof delhiveryAddress>) => value ? { name: value.name, address: value.line, city: value.city, state: value.state, pincode: value.pincode, phone: value.phone, country: value.country } : null;
+  return {
+    pickup_location: pickupLocation,
+    drop_location: address(destination),
+    pickup_address: address(origin),
+    master_order: [{
+      order_id: orderId,
+      invoice_number: invoiceNumber,
+      invoice_amount: declaredValue,
+      payment_mode: paymentMode,
+      product_description: String(payload.description ?? "Shipment").slice(0, 500),
+      quantity: pieces,
+      weight: weightKg,
+      dimensions: length > 0 && width > 0 && height > 0 ? { length, width, height } : undefined,
+      ewaybill_number: payload.e_waybill_no ?? payload.ewaybill_number ?? undefined,
+    }],
+  };
 }
 
 function delhiveryCreatePayload(env: Env, payload: Record<string, unknown>) {
@@ -683,8 +758,55 @@ async function xpressbeesToken(env: Env, credential: string, requestIdValue: str
   } catch { return null; } finally { clearTimeout(timeout); }
 }
 
-function xpressbeesTrackingUrl(endpoint: string) { return `${endpoint.replace(/\/$/, "")}/shipments/track_shipment`; }
+function xpressbeesTrackingUrl(endpoint: string) { return `${endpoint.replace(/\/$/, "")}/franchise/shipments/track_shipment`; }
 function xpressbeesTrackingBody(trackingNumber: string) { return JSON.stringify({ awb_number: trackingNumber }); }
+function xpressbeesServiceabilityBody(payload: Record<string, unknown>) {
+  const cod = Boolean(payload.cod ?? String(payload.payment_mode ?? "").toLowerCase() === "cod");
+  return JSON.stringify({
+    Origin: String(payload.origin_pincode ?? payload.origin ?? ""),
+    Destination: String(payload.destination_pincode ?? payload.destination ?? ""),
+    Cod: cod ? "cod" : "prepaid",
+    "Order amount": Number(payload.order_amount ?? payload.declared_value ?? payload.invoice_value ?? 0),
+  });
+}
+
+function xpressbeesBookingPayload(payload: Record<string, unknown>) {
+  const origin = payload.origin_address && typeof payload.origin_address === "object" ? payload.origin_address as Record<string, unknown> : {};
+  const destination = payload.destination_address && typeof payload.destination_address === "object" ? payload.destination_address as Record<string, unknown> : {};
+  const paymentMethod = String(payload.payment_mode ?? payload.payment_method ?? "prepaid").trim().toUpperCase() === "COD" ? "COD" : "prepaid";
+  const declaredValue = Number(payload.declared_value ?? payload.invoice_value ?? 0);
+  const pieces = Math.max(1, Number(payload.pieces ?? 1));
+  const dimensions = Array.isArray(payload.dimensions) && payload.dimensions.length ? payload.dimensions[0] as Record<string, unknown> : {};
+  const date = new Date().toISOString().slice(0, 10);
+  return {
+    id: String(payload.order_id ?? payload.shipment_id ?? crypto.randomUUID()).slice(0, 20),
+    payment_method: paymentMethod,
+    consigner_name: String(origin.name ?? payload.consignor ?? "PSS Logistics"),
+    consigner_phone: String(origin.phone ?? payload.consignor_phone ?? ""),
+    consigner_pincode: String(origin.pincode ?? origin.pin_code ?? payload.origin_pincode ?? ""),
+    consigner_city: String(origin.city ?? ""),
+    consigner_state: String(origin.state ?? ""),
+    consigner_address: String(origin.line ?? origin.address_line1 ?? origin.address ?? payload.origin ?? ""),
+    consignee_name: String(destination.name ?? payload.consignee ?? "Consignee"),
+    consignee_phone: String(destination.phone ?? payload.consignee_phone ?? ""),
+    consignee_pincode: String(destination.pincode ?? destination.pin_code ?? payload.destination_pincode ?? ""),
+    consignee_city: String(destination.city ?? ""),
+    consignee_state: String(destination.state ?? ""),
+    consignee_address: String(destination.line ?? destination.address_line1 ?? destination.address ?? payload.destination ?? ""),
+    products: [{ product_name: String(payload.description ?? "Shipment").slice(0, 40), product_qty: String(pieces), product_price: String(declaredValue) }],
+    invoice: [{ invoice_number: String(payload.invoice_number ?? `PSS-${payload.shipment_id ?? "SHIPMENT"}`).slice(0, 40), invoice_date: date }],
+    weight: String(Math.max(1, Math.round(Number(payload.total_weight_kg ?? payload.weight ?? 0) * 1000))),
+    length: String(Number(dimensions.length ?? payload.length ?? 1)),
+    breadth: String(Number(dimensions.width ?? dimensions.breadth ?? payload.breadth ?? 1)),
+    height: String(Number(dimensions.height ?? payload.height ?? 1)),
+    courier_id: String(payload.xpressbees_courier_id ?? payload.courier_id ?? "01"),
+    pickup_location: String(payload.pickup_location ?? "franchise"),
+    shipping_charges: String(Number(payload.shipping_charges ?? 0)),
+    cod_charges: String(paymentMethod === "COD" ? Number(payload.cod_charges ?? 0) : 0),
+    discount: String(Number(payload.discount ?? 0)),
+    order_amount: String(declaredValue),
+  };
+}
 
 type RivigoCredentials = { appUuid: string; appSecret: string; clientCode?: string };
 
@@ -846,10 +968,10 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (provider === "trackon" && !new Set(["tracking", "shipments", "labels"]).has(operation)) return { enabled: false, status: "unsupported" as const, reason: "Trackon operation is not supported" };
   if (provider === "xpressbees" && operation === "shipments" && String(env.XPRESSBEES_ENABLE_SHIPMENT_CREATION) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "XpressBees shipment creation is safety-disabled until live billing approval" };
   if (provider === "xpressbees" && operation === "pickups" && String(env.XPRESSBEES_ENABLE_PICKUP_CREATION) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "XpressBees pickup creation is safety-disabled until live operations approval" };
-  if (provider === "xpressbees" && !new Set(["tracking", "shipments", "pickups", "quotes"]).has(operation)) return { enabled: false, status: "unsupported" as const, reason: "XpressBees operation is not enabled" };
+  if (provider === "xpressbees" && operation === "serviceability" && !env.XPRESSBEES_SERVICEABILITY_URL) return { enabled: false, status: "not_configured" as const, reason: "XpressBees serviceability endpoint is not configured" };
+  if (provider === "xpressbees" && !new Set(["tracking", "shipments", "pickups", "quotes", "serviceability"]).has(operation)) return { enabled: false, status: "unsupported" as const, reason: "XpressBees operation is not enabled" };
   if (provider === "rivigo" && String((env as unknown as Record<string, unknown>).RIVIGO_ENABLE_PROVIDER_CALLS) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "Rivigo provider calls are disabled until the developer-portal app and go-live approval are verified" };
   if (provider === "rivigo" && !new Set(["tracking", "shipments", "serviceability", "updates", "cancellations"]).has(operation)) return { enabled: false, status: "unsupported" as const, reason: "Rivigo operation is not supported" };
-  const base = provider === "delhivery" ? env.DELHIVERY_API_BASE_URL : provider === "ekart" ? env.EKART_API_BASE_URL : provider === "trackon" ? env.TRACKON_API_BASE_URL : provider === "xpressbees" ? env.XPRESSBEES_API_BASE_URL : env.RIVIGO_API_BASE_URL;
   const requestedAccountId = providerAccountId(payload);
   // Delhivery has multiple registered account names. Never fall back to the
   // first row in creation order: that can route a shipment through the wrong
@@ -898,6 +1020,12 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
           id: string; provider: CourierProvider; account_name: string; credential_secret_name: string;
           client_enabled: number; priority: number; confidence_score: number; rate_card_id: string | null;
         }>();
+  const resolvedDelhiveryB2b = provider === "delhivery" && Boolean(account && delhiveryAccountIsB2b(account.account_name));
+  const defaultAccountIsB2b = provider === "delhivery" && delhiveryAccountIsB2b(defaultDelhiveryAccountName);
+  const useDelhiveryB2b = resolvedDelhiveryB2b || defaultAccountIsB2b;
+  const base = provider === "delhivery"
+    ? useDelhiveryB2b ? String(env.DELHIVERY_B2B_API_BASE_URL ?? "https://btob.api.delhivery.com") : env.DELHIVERY_API_BASE_URL
+    : provider === "ekart" ? env.EKART_API_BASE_URL : provider === "trackon" ? env.TRACKON_API_BASE_URL : provider === "xpressbees" ? env.XPRESSBEES_API_BASE_URL : env.RIVIGO_API_BASE_URL;
   if (clientId && requestedAccountId && !account) return { enabled: false, status: "disabled" as const, reason: "The selected courier account is not enabled for this client" };
   if (provider === "delhivery" && !account) return { enabled: false, status: "not_configured" as const, reason: defaultDelhiveryAccountName ? `The configured Delhivery account '${defaultDelhiveryAccountName}' is not active` : "A Delhivery account must be selected before booking" };
   const secretBag = env as unknown as Record<string, unknown>;
@@ -907,12 +1035,14 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   const rivigo = provider === "rivigo" ? rivigoCredentials(env, credential) : null;
   if (!base || (provider === "trackon" ? !trackon : provider === "rivigo" ? !rivigo : !credential)) return { enabled: false, status: "not_configured" as const };
   const providerTimeoutMs = Math.min(timeoutMsOverride ?? 10000, 10000);
+  const delhiveryB2bToken = useDelhiveryB2b ? await delhiveryB2bBearer(env, credential, requestIdValue, providerTimeoutMs) : null;
+  if (provider === "delhivery" && useDelhiveryB2b && !delhiveryB2bToken) return { enabled: true, status: "failed" as const, error: "Delhivery B2B authentication failed" };
   const xpressToken = provider === "xpressbees" ? await xpressbeesToken(env, credential!, requestIdValue, providerTimeoutMs) : null;
   if (provider === "xpressbees" && !xpressToken) return { enabled: true, status: "failed" as const, error: "XpressBees authentication failed" };
   const rivigoToken = provider === "rivigo" ? await rivigoAccessToken(env, rivigo!, requestIdValue, providerTimeoutMs) : null;
   if (provider === "rivigo" && !rivigoToken) return { enabled: true, status: "failed" as const, error: "Rivigo authentication failed" };
   const authorization = provider === "delhivery"
-    ? `Token ${credential}`
+    ? useDelhiveryB2b ? `Bearer ${delhiveryB2bToken}` : `Token ${credential}`
     : provider === "ekart"
       ? credential!.trim().startsWith("Basic ") ? credential!.trim() : `Basic ${credential!.trim()}`
       : undefined;
@@ -924,7 +1054,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   const ekartCreate = provider === "ekart" && operation === "shipments" ? ekartCreatePayload(payload) : null;
   if (provider === "ekart" && operation === "shipments" && !ekartCreate) return { enabled: false, status: "invalid_request" as const, reason: "Origin and destination addresses require valid six-digit pincodes and ten-digit phone numbers" };
   const providerPayload = account?.provider === "delhivery" ? { ...payload, delhivery_client_name: account.account_name } : payload;
-  const delhiveryCreate = provider === "delhivery" && operation === "shipments" ? delhiveryCreatePayload(env, providerPayload) : null;
+  const delhiveryCreate = provider === "delhivery" && operation === "shipments" ? useDelhiveryB2b ? delhiveryB2bManifestPayload(env, providerPayload) : delhiveryCreatePayload(env, providerPayload) : null;
   if (provider === "delhivery" && operation === "shipments" && !delhiveryCreate) return { enabled: false, status: "invalid_request" as const, reason: "Delhivery requires valid origin/destination addresses, a registered client name, and a pickup location" };
   const delhiveryPickup = provider === "delhivery" && operation === "pickups" ? delhiveryPickupPayload(env, providerPayload) : null;
   if (provider === "delhivery" && operation === "pickups" && !delhiveryPickup) return { enabled: false, status: "invalid_request" as const, reason: "Delhivery requires a valid pickup date and registered pickup location" };
@@ -940,9 +1070,11 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     : provider === "trackon" && operation === "labels"
       ? trackonLabelUrl(trackonUrl!, trackingNumber, trackon!)
       : provider === "delhivery" && operation === "tracking"
-        ? `${base.replace(/\/$/, "")}/packages/json/?waybill=${encodeURIComponent(trackingNumber)}&ref_ids=${encodeURIComponent(String(payload.order_id ?? ""))}`
+        ? useDelhiveryB2b
+          ? `${base.replace(/\/$/, "")}/v2/track/${encodeURIComponent(trackingNumber)}`
+          : `${base.replace(/\/$/, "")}/packages/json/?waybill=${encodeURIComponent(trackingNumber)}&ref_ids=${encodeURIComponent(String(payload.order_id ?? ""))}`
     : provider === "delhivery" && operation === "shipments"
-      ? `${delhiveryOrigin}/api/cmu/create.json`
+      ? useDelhiveryB2b ? `${base.replace(/\/$/, "")}/v2/manifest` : `${delhiveryOrigin}/api/cmu/create.json`
       : provider === "delhivery" && operation === "pickups"
         ? `${delhiveryOrigin}/fm/request/new/`
         : provider === "delhivery" && operation === "serviceability"
@@ -951,12 +1083,14 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       ? `${base.replace(/\/$/, "")}/v2/shipments/${operation === "shipments" ? "create" : "track"}`
       : provider === "xpressbees" && operation === "tracking"
         ? xpressbeesTrackingUrl(base)
+      : provider === "xpressbees" && operation === "serviceability"
+        ? env.XPRESSBEES_SERVICEABILITY_URL!
       : provider === "xpressbees" && operation === "quotes"
-        ? `${base.replace(/\/$/, "")}/shipments/calculate_pricing`
+        ? `${base.replace(/\/$/, "")}/franchise/shipments/calculate_pricing`
       : provider === "xpressbees" && operation === "shipments"
-        ? `${base.replace(/\/$/, "")}/shipments`
+        ? `${base.replace(/\/$/, "")}/franchise/shipments`
       : provider === "xpressbees" && operation === "pickups"
-        ? `${base.replace(/\/$/, "")}/shipments/pickup`
+        ? `${base.replace(/\/$/, "")}/franchise/shipments/pickup`
       : provider === "rivigo" && operation === "tracking"
         ? `${base.replace(/\/$/, "")}/operations/tracking`
       : provider === "rivigo" && operation === "shipments"
@@ -969,14 +1103,16 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         ? `${base.replace(/\/$/, "")}/operations/booking/cancel?bookingId=${encodeURIComponent(String(payload.booking_id ?? payload.provider_reference ?? ""))}`
       : trackonUrl!;
   const requestBody = provider === "delhivery" && operation === "shipments"
-    ? `format=json&data=${encodeURIComponent(JSON.stringify(delhiveryCreate))}`
+    ? useDelhiveryB2b ? JSON.stringify(delhiveryCreate) : `format=json&data=${encodeURIComponent(JSON.stringify(delhiveryCreate))}`
     : provider === "delhivery" && operation === "pickups"
       ? JSON.stringify(delhiveryPickup)
       : provider === "ekart" && operation === "shipments"
         ? JSON.stringify(ekartCreate)
       : provider === "ekart" ? JSON.stringify({ tracking_id: trackingNumber })
         : provider === "xpressbees" && operation === "tracking" ? xpressbeesTrackingBody(trackingNumber)
+        : provider === "xpressbees" && operation === "serviceability" ? xpressbeesServiceabilityBody(payload)
         : provider === "xpressbees" && operation === "quotes" ? JSON.stringify({ order_type_user: "B2C", origin: String(payload.origin_pincode ?? payload.origin ?? ""), destination: String(payload.destination_pincode ?? payload.destination ?? ""), weight: Number(payload.weight ?? 0), length: Number(payload.length ?? 0), height: Number(payload.height ?? 0), breadth: Number(payload.breadth ?? payload.width ?? 0), cod_amount: Number(payload.cod_amount ?? 0), cod: Boolean(payload.cod) })
+        : provider === "xpressbees" && operation === "shipments" ? JSON.stringify(xpressbeesBookingPayload(payload))
         : provider === "xpressbees" ? JSON.stringify(payload)
         : provider === "rivigo" && operation === "tracking" ? JSON.stringify({ entityList: [trackingNumber] })
         : provider === "rivigo" && operation === "shipments" ? JSON.stringify(rivigoCreate)
@@ -986,7 +1122,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         : operation === "tracking" ? JSON.stringify({ Appkey: trackon!.appKey, userId: trackon!.userId, password: trackon!.password, AWBNo: trackingNumber })
           : operation === "shipments" ? JSON.stringify(trackonPayload(payload, trackon!))
             : JSON.stringify({ Appkey: trackon!.appKey, userId: trackon!.userId, password: trackon!.password, AWBNo: trackingNumber });
-  if (provider === "delhivery" && operation === "shipments") headers["content-type"] = "application/x-www-form-urlencoded";
+  if (provider === "delhivery" && operation === "shipments" && !useDelhiveryB2b) headers["content-type"] = "application/x-www-form-urlencoded";
   let response: Response | null = null; let lastError = "provider_request_failed";
   const readOnlyProviderCall = operation === "tracking" || operation === "serviceability";
   const maxAttempts = readOnlyProviderCall ? 1 : 3;
@@ -1001,7 +1137,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       // XpressBees documents tracking as POST even though it is a read-only
       // lookup. Keep the generic GET behavior for Delhivery/Trackon tracking,
       // but send the XpressBees AWB body with POST to avoid provider HTTP 405.
-      const isGet = (operation === "tracking" && provider !== "xpressbees" && provider !== "rivigo") || operation === "serviceability" || (provider === "trackon" && operation === "labels");
+      const isGet = (operation === "tracking" && provider !== "xpressbees" && provider !== "rivigo") || (operation === "serviceability" && provider !== "xpressbees") || (provider === "trackon" && operation === "labels");
       const method = provider === "rivigo" && operation === "cancellations" ? "DELETE" : provider === "rivigo" && operation === "updates" ? "PUT" : isGet ? "GET" : "POST";
       response = await providerFetch(url, { method, headers, body: isGet ? undefined : requestBody }, attemptTimeoutMs);
       // Some XpressBees accounts expose the tracking route as GET even though
@@ -1056,8 +1192,9 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   let parsedProviderBody: unknown = null;
   try { parsedProviderBody = JSON.parse(responseBody); } catch { parsedProviderBody = null; }
   if (response.ok && provider === "delhivery" && operation === "shipments" && clientId && typeof payload.shipment_id === "string") {
-    const createdReference = findProviderReference(parsedProviderBody, new Set(["waybill", "awb", "tracking_number", "trackingid", "shipment_id"]));
-    if (createdReference) await env.DB.prepare("UPDATE shipments SET tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(provider_reference, ?), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(createdReference, createdReference, payload.shipment_id, clientId).run();
+    const createdReference = findProviderReference(parsedProviderBody, useDelhiveryB2b ? new Set(["lrnum", "lr_number", "lr", "lrn", "waybill", "awb"]) : new Set(["waybill", "awb", "tracking_number", "trackingid", "shipment_id"]));
+    const providerReference = useDelhiveryB2b ? findProviderReference(parsedProviderBody, new Set(["master_awb", "master_awb_number", "masterawb", "master_waybill", "awb"])) ?? createdReference : createdReference;
+    if (createdReference) await env.DB.prepare("UPDATE shipments SET tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(provider_reference, ?), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(createdReference, providerReference, payload.shipment_id, clientId).run();
   }
   if (response.ok && provider === "trackon" && operation === "shipments" && clientId && typeof payload.shipment_id === "string") {
     const createdReference = findProviderReference(parsedProviderBody, new Set(["docketno", "docket_no", "awbno", "awb"])) ?? responseBody.match(/Docket\s*No\.\s*:\s*([A-Za-z0-9]+)/i)?.[1] ?? null;
@@ -1084,6 +1221,12 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     const fromServiceable = Object.keys(from).length > 0 && Boolean(from.deliveryServiceability ?? from.pickupServiceability);
     const toServiceable = Object.keys(to).length > 0 && Boolean(to.deliveryServiceability ?? to.pickupServiceability);
     return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable: fromServiceable && toServiceable, cod: Boolean(to.codDodAllowed), to_pay: Boolean(to.toPayAllowed), tat_days: Number(body.tat ?? 0) || null, origin_oda: providerOdaFlag(from), destination_oda: providerOdaFlag(to) };
+  }
+  if (response.ok && provider === "xpressbees" && operation === "serviceability") {
+    const body = parsedProviderBody && typeof parsedProviderBody === "object" ? parsedProviderBody as Record<string, unknown> : {};
+    const options = Array.isArray(body.message) ? body.message : Array.isArray(body.data) ? body.data : [];
+    const serviceable = body.status === true && options.length > 0;
+    return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable, prepaid: serviceable, cod: serviceable, pickup: serviceable, oda: null };
   }
   if (response.ok && provider === "ekart" && operation === "shipments" && clientId && typeof payload.shipment_id === "string" && ekartCreate) {
     let providerReference: string | null = null;
@@ -1309,12 +1452,19 @@ const worker = {
       if (await publicRateLimited(env, request, "/public/track")) return error("RATE_LIMITED", "Too many tracking requests", 429, id, withCors(request, env));
       const reference = url.searchParams.get("reference")?.trim();
       if (!reference || reference.length > 128) return error("VALIDATION_ERROR", "A tracking reference is required", 400, id, withCors(request, env));
-      type PublicShipment = { id: string; tracking_number: string | null; status: string; edd: string | null; delivered_at: string | null; updated_at: string | null };
+      type PublicShipment = { id: string; tracking_number: string | null; provider_reference: string | null; provider: string | null; provider_account_id: string | null; status: string; edd: string | null; delivered_at: string | null; updated_at: string | null };
       // Resolve PSS, courier, and provider references in one indexed read so
       // public tracking does not pay for up to three sequential D1 round trips.
-      const shipment = await env.DB.prepare("SELECT id, tracking_number, status, edd, delivered_at, updated_at FROM shipments WHERE id = ? OR tracking_number = ? OR provider_reference = ? LIMIT 1").bind(reference, reference, reference).first<PublicShipment>();
+      const shipment = await env.DB.prepare("SELECT id, tracking_number, provider_reference, provider, provider_account_id, status, edd, delivered_at, updated_at FROM shipments WHERE id = ? OR tracking_number = ? OR provider_reference = ? LIMIT 1").bind(reference, reference, reference).first<PublicShipment>();
       if (shipment) {
         const events = await env.DB.prepare("SELECT status, location, description, event_time FROM tracking_events WHERE shipment_id = ? ORDER BY event_time ASC LIMIT 20").bind(shipment.id).all();
+        if (shipment.provider === "delhivery" && shipment.provider_account_id) {
+          const providerResult = await safeProviderRequest(env, "delhivery", "tracking", { shipment_id: shipment.id, tracking_number: shipment.tracking_number, provider_reference: shipment.provider_reference, provider_account_id: shipment.provider_account_id }, id, undefined, undefined, 5000);
+          const tracking = (providerResult as { tracking?: { status?: string; location?: string; description?: string; event_time?: string | null } }).tracking;
+          if (providerResult.status === "accepted" && tracking?.status) {
+            return json({ ok: true, data: { tracking_number: shipment.tracking_number ?? shipment.provider_reference, status: tracking.status, edd: shipment.edd, delivered_at: tracking.status === "delivered" ? tracking.event_time ?? null : shipment.delivered_at, updated_at: tracking.event_time ?? shipment.updated_at, events: [{ status: tracking.status, location: tracking.location ?? "", description: tracking.description ?? "", event_time: tracking.event_time ?? null }] }, provider: "delhivery", provider_status: providerResult.status, request_id: id }, 200, withCors(request, env, { "cache-control": "private, no-store" }));
+          }
+        }
         // This is the intentionally restricted public projection (no client,
         // address, consignee, document, or billing data), so a short edge
         // cache safely removes repeat D1 reads without making operational
@@ -1405,21 +1555,25 @@ const worker = {
         return json({ ok: true, data: { pincode, city: location.facility_city, state: location.facility_state, oda: Boolean(location.oda) }, request_id: id }, 200, headers);
       }
       // Fujiyama receives a stable PSS contract. It never receives Delhivery
-      // credentials or calls Delhivery directly. Tracking accepts an AWB
-      // before a PSS shipment exists; booking delegates to the canonical
-      // shipment path below so pricing, wallet, idempotency, audit, and
-      // provider-account selection remain identical to panel bookings.
+      // credentials or calls Delhivery directly. Tracking is deliberately
+      // database-only: the endpoint remains usable before the first shipment
+      // exists and returns a safe empty result instead of invoking a courier.
+      // Booking delegates to the canonical shipment path below so pricing,
+      // wallet, idempotency, audit, and provider-account selection remain
+      // identical to panel bookings.
       if (route === "/fujiyama/tracking" && request.method === "GET") {
         if (!hasScope(auth, "tracking.read")) return error("FORBIDDEN", "Tracking read scope required", 403, id, headers);
         const awb = url.searchParams.get("awb")?.trim() || url.searchParams.get("tracking_number")?.trim();
         const trackingType = url.searchParams.get("trackingType")?.trim() || "VENDOR-AWB";
         if (!awb || awb.length > 128) return error("VALIDATION_ERROR", "A valid AWB is required", 400, id, headers);
         if (trackingType !== "VENDOR-AWB") return error("VALIDATION_ERROR", "trackingType must be VENDOR-AWB", 400, id, headers);
-        const providerAccountId = url.searchParams.get("provider_account_id")?.trim() || undefined;
-        const result = await safeProviderRequest(env, "delhivery", "tracking", { tracking_number: awb, ...(providerAccountId ? { provider_account_id: providerAccountId } : {}) }, id, auth.clientId, undefined, 10000);
-        const tracking = (result as { tracking?: { status?: string; location?: string; description?: string; event_time?: string | null } }).tracking;
-        if (result.status !== "accepted" || !tracking?.status) return error("TRACKING_UNAVAILABLE", "The shipment could not be resolved by Delhivery", 502, id, headers);
-        return json({ ok: true, data: { tracking_type: trackingType, awb, status: tracking.status, location: tracking.location ?? "", description: tracking.description ?? "", event_time: tracking.event_time ?? null, provider: "delhivery" }, request_id: id }, 200, headers);
+        const shipment = auth.clientId
+          ? await env.DB.prepare("SELECT id, tracking_number, provider_reference, status, provider, destination, edd, delivered_at FROM shipments WHERE client_id = ? AND (tracking_number = ? OR provider_reference = ?) ORDER BY updated_at DESC LIMIT 1").bind(auth.clientId, awb, awb).first<{ id: string; tracking_number: string | null; provider_reference: string | null; status: string | null; provider: string | null; destination: string | null; edd: string | null; delivered_at: string | null }>()
+          : null;
+        if (!shipment) return json({ ok: true, data: { tracking_type: trackingType, awb, found: false, status: "not_found", location: "", description: "No shipment found in the PSS database", event_time: null, provider: "delhivery", events: [] }, request_id: id }, 200, headers);
+        const events = await env.DB.prepare("SELECT status, location, description, event_time FROM tracking_events WHERE shipment_id = ? ORDER BY event_time ASC LIMIT 100").bind(shipment.id).all<{ status: string; location: string | null; description: string | null; event_time: string | null }>();
+        const latest = events.results.at(-1);
+        return json({ ok: true, data: { tracking_type: trackingType, awb, found: true, status: latest?.status ?? shipment.status ?? "unknown", location: latest?.location ?? shipment.destination ?? "", description: latest?.description ?? "", event_time: latest?.event_time ?? shipment.delivered_at ?? null, provider: shipment.provider ?? "delhivery", events: events.results, edd: shipment.edd ?? null }, request_id: id }, 200, headers);
       }
       if (route === "/fujiyama/bookings" && request.method === "POST") {
         if (!hasScope(auth, "shipments.create")) return error("FORBIDDEN", "Shipment creation scope required", 403, id, headers);
@@ -1496,7 +1650,7 @@ const worker = {
           delhivery: { ...providerHealth("delhivery"), configured: delhiveryConfigured, enabled: callsEnabled && delhiveryConfigured, webhook_configured: delhiveryWebhookConfigured, activation_blockers: [...(!callsEnabled ? ["provider_calls_disabled"] : []), ...(!delhiveryConfigured ? ["provider_credentials_missing"] : []), ...(!delhiveryWebhookConfigured ? ["webhook_secret_missing"] : [])], capabilities: ["tracking", ...(delhiveryWebhookConfigured ? ["scan_webhooks", "document_webhooks"] : [])] },
           ekart: { ...providerHealth("ekart"), configured: ekartConfigured, enabled: callsEnabled && ekartConfigured && ekartCallsEnabled, webhook_configured: ekartWebhookConfigured, activation_blockers: [...(!callsEnabled ? ["provider_calls_disabled"] : []), ...(!ekartConfigured ? ["provider_credentials_missing"] : []), ...(ekartCallsEnabled ? [] : ["disabled_by_agreed_scope"]), ...(!ekartWebhookConfigured ? ["webhook_secret_missing"] : [])], capabilities: ["tracking", "shipment_creation", ...(ekartWebhookConfigured ? ["webhooks"] : [])] },
           trackon: { ...providerHealth("trackon"), configured: trackonConfigured, enabled: callsEnabled && trackonConfigured, webhook_configured: trackonWebhookConfigured, activation_blockers: [...(!callsEnabled ? ["provider_calls_disabled"] : []), ...(!trackonConfigured ? ["provider_credentials_or_endpoint_missing"] : []), ...(!trackonWebhookConfigured ? ["webhook_secret_missing"] : [])], capabilities: ["tracking", "labels", ...(trackonWebhookConfigured ? ["webhooks"] : [])] },
-          xpressbees: { ...providerHealth("xpressbees"), configured: xpressbeesConfigured, enabled: callsEnabled && xpressbeesConfigured, webhook_configured: false, activation_blockers: [...(!callsEnabled ? ["provider_calls_disabled"] : []), ...(!xpressbeesConfigured ? ["provider_credentials_or_endpoint_missing"] : [])], capabilities: ["tracking", "quotes"] },
+          xpressbees: { ...providerHealth("xpressbees"), configured: xpressbeesConfigured, enabled: callsEnabled && xpressbeesConfigured, webhook_configured: false, activation_blockers: [...(!callsEnabled ? ["provider_calls_disabled"] : []), ...(!xpressbeesConfigured ? ["provider_credentials_or_endpoint_missing"] : []), ...(!env.XPRESSBEES_SERVICEABILITY_URL ? ["serviceability_endpoint_missing"] : [])], capabilities: ["tracking", "quotes", ...(env.XPRESSBEES_SERVICEABILITY_URL ? ["serviceability"] : [])] },
           rivigo: { ...providerHealth("rivigo"), configured: rivigoConfigured, enabled: callsEnabled && rivigoCallsEnabled && rivigoConfigured, webhook_configured: rivigoWebhookConfigured, activation_blockers: [...(!callsEnabled ? ["provider_calls_disabled"] : []), ...(!rivigoConfigured ? ["provider_credentials_or_endpoint_missing"] : []), ...(rivigoCallsEnabled ? [] : ["disabled_by_go_live_gate"]), ...(!rivigoWebhookConfigured ? ["webhook_app_identity_missing"] : [])], capabilities: ["tracking", "serviceability", "shipment_creation", "shipment_update", "shipment_cancellation", ...(rivigoWebhookConfigured ? ["event_webhooks"] : [])] },
         } }, 200, headers);
       }
@@ -1798,7 +1952,14 @@ const worker = {
         if (route.endsWith("/tracking")) {
           const events = await env.DB.prepare("SELECT * FROM tracking_events WHERE shipment_id = ? ORDER BY event_time ASC LIMIT 100").bind(shipmentGet[1]).all();
           const provider = ["delhivery", "ekart", "trackon", "xpressbees", "rivigo"].includes(String(shipment.provider)) ? shipment.provider as CourierProvider : null;
-          const providerResult = provider ? await safeProviderRequest(env, provider, "tracking", { shipment_id: shipmentGet[1], tracking_number: shipment.tracking_number, provider_reference: shipment.provider_reference }, id, shipment.client_id) : { enabled: false, status: "not_requested" as const };
+          // Client-facing shipment reads intentionally omit provider_account_id from
+          // the response, but the provider lookup must still use the shipment's
+          // assigned Delhivery account. Without this lookup, tracking falls back to
+          // DELHIVERY_DEFAULT_ACCOUNT_NAME and can incorrectly report not_configured.
+          const providerAccountId = typeof shipment.provider_account_id === "string"
+            ? shipment.provider_account_id
+            : (await env.DB.prepare("SELECT provider_account_id FROM shipments WHERE id = ? LIMIT 1").bind(shipmentGet[1]).first<{ provider_account_id: string | null }>())?.provider_account_id ?? null;
+          const providerResult = provider ? await safeProviderRequest(env, provider, "tracking", { shipment_id: shipmentGet[1], tracking_number: shipment.tracking_number, provider_reference: shipment.provider_reference, provider_account_id: providerAccountId }, id, shipment.client_id) : { enabled: false, status: "not_requested" as const };
           return json({ ok: true, data: events.results, provider_status: providerResult.status }, 200, headers);
         }
         return json({ ok: true, data: shipment }, 200, headers);
@@ -2429,7 +2590,8 @@ const worker = {
           } catch { return error("RTO_SOURCE_INVALID", "The original shipment pricing snapshot is invalid", 409, id, headers); }
           if (forwardRatePerKg === undefined) return error("RTO_SOURCE_INVALID", "The original shipment pricing snapshot is invalid", 409, id, headers);
         }
-        const result = calculatePssRate({ account, originCity: originPin.facility_city, destinationCity: destinationPin.facility_city, originState: originPin.facility_state, destinationState: destinationPin.facility_state, actualWeightKg, volumetricWeightKg, invoiceValue, rto, forwardRatePerKg, forwardOriginZoneOverride: rtoSource?.origin_zone, forwardDestinationZoneOverride: rtoSource?.destination_zone, minimumWeightKg: Number(version.minimum_weight_kg ?? 20), gstPercent: Number(version.gst_percent ?? 18), versionId: version.id, oda: false, opa: false, rateMatrix, chargeRules: rules.results.map((rule) => ({ code: rule.code, label: rule.label, kind: rule.calculation_type, value: Number(rule.value), basis: rule.basis, minimum: rule.minimum_value === null ? undefined : Number(rule.minimum_value), maximum: rule.maximum_value === null ? undefined : Number(rule.maximum_value), enabled: Boolean(rule.enabled), marker: rule.marker ?? undefined, condition: rule.condition ?? undefined, displayOrder: Number(rule.display_order ?? 0) })) });
+         const oda = Boolean(originPin.oda || destinationPin.oda);
+         const result = calculatePssRate({ account, originCity: originPin.facility_city, destinationCity: destinationPin.facility_city, originState: originPin.facility_state, destinationState: destinationPin.facility_state, actualWeightKg, volumetricWeightKg, invoiceValue, rto, forwardRatePerKg, forwardOriginZoneOverride: rtoSource?.origin_zone, forwardDestinationZoneOverride: rtoSource?.destination_zone, minimumWeightKg: Number(version.minimum_weight_kg ?? 20), gstPercent: Number(version.gst_percent ?? 18), versionId: version.id, oda, opa: false, rateMatrix, chargeRules: rules.results.map((rule) => ({ code: rule.code, label: rule.label, kind: rule.calculation_type, value: Number(rule.value), basis: rule.basis, minimum: rule.minimum_value === null ? undefined : Number(rule.minimum_value), maximum: rule.maximum_value === null ? undefined : Number(rule.maximum_value), enabled: Boolean(rule.enabled), marker: rule.marker ?? undefined, condition: rule.condition ?? undefined, displayOrder: Number(rule.display_order ?? 0) })) });
         if (previewOnly) return json({ ok: true, data: { quote_id: null, provider: "delhivery", service_level: "b2b", client_id: clientId, provider_account_id: typeof payload.provider_account_id === "string" ? payload.provider_account_id : null, provider_account_name: selectedProviderAccountName || null, account_code: account, ...result } }, 200, headers);
         const quoteId = crypto.randomUUID();
         await env.DB.prepare("INSERT INTO pricing_quotes (id, client_id, version_id, account_scope, origin_zone, destination_zone, chargeable_weight_kg, client_breakdown_json, expires_at, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+15 minutes'), ?)").bind(quoteId, clientId, version.id, account, result.originZone, result.destinationZone, result.chargeableWeightKg, JSON.stringify(result), auth.userId ?? `api:${clientId}`).run();
@@ -2680,7 +2842,7 @@ const worker = {
         const accountRows = providerAccounts.results.filter((account) => Number(account.enabled) === 1);
         const configuredProviders = [...new Set(accountRows.map((account) => account.provider))];
         const providerLabel = (provider: CourierProvider) => provider === "delhivery" ? "Delhivery" : provider === "xpressbees" ? "XpressBees" : provider[0].toUpperCase() + provider.slice(1);
-        const supportedProviders = new Set<CourierProvider>(["delhivery", "rivigo"]);
+        const supportedProviders = new Set<CourierProvider>(["delhivery", "rivigo", "xpressbees"]);
         const serviceabilityRows: Array<{ pincode: string; provider: string; status: string; oda: boolean | null; account_id: string; account_name: string; confidence_score: number; priority: number; source?: string }> = [];
         const routeResults: Array<{ provider: CourierProvider; accountId: string; accountName: string; confidenceScore: number; priority: number; origin: Record<string, unknown>; destination: Record<string, unknown>; routeServiceable: boolean }> = [];
         for (const account of accountRows) {

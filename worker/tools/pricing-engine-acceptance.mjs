@@ -94,14 +94,30 @@ const extras = calculatePssRate({
   chargeRules: [
     { code: "docket", label: "LR charge", kind: "fixed", value: 50, displayOrder: 1 },
     { code: "fov", label: "FOV", kind: "percent", basis: "invoice_value", value: 5, minimum: 80, displayOrder: 2 },
-    { code: "oda", label: "ODA*", kind: "fixed", value: 100, condition: "oda_or_opa", marker: "*", displayOrder: 3 },
+    { code: "oda", label: "ODA surcharge", kind: "per_kg", value: 3, minimum: 750, condition: "oda_or_opa", marker: "*", displayOrder: 3 },
     { code: "green_tax", label: "Green tax", kind: "fixed", value: 999, enabled: false, displayOrder: 4 },
   ],
 });
 assert.equal(extras.lines.find((line) => line.code === "fov")?.amount, 80);
 assert.equal(extras.lines.find((line) => line.code === "oda")?.marker, "*");
+assert.equal(extras.oda, true);
+assert.equal(extras.opa, false);
 assert.equal(extras.lines.find((line) => line.code === "green_tax"), undefined);
-assert.equal(extras.total, 594);
+assert.equal(extras.lines.find((line) => line.code === "oda")?.amount, 750);
+assert.equal(extras.total, 1244);
+
+const odaPerKg = calculatePssRate({
+  ...base,
+  account: "04",
+  actualWeightKg: 300,
+  originCity: "Delhi",
+  originState: "Delhi",
+  destinationCity: "Bengaluru",
+  destinationState: "Karnataka",
+  oda: true,
+  chargeRules: [{ code: "oda", label: "ODA surcharge", kind: "per_kg", value: 3, minimum: 750, condition: "oda_or_opa", marker: "*" }],
+});
+assert.equal(odaPerKg.lines.find((line) => line.code === "oda")?.amount, 900);
 
 const capped = calculatePssRate({
   ...base,

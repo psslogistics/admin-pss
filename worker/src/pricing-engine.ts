@@ -45,6 +45,8 @@ export type PricingLine = { code: string; label: string; amount: number; marker?
 export type PricingResult = {
   versionId?: string;
   account: PricingAccount;
+  oda: boolean;
+  opa: boolean;
   originZone: string;
   destinationZone: string;
   lane: string;
@@ -174,7 +176,7 @@ export function calculatePssRate(input: PricingInput): PricingResult {
   const gstPercent = input.gstPercent ?? 18;
   const gst = roundMoney(subtotal * gstPercent / 100);
   lines.push({ code: "gst", label: `GST ${gstPercent}%`, amount: gst });
-  return { versionId: input.versionId, account: input.account, originZone, destinationZone, lane: `${originZone}->${destinationZone}`, chargeableWeightKg, lines, subtotal, gst, total: roundMoney(subtotal + gst) };
+  return { versionId: input.versionId, account: input.account, oda: Boolean(input.oda), opa: Boolean(input.opa), originZone, destinationZone, lane: `${originZone}->${destinationZone}`, chargeableWeightKg, lines, subtotal, gst, total: roundMoney(subtotal + gst) };
 }
 
 export function defaultRateRows(account: PricingAccount): Array<{ origin_zone: string; destination_zone: string; rate_per_kg: number }> {

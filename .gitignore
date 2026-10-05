@@ -45,3 +45,10 @@ next-env.d.ts
 /worker/.wrangler/
 /worker/backups/
 /tools/
+
+# local runtime, auth, and generated import artifacts
+/.wrangler-config/
+/tmp/
+/worker/.wrangler-dry-run/
+/worker/tmp/
+/worker/worker/.wrangler-fujiyama-verify/
