@@ -590,7 +590,6 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
   const height = Number(payload.height ?? payload.shipment_height ?? 0);
   if (!origin || !destination || !pickupLocation || !providerInvoiceNumber || !Number.isFinite(declaredValue) || declaredValue < 0 || !Number.isFinite(weightKg) || weightKg <= 0 || !Number.isInteger(pieces) || pieces < 1) return null;
   const paymentMode = String(payload.payment_mode ?? "prepaid").trim().toLowerCase() === "cod" ? "COD" : "Prepaid";
-  const address = (value: ReturnType<typeof delhiveryAddress>) => value ? { name: value.name, address: value.line, city: value.city, state: value.state, pincode: value.pincode, phone: value.phone, country: value.country } : null;
   return {
     pickup_location_name: pickupLocation,
     payment_mode: paymentMode.toLowerCase(),
