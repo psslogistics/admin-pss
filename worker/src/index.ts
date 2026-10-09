@@ -488,19 +488,27 @@ async function createShipmentPricingQuote(env: Env, clientId: string, payload: R
 
 type DelhiveryB2bCredential = { username?: string; password?: string; token?: string; jwt?: string };
 
+function normalizeDelhiveryJwt(value: unknown) {
+  if (typeof value !== "string") return undefined;
+  const token = value.trim().replace(/^Bearer\s+/i, "");
+  return /^[^.\s]+\.[^.\s]+\.[^.\s]+$/.test(token) ? token : undefined;
+}
+
 function delhiveryB2bCredential(value: string | undefined): DelhiveryB2bCredential | null {
   const raw = String(value ?? "").trim();
   if (!raw) return null;
   try {
     const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (typeof parsed === "string") return normalizeDelhiveryJwt(parsed) ? { jwt: normalizeDelhiveryJwt(parsed) } : null;
     if (parsed && typeof parsed === "object") return {
       username: typeof parsed.username === "string" ? parsed.username.trim() : undefined,
       password: typeof parsed.password === "string" ? parsed.password : undefined,
-      token: typeof parsed.token === "string" ? parsed.token.trim() : undefined,
-      jwt: typeof parsed.jwt === "string" ? parsed.jwt.trim() : undefined,
+      token: normalizeDelhiveryJwt(parsed.token),
+      jwt: normalizeDelhiveryJwt(parsed.jwt),
     };
   } catch { /* A raw value may be a previously issued bearer token. */ }
-  return { token: raw };
+  const jwt = normalizeDelhiveryJwt(raw);
+  return jwt ? { jwt } : null;
 }
 
 function delhiveryAccountIsB2b(accountName: string) {
@@ -528,7 +536,10 @@ async function delhiveryB2bBearer(env: Env, credentialValue: string | undefined,
   const credential = delhiveryB2bCredential(credentialValue);
   if (!credential) return null;
   const configuredToken = credential.jwt ?? credential.token;
-  if (configuredToken && (!credential.username || !credential.password)) return configuredToken;
+  if (configuredToken && (!credential.username || !credential.password)) {
+    const now = Math.floor(Date.now() / 1000);
+    return (delhiveryJwtExpiry(configuredToken) ?? now + 86400) > now + 30 ? configuredToken : null;
+  }
   if (!credential.username || !credential.password) return configuredToken ?? null;
   const cacheKey = delhiveryTokenCacheKey(accountName);
   const now = Math.floor(Date.now() / 1000);
