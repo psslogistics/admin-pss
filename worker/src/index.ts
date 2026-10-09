@@ -1207,6 +1207,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
           : operation === "shipments" ? JSON.stringify(trackonPayload(payload, trackon!))
             : JSON.stringify({ Appkey: trackon!.appKey, userId: trackon!.userId, password: trackon!.password, AWBNo: trackingNumber });
   if (provider === "delhivery" && operation === "shipments" && !useDelhiveryB2b) headers["content-type"] = "application/x-www-form-urlencoded";
+  if (provider === "delhivery" && operation === "shipments" && useDelhiveryB2b) delete headers["content-type"];
   let response: Response | null = null; let lastError = "provider_request_failed";
   const readOnlyProviderCall = operation === "tracking" || operation === "serviceability";
   const maxAttempts = readOnlyProviderCall ? (provider === "delhivery" && useDelhiveryB2b ? 2 : 1) : 3;
