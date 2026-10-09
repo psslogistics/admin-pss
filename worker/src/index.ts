@@ -1100,7 +1100,14 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (provider === "rivigo") { headers.Authorization = `Bearer ${rivigoToken}`; headers.appUuid = rivigo!.appUuid; }
   const ekartCreate = provider === "ekart" && operation === "shipments" ? ekartCreatePayload(payload) : null;
   if (provider === "ekart" && operation === "shipments" && !ekartCreate) return { enabled: false, status: "invalid_request" as const, reason: "Origin and destination addresses require valid six-digit pincodes and ten-digit phone numbers" };
-  const providerPayload = account?.provider === "delhivery" ? { ...payload, delhivery_client_name: account.account_name } : payload;
+  const providerPayload = account?.provider === "delhivery"
+    ? {
+        ...payload,
+        delhivery_client_name: typeof payload.delhivery_client_name === "string" && payload.delhivery_client_name.trim()
+          ? payload.delhivery_client_name.trim()
+          : account.account_name,
+      }
+    : payload;
   const delhiveryCreate = provider === "delhivery" && operation === "shipments" ? useDelhiveryB2b ? delhiveryB2bManifestPayload(env, providerPayload) : delhiveryCreatePayload(env, providerPayload) : null;
   if (provider === "delhivery" && operation === "shipments" && !delhiveryCreate) return { enabled: false, status: "invalid_request" as const, reason: "Delhivery requires valid origin/destination addresses, a registered client name, and a pickup location" };
   const delhiveryPickup = provider === "delhivery" && operation === "pickups" ? delhiveryPickupPayload(env, providerPayload) : null;
