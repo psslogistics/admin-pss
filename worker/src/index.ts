@@ -581,13 +581,14 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
   const pickupLocation = String(payload.delhivery_pickup_location ?? payload.pickup_location ?? payload.delhivery_client_name ?? env.DELHIVERY_DEFAULT_PICKUP_LOCATION ?? "").trim();
   const orderId = String(payload.order_id ?? payload.shipment_id ?? crypto.randomUUID()).trim().slice(0, 80);
   const invoiceNumber = String(payload.invoice_reference ?? payload.invoice_number ?? "").trim();
+  const providerInvoiceNumber = invoiceNumber.replace(/[^A-Za-z0-9\/-]/g, "-").replace(/-{2,}/g, "-").replace(/^-|-$/g, "").slice(0, 80);
   const declaredValue = Number(payload.declared_value ?? 0);
   const weightKg = Number(payload.total_weight_kg ?? 0);
   const pieces = Number(payload.pieces ?? 1);
   const length = Number(payload.length ?? payload.shipment_length ?? 0);
   const width = Number(payload.width ?? payload.shipment_width ?? 0);
   const height = Number(payload.height ?? payload.shipment_height ?? 0);
-  if (!origin || !destination || !pickupLocation || !invoiceNumber || !Number.isFinite(declaredValue) || declaredValue < 0 || !Number.isFinite(weightKg) || weightKg <= 0 || !Number.isInteger(pieces) || pieces < 1) return null;
+  if (!origin || !destination || !pickupLocation || !providerInvoiceNumber || !Number.isFinite(declaredValue) || declaredValue < 0 || !Number.isFinite(weightKg) || weightKg <= 0 || !Number.isInteger(pieces) || pieces < 1) return null;
   const paymentMode = String(payload.payment_mode ?? "prepaid").trim().toLowerCase() === "cod" ? "COD" : "Prepaid";
   const address = (value: ReturnType<typeof delhiveryAddress>) => value ? { name: value.name, address: value.line, city: value.city, state: value.state, pincode: value.pincode, phone: value.phone, country: value.country } : null;
   return {
@@ -604,7 +605,15 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
       phone: destination.phone,
       email: destination.email ?? "",
     },
-    return_address: address(origin),
+    return_address: {
+      name: origin.name,
+      address: origin.line,
+      city: origin.city,
+      state: origin.state,
+      zip: origin.pincode,
+      phone: origin.phone,
+      email: origin.email,
+    },
     shipment_details: [{
       order_id: orderId,
       box_count: pieces,
@@ -616,7 +625,7 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
     dimensions: length > 0 && width > 0 && height > 0 ? [{ length, width, breadth: width, height, box_count: pieces }] : undefined,
     invoices: [{
       ewaybill: String(payload.e_waybill_no ?? payload.ewaybill_number ?? ""),
-      inv_num: invoiceNumber,
+      inv_num: providerInvoiceNumber,
       inv_amt: declaredValue,
       inv_qr_code: String(payload.invoice_qr_code ?? ""),
     }],
