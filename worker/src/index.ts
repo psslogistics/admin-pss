@@ -613,7 +613,7 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
       waybills: [],
       master: false,
     }],
-    dimensions: length > 0 && width > 0 && height > 0 ? [{ length, width, height }] : undefined,
+    dimensions: length > 0 && width > 0 && height > 0 ? [{ length, breadth: width, height, box_count: pieces }] : undefined,
     invoices: [{
       ewaybill: String(payload.e_waybill_no ?? payload.ewaybill_number ?? ""),
       inv_num: invoiceNumber,
@@ -629,7 +629,10 @@ function delhiveryB2bManifestForm(payload: Record<string, unknown>) {
   const form = new FormData();
   for (const [key, value] of Object.entries(payload)) {
     if (value === undefined || value === null) continue;
-    form.append(key, typeof value === "object" ? JSON.stringify(value) : String(value));
+    const serialized = typeof value === "object" ? JSON.stringify(value) : String(value);
+    // Delhivery's B2B form parser follows the representation used by its
+    // documented curl example for list fields (Python-style booleans).
+    form.append(key, typeof value === "object" ? serialized.replace(/\btrue\b/g, "True").replace(/\bfalse\b/g, "False").replace(/\bnull\b/g, "None") : serialized);
   }
   return form;
 }
