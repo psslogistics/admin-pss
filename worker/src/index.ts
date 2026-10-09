@@ -613,7 +613,7 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
       waybills: [],
       master: false,
     }],
-    dimensions: length > 0 && width > 0 && height > 0 ? [{ length, breadth: width, height, box_count: pieces }] : undefined,
+    dimensions: length > 0 && width > 0 && height > 0 ? [{ length, width, breadth: width, height, box_count: pieces }] : undefined,
     invoices: [{
       ewaybill: String(payload.e_waybill_no ?? payload.ewaybill_number ?? ""),
       inv_num: invoiceNumber,
