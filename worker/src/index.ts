@@ -1,11 +1,18 @@
 import { calculatePssRate, defaultRateRows, type ChargeRule, type PricingAccount } from "./pricing-engine";
 
-export interface Env extends Omit<Cloudflare.Env, "SUPABASE_PUBLISHABLE_KEY" | "API_KEY_PEPPER" | "DELHIVERY_API_TOKEN" | "DELHIVERY_B2B_API_BASE_URL" | "DELHIVERY_WEBHOOK_SECRET" | "EKART_API_KEY" | "EKART_API_SECRET" | "EKART_WEBHOOK_SECRET" | "EKART_ENABLE_PROVIDER_CALLS" | "TRACKON_API_BASE_URL" | "TRACKON_CREDENTIALS_JSON" | "TRACKON_WEBHOOK_SECRET" | "TRACKON_BOOKING_URL" | "TRACKON_TRACKING_URL" | "TRACKON_LABEL_URL" | "TRACKON_ENABLE_SHIPMENT_CREATION" | "TRACKON_ENABLE_PICKUP_CREATION" | "XPRESSBEES_API_BASE_URL" | "XPRESSBEES_CREDENTIALS_JSON" | "XPRESSBEES_ENABLE_SHIPMENT_CREATION" | "XPRESSBEES_ENABLE_PICKUP_CREATION" | "RIVIGO_API_BASE_URL" | "RIVIGO_AUTH_URL" | "RIVIGO_TRACKING_URL" | "RIVIGO_CREDENTIALS_JSON" | "RIVIGO_ENABLE_PROVIDER_CALLS"> {
+type DelhiveryTokenCache = {
+  get<T>(key: string, type: "json"): Promise<T | null>;
+  put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void>;
+  delete(key: string): Promise<void>;
+};
+
+export interface Env extends Omit<Cloudflare.Env, "SUPABASE_PUBLISHABLE_KEY" | "API_KEY_PEPPER" | "DELHIVERY_API_TOKEN" | "DELHIVERY_B2B_API_BASE_URL" | "DELHIVERY_WEBHOOK_SECRET" | "DELHIVERY_TOKEN_CACHE" | "EKART_API_KEY" | "EKART_API_SECRET" | "EKART_WEBHOOK_SECRET" | "EKART_ENABLE_PROVIDER_CALLS" | "TRACKON_API_BASE_URL" | "TRACKON_CREDENTIALS_JSON" | "TRACKON_WEBHOOK_SECRET" | "TRACKON_BOOKING_URL" | "TRACKON_TRACKING_URL" | "TRACKON_LABEL_URL" | "TRACKON_ENABLE_SHIPMENT_CREATION" | "TRACKON_ENABLE_PICKUP_CREATION" | "XPRESSBEES_API_BASE_URL" | "XPRESSBEES_CREDENTIALS_JSON" | "XPRESSBEES_ENABLE_SHIPMENT_CREATION" | "XPRESSBEES_ENABLE_PICKUP_CREATION" | "RIVIGO_API_BASE_URL" | "RIVIGO_AUTH_URL" | "RIVIGO_TRACKING_URL" | "RIVIGO_CREDENTIALS_JSON" | "RIVIGO_ENABLE_PROVIDER_CALLS"> {
   SUPABASE_PUBLISHABLE_KEY: string;
   API_KEY_PEPPER?: string;
   DELHIVERY_API_TOKEN?: string;
   DELHIVERY_B2B_API_BASE_URL?: string;
   DELHIVERY_WEBHOOK_SECRET?: string;
+  DELHIVERY_TOKEN_CACHE?: DelhiveryTokenCache;
   EKART_API_KEY?: string;
   EKART_API_SECRET?: string;
   EKART_WEBHOOK_SECRET?: string;
@@ -500,22 +507,61 @@ function delhiveryAccountIsB2b(accountName: string) {
   return /(^|[^a-z])b2b(c)?([^a-z]|$)/i.test(accountName) || /^PSS\s+B2B$/i.test(accountName.trim());
 }
 
-async function delhiveryB2bBearer(env: Env, credentialValue: string | undefined, requestIdValue: string, timeoutMs: number) {
+function delhiveryJwtExpiry(token: string) {
+  try {
+    const payload = token.split(".")[1];
+    if (!payload) return null;
+    const normalized = payload.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(payload.length / 4) * 4, "=");
+    const parsed = JSON.parse(atob(normalized)) as { exp?: unknown };
+    const exp = Number(parsed.exp);
+    return Number.isFinite(exp) && exp > 0 ? exp : null;
+  } catch { return null; }
+}
+
+function delhiveryTokenCacheKey(accountName: string) {
+  return `delhivery:b2b:${accountName.trim().toUpperCase().replace(/[^A-Z0-9]+/g, "_")}`;
+}
+
+const delhiveryTokenRefreshes = new Map<string, Promise<string | null>>();
+
+async function delhiveryB2bBearer(env: Env, credentialValue: string | undefined, accountName: string, requestIdValue: string, timeoutMs: number, forceRefresh = false) {
   const credential = delhiveryB2bCredential(credentialValue);
   if (!credential) return null;
-  if (credential.jwt || credential.token) return credential.jwt ?? credential.token ?? null;
-  if (!credential.username || !credential.password) return null;
-  const base = String(env.DELHIVERY_B2B_API_BASE_URL ?? "https://btob.api.delhivery.com").replace(/\/$/, "");
-  try {
-    const response = await providerFetch(`${base}/ums/login/`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-request-id": requestIdValue },
-      body: JSON.stringify({ username: credential.username, password: credential.password }),
-    }, timeoutMs);
-    if (!response.ok) return null;
-    const body = JSON.parse(await providerResponseText(response, timeoutMs)) as Record<string, unknown>;
-    return findProviderReference(body, new Set(["jwt", "token", "access_token", "bearer_token"]));
-  } catch { return null; }
+  const configuredToken = credential.jwt ?? credential.token;
+  if (configuredToken && (!credential.username || !credential.password)) return configuredToken;
+  if (!credential.username || !credential.password) return configuredToken ?? null;
+  const cacheKey = delhiveryTokenCacheKey(accountName);
+  const now = Math.floor(Date.now() / 1000);
+  const usable = (token: string | null | undefined, expiresAt?: number | null) => Boolean(token && (expiresAt ?? delhiveryJwtExpiry(token) ?? 0) > now + 300);
+  if (!forceRefresh && env.DELHIVERY_TOKEN_CACHE) {
+    const cached = await env.DELHIVERY_TOKEN_CACHE.get<{ token?: string; expiresAt?: number }>(cacheKey, "json");
+    if (usable(cached?.token, cached?.expiresAt)) return cached!.token!;
+  }
+  const existing = delhiveryTokenRefreshes.get(cacheKey);
+  if (existing) return existing;
+  const refresh = (async () => {
+    try {
+      if (env.DELHIVERY_TOKEN_CACHE) await env.DELHIVERY_TOKEN_CACHE.delete(cacheKey);
+      const base = String(env.DELHIVERY_B2B_API_BASE_URL ?? "https://ltl-clients-api.delhivery.com").replace(/\/$/, "");
+      const response = await providerFetch(`${base}/ums/login`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-request-id": requestIdValue },
+        body: JSON.stringify({ username: credential.username, password: credential.password }),
+      }, timeoutMs);
+      if (!response.ok) return null;
+      const body = JSON.parse(await providerResponseText(response, timeoutMs)) as Record<string, unknown>;
+      const token = findProviderReference(body, new Set(["jwt", "token", "access_token", "bearer_token"]));
+      if (!token) return null;
+      const expiresAt = delhiveryJwtExpiry(token) ?? now + 86400;
+      if (env.DELHIVERY_TOKEN_CACHE) {
+        await env.DELHIVERY_TOKEN_CACHE.put(cacheKey, JSON.stringify({ token, expiresAt }), { expirationTtl: Math.max(60, expiresAt - now) });
+      }
+      return token;
+    } catch { return null; }
+    finally { delhiveryTokenRefreshes.delete(cacheKey); }
+  })();
+  delhiveryTokenRefreshes.set(cacheKey, refresh);
+  return refresh;
 }
 
 function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>) {
@@ -1024,7 +1070,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   const defaultAccountIsB2b = provider === "delhivery" && delhiveryAccountIsB2b(defaultDelhiveryAccountName);
   const useDelhiveryB2b = resolvedDelhiveryB2b || defaultAccountIsB2b;
   const base = provider === "delhivery"
-    ? useDelhiveryB2b ? String(env.DELHIVERY_B2B_API_BASE_URL ?? "https://btob.api.delhivery.com") : env.DELHIVERY_API_BASE_URL
+    ? useDelhiveryB2b ? String(env.DELHIVERY_B2B_API_BASE_URL ?? "https://ltl-clients-api.delhivery.com") : env.DELHIVERY_API_BASE_URL
     : provider === "ekart" ? env.EKART_API_BASE_URL : provider === "trackon" ? env.TRACKON_API_BASE_URL : provider === "xpressbees" ? env.XPRESSBEES_API_BASE_URL : env.RIVIGO_API_BASE_URL;
   if (clientId && requestedAccountId && !account) return { enabled: false, status: "disabled" as const, reason: "The selected courier account is not enabled for this client" };
   if (provider === "delhivery" && !account) return { enabled: false, status: "not_configured" as const, reason: defaultDelhiveryAccountName ? `The configured Delhivery account '${defaultDelhiveryAccountName}' is not active` : "A Delhivery account must be selected before booking" };
@@ -1035,7 +1081,8 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   const rivigo = provider === "rivigo" ? rivigoCredentials(env, credential) : null;
   if (!base || (provider === "trackon" ? !trackon : provider === "rivigo" ? !rivigo : !credential)) return { enabled: false, status: "not_configured" as const };
   const providerTimeoutMs = Math.min(timeoutMsOverride ?? 10000, 10000);
-  const delhiveryB2bToken = useDelhiveryB2b ? await delhiveryB2bBearer(env, credential, requestIdValue, providerTimeoutMs) : null;
+  const delhiveryB2bAccountName = account?.account_name ?? defaultDelhiveryAccountName;
+  const delhiveryB2bToken = useDelhiveryB2b ? await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs) : null;
   if (provider === "delhivery" && useDelhiveryB2b && !delhiveryB2bToken) return { enabled: true, status: "failed" as const, error: "Delhivery B2B authentication failed" };
   const xpressToken = provider === "xpressbees" ? await xpressbeesToken(env, credential!, requestIdValue, providerTimeoutMs) : null;
   if (provider === "xpressbees" && !xpressToken) return { enabled: true, status: "failed" as const, error: "XpressBees authentication failed" };
@@ -1125,7 +1172,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (provider === "delhivery" && operation === "shipments" && !useDelhiveryB2b) headers["content-type"] = "application/x-www-form-urlencoded";
   let response: Response | null = null; let lastError = "provider_request_failed";
   const readOnlyProviderCall = operation === "tracking" || operation === "serviceability";
-  const maxAttempts = readOnlyProviderCall ? 1 : 3;
+  const maxAttempts = readOnlyProviderCall ? (provider === "delhivery" && useDelhiveryB2b ? 2 : 1) : 3;
   // Courier tracking/serviceability are read-only, but provider APIs can take
   // longer than a browser request under normal network load. Keep a bounded
   // timeout so public tracking does not hang indefinitely while avoiding false
@@ -1140,6 +1187,13 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       const isGet = (operation === "tracking" && provider !== "xpressbees" && provider !== "rivigo") || (operation === "serviceability" && provider !== "xpressbees") || (provider === "trackon" && operation === "labels");
       const method = provider === "rivigo" && operation === "cancellations" ? "DELETE" : provider === "rivigo" && operation === "updates" ? "PUT" : isGet ? "GET" : "POST";
       response = await providerFetch(url, { method, headers, body: isGet ? undefined : requestBody }, attemptTimeoutMs);
+      if (provider === "delhivery" && useDelhiveryB2b && response.status === 401 && attempt === 0 && credential) {
+        const refreshedToken = await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs, true);
+        if (refreshedToken) {
+          headers.Authorization = `Bearer ${refreshedToken}`;
+          continue;
+        }
+      }
       // Some XpressBees accounts expose the tracking route as GET even though
       // the franchise documentation describes the same route as POST. A 405
       // is safe to retry because tracking is read-only; keep shipment and
@@ -1555,9 +1609,10 @@ const worker = {
         return json({ ok: true, data: { pincode, city: location.facility_city, state: location.facility_state, oda: Boolean(location.oda) }, request_id: id }, 200, headers);
       }
       // Fujiyama receives a stable PSS contract. It never receives Delhivery
-      // credentials or calls Delhivery directly. Tracking is deliberately
-      // database-only: the endpoint remains usable before the first shipment
-      // exists and returns a safe empty result instead of invoking a courier.
+      // credentials or calls Delhivery directly. Tracking refreshes the
+      // provider through the account already assigned to the PSS shipment,
+      // then returns the normalized PSS history. The provider call remains
+      // read-only and is subject to the normal provider capability gate.
       // Booking delegates to the canonical shipment path below so pricing,
       // wallet, idempotency, audit, and provider-account selection remain
       // identical to panel bookings.
@@ -1568,12 +1623,69 @@ const worker = {
         if (!awb || awb.length > 128) return error("VALIDATION_ERROR", "A valid AWB is required", 400, id, headers);
         if (trackingType !== "VENDOR-AWB") return error("VALIDATION_ERROR", "trackingType must be VENDOR-AWB", 400, id, headers);
         const shipment = auth.clientId
-          ? await env.DB.prepare("SELECT id, tracking_number, provider_reference, status, provider, destination, edd, delivered_at FROM shipments WHERE client_id = ? AND (tracking_number = ? OR provider_reference = ?) ORDER BY updated_at DESC LIMIT 1").bind(auth.clientId, awb, awb).first<{ id: string; tracking_number: string | null; provider_reference: string | null; status: string | null; provider: string | null; destination: string | null; edd: string | null; delivered_at: string | null }>()
+          ? await env.DB.prepare("SELECT id, tracking_number, provider_reference, provider_account_id, status, provider, destination, edd, delivered_at FROM shipments WHERE client_id = ? AND (tracking_number = ? OR provider_reference = ?) ORDER BY updated_at DESC LIMIT 1").bind(auth.clientId, awb, awb).first<{ id: string; tracking_number: string | null; provider_reference: string | null; provider_account_id: string | null; status: string | null; provider: string | null; destination: string | null; edd: string | null; delivered_at: string | null }>()
           : null;
-        if (!shipment) return json({ ok: true, data: { tracking_type: trackingType, awb, found: false, status: "not_found", location: "", description: "No shipment found in the PSS database", event_time: null, provider: "delhivery", events: [] }, request_id: id }, 200, headers);
+        if (!shipment) {
+          const assignedAccounts = await env.DB.prepare(`
+            SELECT pa.id
+            FROM provider_accounts pa
+            LEFT JOIN provider_account_client_policies p
+              ON p.provider_account_id = pa.id AND p.client_id = ?
+            WHERE pa.provider = 'delhivery'
+              AND pa.status = 'active'
+              AND (pa.client_id = ? OR pa.client_id IS NULL)
+              AND (p.provider_account_id IS NULL OR p.enabled = 1)
+            ORDER BY COALESCE(p.priority, 100) ASC, pa.created_at ASC
+            LIMIT 20`).bind(auth.clientId, auth.clientId).all<{ id: string }>();
+          const directResults = await Promise.all(assignedAccounts.results.map(async (account) => {
+            try {
+              const providerResult = await safeProviderRequest(env, "delhivery", "tracking", { tracking_number: awb, provider_account_id: account.id }, id, auth.clientId ?? undefined, undefined, 5000);
+              const tracking = (providerResult as { tracking?: { status?: string; location?: string; description?: string; event_time?: string | null } }).tracking;
+              return { status: String(providerResult.status), tracking };
+            } catch { return { status: "failed", tracking: undefined }; }
+          }));
+          const directMatch = directResults.find(({ status, tracking }) => status === "accepted" && tracking?.status);
+          if (directMatch?.tracking?.status) {
+            const tracking = directMatch.tracking;
+            return json({ ok: true, data: {
+              tracking_type: trackingType,
+              awb,
+              found: true,
+              source: "delhivery",
+              status: tracking.status,
+              location: tracking.location ?? "",
+              description: tracking.description ?? "",
+              event_time: tracking.event_time ?? null,
+              provider: "delhivery",
+              events: [{ status: tracking.status, location: tracking.location ?? "", description: tracking.description ?? "", event_time: tracking.event_time ?? null }],
+            }, request_id: id }, 200, headers);
+          }
+          return json({ ok: true, data: { tracking_type: trackingType, awb, found: false, source: "delhivery", status: "not_found", location: "", description: "No shipment found in PSS or the client’s active Delhivery accounts", event_time: null, provider: "delhivery", events: [] }, request_id: id }, 200, headers);
+        }
+        const providerResult = shipment.provider === "delhivery"
+          ? await safeProviderRequest(env, "delhivery", "tracking", {
+              shipment_id: shipment.id,
+              tracking_number: shipment.tracking_number ?? awb,
+              provider_reference: shipment.provider_reference ?? awb,
+              provider_account_id: shipment.provider_account_id ?? undefined,
+            }, id, auth.clientId, undefined, 5000)
+          : { enabled: false, status: "not_requested" as const };
         const events = await env.DB.prepare("SELECT status, location, description, event_time FROM tracking_events WHERE shipment_id = ? ORDER BY event_time ASC LIMIT 100").bind(shipment.id).all<{ status: string; location: string | null; description: string | null; event_time: string | null }>();
         const latest = events.results.at(-1);
-        return json({ ok: true, data: { tracking_type: trackingType, awb, found: true, status: latest?.status ?? shipment.status ?? "unknown", location: latest?.location ?? shipment.destination ?? "", description: latest?.description ?? "", event_time: latest?.event_time ?? shipment.delivered_at ?? null, provider: shipment.provider ?? "delhivery", events: events.results, edd: shipment.edd ?? null }, request_id: id }, 200, headers);
+        const liveTracking = (providerResult as { tracking?: { status?: string; location?: string; description?: string; event_time?: string | null } }).tracking;
+        return json({ ok: true, data: {
+          tracking_type: trackingType,
+          awb,
+          found: true,
+          status: liveTracking?.status ?? latest?.status ?? shipment.status ?? "unknown",
+          location: liveTracking?.location ?? latest?.location ?? shipment.destination ?? "",
+          description: liveTracking?.description ?? latest?.description ?? "",
+          event_time: liveTracking?.event_time ?? latest?.event_time ?? shipment.delivered_at ?? null,
+          provider: shipment.provider ?? "delhivery",
+          provider_status: providerResult.status,
+          events: events.results,
+          edd: shipment.edd ?? null,
+        }, request_id: id }, 200, headers);
       }
       if (route === "/fujiyama/bookings" && request.method === "POST") {
         if (!hasScope(auth, "shipments.create")) return error("FORBIDDEN", "Shipment creation scope required", 403, id, headers);

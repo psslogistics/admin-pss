@@ -22,10 +22,14 @@ records for another client.
 
 ## Tracking
 
-Tracking is read-only and is resolved from the PSS database. PSS does not call
-Delhivery for this endpoint, so the endpoint is available before Fujiyama has
-any shipments in the database. A request for an unknown AWB returns HTTP 200
-with `found: false` and an empty `events` array.
+Tracking is read-only. PSS resolves the shipment within Fujiyama's tenant,
+refreshes the assigned Delhivery account through the PSS Worker, persists any
+normalized provider event, and returns the combined PSS history. Delhivery
+credentials are never exposed to Fujiyama. A request for an unknown AWB
+first checks the client's active Delhivery accounts directly; if Delhivery
+returns a normalized result, it is returned with `source: "delhivery"` without
+creating a PSS shipment. If neither PSS nor Delhivery finds it, the endpoint
+returns HTTP 200 with `found: false` and an empty `events` array.
 
 ```bash
 curl --fail-with-body --request GET \
