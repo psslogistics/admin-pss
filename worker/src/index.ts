@@ -383,7 +383,7 @@ function delhiveryAddress(value: unknown, fallbackName: string) {
   const name = String(address.name ?? fallbackName).trim();
   const phone = String(address.phone ?? address.primary_contact_number ?? "").replace(/[^0-9]/g, "").slice(-10);
   if (!line || !city || !state || !/^\d{6}$/.test(pincode) || !/^\d{10}$/.test(phone)) return null;
-  return { line, city, state, pincode, name, phone, country: String(address.country ?? "India").trim() || "India" };
+  return { line, city, state, pincode, name, phone, email: String(address.email ?? "").trim(), country: String(address.country ?? "India").trim() || "India" };
 }
 
 function shipmentAddress(value: unknown) {
@@ -591,21 +591,47 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
   const paymentMode = String(payload.payment_mode ?? "prepaid").trim().toLowerCase() === "cod" ? "COD" : "Prepaid";
   const address = (value: ReturnType<typeof delhiveryAddress>) => value ? { name: value.name, address: value.line, city: value.city, state: value.state, pincode: value.pincode, phone: value.phone, country: value.country } : null;
   return {
-    pickup_location: pickupLocation,
-    drop_location: address(destination),
-    pickup_address: address(origin),
-    master_order: [{
+    pickup_location_name: pickupLocation,
+    payment_mode: paymentMode.toLowerCase(),
+    cod_amount: paymentMode === "COD" ? Number(payload.cod_amount ?? declaredValue) : undefined,
+    weight: Math.max(1, Math.round(weightKg * 1000)),
+    dropoff_location: {
+      consignee_name: destination.name,
+      address: destination.line,
+      city: destination.city,
+      state: destination.state,
+      zip: destination.pincode,
+      phone: destination.phone,
+      email: destination.email ?? "",
+    },
+    return_address: address(origin),
+    shipment_details: [{
       order_id: orderId,
-      invoice_number: invoiceNumber,
-      invoice_amount: declaredValue,
-      payment_mode: paymentMode,
-      product_description: String(payload.description ?? "Shipment").slice(0, 500),
-      quantity: pieces,
-      weight: weightKg,
-      dimensions: length > 0 && width > 0 && height > 0 ? { length, width, height } : undefined,
-      ewaybill_number: payload.e_waybill_no ?? payload.ewaybill_number ?? undefined,
+      box_count: pieces,
+      description: String(payload.description ?? "Shipment").slice(0, 500),
+      weight: Math.max(1, Math.round(weightKg * 1000)),
+      waybills: [],
+      master: false,
     }],
+    dimensions: length > 0 && width > 0 && height > 0 ? [{ length, width, height }] : undefined,
+    invoices: [{
+      ewaybill: String(payload.e_waybill_no ?? payload.ewaybill_number ?? ""),
+      inv_num: invoiceNumber,
+      inv_amt: declaredValue,
+      inv_qr_code: String(payload.invoice_qr_code ?? ""),
+    }],
+    freight_mode: "fop",
+    fm_pickup: true,
   };
+}
+
+function delhiveryB2bManifestForm(payload: Record<string, unknown>) {
+  const form = new FormData();
+  for (const [key, value] of Object.entries(payload)) {
+    if (value === undefined || value === null) continue;
+    form.append(key, typeof value === "object" ? JSON.stringify(value) : String(value));
+  }
+  return form;
 }
 
 function delhiveryCreatePayload(env: Env, payload: Record<string, unknown>) {
@@ -1132,7 +1158,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
           ? `${base.replace(/\/$/, "")}/v2/track/${encodeURIComponent(trackingNumber)}`
           : `${base.replace(/\/$/, "")}/packages/json/?waybill=${encodeURIComponent(trackingNumber)}&ref_ids=${encodeURIComponent(String(payload.order_id ?? ""))}`
     : provider === "delhivery" && operation === "shipments"
-      ? useDelhiveryB2b ? `${base.replace(/\/$/, "")}/v2/manifest` : `${delhiveryOrigin}/api/cmu/create.json`
+      ? useDelhiveryB2b ? `${base.replace(/\/$/, "")}/manifest` : `${delhiveryOrigin}/api/cmu/create.json`
       : provider === "delhivery" && operation === "pickups"
         ? `${delhiveryOrigin}/fm/request/new/`
         : provider === "delhivery" && operation === "serviceability"
@@ -1161,7 +1187,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         ? `${base.replace(/\/$/, "")}/operations/booking/cancel?bookingId=${encodeURIComponent(String(payload.booking_id ?? payload.provider_reference ?? ""))}`
       : trackonUrl!;
   const requestBody = provider === "delhivery" && operation === "shipments"
-    ? useDelhiveryB2b ? JSON.stringify(delhiveryCreate) : `format=json&data=${encodeURIComponent(JSON.stringify(delhiveryCreate))}`
+    ? useDelhiveryB2b ? delhiveryB2bManifestForm(delhiveryCreate as Record<string, unknown>) : `format=json&data=${encodeURIComponent(JSON.stringify(delhiveryCreate))}`
     : provider === "delhivery" && operation === "pickups"
       ? JSON.stringify(delhiveryPickup)
       : provider === "ekart" && operation === "shipments"
@@ -1257,7 +1283,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   let parsedProviderBody: unknown = null;
   try { parsedProviderBody = JSON.parse(responseBody); } catch { parsedProviderBody = null; }
   if (response.ok && provider === "delhivery" && operation === "shipments" && clientId && typeof payload.shipment_id === "string") {
-    const createdReference = findProviderReference(parsedProviderBody, useDelhiveryB2b ? new Set(["lrnum", "lr_number", "lr", "lrn", "waybill", "awb"]) : new Set(["waybill", "awb", "tracking_number", "trackingid", "shipment_id"]));
+    const createdReference = findProviderReference(parsedProviderBody, useDelhiveryB2b ? new Set(["lrnum", "lr_number", "lr", "lrn", "waybill", "awb", "job_id", "jobid", "request_id"]) : new Set(["waybill", "awb", "tracking_number", "trackingid", "shipment_id"]));
     const providerReference = useDelhiveryB2b ? findProviderReference(parsedProviderBody, new Set(["master_awb", "master_awb_number", "masterawb", "master_waybill", "awb"])) ?? createdReference : createdReference;
     if (createdReference) await env.DB.prepare("UPDATE shipments SET tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(provider_reference, ?), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(createdReference, providerReference, payload.shipment_id, clientId).run();
   }
