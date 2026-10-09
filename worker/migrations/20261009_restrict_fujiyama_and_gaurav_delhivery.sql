@@ -18,13 +18,13 @@ INSERT INTO provider_account_client_policies (
   rate_card_id, notes, updated_by_user_id, updated_at
 )
 SELECT pa.id, '515f3d94-496d-4376-84e4-84d70d9fc068', 1, 0, 100,
-       NULL, 'Only enabled Delhivery account for itismeoogway@gmail.com', 'system', CURRENT_TIMESTAMP
+       '57bdb049-28a7-472d-a235-7a3166ade1ed', 'Only enabled Delhivery account for itismeoogway@gmail.com; temporary test card: Namo sales rate card.xlsx', 'system', CURRENT_TIMESTAMP
 FROM provider_accounts pa
 WHERE pa.provider = 'delhivery' AND pa.status = 'active'
   AND upper(trim(pa.account_name)) = 'PSSLOGISTICS10 B2BC'
 ON CONFLICT(provider_account_id, client_id) DO UPDATE SET
   enabled = 1, priority = 0, confidence_score = 100,
-  notes = excluded.notes, updated_by_user_id = 'system', updated_at = CURRENT_TIMESTAMP;
+  rate_card_id = excluded.rate_card_id, notes = excluded.notes, updated_by_user_id = 'system', updated_at = CURRENT_TIMESTAMP;
 
 INSERT INTO provider_account_client_policies (
   provider_account_id, client_id, enabled, priority, confidence_score,
