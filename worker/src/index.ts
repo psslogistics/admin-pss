@@ -2327,7 +2327,7 @@ const worker = {
         // and returns 404, so retain the PSS pickup record without duplicating
         // the provider request when the booking flow marks it provider-managed.
         const providerManaged = payload.provider_managed === true;
-        const providerResult = provider && !providerManaged ? await safeProviderRequest(env, provider, "pickups", { pickup_id: pickupId, shipment_id: payload.shipment_id, tracking_number: shipment?.tracking_number, provider_reference: shipment?.provider_reference, provider_account_id: payload.provider_account_id ?? shipment?.provider_account_id, ...payload }, id, clientId, key) : { enabled: false, status: "not_requested" as const };
+        const providerResult = provider && !providerManaged ? await safeProviderRequest(env, provider, "pickups", { pickup_id: pickupId, shipment_id: payload.shipment_id, tracking_number: shipment?.tracking_number, provider_reference: shipment?.provider_reference, provider_account_id: payload.provider_account_id ?? shipment?.provider_account_id, ...payload }, id, clientId, key) : providerManaged ? { enabled: true, status: "accepted" as const, providerStatus: 204, managedBy: "shipment_manifest" } : { enabled: false, status: "not_requested" as const };
         if (provider && providerResult.status !== "accepted") {
           const failureReason = String((providerResult as { error?: string; reason?: string }).error ?? (providerResult as { reason?: string }).reason ?? `The ${provider} pickup request was not accepted`).slice(0, 500);
           await env.DB.prepare("UPDATE pickup_requests SET status = 'failed', failure_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(failureReason, pickupId, clientId).run();
