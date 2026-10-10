@@ -1461,8 +1461,12 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   let parsedProviderBody: unknown = null;
   try { parsedProviderBody = JSON.parse(responseBody); } catch { parsedProviderBody = null; }
   if (response.ok && provider === "delhivery" && operation === "shipments" && clientId && typeof payload.shipment_id === "string") {
-    const createdReference = findProviderReference(parsedProviderBody, useDelhiveryB2b ? new Set(["lrnum", "lr_number", "lr", "lrn", "waybill", "awb", "job_id", "jobid", "request_id"]) : new Set(["waybill", "awb", "tracking_number", "trackingid", "shipment_id"]));
-    const providerReference = useDelhiveryB2b ? findProviderReference(parsedProviderBody, new Set(["master_awb", "master_awb_number", "masterawb", "master_waybill", "awb"])) ?? createdReference : createdReference;
+    const b2bReference = findProviderReference(parsedProviderBody, new Set(["lrnum", "lr_num", "lr_number", "lr_no", "lrn", "lrn_number", "lr", "waybill", "waybill_number", "waybill_no", "awb", "awb_number", "job_id", "jobid", "request_id"]));
+    const textReference = useDelhiveryB2b
+      ? responseBody.match(/(?:lr(?:n|[_ ]?(?:number|num|no))?|awb|waybill)[^A-Za-z0-9]{0,12}(\d{6,20})/i)?.[1] ?? null
+      : null;
+    const createdReference = useDelhiveryB2b ? b2bReference ?? textReference : findProviderReference(parsedProviderBody, new Set(["waybill", "awb", "tracking_number", "trackingid", "shipment_id"]));
+    const providerReference = useDelhiveryB2b ? findProviderReference(parsedProviderBody, new Set(["master_awb", "master_awb_number", "masterawb", "master_waybill", "awb", "awb_number"])) ?? createdReference : createdReference;
     if (createdReference) await env.DB.prepare("UPDATE shipments SET tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(provider_reference, ?), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(createdReference, providerReference, payload.shipment_id, clientId).run();
   }
   if (response.ok && provider === "trackon" && operation === "shipments" && clientId && typeof payload.shipment_id === "string") {
