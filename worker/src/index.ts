@@ -643,6 +643,10 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
     const alreadyRegistered = lower.includes("already exists") || lower.includes("already configured") || lower.includes("duplicate") || lower.includes("warehouse exists");
     if (!alreadyRegistered) return { ok: false as const, error: `Delhivery warehouse creation failed (${response.status}): ${responseText.slice(0, 240)}` };
   }
+  // Delhivery may acknowledge warehouse creation before FAAS makes the name
+  // available to manifestation. Give the provider a short propagation window
+  // before using the warehouse in the shipment request.
+  await new Promise((resolve) => setTimeout(resolve, 2000));
   if (!existing) {
     await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, pincode, contact) VALUES (?, ?, ?, ?, ?, ?, ?)")
       .bind(crypto.randomUUID(), clientId, name, origin.line, origin.city, origin.pincode, origin.phone)
@@ -1418,6 +1422,14 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         fallbackUrl.searchParams.set("awb_number", trackingNumber);
         response = await providerFetch(fallbackUrl.toString(), { method: "GET", headers }, attemptTimeoutMs);
       }
+      // A newly-created Delhivery warehouse can take a moment to propagate in
+      // FAAS. Retry its 400 response instead of immediately exposing a false
+      // booking failure; other client errors remain non-retryable.
+      if (provider === "delhivery" && useDelhiveryB2b && operation === "shipments" && response.status === 400 && attempt < maxAttempts - 1) {
+        lastError = "provider_http_400";
+        await new Promise((resolve) => setTimeout(resolve, 2000 * (attempt + 1)));
+        continue;
+      }
       if (response.ok || (response.status >= 400 && response.status < 500 && response.status !== 429)) {
         if (!response.ok) {
           const allow = response.headers.get("allow")?.replace(/[^A-Za-z, ]/g, "").trim();
@@ -1516,7 +1528,10 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     ? undefined
     : findProviderReference(parsedProviderBody, new Set(["message", "error", "errors", "rmk", "remark", "remarks", "reason", "detail"]))
       ?? (responseBody.replace(/\s+/g, " ").trim().slice(0, 300) || lastError);
-  return { enabled: true, status: response.ok ? "accepted" as const : "failed" as const, providerStatus: response.status, normalized_status: normalizedTracking?.status, tracking: normalizedTracking ? { status: normalizedTracking.status, location: normalizedTracking.location, description: normalizedTracking.description, event_time: normalizedTracking.eventTime } : undefined, amount: provider === "xpressbees" && operation === "quotes" ? findProviderAmount(parsedProviderBody) : undefined, provider_account_id: account?.id, account_name: account?.account_name, confidence_score: account?.confidence_score, priority: account?.priority, rate_card_id: account?.rate_card_id ?? undefined, error: response.ok ? undefined : `${lastError}: ${providerError}` };
+  const normalizedError = !response.ok && /warehouse|configured|faas/i.test(String(providerError))
+    ? "Delhivery warehouse is not active yet. The pickup location must be registered and activated before booking."
+    : response.ok ? undefined : `${lastError}: ${providerError}`;
+  return { enabled: true, status: response.ok ? "accepted" as const : "failed" as const, providerStatus: response.status, normalized_status: normalizedTracking?.status, tracking: normalizedTracking ? { status: normalizedTracking.status, location: normalizedTracking.location, description: normalizedTracking.description, event_time: normalizedTracking.eventTime } : undefined, amount: provider === "xpressbees" && operation === "quotes" ? findProviderAmount(parsedProviderBody) : undefined, provider_account_id: account?.id, account_name: account?.account_name, confidence_score: account?.confidence_score, priority: account?.priority, rate_card_id: account?.rate_card_id ?? undefined, error: normalizedError };
 }
 
 async function safeProviderRequest(env: Env, provider: CourierProvider, operation: string, payload: Record<string, unknown>, requestIdValue: string, clientId?: string, idempotencyKey?: string, timeoutMsOverride?: number) {
