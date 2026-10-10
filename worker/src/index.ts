@@ -639,7 +639,11 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
       state: origin.state,
       pin: origin.pincode,
       phone: origin.phone,
-      ...(String(payload.client_gst_tin ?? payload.seller_gst_tin ?? "").trim() ? { gst_number: String(payload.client_gst_tin ?? payload.seller_gst_tin).trim() } : {}),
+      ...(String(payload.client_gst_tin ?? payload.seller_gst_tin ?? "").trim()
+        ? { gst_number: String(payload.client_gst_tin ?? payload.seller_gst_tin).trim() }
+        : String(payload.client_pan ?? payload.client_pan_number ?? payload.pan_number ?? "").trim()
+          ? { pan_number: String(payload.client_pan ?? payload.client_pan_number ?? payload.pan_number).trim() }
+          : {}),
     },
   };
 }
@@ -1159,7 +1163,23 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (provider === "rivigo") { headers.Authorization = `Bearer ${rivigoToken}`; headers.appUuid = rivigo!.appUuid; }
   const ekartCreate = provider === "ekart" && operation === "shipments" ? ekartCreatePayload(payload) : null;
   if (provider === "ekart" && operation === "shipments" && !ekartCreate) return { enabled: false, status: "invalid_request" as const, reason: "Origin and destination addresses require valid six-digit pincodes and ten-digit phone numbers" };
-  const providerPayload = account?.provider === "delhivery" ? { ...payload, delhivery_client_name: account.account_name } : payload;
+  let providerPayload: Record<string, unknown> = account?.provider === "delhivery" ? { ...payload, delhivery_client_name: account.account_name } : payload;
+  if (provider === "delhivery" && operation === "shipments" && clientId) {
+    const preferenceRow = await env.DB.prepare("SELECT preferences_json FROM client_preferences WHERE client_id = ? LIMIT 1")
+      .bind(clientId)
+      .first<{ preferences_json: string }>();
+    if (preferenceRow?.preferences_json) {
+      try {
+        const preferences = JSON.parse(preferenceRow.preferences_json) as { kyc?: { pan?: unknown; gstin?: unknown; gst_number?: unknown } };
+        const storedGstin = String(preferences.kyc?.gstin ?? preferences.kyc?.gst_number ?? "").trim();
+        const storedPan = String(preferences.kyc?.pan ?? "").trim();
+        if (!String(providerPayload.client_gst_tin ?? providerPayload.seller_gst_tin ?? "").trim() && storedGstin) providerPayload.client_gst_tin = storedGstin;
+        if (!String(providerPayload.client_pan ?? providerPayload.client_pan_number ?? providerPayload.pan_number ?? "").trim() && storedPan) providerPayload.client_pan = storedPan;
+      } catch {
+        // Ignore malformed optional preferences; the provider payload validation will report a missing KYC value.
+      }
+    }
+  }
   const delhiveryCreate = provider === "delhivery" && operation === "shipments" ? useDelhiveryB2b ? delhiveryB2bManifestPayload(env, providerPayload) : delhiveryCreatePayload(env, providerPayload) : null;
   if (provider === "delhivery" && operation === "shipments" && !delhiveryCreate) return { enabled: false, status: "invalid_request" as const, reason: "Delhivery requires valid origin/destination addresses, a registered client name, and a pickup location" };
   const delhiveryPickup = provider === "delhivery" && operation === "pickups" ? delhiveryPickupPayload(env, providerPayload) : null;
