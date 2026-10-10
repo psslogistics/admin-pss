@@ -706,10 +706,9 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
       inv_amt: declaredValue,
       inv_qr_code: String(payload.invoice_qr_code ?? ""),
     }],
-    // Delhivery's multipart parser requires the literal lowercase strings.
-    // A Boolean is serialized as Python-style `False` by the form builder and
-    // is treated as an empty ROV value by the provider.
-    rov_type: payload.rov_type === true ? "true" : "false",
+    // Delhivery's documented B2B field is rov_insurance: true for Carrier
+    // Risk and false for Owner Risk. `rov_type` is not a provider field.
+    rov_insurance: payload.rov_type === true,
     // PSS settles the shipment through its wallet before confirmation. That
     // is an internal billing event and must not be sent as Delhivery FoP/FoD:
     // this client is not enabled for those provider freight modes. Omitting
