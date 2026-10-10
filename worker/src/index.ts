@@ -874,6 +874,10 @@ function findProviderReference(value: unknown, keys: Set<string>, depth = 0): st
   for (const candidate of Object.values(object)) { const found = findProviderReference(candidate, keys, depth + 1); if (found) return found; }
   return null;
 }
+function delhiveryB2bNumber(value: string | null | undefined) {
+  const normalized = String(value ?? "").trim();
+  return /^\d{6,20}$/.test(normalized) ? normalized : null;
+}
 function findProviderAmount(value: unknown, keys = new Set(["amount", "total_amount", "total", "freight", "grand_total", "shipping_charge"]), depth = 0): number | null {
   if (depth > 5 || value === null || value === undefined) return null;
   if (Array.isArray(value)) { for (const item of value) { const found = findProviderAmount(item, keys, depth + 1); if (found !== null) return found; } return null; }
@@ -1336,7 +1340,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       ? trackonLabelUrl(trackonUrl!, trackingNumber, trackon!)
       : provider === "delhivery" && operation === "tracking"
         ? useDelhiveryB2b
-          ? `${base.replace(/\/$/, "")}/v2/track/${encodeURIComponent(trackingNumber)}`
+        ? `${base.replace(/\/$/, "")}/v2/track/${encodeURIComponent(delhiveryB2bNumber(trackingNumber) ?? String(payload.shipment_id ?? trackingNumber))}`
           : `${base.replace(/\/$/, "")}/packages/json/?waybill=${encodeURIComponent(trackingNumber)}&ref_ids=${encodeURIComponent(String(payload.order_id ?? ""))}`
     : provider === "delhivery" && operation === "shipments"
       ? useDelhiveryB2b ? `${base.replace(/\/$/, "")}/manifest` : `${delhiveryOrigin}/api/cmu/create.json`
@@ -1472,13 +1476,19 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   }
   let parsedProviderBody: unknown = null;
   try { parsedProviderBody = JSON.parse(responseBody); } catch { parsedProviderBody = null; }
+  if (response.ok && provider === "delhivery" && useDelhiveryB2b && operation === "tracking" && clientId && typeof payload.shipment_id === "string") {
+    const liveReference = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["lrnum", "lr_num", "lr_number", "lr_no", "lrn", "lrn_number", "waybill", "waybill_number", "awb", "awb_number"])))
+      ?? responseBody.match(/(?:lr(?:n|[_ ]?(?:number|num|no))?|awb|waybill)[^A-Za-z0-9]{0,12}(\d{6,20})/i)?.[1]
+      ?? null;
+    if (liveReference) await env.DB.prepare("UPDATE shipments SET tracking_number = ?, provider_reference = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(liveReference, liveReference, payload.shipment_id, clientId).run();
+  }
   if (response.ok && provider === "delhivery" && operation === "shipments" && clientId && typeof payload.shipment_id === "string") {
-    const b2bReference = findProviderReference(parsedProviderBody, new Set(["lrnum", "lr_num", "lr_number", "lr_no", "lrn", "lrn_number", "lr", "waybill", "waybill_number", "waybill_no", "awb", "awb_number", "job_id", "jobid", "request_id"]));
+    const b2bReference = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["lrnum", "lr_num", "lr_number", "lr_no", "lrn", "lrn_number", "lr", "waybill", "waybill_number", "waybill_no", "awb", "awb_number", "job_id", "jobid"])));
     const textReference = useDelhiveryB2b
       ? responseBody.match(/(?:lr(?:n|[_ ]?(?:number|num|no))?|awb|waybill)[^A-Za-z0-9]{0,12}(\d{6,20})/i)?.[1] ?? null
       : null;
     const createdReference = useDelhiveryB2b ? b2bReference ?? textReference : findProviderReference(parsedProviderBody, new Set(["waybill", "awb", "tracking_number", "trackingid", "shipment_id"]));
-    const providerReference = useDelhiveryB2b ? findProviderReference(parsedProviderBody, new Set(["master_awb", "master_awb_number", "masterawb", "master_waybill", "awb", "awb_number"])) ?? createdReference : createdReference;
+    const providerReference = useDelhiveryB2b ? delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["master_awb", "master_awb_number", "masterawb", "master_waybill", "awb", "awb_number"]))) ?? createdReference : createdReference;
     if (createdReference) await env.DB.prepare("UPDATE shipments SET tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(provider_reference, ?), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(createdReference, providerReference, payload.shipment_id, clientId).run();
   }
   if (response.ok && provider === "trackon" && operation === "shipments" && clientId && typeof payload.shipment_id === "string") {
