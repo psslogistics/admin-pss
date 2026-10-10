@@ -626,13 +626,17 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
     return_state: origin.state,
     return_country: "India",
   };
-  const endpoint = "https://track.delhivery.com/api/backend/clientwarehouse/create/";
+  // Use the same LTL/B2B host and JWT scheme as manifestation. The legacy
+  // track.delhivery.com endpoint expects a different static API token and
+  // returns 401 Invalid token for this account's B2B JWT.
+  const endpoint = "https://ltl-clients-api.delhivery.com/client-warehouse/create/";
   let response: Response;
   try {
     response = await providerFetch(endpoint, {
       method: "POST",
       headers: {
-        authorization: `Token ${token}`,
+        authorization: `Bearer ${token}`,
+        "x-b2b-token": token,
         "content-type": "application/json",
         accept: "application/json",
         "x-request-id": requestIdValue,
