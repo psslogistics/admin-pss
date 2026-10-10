@@ -720,7 +720,7 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
   };
 }
 
-function delhiveryB2bManifestForm(payload: Record<string, unknown>) {
+function delhiveryB2bManifestForm(payload: Record<string, unknown>, invoiceDocuments: unknown) {
   const form = new FormData();
   for (const [key, value] of Object.entries(payload)) {
     if (value === undefined || value === null) continue;
@@ -729,7 +729,50 @@ function delhiveryB2bManifestForm(payload: Record<string, unknown>) {
     // documented curl example for list fields (Python-style booleans).
     form.append(key, typeof value === "object" ? serialized.replace(/\btrue\b/g, "True").replace(/\bfalse\b/g, "False").replace(/\bnull\b/g, "None") : serialized);
   }
+  const documents = Array.isArray(invoiceDocuments) ? invoiceDocuments.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object") : [];
+  if (documents.length) {
+    const invoices = Array.isArray(payload.invoices) ? payload.invoices as Array<Record<string, unknown>> : [];
+    form.append("doc_data", JSON.stringify(documents.map((document, index) => ({
+      doc_type: "INVOICE_COPY",
+      doc_meta: { invoice_num: [String(document.invoice_number ?? invoices[index]?.inv_num ?? "")] },
+    }))));
+    for (const document of documents) {
+      const encoded = String(document.body_base64 ?? "").replace(/^data:[^,]+,/, "");
+      const binary = atob(encoded);
+      const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+      const blob = new Blob([bytes], { type: String(document.content_type ?? "application/pdf") });
+      form.append("doc_file", blob, String(document.name ?? "invoice.pdf"));
+    }
+  }
   return form;
+}
+
+async function persistShipmentDocuments(env: Env, clientId: string, shipmentId: string, documents: unknown, uploadedBy: string) {
+  const items = Array.isArray(documents) ? documents.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object") : [];
+  if (!items.length) return { ok: false as const, error: "An invoice document is required for Delhivery B2B booking" };
+  const allowed = new Set(["application/pdf", "image/jpeg", "image/png"]);
+  let totalBytes = 0;
+  for (const item of items) {
+    const name = String(item.name ?? "").trim();
+    const contentType = String(item.content_type ?? "").split(";", 1)[0].trim().toLowerCase();
+    const encoded = String(item.body_base64 ?? "").replace(/^data:[^,]+,/, "");
+    if (!name || name.length > 200 || !allowed.has(contentType) || !encoded || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded) || encoded.length % 4 === 1) return { ok: false as const, error: "Invoice files must be valid PDF, JPG, or PNG documents" };
+    let binary: string;
+    try { binary = atob(encoded); } catch { return { ok: false as const, error: "Invoice file content is not valid base64" }; }
+    const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    totalBytes += bytes.byteLength;
+    if (bytes.byteLength < 1 || bytes.byteLength > 10 * 1024 * 1024 || totalBytes > 20 * 1024 * 1024 || !documentSignatureMatches(contentType, bytes)) return { ok: false as const, error: "Invoice files must be valid documents up to 10 MB each and 20 MB total" };
+    const documentId = crypto.randomUUID();
+    const objectKey = `clients/${clientId}/shipments/${shipmentId}/${documentId}-${name.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
+    await env.FILES.put(objectKey, bytes, { httpMetadata: { contentType } });
+    try {
+      await env.DB.prepare("INSERT INTO shipment_documents (id, shipment_id, client_id, object_key, original_filename, content_type, file_size_bytes, uploaded_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").bind(documentId, shipmentId, clientId, objectKey, name, contentType, bytes.byteLength, uploadedBy).run();
+    } catch (caught) {
+      await env.FILES.delete(objectKey).catch(() => undefined);
+      throw caught;
+    }
+  }
+  return { ok: true as const };
 }
 
 function delhiveryCreatePayload(env: Env, payload: Record<string, unknown>) {
@@ -1310,7 +1353,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         ? `${base.replace(/\/$/, "")}/operations/booking/cancel?bookingId=${encodeURIComponent(String(payload.booking_id ?? payload.provider_reference ?? ""))}`
       : trackonUrl!;
   const requestBody = provider === "delhivery" && operation === "shipments"
-    ? useDelhiveryB2b ? delhiveryB2bManifestForm(delhiveryCreate as Record<string, unknown>) : `format=json&data=${encodeURIComponent(JSON.stringify(delhiveryCreate))}`
+    ? useDelhiveryB2b ? delhiveryB2bManifestForm(delhiveryCreate as Record<string, unknown>, providerPayload.invoice_documents) : `format=json&data=${encodeURIComponent(JSON.stringify(delhiveryCreate))}`
     : provider === "delhivery" && operation === "pickups"
       ? JSON.stringify(delhiveryPickup)
       : provider === "ekart" && operation === "shipments"
@@ -1966,7 +2009,7 @@ const worker = {
         if (!hasScope(auth, "provider_accounts.manage") || !hasRole(auth, ["admin", "super_admin"])) return error("FORBIDDEN", "Provider account policy management permission required", 403, id, headers);
         const account = await env.DB.prepare("SELECT id, provider, client_id, status FROM provider_accounts WHERE id = ? LIMIT 1").bind(providerPolicyMatch[1]).first<{ id: string; provider: CourierProvider; client_id: string | null; status: string }>();
         if (!account || account.status !== "active") return error("NOT_FOUND", "Active provider account not found", 404, id, headers);
-        const payload = await bodyJson(request);
+        const payload = await bodyJson(request, 32 * 1024 * 1024);
         const clientId = typeof payload.client_id === "string" ? payload.client_id.trim() : "";
         const enabled = payload.enabled === undefined ? true : payload.enabled;
         const priority = payload.priority === undefined ? 100 : Number(payload.priority);
@@ -2069,7 +2112,7 @@ const worker = {
 
       if (route === "/shipments" && request.method === "POST") {
         if (!hasScope(auth, "shipments.create")) return error("FORBIDDEN", "Shipment creation scope required", 403, id, headers);
-        const payload = await bodyJson(request);
+        const payload = await bodyJson(request, 32 * 1024 * 1024);
         const requestHash = await payloadFingerprint(payload);
         const description = typeof payload.description === "string" ? payload.description.trim() : "";
         const origin = typeof payload.origin === "string" ? payload.origin.trim() : "";
@@ -2092,6 +2135,7 @@ const worker = {
         if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
         const provider = typeof payload.provider === "string" && ["delhivery", "ekart", "trackon", "xpressbees", "rivigo"].includes(payload.provider) ? payload.provider : (hasRole(auth, ["employee", "admin", "super_admin"]) ? "delhivery" : null);
         if ((auth.kind === "api" || hasRole(auth, ["client"])) && provider !== "delhivery") return error("DELHIVERY_B2B_ONLY", "Client shipment booking is currently limited to Delhivery B2B", 409, id, headers);
+        if (provider === "delhivery" && (!Array.isArray(payload.invoice_documents) || payload.invoice_documents.length < 1)) return error("INVOICE_DOCUMENT_REQUIRED", "Upload at least one invoice document before booking this Delhivery B2B shipment", 400, id, headers);
         const pricingQuoteId = typeof payload.pricing_quote_id === "string" ? payload.pricing_quote_id.trim() : "";
         const submittedPricingQuote = pricingQuoteId ? await env.DB.prepare("SELECT id, version_id, account_scope, origin_zone, destination_zone, chargeable_weight_kg, client_breakdown_json, expires_at FROM pricing_quotes WHERE id = ? AND client_id = ? LIMIT 1").bind(pricingQuoteId, clientId).first<PricingQuoteRecord & { expires_at: string }>() : null;
         if (pricingQuoteId && !submittedPricingQuote) return error("PRICING_QUOTE_NOT_FOUND", "The submitted PSS quote was not found for this client. Request a fresh quote before booking.", 409, id, headers);
@@ -2120,6 +2164,11 @@ const worker = {
         while (await env.DB.prepare("SELECT 1 FROM shipments WHERE pss_reference = ? LIMIT 1").bind(pssReference).first()) pssReference = String(Number(pssReference) + 1);
         await env.DB.prepare("INSERT INTO shipments (id, pss_reference, client_id, created_by_user_id, provider, provider_account_id, status, description, origin, destination, origin_address_json, destination_address_json, consignee, total_weight_kg, declared_value, pieces, edd) VALUES (?, ?, ?, ?, ?, NULL, 'booked', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(shipmentId, pssReference, clientId, auth.userId ?? `api:${clientId}`, provider, description, origin, destination, JSON.stringify(originAddress), JSON.stringify(destinationAddress), String(destinationAddress.name), weight, declaredValue, pieces, typeof payload.edd === "string" ? payload.edd : null).run();
         await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'booked', 'Shipment created', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipmentId, auth.userId ?? `api:${clientId}`).run();
+        const storedDocuments = await persistShipmentDocuments(env, clientId, shipmentId, payload.invoice_documents, auth.userId ?? `api:${clientId}`);
+        if (!storedDocuments.ok) {
+          await env.DB.prepare("UPDATE shipments SET status = 'exception', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(shipmentId, clientId).run();
+          return error("INVOICE_DOCUMENT_INVALID", storedDocuments.error, 400, id, headers);
+        }
         if (pricingQuote) await env.DB.prepare("INSERT INTO weight_reconciliations (id, client_id, shipment_id, declared_weight_kg, declared_volumetric_weight_kg, initial_billable_weight_kg, measured_weight_kg, billable_weight_kg, client_dispute_deadline_at, status) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, NULL, 'pending')").bind(crypto.randomUUID(), clientId, shipmentId, weight, volumetricWeightFromPayload(payload), pricingQuote.chargeable_weight_kg, pricingQuote.chargeable_weight_kg).run();
         if (pricingQuote) {
           const billingId = crypto.randomUUID(); const walletId = crypto.randomUUID();
