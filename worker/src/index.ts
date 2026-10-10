@@ -2353,7 +2353,8 @@ const worker = {
         const operation = kind === "lr-copy" ? "lr_copy" : kind === "document" ? "document" : "labels";
         const requestedSize = url.searchParams.get("size") ?? (kind === "sticker" ? "std" : "a4");
         if (operation === "labels" && !["sm", "md", "a4", "std"].includes(requestedSize)) return error("INVALID_REQUEST", "Delhivery label size must be sm, md, a4, or std", 400, id, headers);
-        const providerReference = shipment.tracking_number ?? shipment.provider_reference ?? shipment.pickup_reference;
+        const providerReference = shipment.tracking_number ?? shipment.provider_reference;
+        if (!providerReference) return error("PROVIDER_REFERENCE_UNAVAILABLE", "Delhivery LR is not available yet; the PUR cannot be used as an LR", 409, id, headers);
         const payload = { shipment_id: shipment.id, tracking_number: providerReference, provider_reference: providerReference, provider_account_id: shipment.provider_account_id, label_size: requestedSize, lr_copy_type: url.searchParams.get("lr_copy_type") ?? undefined, doc_type: url.searchParams.get("doc_type") ?? "LM_POD" };
         const providerResult = await safeProviderRequest(env, "delhivery", operation, payload, id, shipment.client_id);
         return json({ ok: true, data: providerResult }, 200, headers);
