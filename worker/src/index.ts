@@ -700,8 +700,10 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
       inv_amt: declaredValue,
       inv_qr_code: String(payload.invoice_qr_code ?? ""),
     }],
-    freight_mode: "fop",
-    fm_pickup: true,
+    // PSS settles the shipment through its wallet before confirmation. That
+    // is an internal billing event and must not be sent as Delhivery FoP/FoD:
+    // this client is not enabled for those provider freight modes. Omitting
+    // both fields lets Delhivery use the account's normal prepaid billing.
     billing_address: {
       name: origin.name,
       company: String(payload.delhivery_client_name ?? origin.name).trim(),
