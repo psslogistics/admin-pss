@@ -1277,7 +1277,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   const trackon = provider === "trackon" ? trackonCredentials(env, credential) : null;
   const rivigo = provider === "rivigo" ? rivigoCredentials(env, credential) : null;
   if (!base || (provider === "trackon" ? !trackon : provider === "rivigo" ? !rivigo : !credential)) return { enabled: false, status: "not_configured" as const };
-  const providerTimeoutMs = Math.min(timeoutMsOverride ?? 10000, 10000);
+  const providerTimeoutMs = Math.min(timeoutMsOverride ?? (provider === "delhivery" && operation === "shipments" ? 30000 : 10000), provider === "delhivery" && operation === "shipments" ? 30000 : 10000);
   const delhiveryB2bAccountName = account?.account_name ?? defaultDelhiveryAccountName;
   const delhiveryB2bToken = useDelhiveryB2b ? await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs) : null;
   if (provider === "delhivery" && useDelhiveryB2b && !delhiveryB2bToken) return { enabled: true, status: "failed" as const, error: "Delhivery B2B authentication failed" };
