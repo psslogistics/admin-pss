@@ -595,40 +595,53 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   const existing = await env.DB.prepare("SELECT name FROM warehouses WHERE client_id = ? AND address = ? AND city = ? AND pincode = ? LIMIT 1")
     .bind(clientId, origin.line, origin.city, origin.pincode)
     .first<{ name: string }>();
-  if (existing?.name?.trim()) return { ok: true as const, name: existing.name.trim() };
-
-  const name = delhiveryWarehouseName(origin);
+  const name = existing?.name?.trim() || delhiveryWarehouseName(origin);
+  // Delhivery B2B manifestation validates this against the B2B warehouse
+  // registry. A local PSS warehouse row is not proof that the provider knows
+  // the location, so always make the provider-side create call when booking.
   const warehousePayload = {
-    phone: origin.phone,
-    city: origin.city,
     name,
-    pin: origin.pincode,
-    address: origin.line,
+    pin_code: origin.pincode,
+    city: origin.city,
+    state: origin.state,
     country: "India",
-    email: delhiveryJwtClaim(token, "client_email") || delhiveryJwtClaim(token, "email") || "support@psslogistics.in",
-    registered_name: name,
-    return_address: origin.line,
-    return_pin: origin.pincode,
-    return_city: origin.city,
-    return_state: origin.state,
-    return_country: "India",
+    address_details: {
+      address: origin.line,
+      contact_person: origin.name,
+      phone_number: origin.phone,
+      email: delhiveryJwtClaim(token, "client_email") || delhiveryJwtClaim(token, "email") || "support@psslogistics.in",
+    },
+    same_as_fwd_add: true,
+    ret_address: { pin: origin.pincode, address: origin.line },
   };
-  const endpoint = "https://track.delhivery.com/api/backend/clientwarehouse/create/";
-  const authorization = /^[^\s.]+\.[^\s.]+\.[^\s.]+$/.test(token) ? `Bearer ${token}` : `Token ${token}`;
+  const endpoint = "https://ltl-clients-api.delhivery.com/client-warehouse/create/";
   let response: Response;
   try {
     response = await providerFetch(endpoint, {
       method: "POST",
-      headers: { authorization, "content-type": "application/json", accept: "application/json", "x-request-id": requestIdValue },
+      headers: {
+        authorization: `Bearer ${token}`,
+        "x-b2b-token": token,
+        "content-type": "application/json",
+        accept: "application/json",
+        "x-request-id": requestIdValue,
+      },
       body: JSON.stringify(warehousePayload),
     }, timeoutMs);
   } catch (caught) {
     return { ok: false as const, error: caught instanceof Error ? caught.message : "Delhivery warehouse creation failed" };
   }
-  if (!response.ok) return { ok: false as const, error: `Delhivery warehouse creation failed (${response.status})` };
-  await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, pincode, contact) VALUES (?, ?, ?, ?, ?, ?, ?)")
-    .bind(crypto.randomUUID(), clientId, name, origin.line, origin.city, origin.pincode, origin.phone)
-    .run();
+  const responseText = await providerResponseText(response, timeoutMs);
+  if (!response.ok) {
+    const lower = responseText.toLowerCase();
+    const alreadyRegistered = lower.includes("already exists") || lower.includes("already configured") || lower.includes("duplicate") || lower.includes("warehouse exists");
+    if (!alreadyRegistered) return { ok: false as const, error: `Delhivery warehouse creation failed (${response.status}): ${responseText.slice(0, 240)}` };
+  }
+  if (!existing) {
+    await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, pincode, contact) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .bind(crypto.randomUUID(), clientId, name, origin.line, origin.city, origin.pincode, origin.phone)
+      .run();
+  }
   return { ok: true as const, name };
 }
 
