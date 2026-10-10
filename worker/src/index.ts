@@ -630,6 +630,17 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
     }],
     freight_mode: "fop",
     fm_pickup: true,
+    billing_address: {
+      name: origin.name,
+      company: String(payload.delhivery_client_name ?? origin.name).trim(),
+      consignor: origin.name,
+      address: origin.line,
+      city: origin.city,
+      state: origin.state,
+      pin: origin.pincode,
+      phone: origin.phone,
+      ...(String(payload.client_gst_tin ?? payload.seller_gst_tin ?? "").trim() ? { gst_number: String(payload.client_gst_tin ?? payload.seller_gst_tin).trim() } : {}),
+    },
   };
 }
 
