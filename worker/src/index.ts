@@ -481,6 +481,11 @@ async function createShipmentPricingQuote(env: Env, clientId: string, payload: R
   }
   const oda = Boolean(originPin?.oda || destinationPin?.oda);
   const result = calculatePssRate({ account, originCity, destinationCity, originState, destinationState, actualWeightKg, volumetricWeightKg, invoiceValue, rto, forwardRatePerKg, forwardOriginZoneOverride: rtoSource?.origin_zone, forwardDestinationZoneOverride: rtoSource?.destination_zone, minimumWeightKg: Number(version.minimum_weight_kg ?? 20), gstPercent: Number(version.gst_percent ?? 18), versionId: version.id, oda, opa: false, rateMatrix: Object.fromEntries(matrixRows.results.map((row) => [`${row.origin_zone}->${row.destination_zone}`, Number(row.rate_per_kg)])), chargeRules: rules.results.map((rule) => ({ code: rule.code, label: rule.label, kind: rule.calculation_type, value: Number(rule.value), basis: rule.basis, minimum: rule.minimum_value === null ? undefined : Number(rule.minimum_value), maximum: rule.maximum_value === null ? undefined : Number(rule.maximum_value), enabled: Boolean(rule.enabled), marker: rule.marker ?? undefined, condition: rule.condition ?? undefined, displayOrder: Number(rule.display_order ?? 0) })) });
+  const carrierRisk = payload.risk_type === "carrier";
+  if (carrierRisk) {
+    result.lines.push({ code: "carrier_risk", label: "Carrier risk fee", amount: 100 });
+    result.total = Number(result.total) + 100;
+  }
   const quoteId = crypto.randomUUID(); const breakdown = JSON.stringify(result);
   await env.DB.prepare("INSERT INTO pricing_quotes (id, client_id, version_id, account_scope, origin_zone, destination_zone, chargeable_weight_kg, client_breakdown_json, expires_at, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+15 minutes'), ?)").bind(quoteId, clientId, version.id, account, result.originZone, result.destinationZone, result.chargeableWeightKg, breakdown, createdByUserId).run();
   return { id: quoteId, version_id: version.id, account_scope: account, origin_zone: result.originZone, destination_zone: result.destinationZone, chargeable_weight_kg: result.chargeableWeightKg, client_breakdown_json: breakdown };
@@ -700,6 +705,8 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
       inv_amt: declaredValue,
       inv_qr_code: String(payload.invoice_qr_code ?? ""),
     }],
+    // Delhivery expects true for Carrier Risk and false for Owner Risk.
+    rov_type: payload.rov_type === true,
     // PSS settles the shipment through its wallet before confirmation. That
     // is an internal billing event and must not be sent as Delhivery FoP/FoD:
     // this client is not enabled for those provider freight modes. Omitting
