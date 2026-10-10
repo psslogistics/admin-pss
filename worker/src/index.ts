@@ -874,6 +874,24 @@ function providerSafePickupDate(dateValue: string) {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit" }).format(next);
 }
 
+function delhiveryPickupOptions() {
+  const now = new Date();
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", hour12: false }).formatToParts(now).filter((part) => part.type !== "literal").map((part) => [part.type, part.value]));
+  const today = `${parts.year}-${parts.month}-${parts.day}`;
+  const afterCutoff = Number(parts.hour) >= 14;
+  const slots = ["09:00 AM – 11:00 AM", "11:00 AM – 01:00 PM", "02:00 PM – 04:00 PM", "04:00 PM – 06:00 PM"];
+  const dates: Array<{ date: string; slots: string[]; reason: string }> = [];
+  for (let offset = 0; dates.length < 3 && offset < 8; offset += 1) {
+    const candidate = new Date(`${today}T12:00:00+05:30`);
+    candidate.setUTCDate(candidate.getUTCDate() + offset);
+    const date = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit" }).format(candidate);
+    const weekday = new Intl.DateTimeFormat("en-US", { timeZone: "Asia/Kolkata", weekday: "short" }).format(candidate);
+    if (weekday === "Sun" || (offset === 0 && afterCutoff)) continue;
+    dates.push({ date, slots, reason: offset === 0 ? "same_day_before_cutoff" : "next_operational_day" });
+  }
+  return { dates, source: "delhivery_pickup_policy", cutoff_time: "14:00", timezone: "Asia/Kolkata", note: "Final acceptance remains subject to the Delhivery pickup location's configured working days and slot capacity." };
+}
+
 function findProviderReference(value: unknown, keys: Set<string>, depth = 0): string | null {
   if (depth > 8 || value === null || value === undefined) return null;
   const normalizedKeys = new Set([...keys].map((key) => key.toLowerCase()));
@@ -1214,10 +1232,10 @@ function providerOdaFlag(value: Record<string, unknown> | null | undefined): boo
 async function providerRequest(env: Env, provider: CourierProvider, operation: string, payload: Record<string, unknown>, requestIdValue: string, clientId?: string, idempotencyKey?: string, timeoutMsOverride?: number) {
   if (String(env.ENABLE_PROVIDER_CALLS) !== "true") return { enabled: false, status: "disabled" as const };
   const trackingNumber = String(payload.tracking_number ?? payload.provider_reference ?? "").trim();
-  if ((operation === "tracking" || operation === "labels") && !trackingNumber) return { enabled: false, status: "invalid_request" as const, reason: "A provider tracking reference is required" };
+  if (["tracking", "labels", "lr_copy", "document"].includes(operation) && !trackingNumber) return { enabled: false, status: "invalid_request" as const, reason: "A provider tracking reference is required" };
   if (provider === "delhivery" && operation === "shipments" && String(env.DELHIVERY_ENABLE_SHIPMENT_CREATION) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "Delhivery shipment creation is safety-disabled until live billing approval" };
   if (provider === "delhivery" && operation === "pickups" && String(env.DELHIVERY_ENABLE_PICKUP_CREATION) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "Delhivery pickup creation is safety-disabled until live operations approval" };
-  if (provider === "delhivery" && !new Set(["tracking", "shipments", "pickups", "serviceability"]).has(operation)) return { enabled: false, status: "unsupported" as const, reason: "Delhivery operation is not supported" };
+  if (provider === "delhivery" && !new Set(["tracking", "shipments", "pickups", "serviceability", "labels", "lr_copy", "document"]).has(operation)) return { enabled: false, status: "unsupported" as const, reason: "Delhivery operation is not supported" };
   if (provider === "ekart" && operation === "pickups") return { enabled: false, status: "unsupported" as const, reason: "Ekart pickup contract is not verified" };
   if (provider === "ekart" && String(env.EKART_ENABLE_PROVIDER_CALLS) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "Ekart is configured but disabled until the agreed provider scope is approved" };
   if (provider === "ekart" && operation !== "tracking" && operation !== "shipments") return { enabled: false, status: "unsupported" as const, reason: "Ekart operation is not supported" };
@@ -1353,6 +1371,12 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     ? trackonTrackingUrl(trackonUrl!, trackingNumber, trackon!)
     : provider === "trackon" && operation === "labels"
       ? trackonLabelUrl(trackonUrl!, trackingNumber, trackon!)
+      : provider === "delhivery" && operation === "labels"
+        ? `${base.replace(/\/$/, "")}/label/get_urls/${encodeURIComponent(String(payload.label_size ?? "std"))}/${encodeURIComponent(trackingNumber)}`
+      : provider === "delhivery" && operation === "lr_copy"
+        ? `${base.replace(/\/$/, "")}/lr_copy/print/${encodeURIComponent(trackingNumber)}${payload.lr_copy_type ? `?lr_copy_type=${encodeURIComponent(String(payload.lr_copy_type))}` : ""}`
+      : provider === "delhivery" && operation === "document"
+        ? `${base.replace(/\/$/, "")}/document/download?lrn=${encodeURIComponent(trackingNumber)}${payload.doc_type ? `&doc_type=${encodeURIComponent(String(payload.doc_type))}` : ""}&auto_download=true&version=latest`
       : provider === "delhivery" && operation === "tracking"
         ? useDelhiveryB2b
         ? `${base.replace(/\/$/, "")}/v2/track/${encodeURIComponent(delhiveryB2bNumber(trackingNumber) ?? String(payload.shipment_id ?? trackingNumber))}`
@@ -1402,7 +1426,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         : provider === "rivigo" && operation === "shipments" ? JSON.stringify(rivigoCreate)
         : provider === "rivigo" && operation === "updates" ? JSON.stringify(payload)
         : provider === "rivigo" && operation === "cancellations" ? JSON.stringify(payload.cnotes_list ? { cnotesList: payload.cnotes_list } : {})
-        : provider === "delhivery" && (operation === "tracking" || operation === "serviceability") ? ""
+        : provider === "delhivery" && ["tracking", "serviceability", "labels", "lr_copy", "document"].includes(operation) ? ""
         : operation === "tracking" ? JSON.stringify({ Appkey: trackon!.appKey, userId: trackon!.userId, password: trackon!.password, AWBNo: trackingNumber })
           : operation === "shipments" ? JSON.stringify(trackonPayload(payload, trackon!))
             : JSON.stringify({ Appkey: trackon!.appKey, userId: trackon!.userId, password: trackon!.password, AWBNo: trackingNumber });
@@ -1422,7 +1446,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       // XpressBees documents tracking as POST even though it is a read-only
       // lookup. Keep the generic GET behavior for Delhivery/Trackon tracking,
       // but send the XpressBees AWB body with POST to avoid provider HTTP 405.
-      const isGet = (operation === "tracking" && provider !== "xpressbees" && provider !== "rivigo") || (operation === "serviceability" && provider !== "xpressbees") || (provider === "trackon" && operation === "labels");
+      const isGet = (["tracking", "serviceability", "labels", "lr_copy", "document"].includes(operation) && provider !== "xpressbees" && provider !== "rivigo") || (provider === "trackon" && operation === "labels");
       const method = provider === "rivigo" && operation === "cancellations" ? "DELETE" : provider === "rivigo" && operation === "updates" ? "PUT" : isGet ? "GET" : "POST";
       response = await providerFetch(url, { method, headers, body: isGet ? undefined : requestBody }, attemptTimeoutMs);
       if (provider === "delhivery" && useDelhiveryB2b && response.status === 401 && attempt === 0 && credential) {
@@ -1513,6 +1537,11 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (response.ok && provider === "trackon" && operation === "labels") {
     const labelUrl = findProviderReference(parsedProviderBody, new Set(["fileurl", "file_url"]));
     return { enabled: true, status: labelUrl ? "accepted" as const : "failed" as const, providerStatus: response.status, label_url: labelUrl, error: labelUrl ? undefined : "Trackon did not return a label URL" };
+  }
+  if (response.ok && provider === "delhivery" && ["labels", "lr_copy", "document"].includes(operation)) {
+    let artifact: unknown = null;
+    try { artifact = JSON.parse(responseBody); } catch { artifact = { content_base64: btoa(responseBody), content_type: response.headers.get("content-type") ?? "application/octet-stream" }; }
+    return { enabled: true, status: "accepted" as const, providerStatus: response.status, artifact };
   }
   if (response.ok && provider === "delhivery" && operation === "pickups" && typeof payload.pickup_id === "string") {
     const pickupReference = findProviderReference(parsedProviderBody, new Set(["pickup_id", "pickup_request_id", "pur_id", "request_id"]));
@@ -2313,14 +2342,19 @@ const worker = {
         return json({ ok: true, data: documents.results }, 200, headers);
       }
 
-      const shipmentLabel = route.match(/^\/shipments\/([^/]+)\/label$/);
-      if (shipmentLabel && request.method === "GET") {
-        if (!hasRole(auth, ["employee", "admin", "super_admin"]) && !auth.system) return error("FORBIDDEN", "Provider label operations are not available to client users", 403, id, headers);
-        if (!hasScope(auth, "tracking.read")) return error("FORBIDDEN", "Tracking read scope required", 403, id, headers);
-        const shipment = await env.DB.prepare("SELECT id, client_id, provider, tracking_number, provider_reference FROM shipments WHERE id = ? LIMIT 1").bind(shipmentLabel[1]).first<{ id: string; client_id: string; provider: string | null; tracking_number: string | null; provider_reference: string | null }>();
+      const shipmentArtifact = route.match(/^\/shipments\/([^/]+)\/(label|sticker|lr-copy|document)$/);
+      if (shipmentArtifact && request.method === "GET") {
+        if (!hasScope(auth, "tracking.read") && !hasScope(auth, "documents.read")) return error("FORBIDDEN", "Tracking or document read scope required", 403, id, headers);
+        const shipment = await env.DB.prepare("SELECT id, client_id, provider, tracking_number, provider_reference, provider_account_id FROM shipments WHERE id = ? LIMIT 1").bind(shipmentArtifact[1]).first<{ id: string; client_id: string; provider: string | null; tracking_number: string | null; provider_reference: string | null; provider_account_id: string | null }>();
         if (!shipment || !canAccessClient(auth, shipment.client_id)) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
-        if (shipment.provider !== "trackon") return error("UNSUPPORTED_PROVIDER_OPERATION", "Label generation is currently available only for Trackon", 409, id, headers);
-        const providerResult = await safeProviderRequest(env, "trackon", "labels", { shipment_id: shipment.id, tracking_number: shipment.tracking_number, provider_reference: shipment.provider_reference }, id, shipment.client_id);
+        if (shipment.provider !== "delhivery") return error("UNSUPPORTED_PROVIDER_OPERATION", "Provider documents are currently available only for Delhivery", 409, id, headers);
+        const url = new URL(request.url);
+        const kind = shipmentArtifact[2];
+        const operation = kind === "lr-copy" ? "lr_copy" : kind === "document" ? "document" : "labels";
+        const requestedSize = url.searchParams.get("size") ?? (kind === "sticker" ? "std" : "a4");
+        if (operation === "labels" && !["sm", "md", "a4", "std"].includes(requestedSize)) return error("INVALID_REQUEST", "Delhivery label size must be sm, md, a4, or std", 400, id, headers);
+        const payload = { shipment_id: shipment.id, tracking_number: shipment.tracking_number, provider_reference: shipment.provider_reference, provider_account_id: shipment.provider_account_id, label_size: requestedSize, lr_copy_type: url.searchParams.get("lr_copy_type") ?? undefined, doc_type: url.searchParams.get("doc_type") ?? "LM_POD" };
+        const providerResult = await safeProviderRequest(env, "delhivery", operation, payload, id, shipment.client_id);
         return json({ ok: true, data: providerResult }, 200, headers);
       }
 
@@ -2344,6 +2378,11 @@ const worker = {
           return json({ ok: true, data: events.results, provider_status: providerResult.status }, 200, headers);
         }
         return json({ ok: true, data: shipment }, 200, headers);
+      }
+
+      if (route === "/pickup-slots" && request.method === "GET") {
+        if (!hasScope(auth, "pickups.read")) return error("FORBIDDEN", "Pickup read scope required", 403, id, headers);
+        return json({ ok: true, data: delhiveryPickupOptions() }, 200, headers);
       }
 
       if (route === "/pickups" && request.method === "GET") {
