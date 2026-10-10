@@ -1337,7 +1337,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     : provider === "delhivery" && operation === "shipments"
       ? useDelhiveryB2b ? `${base.replace(/\/$/, "")}/manifest` : `${delhiveryOrigin}/api/cmu/create.json`
       : provider === "delhivery" && operation === "pickups"
-        ? `${delhiveryOrigin}/fm/request/new/`
+        ? "https://track.delhivery.com/fm/request/new/"
         : provider === "delhivery" && operation === "serviceability"
           ? `${delhiveryOrigin}/c/api/pin-codes/json/?filter_codes=${encodeURIComponent(String(payload.destination_pincode ?? ""))}`
     : provider === "ekart"
