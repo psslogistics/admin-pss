@@ -2322,7 +2322,12 @@ const worker = {
         const shipment = typeof payload.shipment_id === "string" ? await env.DB.prepare("SELECT provider, provider_account_id, tracking_number, provider_reference FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(payload.shipment_id, clientId).first<{ provider: string | null; provider_account_id: string | null; tracking_number: string | null; provider_reference: string | null }>() : null;
         const requestedProvider = ["delhivery", "ekart", "trackon", "xpressbees", "rivigo"].includes(String(payload.provider)) ? payload.provider as CourierProvider : null;
         const provider = requestedProvider ?? (["delhivery", "ekart", "trackon", "xpressbees", "rivigo"].includes(String(shipment?.provider)) ? shipment?.provider as CourierProvider : null);
-        const providerResult = provider ? await safeProviderRequest(env, provider, "pickups", { pickup_id: pickupId, shipment_id: payload.shipment_id, tracking_number: shipment?.tracking_number, provider_reference: shipment?.provider_reference, provider_account_id: payload.provider_account_id ?? shipment?.provider_account_id, ...payload }, id, clientId, key) : { enabled: false, status: "not_requested" as const };
+        // Delhivery B2B pickup is created as part of the manifest request. The
+        // separate legacy pickup endpoint is not available for these accounts
+        // and returns 404, so retain the PSS pickup record without duplicating
+        // the provider request when the booking flow marks it provider-managed.
+        const providerManaged = payload.provider_managed === true;
+        const providerResult = provider && !providerManaged ? await safeProviderRequest(env, provider, "pickups", { pickup_id: pickupId, shipment_id: payload.shipment_id, tracking_number: shipment?.tracking_number, provider_reference: shipment?.provider_reference, provider_account_id: payload.provider_account_id ?? shipment?.provider_account_id, ...payload }, id, clientId, key) : { enabled: false, status: "not_requested" as const };
         if (provider && providerResult.status !== "accepted") {
           const failureReason = String((providerResult as { error?: string; reason?: string }).error ?? (providerResult as { reason?: string }).reason ?? `The ${provider} pickup request was not accepted`).slice(0, 500);
           await env.DB.prepare("UPDATE pickup_requests SET status = 'failed', failure_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(failureReason, pickupId, clientId).run();
