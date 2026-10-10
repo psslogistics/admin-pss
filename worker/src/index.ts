@@ -578,7 +578,9 @@ async function delhiveryB2bBearer(env: Env, credentialValue: string | undefined,
 function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>) {
   const origin = delhiveryAddress(payload.origin_address, String(payload.origin ?? "PSS Logistics"));
   const destination = delhiveryAddress(payload.destination_address, String(payload.consignee ?? "Consignee"));
-  const pickupLocation = String(payload.delhivery_pickup_location ?? payload.pickup_location ?? payload.delhivery_client_name ?? env.DELHIVERY_DEFAULT_PICKUP_LOCATION ?? "").trim();
+  // The Delhivery account label and the registered pickup warehouse are
+  // separate provider values. Never use the account label as the warehouse.
+  const pickupLocation = String(payload.delhivery_pickup_location ?? payload.pickup_location ?? env.DELHIVERY_DEFAULT_PICKUP_LOCATION ?? "").trim();
   const orderId = String(payload.order_id ?? payload.shipment_id ?? crypto.randomUUID()).trim().slice(0, 80);
   const invoiceNumber = String(payload.invoice_reference ?? payload.invoice_number ?? "").trim();
   const providerInvoiceNumber = invoiceNumber.replace(/[^A-Za-z0-9\/-]/g, "-").replace(/-{2,}/g, "-").replace(/^-|-$/g, "").slice(0, 80);
@@ -664,7 +666,7 @@ function delhiveryCreatePayload(env: Env, payload: Record<string, unknown>) {
   const origin = delhiveryAddress(payload.origin_address, String(payload.origin ?? "PSS Logistics"));
   const destination = delhiveryAddress(payload.destination_address, String(payload.consignee ?? "Consignee"));
   const client = String(payload.delhivery_client_name ?? env.DELHIVERY_CLIENT_NAME ?? "").trim();
-  const pickupLocation = String(payload.delhivery_pickup_location ?? payload.pickup_location ?? payload.delhivery_client_name ?? env.DELHIVERY_DEFAULT_PICKUP_LOCATION ?? "").trim();
+  const pickupLocation = String(payload.delhivery_pickup_location ?? payload.pickup_location ?? env.DELHIVERY_DEFAULT_PICKUP_LOCATION ?? "").trim();
   const weightKg = Number(payload.total_weight_kg ?? 0);
   const pieces = Number(payload.pieces ?? 1);
   const declaredValue = Math.max(Number(payload.declared_value ?? 0), 0);
@@ -721,7 +723,7 @@ function delhiveryCreatePayload(env: Env, payload: Record<string, unknown>) {
 }
 
 function delhiveryPickupPayload(env: Env, payload: Record<string, unknown>) {
-  const pickupLocation = String(payload.delhivery_pickup_location ?? payload.pickup_location ?? payload.delhivery_client_name ?? env.DELHIVERY_DEFAULT_PICKUP_LOCATION ?? "").trim();
+  const pickupLocation = String(payload.delhivery_pickup_location ?? payload.pickup_location ?? env.DELHIVERY_DEFAULT_PICKUP_LOCATION ?? "").trim();
   const pickupDate = String(payload.scheduled_date ?? "").trim();
   const rawWindow = String(payload.window ?? payload.pickup_time ?? "10:00:00").trim();
   const pickupTime = (rawWindow.match(/\b\d{1,2}:\d{2}(?::\d{2})?\b/)?.[0] ?? "10:00:00").split(":").map((part) => part.padStart(2, "0"));
