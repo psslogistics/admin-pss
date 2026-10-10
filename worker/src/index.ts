@@ -500,21 +500,27 @@ function normalizeDelhiveryJwt(value: unknown) {
   return /^[^.\s]+\.[^.\s]+\.[^.\s]+$/.test(token) ? token : undefined;
 }
 
+function normalizeDelhiveryToken(value: unknown) {
+  if (typeof value !== "string") return undefined;
+  const token = value.trim().replace(/^Bearer\s+/i, "");
+  return token && !/[\r\n]/.test(token) ? token : undefined;
+}
+
 function delhiveryB2bCredential(value: string | undefined): DelhiveryB2bCredential | null {
   const raw = String(value ?? "").trim();
   if (!raw) return null;
   try {
     const parsed = JSON.parse(raw) as Record<string, unknown>;
-    if (typeof parsed === "string") return normalizeDelhiveryJwt(parsed) ? { jwt: normalizeDelhiveryJwt(parsed) } : null;
+    if (typeof parsed === "string") return normalizeDelhiveryToken(parsed) ? { token: normalizeDelhiveryToken(parsed) } : null;
     if (parsed && typeof parsed === "object") return {
-      username: typeof parsed.username === "string" ? parsed.username.trim() : undefined,
-      password: typeof parsed.password === "string" ? parsed.password : undefined,
-      token: normalizeDelhiveryJwt(parsed.token),
+      username: typeof (parsed.username ?? parsed.user_name ?? parsed.email ?? parsed.client_email) === "string" ? String(parsed.username ?? parsed.user_name ?? parsed.email ?? parsed.client_email).trim() : undefined,
+      password: typeof (parsed.password ?? parsed.pass ?? parsed.secret) === "string" ? String(parsed.password ?? parsed.pass ?? parsed.secret) : undefined,
+      token: normalizeDelhiveryToken(parsed.token ?? parsed.api_token ?? parsed.access_token ?? parsed.bearer_token),
       jwt: normalizeDelhiveryJwt(parsed.jwt),
     };
   } catch { /* A raw value may be a previously issued bearer token. */ }
-  const jwt = normalizeDelhiveryJwt(raw);
-  return jwt ? { jwt } : null;
+  const token = normalizeDelhiveryToken(raw);
+  return token ? { token, jwt: normalizeDelhiveryJwt(token) } : null;
 }
 
 function delhiveryAccountIsB2b(accountName: string) {
