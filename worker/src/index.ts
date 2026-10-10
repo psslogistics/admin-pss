@@ -859,17 +859,15 @@ function delhiveryPickupPayload(env: Env, payload: Record<string, unknown>) {
   return { pickup_time: `${pickupTime[0]}:${pickupTime[1]}:${pickupTime[2] ?? "00"}`, pickup_date: pickupDate, pickup_location: pickupLocation, expected_package_count: Math.max(1, Number(payload.expected_package_count ?? payload.package_count ?? 1)) };
 }
 
-function providerSafePickupDate(dateValue: string, windowValue: string) {
+function providerSafePickupDate(dateValue: string) {
   const now = new Date();
   const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(now);
   const current = Object.fromEntries(parts.filter((part) => part.type !== "literal").map((part) => [part.type, part.value]));
   const today = `${current.year}-${current.month}-${current.day}`;
-  const match = String(windowValue).match(/(\d{1,2})(?::(\d{2}))?\s*(AM|PM)?/i);
-  let hour = match ? Number(match[1]) : 10;
-  const minute = match?.[2] ? Number(match[2]) : 0;
-  if (match?.[3]?.toUpperCase() === "PM" && hour < 12) hour += 12;
-  if (match?.[3]?.toUpperCase() === "AM" && hour === 12) hour = 0;
-  const isPast = !/^\d{4}-\d{2}-\d{2}$/.test(dateValue) || dateValue < today || (dateValue === today && (hour < Number(current.hour) || (hour === Number(current.hour) && minute <= Number(current.minute))));
+  // Keep today's date while the booking flow tries the remaining windows.
+  // Delhivery decides whether a particular window is still bookable; moving
+  // directly to tomorrow here would skip valid later slots today.
+  const isPast = !/^\d{4}-\d{2}-\d{2}$/.test(dateValue) || dateValue < today;
   if (!isPast) return dateValue;
   const next = new Date(`${today}T12:00:00+05:30`);
   next.setUTCDate(next.getUTCDate() + 1);
@@ -2360,7 +2358,7 @@ const worker = {
         const payload = await bodyJson(request); const requestHash = await payloadFingerprint(payload); const clientId = requireClient(auth, payload.client_id);
         if (!clientId || !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
         if (typeof payload.scheduled_date !== "string" || typeof payload.location !== "string") return error("VALIDATION_ERROR", "Pickup date and location are required", 400, id, headers);
-        const normalizedScheduledDate = providerSafePickupDate(payload.scheduled_date, String(payload.window ?? ""));
+        const normalizedScheduledDate = providerSafePickupDate(payload.scheduled_date);
         const providerPayload: Record<string, unknown> = { ...payload, scheduled_date: normalizedScheduledDate };
         if (payload.shipment_id !== undefined && !(await shipmentBelongsToClient(env, payload.shipment_id, clientId))) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
         const key = request.headers.get("Idempotency-Key"); if (!key) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
