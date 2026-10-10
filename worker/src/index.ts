@@ -859,6 +859,23 @@ function delhiveryPickupPayload(env: Env, payload: Record<string, unknown>) {
   return { pickup_time: `${pickupTime[0]}:${pickupTime[1]}:${pickupTime[2] ?? "00"}`, pickup_date: pickupDate, pickup_location: pickupLocation, expected_package_count: Math.max(1, Number(payload.expected_package_count ?? payload.package_count ?? 1)) };
 }
 
+function providerSafePickupDate(dateValue: string, windowValue: string) {
+  const now = new Date();
+  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(now);
+  const current = Object.fromEntries(parts.filter((part) => part.type !== "literal").map((part) => [part.type, part.value]));
+  const today = `${current.year}-${current.month}-${current.day}`;
+  const match = String(windowValue).match(/(\d{1,2})(?::(\d{2}))?\s*(AM|PM)?/i);
+  let hour = match ? Number(match[1]) : 10;
+  const minute = match?.[2] ? Number(match[2]) : 0;
+  if (match?.[3]?.toUpperCase() === "PM" && hour < 12) hour += 12;
+  if (match?.[3]?.toUpperCase() === "AM" && hour === 12) hour = 0;
+  const isPast = !/^\d{4}-\d{2}-\d{2}$/.test(dateValue) || dateValue < today || (dateValue === today && (hour < Number(current.hour) || (hour === Number(current.hour) && minute <= Number(current.minute))));
+  if (!isPast) return dateValue;
+  const next = new Date(`${today}T12:00:00+05:30`);
+  next.setUTCDate(next.getUTCDate() + 1);
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit" }).format(next);
+}
+
 function findProviderReference(value: unknown, keys: Set<string>, depth = 0): string | null {
   if (depth > 8 || value === null || value === undefined) return null;
   const normalizedKeys = new Set([...keys].map((key) => key.toLowerCase()));
@@ -2343,11 +2360,13 @@ const worker = {
         const payload = await bodyJson(request); const requestHash = await payloadFingerprint(payload); const clientId = requireClient(auth, payload.client_id);
         if (!clientId || !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
         if (typeof payload.scheduled_date !== "string" || typeof payload.location !== "string") return error("VALIDATION_ERROR", "Pickup date and location are required", 400, id, headers);
+        const normalizedScheduledDate = providerSafePickupDate(payload.scheduled_date, String(payload.window ?? ""));
+        const providerPayload: Record<string, unknown> = { ...payload, scheduled_date: normalizedScheduledDate };
         if (payload.shipment_id !== undefined && !(await shipmentBelongsToClient(env, payload.shipment_id, clientId))) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
         const key = request.headers.get("Idempotency-Key"); if (!key) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
         const existing = await idempotentResponse(env, key, clientId, "POST /v1/pickups", requestHash); if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
         const pickupId = crypto.randomUUID();
-        await env.DB.prepare("INSERT INTO pickup_requests (id, shipment_id, client_id, created_by_user_id, requested_date, requested_time_slot, pickup_address, contact_name, contact_phone, status, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?)").bind(pickupId, typeof payload.shipment_id === "string" ? payload.shipment_id : null, clientId, auth.userId ?? `api:${clientId}`, payload.scheduled_date, String(payload.window ?? ""), payload.location, String(payload.contact_name ?? payload.customer ?? "Pickup contact"), String(payload.contact_phone ?? payload.contact ?? ""), typeof payload.notes === "string" ? payload.notes.trim().slice(0, 2000) : null).run();
+        await env.DB.prepare("INSERT INTO pickup_requests (id, shipment_id, client_id, created_by_user_id, requested_date, requested_time_slot, pickup_address, contact_name, contact_phone, status, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?)").bind(pickupId, typeof payload.shipment_id === "string" ? payload.shipment_id : null, clientId, auth.userId ?? `api:${clientId}`, normalizedScheduledDate, String(payload.window ?? ""), payload.location, String(payload.contact_name ?? payload.customer ?? "Pickup contact"), String(payload.contact_phone ?? payload.contact ?? ""), typeof payload.notes === "string" ? payload.notes.trim().slice(0, 2000) : null).run();
         const shipment = typeof payload.shipment_id === "string" ? await env.DB.prepare("SELECT provider, provider_account_id, tracking_number, provider_reference FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(payload.shipment_id, clientId).first<{ provider: string | null; provider_account_id: string | null; tracking_number: string | null; provider_reference: string | null }>() : null;
         const requestedProvider = ["delhivery", "ekart", "trackon", "xpressbees", "rivigo"].includes(String(payload.provider)) ? payload.provider as CourierProvider : null;
         const provider = requestedProvider ?? (["delhivery", "ekart", "trackon", "xpressbees", "rivigo"].includes(String(shipment?.provider)) ? shipment?.provider as CourierProvider : null);
@@ -2356,7 +2375,7 @@ const worker = {
         // and returns 404, so retain the PSS pickup record without duplicating
         // the provider request when the booking flow marks it provider-managed.
         const providerManaged = payload.provider_managed === true;
-        const providerResult = provider && !providerManaged ? await safeProviderRequest(env, provider, "pickups", { pickup_id: pickupId, shipment_id: payload.shipment_id, tracking_number: shipment?.tracking_number, provider_reference: shipment?.provider_reference, provider_account_id: payload.provider_account_id ?? shipment?.provider_account_id, ...payload }, id, clientId, key) : providerManaged ? { enabled: true, status: "accepted" as const, providerStatus: 204, managedBy: "shipment_manifest" } : { enabled: false, status: "not_requested" as const };
+        const providerResult = provider && !providerManaged ? await safeProviderRequest(env, provider, "pickups", { pickup_id: pickupId, shipment_id: providerPayload.shipment_id, tracking_number: shipment?.tracking_number, provider_reference: shipment?.provider_reference, provider_account_id: providerPayload.provider_account_id ?? shipment?.provider_account_id, ...providerPayload }, id, clientId, key) : providerManaged ? { enabled: true, status: "accepted" as const, providerStatus: 204, managedBy: "shipment_manifest" } : { enabled: false, status: "not_requested" as const };
         if (provider && providerResult.status !== "accepted") {
           const failureReason = String((providerResult as { error?: string; reason?: string }).error ?? (providerResult as { reason?: string }).reason ?? `The ${provider} pickup request was not accepted`).slice(0, 500);
           await env.DB.prepare("UPDATE pickup_requests SET status = 'failed', failure_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(failureReason, pickupId, clientId).run();
@@ -2365,7 +2384,7 @@ const worker = {
           await audit(env, ctx, auth, id, "pickup.provider_failed", "pickup", pickupId, { client_id: clientId, provider, reason: failureReason });
           return new Response(failedResponse, { status: 502, headers: { ...headers, "content-type": "application/json" } });
         }
-        const serialized = JSON.stringify({ ok: true, data: { id: pickupId, client_id: clientId, status: "scheduled", provider, provider_status: providerResult.status }, request_id: id });
+        const serialized = JSON.stringify({ ok: true, data: { id: pickupId, client_id: clientId, status: "scheduled", provider, provider_status: providerResult.status, scheduled_date: normalizedScheduledDate, rescheduled: normalizedScheduledDate !== payload.scheduled_date }, request_id: id });
         await saveIdempotent(env, key, clientId, "POST /v1/pickups", 201, serialized, requestHash); await audit(env, ctx, auth, id, "pickup.created", "pickup", pickupId, { client_id: clientId });
         return new Response(serialized, { status: 201, headers: { ...headers, "content-type": "application/json" } });
       }
