@@ -526,6 +526,17 @@ function delhiveryJwtExpiry(token: string) {
   } catch { return null; }
 }
 
+function delhiveryJwtClaim(token: string | undefined, claim: string) {
+  if (!token) return "";
+  try {
+    const encoded = token.split(".")[1];
+    if (!encoded) return "";
+    const normalized = encoded.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(encoded.length / 4) * 4, "=");
+    const parsed = JSON.parse(atob(normalized)) as Record<string, unknown>;
+    return typeof parsed[claim] === "string" ? parsed[claim].trim() : "";
+  } catch { return ""; }
+}
+
 function delhiveryTokenCacheKey(accountName: string) {
   return `delhivery:b2b:${accountName.trim().toUpperCase().replace(/[^A-Z0-9]+/g, "_")}`;
 }
@@ -573,6 +584,52 @@ async function delhiveryB2bBearer(env: Env, credentialValue: string | undefined,
   })();
   delhiveryTokenRefreshes.set(cacheKey, refresh);
   return refresh;
+}
+
+function delhiveryWarehouseName(origin: { name: string; pincode: string }) {
+  const base = origin.name.replace(/[^A-Za-z0-9 -]/g, " ").replace(/\s+/g, " ").trim() || "PSS Warehouse";
+  return `${base} ${origin.pincode}`.slice(0, 50).trim();
+}
+
+async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: string, origin: { name: string; line: string; city: string; state: string; pincode: string; phone: string }, requestIdValue: string, timeoutMs: number) {
+  const existing = await env.DB.prepare("SELECT name FROM warehouses WHERE client_id = ? AND address = ? AND city = ? AND pincode = ? LIMIT 1")
+    .bind(clientId, origin.line, origin.city, origin.pincode)
+    .first<{ name: string }>();
+  if (existing?.name?.trim()) return { ok: true as const, name: existing.name.trim() };
+
+  const name = delhiveryWarehouseName(origin);
+  const warehousePayload = {
+    phone: origin.phone,
+    city: origin.city,
+    name,
+    pin: origin.pincode,
+    address: origin.line,
+    country: "India",
+    email: delhiveryJwtClaim(token, "client_email") || delhiveryJwtClaim(token, "email") || "support@psslogistics.in",
+    registered_name: name,
+    return_address: origin.line,
+    return_pin: origin.pincode,
+    return_city: origin.city,
+    return_state: origin.state,
+    return_country: "India",
+  };
+  const endpoint = "https://track.delhivery.com/api/backend/clientwarehouse/create/";
+  const authorization = /^[^\s.]+\.[^\s.]+\.[^\s.]+$/.test(token) ? `Bearer ${token}` : `Token ${token}`;
+  let response: Response;
+  try {
+    response = await providerFetch(endpoint, {
+      method: "POST",
+      headers: { authorization, "content-type": "application/json", accept: "application/json", "x-request-id": requestIdValue },
+      body: JSON.stringify(warehousePayload),
+    }, timeoutMs);
+  } catch (caught) {
+    return { ok: false as const, error: caught instanceof Error ? caught.message : "Delhivery warehouse creation failed" };
+  }
+  if (!response.ok) return { ok: false as const, error: `Delhivery warehouse creation failed (${response.status})` };
+  await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, pincode, contact) VALUES (?, ?, ?, ?, ?, ?, ?)")
+    .bind(crypto.randomUUID(), clientId, name, origin.line, origin.city, origin.pincode, origin.phone)
+    .run();
+  return { ok: true as const, name };
 }
 
 function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>) {
@@ -1149,6 +1206,14 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   const delhiveryB2bAccountName = account?.account_name ?? defaultDelhiveryAccountName;
   const delhiveryB2bToken = useDelhiveryB2b ? await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs) : null;
   if (provider === "delhivery" && useDelhiveryB2b && !delhiveryB2bToken) return { enabled: true, status: "failed" as const, error: "Delhivery B2B authentication failed" };
+  let delhiveryPickupLocation = "";
+  if (provider === "delhivery" && operation === "shipments" && useDelhiveryB2b && clientId && delhiveryB2bToken) {
+    const origin = delhiveryAddress(payload.origin_address, String(payload.origin ?? "PSS Logistics"));
+    if (!origin) return { enabled: true, status: "invalid_request" as const, reason: "A complete consignor address is required to create or select the pickup warehouse" };
+    const warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs);
+    if (!warehouse.ok) return { enabled: true, status: "failed" as const, error: warehouse.error };
+    delhiveryPickupLocation = warehouse.name;
+  }
   const xpressToken = provider === "xpressbees" ? await xpressbeesToken(env, credential!, requestIdValue, providerTimeoutMs) : null;
   if (provider === "xpressbees" && !xpressToken) return { enabled: true, status: "failed" as const, error: "XpressBees authentication failed" };
   const rivigoToken = provider === "rivigo" ? await rivigoAccessToken(env, rivigo!, requestIdValue, providerTimeoutMs) : null;
@@ -1166,6 +1231,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   const ekartCreate = provider === "ekart" && operation === "shipments" ? ekartCreatePayload(payload) : null;
   if (provider === "ekart" && operation === "shipments" && !ekartCreate) return { enabled: false, status: "invalid_request" as const, reason: "Origin and destination addresses require valid six-digit pincodes and ten-digit phone numbers" };
   let providerPayload: Record<string, unknown> = account?.provider === "delhivery" ? { ...payload, delhivery_client_name: account.account_name } : payload;
+  if (delhiveryPickupLocation) providerPayload.delhivery_pickup_location = delhiveryPickupLocation;
   if (provider === "delhivery" && operation === "shipments" && clientId) {
     const preferenceRow = await env.DB.prepare("SELECT preferences_json FROM client_preferences WHERE client_id = ? LIMIT 1")
       .bind(clientId)
