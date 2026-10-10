@@ -1546,12 +1546,22 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     if (liveReference) await env.DB.prepare("UPDATE shipments SET tracking_number = ?, provider_reference = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(liveReference, liveReference, payload.shipment_id, clientId).run();
   }
   if (response.ok && provider === "delhivery" && operation === "shipments" && clientId && typeof payload.shipment_id === "string") {
-    const b2bReference = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["lrnum", "lr_num", "lr_number", "lr_no", "lrn", "lrn_number", "lr", "waybill", "waybill_number", "waybill_no", "awb", "awb_number", "job_id", "jobid"])));
+    // A PUR is a pickup-request identifier, not an LR. Keep extraction
+    // ordered and type-specific so an AWB/job id cannot be mistaken for the
+    // LR, and never allow the UI to fall back to the pickup reference as the
+    // shipment booking reference.
+    const b2bLrReference = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["lrnum", "lr_num", "lr_number", "lr_no", "lrn", "lrn_number", "lr"])));
+    const b2bAwbReference = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["master_awb", "master_awb_number", "masterawb", "master_waybill", "awb", "awb_number", "waybill", "waybill_number", "waybill_no"])));
     const textReference = useDelhiveryB2b
       ? responseBody.match(/(?:lr(?:n|[_ ]?(?:number|num|no))?|awb|waybill)[^A-Za-z0-9]{0,12}(\d{6,20})/i)?.[1] ?? null
       : null;
-    const createdReference = useDelhiveryB2b ? b2bReference ?? textReference : findProviderReference(parsedProviderBody, new Set(["waybill", "awb", "tracking_number", "trackingid", "shipment_id"]));
-    const providerReference = useDelhiveryB2b ? delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["master_awb", "master_awb_number", "masterawb", "master_waybill", "awb", "awb_number"]))) ?? createdReference : createdReference;
+    const createdReference = useDelhiveryB2b ? b2bLrReference ?? textReference ?? b2bAwbReference : findProviderReference(parsedProviderBody, new Set(["waybill", "awb", "tracking_number", "trackingid", "shipment_id"]));
+    const providerReference = useDelhiveryB2b ? b2bAwbReference ?? createdReference : createdReference;
+    if (useDelhiveryB2b && !createdReference) {
+      const failure = "Delhivery accepted the request but returned no LR or AWB. The pickup request was not treated as a shipment booking.";
+      await env.DB.prepare("UPDATE integration_requests SET status = 'failed', error_code = 'PROVIDER_REFERENCE_MISSING', error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(failure, integrationId).run();
+      return { enabled: true, status: "failed" as const, providerStatus: response.status, error: failure };
+    }
     if (createdReference) await env.DB.prepare("UPDATE shipments SET tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(provider_reference, ?), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(createdReference, providerReference, payload.shipment_id, clientId).run();
   }
   if (response.ok && provider === "trackon" && operation === "shipments" && clientId && typeof payload.shipment_id === "string") {
