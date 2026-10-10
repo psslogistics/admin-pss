@@ -592,9 +592,10 @@ async function delhiveryB2bBearer(env: Env, credentialValue: string | undefined,
   return refresh;
 }
 
-function delhiveryWarehouseName(origin: { name: string; pincode: string }) {
+function delhiveryWarehouseName(origin: { name: string; state?: string; pincode: string }) {
   const base = origin.name.replace(/[^A-Za-z0-9 -]/g, " ").replace(/\s+/g, " ").trim() || "PSS Warehouse";
-  return `${base} ${origin.pincode}`.slice(0, 50).trim();
+  const state = String(origin.state ?? "").replace(/[^A-Za-z0-9]/g, "").trim();
+  return `${base} ${state} ${origin.pincode}`.replace(/\s+/g, " ").slice(0, 50).trim();
 }
 
 async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: string, origin: { name: string; line: string; city: string; state: string; pincode: string; phone: string }, requestIdValue: string, timeoutMs: number) {
@@ -605,29 +606,33 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   // Delhivery B2B manifestation validates this against the B2B warehouse
   // registry. A local PSS warehouse row is not proof that the provider knows
   // the location, so always make the provider-side create call when booking.
+  // Delhivery's warehouse API accepts a flat payload. The previous nested
+  // shape was accepted by our wrapper but did not register the warehouse in
+  // Delhivery's client-warehouse registry, so manifestation later reported it
+  // as inactive/non-existent.
+  const email = delhiveryJwtClaim(token, "client_email") || delhiveryJwtClaim(token, "email") || "support@psslogistics.in";
   const warehousePayload = {
-    name,
-    pin_code: origin.pincode,
+    phone: origin.phone,
     city: origin.city,
-    state: origin.state,
+    name,
+    pin: origin.pincode,
+    address: origin.line,
     country: "India",
-    address_details: {
-      address: origin.line,
-      contact_person: origin.name,
-      phone_number: origin.phone,
-      email: delhiveryJwtClaim(token, "client_email") || delhiveryJwtClaim(token, "email") || "support@psslogistics.in",
-    },
-    same_as_fwd_add: true,
-    ret_address: { pin: origin.pincode, address: origin.line },
+    email,
+    registered_name: origin.name || name,
+    return_address: origin.line,
+    return_pin: origin.pincode,
+    return_city: origin.city,
+    return_state: origin.state,
+    return_country: "India",
   };
-  const endpoint = "https://ltl-clients-api.delhivery.com/client-warehouse/create/";
+  const endpoint = "https://track.delhivery.com/api/backend/clientwarehouse/create/";
   let response: Response;
   try {
     response = await providerFetch(endpoint, {
       method: "POST",
       headers: {
-        authorization: `Bearer ${token}`,
-        "x-b2b-token": token,
+        authorization: `Token ${token}`,
         "content-type": "application/json",
         accept: "application/json",
         "x-request-id": requestIdValue,
@@ -646,7 +651,7 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   // Delhivery may acknowledge warehouse creation before FAAS makes the name
   // available to manifestation. Give the provider a short propagation window
   // before using the warehouse in the shipment request.
-  await new Promise((resolve) => setTimeout(resolve, 2000));
+  await new Promise((resolve) => setTimeout(resolve, 1500));
   if (!existing) {
     await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, pincode, contact) VALUES (?, ?, ?, ?, ?, ?, ?)")
       .bind(crypto.randomUUID(), clientId, name, origin.line, origin.city, origin.pincode, origin.phone)
