@@ -598,7 +598,7 @@ function delhiveryWarehouseName(origin: { name: string; state?: string; pincode:
   return `${base} ${state} ${origin.pincode}`.replace(/\s+/g, " ").slice(0, 50).trim();
 }
 
-async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: string, origin: { name: string; line: string; city: string; state: string; pincode: string; phone: string }, requestIdValue: string, timeoutMs: number) {
+async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: string, origin: { name: string; line: string; city: string; state: string; pincode: string; phone: string }, requestIdValue: string, timeoutMs: number, b2bBaseUrl = env.DELHIVERY_B2B_API_BASE_URL ?? "https://ltl-clients-api.delhivery.com") {
   const existing = await env.DB.prepare("SELECT name FROM warehouses WHERE client_id = ? AND address = ? AND city = ? AND pincode = ? LIMIT 1")
     .bind(clientId, origin.line, origin.city, origin.pincode)
     .first<{ name: string }>();
@@ -629,7 +629,7 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   // Use the same LTL/B2B host and JWT scheme as manifestation. The legacy
   // track.delhivery.com endpoint expects a different static API token and
   // returns 401 Invalid token for this account's B2B JWT.
-  const endpoint = "https://ltl-clients-api.delhivery.com/client-warehouse/create/";
+  const endpoint = `${String(b2bBaseUrl).replace(/\/$/, "")}/client-warehouse/create/`;
   let response: Response;
   try {
     response = await providerFetch(endpoint, {
@@ -647,6 +647,17 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
     return { ok: false as const, error: caught instanceof Error ? caught.message : "Delhivery warehouse creation failed" };
   }
   const responseText = await providerResponseText(response, timeoutMs);
+  if (response.ok) {
+    try {
+      const providerBody = JSON.parse(responseText) as Record<string, unknown>;
+      const explicitFailure = providerBody.ok === false || providerBody.success === false || providerBody.error === true;
+      const embeddedError = typeof providerBody.error === "string" ? providerBody.error : typeof providerBody.message === "string" && /error|fail|invalid|inactive/i.test(providerBody.message) ? providerBody.message : "";
+      if (explicitFailure || embeddedError) return { ok: false as const, error: `Delhivery warehouse registration was rejected: ${(embeddedError || "provider returned success=false").slice(0, 240)}` };
+    } catch {
+      // Some Delhivery deployments return an empty/text success response.
+      // HTTP success remains sufficient when there is no structured failure.
+    }
+  }
   if (!response.ok) {
     const lower = responseText.toLowerCase();
     const alreadyRegistered = lower.includes("already exists") || lower.includes("already configured") || lower.includes("duplicate") || lower.includes("warehouse exists");
@@ -1327,7 +1338,11 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (provider === "delhivery" && operation === "shipments" && useDelhiveryB2b && clientId && delhiveryB2bToken) {
     const origin = delhiveryAddress(payload.origin_address, String(payload.origin ?? "PSS Logistics"));
     if (!origin) return { enabled: true, status: "invalid_request" as const, reason: "A complete consignor address is required to create or select the pickup warehouse" };
-    const warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs);
+    let warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base);
+    if (!warehouse.ok && /\b401\b|invalid token|unauthorized/i.test(warehouse.error)) {
+      const refreshedToken = await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs, true);
+      if (refreshedToken) warehouse = await ensureDelhiveryWarehouse(env, clientId, refreshedToken, origin, requestIdValue, providerTimeoutMs, base);
+    }
     if (!warehouse.ok) return { enabled: true, status: "failed" as const, error: warehouse.error };
     delhiveryPickupLocation = warehouse.name;
   }
