@@ -1553,7 +1553,8 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     await env.DB.prepare("UPDATE integration_requests SET status = 'failed', error_code = 'PROVIDER_REQUEST_FAILED', error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(bodyError, integrationId).run();
     return { enabled: true, status: "failed" as const, providerStatus: response.status, error: bodyError };
   }
-  await env.DB.prepare("UPDATE integration_requests SET status = ?, error_code = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(response.ok ? "succeeded" : "failed", response.ok ? null : `HTTP_${response.status}`, response.ok ? null : lastError, integrationId).run();
+  const providerFailureDetail = !response.ok ? responseBody.replace(/\s+/g, " ").trim().slice(0, 300) : null;
+  await env.DB.prepare("UPDATE integration_requests SET status = ?, error_code = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(response.ok ? "succeeded" : "failed", response.ok ? null : `HTTP_${response.status}`, response.ok ? null : `${lastError}${providerFailureDetail ? `: ${providerFailureDetail}` : ""}`.slice(0, 500), integrationId).run();
   let normalizedTracking: NormalizedProviderTracking | null = null;
   if (response.ok && operation === "tracking") {
     try { normalizedTracking = normalizeProviderTracking(JSON.parse(responseBody)); } catch { normalizedTracking = null; }
