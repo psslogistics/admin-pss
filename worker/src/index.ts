@@ -1230,6 +1230,15 @@ async function providerResponseText(response: Response, timeoutMs: number) {
   }
 }
 
+function providerBytesToBase64(bytes: Uint8Array) {
+  let value = "";
+  const chunkSize = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    value += String.fromCharCode(...bytes.subarray(offset, Math.min(offset + chunkSize, bytes.length)));
+  }
+  return btoa(value);
+}
+
 async function providerResponseBytes(response: Response, maxBytes: number) {
   const declaredLength = Number(response.headers.get("content-length") ?? 0);
   if (declaredLength > maxBytes) throw new Error("provider_response_too_large");
@@ -1563,8 +1572,14 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   // Provider payloads can contain customer data or contract-specific fields; only a
   // normalized tracking event is persisted and returned to the internal caller.
   let responseBody = "";
+  let responseBytes: Uint8Array | null = null;
   try {
-    responseBody = await providerResponseText(response, attemptTimeoutMs);
+    if (provider === "delhivery" && ["labels", "lr_copy", "document"].includes(operation)) {
+      responseBytes = await providerResponseBytes(response, 12 * 1024 * 1024);
+      responseBody = new TextDecoder().decode(responseBytes);
+    } else {
+      responseBody = await providerResponseText(response, attemptTimeoutMs);
+    }
   } catch (caught) {
     const bodyError = caught instanceof Error ? caught.message : "provider_timeout";
     await env.DB.prepare("UPDATE integration_requests SET status = 'failed', error_code = 'PROVIDER_REQUEST_FAILED', error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(bodyError, integrationId).run();
@@ -1664,7 +1679,14 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   }
   if (response.ok && provider === "delhivery" && ["labels", "lr_copy", "document"].includes(operation)) {
     let artifact: unknown = null;
-    try { artifact = JSON.parse(responseBody); } catch { artifact = { content_base64: btoa(responseBody), content_type: response.headers.get("content-type") ?? "application/octet-stream" }; }
+    try {
+      artifact = JSON.parse(responseBody);
+    } catch {
+      artifact = {
+        content_base64: responseBytes ? providerBytesToBase64(responseBytes) : btoa(responseBody),
+        content_type: response.headers.get("content-type") ?? "application/octet-stream",
+      };
+    }
     return { enabled: true, status: "accepted" as const, providerStatus: response.status, artifact };
   }
   if (response.ok && provider === "delhivery" && operation === "pickups" && typeof payload.pickup_id === "string") {
@@ -2477,8 +2499,13 @@ const worker = {
         const operation = kind === "lr-copy" ? "lr_copy" : kind === "document" ? "document" : "labels";
         const requestedSize = url.searchParams.get("size") ?? (kind === "sticker" ? "std" : "a4");
         if (operation === "labels" && !["sm", "md", "a4", "std"].includes(requestedSize)) return error("INVALID_REQUEST", "Delhivery label size must be sm, md, a4, or std", 400, id, headers);
-        const providerReference = shipment.tracking_number ?? shipment.provider_reference;
-        if (!providerReference) return error("PROVIDER_REFERENCE_UNAVAILABLE", "Delhivery LR is not available yet; the PUR cannot be used as an LR", 409, id, headers);
+        // Delhivery B2B uses the AWB/master waybill for labels and stickers,
+        // while LR copy/document endpoints use the LR number. Never send the
+        // PUR or the wrong reference type to a provider document endpoint.
+        const providerReference = operation === "labels"
+          ? shipment.provider_reference ?? shipment.tracking_number
+          : shipment.tracking_number ?? shipment.provider_reference;
+        if (!providerReference) return error("PROVIDER_REFERENCE_UNAVAILABLE", "The Delhivery LR/AWB is not available yet; the PUR cannot be used for downloads", 409, id, headers);
         const payload = { shipment_id: shipment.id, tracking_number: providerReference, provider_reference: providerReference, provider_account_id: shipment.provider_account_id, label_size: requestedSize, lr_copy_type: url.searchParams.get("lr_copy_type") ?? undefined, doc_type: url.searchParams.get("doc_type") ?? "LM_POD" };
         const providerResult = await safeProviderRequest(env, "delhivery", operation, payload, id, shipment.client_id);
         return json({ ok: true, data: providerResult }, 200, headers);
