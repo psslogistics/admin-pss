@@ -1395,6 +1395,23 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (provider === "ekart" && operation === "shipments" && !ekartCreate) return { enabled: false, status: "invalid_request" as const, reason: "Origin and destination addresses require valid six-digit pincodes and ten-digit phone numbers" };
   let providerPayload: Record<string, unknown> = account?.provider === "delhivery" ? { ...payload, delhivery_client_name: account.account_name } : payload;
   if (delhiveryPickupLocation) providerPayload.delhivery_pickup_location = delhiveryPickupLocation;
+  if (provider === "delhivery" && operation === "pickups" && useDelhiveryB2b && clientId && delhiveryB2bToken && typeof payload.shipment_id === "string") {
+    const shipmentOrigin = await env.DB.prepare("SELECT origin_address_json FROM shipments WHERE id = ? AND client_id = ? LIMIT 1")
+      .bind(payload.shipment_id, clientId)
+      .first<{ origin_address_json: string | null }>();
+    let origin: ReturnType<typeof delhiveryAddress> = null;
+    if (shipmentOrigin?.origin_address_json) {
+      try { origin = delhiveryAddress(JSON.parse(shipmentOrigin.origin_address_json), "PSS Logistics"); } catch { origin = null; }
+    }
+    if (origin) {
+      let warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base);
+      if (!warehouse.ok && /\b401\b|invalid token|unauthorized|token decode|not enough segments/i.test(warehouse.error)) {
+        const refreshedToken = await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs, true);
+        if (refreshedToken) warehouse = await ensureDelhiveryWarehouse(env, clientId, refreshedToken, origin, requestIdValue, providerTimeoutMs, base);
+      }
+      if (warehouse.ok) providerPayload = { ...providerPayload, delhivery_pickup_location: warehouse.name };
+    }
+  }
   if (provider === "delhivery" && operation === "shipments" && clientId) {
     const preferenceRow = await env.DB.prepare("SELECT preferences_json FROM client_preferences WHERE client_id = ? LIMIT 1")
       .bind(clientId)
