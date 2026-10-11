@@ -612,25 +612,22 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   // Delhivery B2B manifestation validates this against the B2B warehouse
   // registry. A local PSS warehouse row is not proof that the provider knows
   // the location, so always make the provider-side create call when booking.
-  // Delhivery's warehouse API accepts a flat payload. The previous nested
-  // shape was accepted by our wrapper but did not register the warehouse in
-  // Delhivery's client-warehouse registry, so manifestation later reported it
-  // as inactive/non-existent.
-  const email = delhiveryJwtClaim(token, "client_email") || delhiveryJwtClaim(token, "email") || "support@psslogistics.in";
+  // Delhivery's current B2B warehouse contract requires pin_code and the
+  // nested address_details object. Sending the legacy flat fields can make
+  // the provider reject the request before it registers the pickup location.
+  const contactPerson = origin.name || name;
   const warehousePayload = {
-    phone: origin.phone,
-    city: origin.city,
     name,
-    pin: origin.pincode,
-    address: origin.line,
+    pin_code: origin.pincode,
+    city: origin.city,
+    state: origin.state,
     country: "India",
-    email,
-    registered_name: origin.name || name,
-    return_address: origin.line,
-    return_pin: origin.pincode,
-    return_city: origin.city,
-    return_state: origin.state,
-    return_country: "India",
+    address_details: {
+      address: origin.line,
+      contact_person: contactPerson,
+      phone_number: origin.phone,
+    },
+    same_as_fwd_add: true,
   };
   // Use the same LTL/B2B host and JWT scheme as manifestation. The legacy
   // track.delhivery.com endpoint expects a different static API token and
@@ -642,7 +639,6 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
       method: "POST",
       headers: {
         authorization: `Bearer ${token}`,
-        "x-b2b-token": token,
         "content-type": "application/json",
         accept: "application/json",
         "x-request-id": requestIdValue,
