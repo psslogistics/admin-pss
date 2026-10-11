@@ -2502,11 +2502,11 @@ const worker = {
         const operation = kind === "lr-copy" ? "lr_copy" : kind === "document" ? "document" : "labels";
         const requestedSize = url.searchParams.get("size") ?? (kind === "sticker" ? "std" : "a4");
         if (operation === "labels" && !["sm", "md", "a4", "std"].includes(requestedSize)) return error("INVALID_REQUEST", "Delhivery label size must be sm, md, a4, or std", 400, id, headers);
-        // Delhivery B2B uses the AWB/master waybill for labels and stickers,
-        // while LR copy/document endpoints use the LR number. Never send the
-        // PUR or the wrong reference type to a provider document endpoint.
+        // Delhivery's B2B label endpoint validates its path parameter as an
+        // active LR number (LRN), not the master AWB. LR copy/document also
+        // use the LR number. Keep the PUR and master AWB out of these paths.
         const providerReference = operation === "labels"
-          ? shipment.provider_reference ?? shipment.tracking_number
+          ? shipment.tracking_number ?? shipment.provider_reference
           : shipment.tracking_number ?? shipment.provider_reference;
         if (!providerReference) return error("PROVIDER_REFERENCE_UNAVAILABLE", "The Delhivery LR/AWB is not available yet; the PUR cannot be used for downloads", 409, id, headers);
         const payload = { shipment_id: shipment.id, tracking_number: providerReference, provider_reference: providerReference, provider_account_id: shipment.provider_account_id, label_size: requestedSize, lr_copy_type: url.searchParams.get("lr_copy_type") ?? undefined, doc_type: url.searchParams.get("doc_type") ?? "LM_POD" };
