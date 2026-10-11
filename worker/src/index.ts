@@ -946,6 +946,32 @@ function findProviderReference(value: unknown, keys: Set<string>, depth = 0): st
   return null;
 }
 
+function findProviderUrl(value: unknown, depth = 0): string | null {
+  if (depth > 8 || value === null || value === undefined) return null;
+  if (typeof value === "string") return /^https?:\/\//i.test(value.trim()) ? value.trim() : null;
+  if (Array.isArray(value)) { for (const item of value) { const found = findProviderUrl(item, depth + 1); if (found) return found; } return null; }
+  if (typeof value !== "object") return null;
+  const object = value as Record<string, unknown>;
+  for (const key of ["download_url", "downloadUrl", "file_url", "fileUrl", "url", "link"]) { const found = findProviderUrl(object[key], depth + 1); if (found) return found; }
+  for (const item of Object.values(object)) { const found = findProviderUrl(item, depth + 1); if (found) return found; }
+  return null;
+}
+
+function findProviderContentBase64(value: unknown, depth = 0): string | null {
+  if (depth > 8 || value === null || value === undefined || typeof value !== "object") return null;
+  if (Array.isArray(value)) { for (const item of value) { const found = findProviderContentBase64(item, depth + 1); if (found) return found; } return null; }
+  const object = value as Record<string, unknown>;
+  for (const key of ["content_base64", "base64", "content", "data"]) {
+    const candidate = object[key];
+    if (typeof candidate === "string") {
+      const normalized = candidate.trim().replace(/^data:[^;]+;base64,/, "");
+      if (normalized.length > 100 && /^[A-Za-z0-9+/=\r\n]+$/.test(normalized)) return normalized;
+    }
+  }
+  for (const item of Object.values(object)) { const found = findProviderContentBase64(item, depth + 1); if (found) return found; }
+  return null;
+}
+
 function findProviderToken(value: unknown, keys: Set<string>, depth = 0): string | null {
   if (depth > 8 || value === null || value === undefined) return null;
   const normalizedKeys = new Set([...keys].map((key) => key.toLowerCase()));
@@ -1689,6 +1715,28 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         content_base64: responseBytes ? providerBytesToBase64(responseBytes) : btoa(responseBody),
         content_type: response.headers.get("content-type") ?? "application/octet-stream",
       };
+    }
+    if (operation === "labels" && artifact && typeof artifact === "object") {
+      const labelUrl = findProviderUrl(artifact);
+      if (labelUrl) {
+        try {
+          const labelResponse = await providerFetch(labelUrl, { method: "GET", headers: { accept: "application/json,image/*,application/pdf" } }, attemptTimeoutMs);
+          if (!labelResponse.ok) throw new Error(`label_content_http_${labelResponse.status}`);
+          const labelContentType = labelResponse.headers.get("content-type") ?? "application/octet-stream";
+          if (labelContentType.toLowerCase().includes("json")) {
+            const labelBody = await providerResponseText(labelResponse, attemptTimeoutMs);
+            let labelJson: unknown = null;
+            try { labelJson = JSON.parse(labelBody); } catch { labelJson = null; }
+            const labelBase64 = findProviderContentBase64(labelJson);
+            if (labelBase64) artifact = { content_base64: labelBase64, content_type: "image/png" };
+          } else {
+            const labelBytes = await providerResponseBytes(labelResponse, 12 * 1024 * 1024);
+            artifact = { content_base64: providerBytesToBase64(labelBytes), content_type: labelContentType };
+          }
+        } catch (caught) {
+          return { enabled: true, status: "failed" as const, providerStatus: response.status, error: caught instanceof Error ? caught.message : "label_content_fetch_failed" };
+        }
+      }
     }
     return { enabled: true, status: "accepted" as const, providerStatus: response.status, artifact };
   }
