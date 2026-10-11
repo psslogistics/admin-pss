@@ -753,7 +753,10 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
     // both fields lets Delhivery use the account's normal prepaid billing.
     billing_address: {
       name: origin.name,
-      company: String(payload.delhivery_client_name ?? origin.name).trim(),
+      // The provider account is used for authentication and routing. The
+      // physical shipper printed on the LR/label must be the consignor from
+      // the booking, not the internal PSS Delhivery account label.
+      company: origin.name,
       consignor: origin.name,
       address: origin.line,
       city: origin.city,
