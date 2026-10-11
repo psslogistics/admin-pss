@@ -538,6 +538,10 @@ function delhiveryJwtExpiry(token: string) {
   } catch { return null; }
 }
 
+function delhiveryLooksLikeJwt(token: string | undefined) {
+  return Boolean(token && token.split(".").length === 3 && token.split(".").every((part) => part.trim()));
+}
+
 function delhiveryJwtClaim(token: string | undefined, claim: string) {
   if (!token) return "";
   try {
@@ -560,13 +564,14 @@ async function delhiveryB2bBearer(env: Env, credentialValue: string | undefined,
   if (!credential) return null;
   const configuredToken = credential.jwt ?? credential.token;
   if (configuredToken && (!credential.username || !credential.password)) {
+    if (!delhiveryLooksLikeJwt(configuredToken)) return null;
     const now = Math.floor(Date.now() / 1000);
     return (delhiveryJwtExpiry(configuredToken) ?? now + 86400) > now + 30 ? configuredToken : null;
   }
   if (!credential.username || !credential.password) return configuredToken ?? null;
   const cacheKey = delhiveryTokenCacheKey(accountName);
   const now = Math.floor(Date.now() / 1000);
-  const usable = (token: string | null | undefined, expiresAt?: number | null) => Boolean(token && (expiresAt ?? delhiveryJwtExpiry(token) ?? 0) > now + 300);
+  const usable = (token: string | null | undefined, expiresAt?: number | null) => Boolean(delhiveryLooksLikeJwt(token) && (expiresAt ?? delhiveryJwtExpiry(token) ?? 0) > now + 300);
   if (!forceRefresh && env.DELHIVERY_TOKEN_CACHE) {
     const cached = await env.DELHIVERY_TOKEN_CACHE.get<{ token?: string; expiresAt?: number }>(cacheKey, "json");
     if (usable(cached?.token, cached?.expiresAt)) return cached!.token!;
@@ -585,7 +590,7 @@ async function delhiveryB2bBearer(env: Env, credentialValue: string | undefined,
       if (!response.ok) return null;
       const body = JSON.parse(await providerResponseText(response, timeoutMs)) as Record<string, unknown>;
       const token = findProviderReference(body, new Set(["jwt", "token", "access_token", "bearer_token"]));
-      if (!token) return null;
+      if (!delhiveryLooksLikeJwt(token ?? undefined)) return null;
       const expiresAt = delhiveryJwtExpiry(token) ?? now + 86400;
       if (env.DELHIVERY_TOKEN_CACHE) {
         await env.DELHIVERY_TOKEN_CACHE.put(cacheKey, JSON.stringify({ token, expiresAt }), { expirationTtl: Math.max(60, expiresAt - now) });
@@ -1341,7 +1346,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     const origin = delhiveryAddress(payload.origin_address, String(payload.origin ?? "PSS Logistics"));
     if (!origin) return { enabled: true, status: "invalid_request" as const, reason: "A complete consignor address is required to create or select the pickup warehouse" };
     let warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base);
-    if (!warehouse.ok && /\b401\b|invalid token|unauthorized/i.test(warehouse.error)) {
+    if (!warehouse.ok && /\b401\b|invalid token|unauthorized|token decode|not enough segments/i.test(warehouse.error)) {
       const refreshedToken = await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs, true);
       if (refreshedToken) warehouse = await ensureDelhiveryWarehouse(env, clientId, refreshedToken, origin, requestIdValue, providerTimeoutMs, base);
     }
