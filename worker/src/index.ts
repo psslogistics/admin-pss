@@ -957,6 +957,22 @@ function findProviderUrl(value: unknown, depth = 0): string | null {
   return null;
 }
 
+function findProviderUrls(value: unknown, result: string[] = [], depth = 0): string[] {
+  if (depth > 8 || value === null || value === undefined) return result;
+  if (typeof value === "string") {
+    const url = value.trim();
+    if (/^https?:\/\//i.test(url) && !result.includes(url)) result.push(url);
+    return result;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) findProviderUrls(item, result, depth + 1);
+    return result;
+  }
+  if (typeof value !== "object") return result;
+  for (const item of Object.values(value as Record<string, unknown>)) findProviderUrls(item, result, depth + 1);
+  return result;
+}
+
 function findProviderContentBase64(value: unknown, depth = 0): string | null {
   if (depth > 8 || value === null || value === undefined || typeof value !== "object") return null;
   if (Array.isArray(value)) { for (const item of value) { const found = findProviderContentBase64(item, depth + 1); if (found) return found; } return null; }
@@ -1717,21 +1733,29 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       };
     }
     if (operation === "labels" && artifact && typeof artifact === "object") {
-      const labelUrl = findProviderUrl(artifact);
-      if (labelUrl) {
+      const labelUrls = findProviderUrls(artifact);
+      if (labelUrls.length) {
         try {
-          const labelResponse = await providerFetch(labelUrl, { method: "GET", headers: { accept: "application/json,image/*,application/pdf" } }, attemptTimeoutMs);
-          if (!labelResponse.ok) throw new Error(`label_content_http_${labelResponse.status}`);
-          const labelContentType = labelResponse.headers.get("content-type") ?? "application/octet-stream";
-          if (labelContentType.toLowerCase().includes("json")) {
-            const labelBody = await providerResponseText(labelResponse, attemptTimeoutMs);
-            let labelJson: unknown = null;
-            try { labelJson = JSON.parse(labelBody); } catch { labelJson = null; }
-            const labelBase64 = findProviderContentBase64(labelJson);
-            if (labelBase64) artifact = { content_base64: labelBase64, content_type: "image/png" };
-          } else {
-            const labelBytes = await providerResponseBytes(labelResponse, 12 * 1024 * 1024);
-            artifact = { content_base64: providerBytesToBase64(labelBytes), content_type: labelContentType };
+          const labelArtifacts: Array<{ content_base64: string; content_type: string }> = [];
+          for (const labelUrl of labelUrls) {
+            const labelResponse = await providerFetch(labelUrl, { method: "GET", headers: { accept: "application/json,image/*,application/pdf" } }, attemptTimeoutMs);
+            if (!labelResponse.ok) throw new Error(`label_content_http_${labelResponse.status}`);
+            const labelContentType = labelResponse.headers.get("content-type") ?? "application/octet-stream";
+            if (labelContentType.toLowerCase().includes("json")) {
+              const labelBody = await providerResponseText(labelResponse, attemptTimeoutMs);
+              let labelJson: unknown = null;
+              try { labelJson = JSON.parse(labelBody); } catch { labelJson = null; }
+              const labelBase64 = findProviderContentBase64(labelJson);
+              if (labelBase64) labelArtifacts.push({ content_base64: labelBase64, content_type: "image/png" });
+            } else {
+              const labelBytes = await providerResponseBytes(labelResponse, 12 * 1024 * 1024);
+              labelArtifacts.push({ content_base64: providerBytesToBase64(labelBytes), content_type: labelContentType });
+            }
+          }
+          if (labelArtifacts.length) {
+            const requestedCopies = Math.max(1, Number(payload.boxes ?? payload.pieces ?? 1) + 1);
+            while (labelArtifacts.length < requestedCopies) labelArtifacts.push(labelArtifacts[labelArtifacts.length % Math.max(1, labelArtifacts.length)]);
+            artifact = { artifacts: labelArtifacts.slice(0, requestedCopies), content_type: labelArtifacts[0].content_type, copies: requestedCopies };
           }
         } catch (caught) {
           return { enabled: true, status: "failed" as const, providerStatus: response.status, error: caught instanceof Error ? caught.message : "label_content_fetch_failed" };
@@ -2542,7 +2566,7 @@ const worker = {
       const shipmentArtifact = route.match(/^\/shipments\/([^/]+)\/(label|sticker|lr-copy|document)$/);
       if (shipmentArtifact && request.method === "GET") {
         if (!hasScope(auth, "tracking.read") && !hasScope(auth, "documents.read")) return error("FORBIDDEN", "Tracking or document read scope required", 403, id, headers);
-        const shipment = await env.DB.prepare("SELECT s.id, s.client_id, s.provider, s.tracking_number, s.provider_reference, s.provider_account_id, (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = s.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference FROM shipments s WHERE s.id = ? LIMIT 1").bind(shipmentArtifact[1]).first<{ id: string; client_id: string; provider: string | null; tracking_number: string | null; provider_reference: string | null; provider_account_id: string | null; pickup_reference: string | null }>();
+        const shipment = await env.DB.prepare("SELECT s.id, s.client_id, s.provider, s.tracking_number, s.provider_reference, s.provider_account_id, s.pieces, (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = s.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference FROM shipments s WHERE s.id = ? LIMIT 1").bind(shipmentArtifact[1]).first<{ id: string; client_id: string; provider: string | null; tracking_number: string | null; provider_reference: string | null; provider_account_id: string | null; pieces: number | null; pickup_reference: string | null }>();
         if (!shipment || !canAccessClient(auth, shipment.client_id)) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
         if (shipment.provider !== "delhivery") return error("UNSUPPORTED_PROVIDER_OPERATION", "Provider documents are currently available only for Delhivery", 409, id, headers);
         const url = new URL(request.url);
@@ -2557,7 +2581,7 @@ const worker = {
           ? shipment.tracking_number ?? shipment.provider_reference
           : shipment.tracking_number ?? shipment.provider_reference;
         if (!providerReference) return error("PROVIDER_REFERENCE_UNAVAILABLE", "The Delhivery LR/AWB is not available yet; the PUR cannot be used for downloads", 409, id, headers);
-        const payload = { shipment_id: shipment.id, tracking_number: providerReference, provider_reference: providerReference, provider_account_id: shipment.provider_account_id, label_size: requestedSize, lr_copy_type: url.searchParams.get("lr_copy_type") ?? undefined, doc_type: url.searchParams.get("doc_type") ?? "LM_POD" };
+        const payload = { shipment_id: shipment.id, tracking_number: providerReference, provider_reference: providerReference, provider_account_id: shipment.provider_account_id, label_size: requestedSize, boxes: Math.max(1, Number(shipment.pieces ?? 1)), lr_copy_type: url.searchParams.get("lr_copy_type") ?? undefined, doc_type: url.searchParams.get("doc_type") ?? "LM_POD" };
         const providerResult = await safeProviderRequest(env, "delhivery", operation, payload, id, shipment.client_id);
         return json({ ok: true, data: providerResult }, 200, headers);
       }
