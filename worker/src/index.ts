@@ -590,9 +590,10 @@ async function delhiveryB2bBearer(env: Env, credentialValue: string | undefined,
             headers: { "content-type": "application/json", "x-request-id": requestIdValue },
             body: JSON.stringify({ username: credential.username, password: credential.password }),
           }, timeoutMs);
+          const responseText = await providerResponseText(response, timeoutMs);
           if (!response.ok) continue;
-          const body = JSON.parse(await providerResponseText(response, timeoutMs)) as Record<string, unknown>;
-          const token = findProviderReference(body, new Set(["jwt", "token", "access_token", "bearer_token"]));
+          const body = JSON.parse(responseText) as Record<string, unknown>;
+          const token = findProviderToken(body, new Set(["jwt", "token", "access_token", "bearer_token"]));
           if (!delhiveryLooksLikeJwt(token ?? undefined)) continue;
           const expiresAt = delhiveryJwtExpiry(token) ?? now + 86400;
           if (env.DELHIVERY_TOKEN_CACHE) {
@@ -938,6 +939,22 @@ function findProviderReference(value: unknown, keys: Set<string>, depth = 0): st
     if (normalizedKeys.has(key.toLowerCase()) && (typeof candidate === "string" || typeof candidate === "number") && String(candidate).trim()) return String(candidate).trim().slice(0, 160);
   }
   for (const candidate of Object.values(object)) { const found = findProviderReference(candidate, keys, depth + 1); if (found) return found; }
+  return null;
+}
+
+function findProviderToken(value: unknown, keys: Set<string>, depth = 0): string | null {
+  if (depth > 8 || value === null || value === undefined) return null;
+  const normalizedKeys = new Set([...keys].map((key) => key.toLowerCase()));
+  if (Array.isArray(value)) {
+    for (const item of value) { const found = findProviderToken(item, keys, depth + 1); if (found) return found; }
+    return null;
+  }
+  if (typeof value !== "object") return null;
+  const object = value as Record<string, unknown>;
+  for (const [key, candidate] of Object.entries(object)) {
+    if (normalizedKeys.has(key.toLowerCase()) && typeof candidate === "string" && candidate.trim()) return candidate.trim();
+  }
+  for (const candidate of Object.values(object)) { const found = findProviderToken(candidate, keys, depth + 1); if (found) return found; }
   return null;
 }
 function delhiveryB2bNumber(value: string | null | undefined) {
