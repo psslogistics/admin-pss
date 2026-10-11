@@ -1737,7 +1737,12 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       if (labelUrls.length) {
         try {
           const labelArtifacts: Array<{ content_base64: string; content_type: string }> = [];
-          for (const labelUrl of labelUrls) {
+          const requestedCopies = Math.max(1, Number(payload.boxes ?? payload.pieces ?? 1) + 1);
+          const boxCount = Math.max(1, Number(payload.boxes ?? payload.pieces ?? 1));
+          // get_urls can return the box label followed by a document asset.
+          // The client needs box labels only; the extra required copy is made
+          // from the label image rather than turning the document into page 2.
+          for (const labelUrl of labelUrls.slice(0, boxCount)) {
             const labelResponse = await providerFetch(labelUrl, { method: "GET", headers: { accept: "application/json,image/*,application/pdf" } }, attemptTimeoutMs);
             if (!labelResponse.ok) throw new Error(`label_content_http_${labelResponse.status}`);
             const labelContentType = labelResponse.headers.get("content-type") ?? "application/octet-stream";
@@ -1753,7 +1758,6 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
             }
           }
           if (labelArtifacts.length) {
-            const requestedCopies = Math.max(1, Number(payload.boxes ?? payload.pieces ?? 1) + 1);
             while (labelArtifacts.length < requestedCopies) labelArtifacts.push(labelArtifacts[labelArtifacts.length % Math.max(1, labelArtifacts.length)]);
             artifact = { artifacts: labelArtifacts.slice(0, requestedCopies), content_type: labelArtifacts[0].content_type, copies: requestedCopies };
           }
