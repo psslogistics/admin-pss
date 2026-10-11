@@ -884,12 +884,13 @@ function delhiveryCreatePayload(env: Env, payload: Record<string, unknown>) {
   return { shipments: [shipment] };
 }
 
-function delhiveryPickupPayload(env: Env, payload: Record<string, unknown>) {
+function delhiveryPickupPayload(env: Env, payload: Record<string, unknown>, useDelhiveryB2b = false) {
   const pickupLocation = String(payload.delhivery_pickup_location ?? payload.pickup_location ?? env.DELHIVERY_DEFAULT_PICKUP_LOCATION ?? "").trim();
   const pickupDate = String(payload.scheduled_date ?? "").trim();
   const rawWindow = String(payload.window ?? payload.pickup_time ?? "10:00:00").trim();
   const pickupTime = (rawWindow.match(/\b\d{1,2}:\d{2}(?::\d{2})?\b/)?.[0] ?? "10:00:00").split(":").map((part) => part.padStart(2, "0"));
   if (!pickupLocation || !/^\d{4}-\d{2}-\d{2}$/.test(pickupDate)) return null;
+  if (useDelhiveryB2b) return { client_warehouse: pickupLocation, pickup_date: pickupDate, start_time: `${pickupTime[0]}:${pickupTime[1]}:${pickupTime[2] ?? "00"}`, expected_package_count: Math.max(1, Number(payload.expected_package_count ?? payload.package_count ?? 1)) };
   return { pickup_time: `${pickupTime[0]}:${pickupTime[1]}:${pickupTime[2] ?? "00"}`, pickup_date: pickupDate, pickup_location: pickupLocation, expected_package_count: Math.max(1, Number(payload.expected_package_count ?? payload.package_count ?? 1)) };
 }
 
@@ -1412,7 +1413,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   }
   const delhiveryCreate = provider === "delhivery" && operation === "shipments" ? useDelhiveryB2b ? delhiveryB2bManifestPayload(env, providerPayload) : delhiveryCreatePayload(env, providerPayload) : null;
   if (provider === "delhivery" && operation === "shipments" && !delhiveryCreate) return { enabled: false, status: "invalid_request" as const, reason: "Delhivery requires valid origin/destination addresses, a registered client name, and a pickup location" };
-  const delhiveryPickup = provider === "delhivery" && operation === "pickups" ? delhiveryPickupPayload(env, providerPayload) : null;
+  const delhiveryPickup = provider === "delhivery" && operation === "pickups" ? delhiveryPickupPayload(env, providerPayload, useDelhiveryB2b) : null;
   if (provider === "delhivery" && operation === "pickups" && !delhiveryPickup) return { enabled: false, status: "invalid_request" as const, reason: "Delhivery requires a valid pickup date and registered pickup location" };
   const rivigoCreate = provider === "rivigo" && operation === "shipments" ? rivigoBookingPayload(payload, rivigo!) : null;
   if (provider === "rivigo" && operation === "shipments" && !rivigoCreate) return { enabled: false, status: "invalid_request" as const, reason: "Rivigo requires valid origin/destination addresses, positive weight, and at least one box" };
@@ -1438,7 +1439,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     : provider === "delhivery" && operation === "shipments"
       ? useDelhiveryB2b ? `${base.replace(/\/$/, "")}/manifest` : `${delhiveryOrigin}/api/cmu/create.json`
       : provider === "delhivery" && operation === "pickups"
-        ? "https://track.delhivery.com/fm/request/new/"
+        ? useDelhiveryB2b ? `${base.replace(/\/$/, "")}/pickup_requests/` : "https://track.delhivery.com/fm/request/new/"
         : provider === "delhivery" && operation === "serviceability"
           ? `${delhiveryOrigin}/c/api/pin-codes/json/?filter_codes=${encodeURIComponent(String(payload.destination_pincode ?? ""))}`
     : provider === "ekart"
@@ -1649,7 +1650,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     return { enabled: true, status: "accepted" as const, providerStatus: response.status, artifact };
   }
   if (response.ok && provider === "delhivery" && operation === "pickups" && typeof payload.pickup_id === "string") {
-    const pickupReference = findProviderReference(parsedProviderBody, new Set(["pickup_id", "pickup_request_id", "pur_id", "request_id"]));
+    const pickupReference = findProviderReference(parsedProviderBody, new Set(["pickup_id", "pickup_request_id", "pur_id", "pur", "pur_number", "pickup_request", "pickup_request_no", "request_id", "request_no"]));
     if (pickupReference) await env.DB.prepare("UPDATE pickup_requests SET provider = 'delhivery', provider_reference = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(pickupReference, payload.pickup_id, clientId ?? "").run();
   }
   if (response.ok && provider === "delhivery" && operation === "serviceability") {
