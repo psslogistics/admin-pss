@@ -3258,6 +3258,18 @@ const worker = {
         await env.DB.prepare("INSERT INTO pricing_quotes (id, client_id, version_id, account_scope, origin_zone, destination_zone, chargeable_weight_kg, client_breakdown_json, expires_at, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+15 minutes'), ?)").bind(quoteId, clientId, version.id, account, result.originZone, result.destinationZone, result.chargeableWeightKg, JSON.stringify(result), auth.userId ?? `api:${clientId}`).run();
         return json({ ok: true, data: { quote_id: quoteId, provider: "delhivery", service_level: "b2b", client_id: clientId, ...result } }, 200, headers);
       }
+      if (route === "/pricing/assigned" && request.method === "GET") {
+        if (!hasScope(auth, "quotes.create")) return error("FORBIDDEN", "Pricing view permission required", 403, id, headers);
+        const clientId = requireClient(auth, null);
+        if (!clientId || !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
+        const version = await env.DB.prepare("SELECT id, status, effective_at, minimum_weight_kg, volumetric_divisor, gst_percent FROM pricing_versions WHERE client_id = ? AND provider = 'delhivery' AND service_level = 'b2b' AND status = 'active' AND datetime(effective_at) <= CURRENT_TIMESTAMP ORDER BY datetime(effective_at) DESC LIMIT 1").bind(clientId).first();
+        if (!version) return error("PRICING_NOT_CONFIGURED", "A published PSS rate card is not configured for this client", 409, id, headers);
+        const [matrixRows, chargeRules] = await Promise.all([
+          env.DB.prepare("SELECT origin_zone, destination_zone, rate_per_kg FROM pricing_rate_matrix WHERE version_id = ? AND account_scope = 'other' ORDER BY origin_zone, destination_zone").bind((version as Record<string, unknown>).id).all(),
+          env.DB.prepare("SELECT code, label, calculation_type, value, basis, minimum_value, maximum_value, enabled, marker FROM pricing_charge_rules WHERE version_id = ? ORDER BY display_order, code").bind((version as Record<string, unknown>).id).all(),
+        ]);
+        return json({ ok: true, data: { version, rate_matrices: { other: matrixRows.results }, charge_rules: chargeRules.results } }, 200, headers);
+      }
       if (route === "/pricing/versions" && request.method === "GET") {
         if (!hasScope(auth, "pricing.read")) return error("FORBIDDEN", "Pricing view permission required", 403, id, headers);
         const clientId = requireClient(auth, url.searchParams.get("client_id"));
