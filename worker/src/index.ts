@@ -581,21 +581,27 @@ async function delhiveryB2bBearer(env: Env, credentialValue: string | undefined,
   const refresh = (async () => {
     try {
       if (env.DELHIVERY_TOKEN_CACHE) await env.DELHIVERY_TOKEN_CACHE.delete(cacheKey);
-      const base = String(env.DELHIVERY_B2B_API_BASE_URL ?? "https://ltl-clients-api.delhivery.com").replace(/\/$/, "");
-      const response = await providerFetch(`${base}/ums/login`, {
-        method: "POST",
-        headers: { "content-type": "application/json", "x-request-id": requestIdValue },
-        body: JSON.stringify({ username: credential.username, password: credential.password }),
-      }, timeoutMs);
-      if (!response.ok) return null;
-      const body = JSON.parse(await providerResponseText(response, timeoutMs)) as Record<string, unknown>;
-      const token = findProviderReference(body, new Set(["jwt", "token", "access_token", "bearer_token"]));
-      if (!delhiveryLooksLikeJwt(token ?? undefined)) return null;
-      const expiresAt = delhiveryJwtExpiry(token) ?? now + 86400;
-      if (env.DELHIVERY_TOKEN_CACHE) {
-        await env.DELHIVERY_TOKEN_CACHE.put(cacheKey, JSON.stringify({ token, expiresAt }), { expirationTtl: Math.max(60, expiresAt - now) });
+      const configuredBase = String(env.DELHIVERY_B2B_API_BASE_URL ?? "https://ltl-clients-api.delhivery.com").replace(/\/$/, "");
+      const loginBases = [...new Set([configuredBase, "https://btob.api.delhivery.com"])];
+      for (const base of loginBases) {
+        try {
+          const response = await providerFetch(`${base}/ums/login`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-request-id": requestIdValue },
+            body: JSON.stringify({ username: credential.username, password: credential.password }),
+          }, timeoutMs);
+          if (!response.ok) continue;
+          const body = JSON.parse(await providerResponseText(response, timeoutMs)) as Record<string, unknown>;
+          const token = findProviderReference(body, new Set(["jwt", "token", "access_token", "bearer_token"]));
+          if (!delhiveryLooksLikeJwt(token ?? undefined)) continue;
+          const expiresAt = delhiveryJwtExpiry(token) ?? now + 86400;
+          if (env.DELHIVERY_TOKEN_CACHE) {
+            await env.DELHIVERY_TOKEN_CACHE.put(cacheKey, JSON.stringify({ token, expiresAt }), { expirationTtl: Math.max(60, expiresAt - now) });
+          }
+          return token;
+        } catch { /* Try the alternate Delhivery B2B auth host. */ }
       }
-      return token;
+      return null;
     } catch { return null; }
     finally { delhiveryTokenRefreshes.delete(cacheKey); }
   })();
