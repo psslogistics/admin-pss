@@ -208,7 +208,8 @@ function hasScope(auth: Auth, scope: string) {
   const roles = auth.roles;
   if (["shipments.read", "tracking.read", "pickups.read", "documents.read", "reports.read", "departments.read"].includes(scope)) return roles.has("client") || roles.has("employee") || roles.has("admin");
   if (["shipments.create", "pickups.create", "documents.manage", "tickets.create", "tickets.read", "notifications.read", "cases.read", "cases.manage", "addresses.manage", "quotes.create", "billing.read", "wallet.read", "cod.read", "weight.read", "tasks.read", "activity.read"].includes(scope)) return roles.has("client") || roles.has("employee") || roles.has("admin");
-  if (["pickups.manage", "tasks.manage"].includes(scope)) return roles.has("employee") || roles.has("admin");
+  if (scope === "pickups.manage") return roles.has("client") || roles.has("employee") || roles.has("admin");
+  if (scope === "tasks.manage") return roles.has("employee") || roles.has("admin");
   if (scope === "departments.manage") return roles.has("admin") || roles.has("super_admin");
   if (scope === "provider_accounts.read") return roles.has("admin") || roles.has("super_admin");
   if (scope === "provider_accounts.manage") return roles.has("admin") || roles.has("super_admin");
@@ -441,9 +442,21 @@ async function pricingPincode(env: Env, pincode: string) {
   if (!/^\d{6}$/.test(pincode)) return null;
   return env.DB.prepare("SELECT pincode, facility_city, facility_state, oda FROM delhivery_b2b_pincode_zones WHERE pincode = ? LIMIT 1").bind(pincode).first<{ pincode: string; facility_city: string; facility_state: string; oda: number }>();
 }
+const FUJIYAMA_CLIENT_ID = "bb308dde-aae8-4503-ac7b-f91cd80ada78";
+const FUJIYAMA_DELHIVERY_ACCOUNT_ID = "dlv-psslogistics10-b2bc";
+const FUJIYAMA_FORWARD_RATES: Record<string, number> = { N1: 5.5, N2: 6.2, N3: 6.5, N4: 6.9, C1: 7.9, C2: 8.6, E1: 10.5, E2: 11.2, NE1: 15.9, NE2: 18.8, S1: 8.8, S2: 9.4, S3: 9.8, S4: 10.5, W1: 7.9, W2: 8.7 };
+const FUJIYAMA_REVERSE_RATES: Record<string, number> = { North: 7.5, West: 11, South: 14.5, East: 14.5, Northeast: 18.5 };
+const fujiyamaKey = (value: string | undefined) => String(value ?? "").toLowerCase().replace(/[^a-z]/g, "");
+const FUJIYAMA_CITY_ZONES: Record<string, string> = { bhopal: "C1", indore: "C1", raipur: "C1", kolkata: "E1", patna: "E1", ranchi: "E1", bhubaneswar: "E1", siliguri: "E1", delhi: "N1", faridabad: "N1", gurgaon: "N1", gurugram: "N1", ghaziabad: "N1", noida: "N1", chandigarh: "N1", jaipur: "N1", dehradun: "N2", ludhiana: "N2", guwahati: "NE1", hyderabad: "S1", chennai: "S1", bengaluru: "S1", bangalore: "S1", mumbai: "W1", pune: "W1", thane: "W1", ahmedabad: "W1", surat: "W1" };
+const FUJIYAMA_STATE_ZONES: Record<string, string> = { chhattisgarh: "C2", madhyapradesh: "C2", bihar: "E2", odisha: "E2", jharkhand: "E2", westbengal: "E2", haryana: "N3", punjab: "N3", rajasthan: "N3", uttarpradesh: "N3", himachalpradesh: "N4", jammuandkashmir: "N4", uttarakhand: "N4", assam: "NE2", arunachalpradesh: "NE2", manipur: "NE2", meghalaya: "NE2", mizoram: "NE2", nagaland: "NE2", sikkim: "NE2", tripura: "NE2", andhrapradesh: "S2", karnataka: "S2", telangana: "S2", tamilnadu: "S3", puducherry: "S3", kerala: "S4", maharashtra: "W2", gujarat: "W2", goa: "W2" };
+const FUJIYAMA_REVERSE_ZONE_BY_STATE: Record<string, string> = { punjab: "North", delhi: "North", haryana: "North", himachalpradesh: "North", jammuandkashmir: "North", rajasthan: "North", uttarpradesh: "North", uttarakhand: "North", chhattisgarh: "West", goa: "West", gujarat: "West", madhyapradesh: "West", maharashtra: "West", andhrapradesh: "South", karnataka: "South", puducherry: "South", tamilnadu: "South", telangana: "South", kerala: "South", bihar: "East", jharkhand: "East", odisha: "East", westbengal: "East", arunachalpradesh: "Northeast", assam: "Northeast", manipur: "Northeast", meghalaya: "Northeast", sikkim: "Northeast", nagaland: "Northeast" };
+function fujiyamaForwardZone(city: string, state: string) { return FUJIYAMA_CITY_ZONES[fujiyamaKey(city)] ?? FUJIYAMA_STATE_ZONES[fujiyamaKey(state)] ?? null; }
+function fujiyamaReverseZone(city: string, state: string) { return FUJIYAMA_REVERSE_ZONE_BY_STATE[fujiyamaKey(state)] ?? (fujiyamaKey(city) === "guwahati" ? "Northeast" : null); }
 async function createShipmentPricingQuote(env: Env, clientId: string, payload: Record<string, unknown>, createdByUserId: string, versionIdOverride?: string): Promise<PricingQuoteRecord> {
   const origin = shipmentAddress(payload.origin_address); const destination = shipmentAddress(payload.destination_address);
   if (!origin || !destination) throw new Error("PRICING_ADDRESS_REQUIRED");
+  const fujiyamaLane = clientId === FUJIYAMA_CLIENT_ID ? String(payload.lane ?? "").trim().toLowerCase() : "";
+  if (clientId === FUJIYAMA_CLIENT_ID && fujiyamaLane !== "forward" && fujiyamaLane !== "reverse") throw new Error("FUJIYAMA_LANE_REQUIRED");
   let accountValue = String(payload.account_code ?? "").trim().toLowerCase();
   if (!accountValue && typeof payload.provider_account_id === "string") {
     const providerAccount = await env.DB.prepare("SELECT account_name FROM provider_accounts WHERE id = ? AND provider = 'delhivery' LIMIT 1").bind(payload.provider_account_id).first<{ account_name: string }>();
@@ -470,6 +483,9 @@ async function createShipmentPricingQuote(env: Env, clientId: string, payload: R
   const [originPin, destinationPin] = await Promise.all([pricingPincode(env, origin.pincode), pricingPincode(env, destination.pincode)]);
   const originCity = originPin?.facility_city ?? origin.city; const destinationCity = destinationPin?.facility_city ?? destination.city;
   const originState = originPin?.facility_state ?? origin.state; const destinationState = destinationPin?.facility_state ?? destination.state;
+  const fujiyamaOriginZone = fujiyamaLane === "forward" ? "N1" : fujiyamaLane === "reverse" ? fujiyamaReverseZone(originCity, originState) : null;
+  const fujiyamaDestinationZone = fujiyamaLane === "forward" ? fujiyamaForwardZone(destinationCity, destinationState) : fujiyamaLane === "reverse" ? "North" : null;
+  if (fujiyamaLane && (!fujiyamaOriginZone || !fujiyamaDestinationZone)) throw new Error("FUJIYAMA_ZONE_NOT_CONFIGURED");
   let forwardRatePerKg: number | undefined;
   if (rtoSource) {
     try {
@@ -480,13 +496,34 @@ async function createShipmentPricingQuote(env: Env, clientId: string, payload: R
     if (forwardRatePerKg === undefined) throw new Error("RTO_SOURCE_INVALID");
   }
   const oda = Boolean(originPin?.oda || destinationPin?.oda);
-  const result = calculatePssRate({ account, originCity, destinationCity, originState, destinationState, actualWeightKg, volumetricWeightKg, invoiceValue, rto, forwardRatePerKg, forwardOriginZoneOverride: rtoSource?.origin_zone, forwardDestinationZoneOverride: rtoSource?.destination_zone, minimumWeightKg: Number(version.minimum_weight_kg ?? 20), gstPercent: Number(version.gst_percent ?? 18), versionId: version.id, oda, opa: false, rateMatrix: Object.fromEntries(matrixRows.results.map((row) => [`${row.origin_zone}->${row.destination_zone}`, Number(row.rate_per_kg)])), chargeRules: rules.results.map((rule) => ({ code: rule.code, label: rule.label, kind: rule.calculation_type, value: Number(rule.value), basis: rule.basis, minimum: rule.minimum_value === null ? undefined : Number(rule.minimum_value), maximum: rule.maximum_value === null ? undefined : Number(rule.maximum_value), enabled: Boolean(rule.enabled), marker: rule.marker ?? undefined, condition: rule.condition ?? undefined, displayOrder: Number(rule.display_order ?? 0) })) });
-  const carrierRisk = payload.risk_type === "carrier";
-  const riskFee = carrierRisk
-    ? Math.max(80, Math.round(invoiceValue * 0.003 * 100) / 100)
-    : Math.max(50, Math.round(invoiceValue * 0.001 * 100) / 100);
-  result.lines.push({ code: carrierRisk ? "carrier_risk" : "owner_risk", label: carrierRisk ? "Carrier risk fee" : "Owner risk fee", amount: riskFee });
-  result.total = Number(result.total) + riskFee;
+  const fujiyamaRules: ChargeRule[] = fujiyamaLane === "forward"
+    ? [
+        { code: "docket", label: "Docket / LR charge", kind: "fixed", value: 50, basis: "freight", displayOrder: 10 },
+        { code: "fuel", label: "Fuel surcharge", kind: "percent", value: 15, basis: "freight", displayOrder: 20 },
+        { code: "fm", label: "FM charge", kind: "per_kg", value: 1, basis: "chargeable_weight", displayOrder: 30 },
+        { code: "oda", label: "ODA surcharge", kind: "per_kg", value: 2, basis: "chargeable_weight", minimum: 450, condition: "oda_or_opa", marker: "*", displayOrder: 40 },
+        { code: "minimum_freight", label: "Minimum waybill freight", kind: "minimum", value: 500, basis: "subtotal", displayOrder: 60 },
+      ]
+    : fujiyamaLane === "reverse"
+      ? [
+          { code: "docket", label: "Docket / LR charge", kind: "fixed", value: 50, basis: "freight", displayOrder: 10 },
+          { code: "fuel", label: "Fuel surcharge", kind: "percent", value: 10, basis: "freight", displayOrder: 20 },
+          { code: "oda", label: "ODA surcharge", kind: "per_kg", value: 3, basis: "chargeable_weight", minimum: 550, condition: "oda_or_opa", marker: "*", displayOrder: 40 },
+          { code: "minimum_freight", label: "Minimum waybill freight", kind: "minimum", value: 450, basis: "subtotal", displayOrder: 60 },
+        ]
+      : rules.results.map((rule) => ({ code: rule.code, label: rule.label, kind: rule.calculation_type, value: Number(rule.value), basis: rule.basis, minimum: rule.minimum_value === null ? undefined : Number(rule.minimum_value), maximum: rule.maximum_value === null ? undefined : Number(rule.maximum_value), enabled: Boolean(rule.enabled), marker: rule.marker ?? undefined, condition: rule.condition ?? undefined, displayOrder: Number(rule.display_order ?? 0) }));
+  const laneMatrix = fujiyamaLane === "forward"
+    ? Object.fromEntries(Object.entries(FUJIYAMA_FORWARD_RATES).map(([zone, rate]) => [`N1->${zone}`, rate]))
+    : fujiyamaLane === "reverse"
+      ? Object.fromEntries(Object.entries(FUJIYAMA_REVERSE_RATES).map(([zone, rate]) => [`${zone}->North`, rate]))
+      : Object.fromEntries(matrixRows.results.map((row) => [`${row.origin_zone}->${row.destination_zone}`, Number(row.rate_per_kg)]));
+  const result = calculatePssRate({ account, originCity, destinationCity, originState, destinationState, actualWeightKg, volumetricWeightKg, invoiceValue, rto: fujiyamaLane ? false : rto, forwardRatePerKg: fujiyamaLane ? undefined : forwardRatePerKg, forwardOriginZoneOverride: rtoSource?.origin_zone, forwardDestinationZoneOverride: rtoSource?.destination_zone, originZoneOverride: fujiyamaOriginZone ?? undefined, destinationZoneOverride: fujiyamaDestinationZone ?? undefined, minimumWeightKg: Number(version.minimum_weight_kg ?? 20), gstPercent: Number(version.gst_percent ?? 18), versionId: version.id, oda, opa: false, rateMatrix: laneMatrix, chargeRules: fujiyamaRules, riskCharges: fujiyamaLane === "forward" ? [{ code: "rov", label: "ROV", percent: 0.3, minimum: 80 }] : fujiyamaLane === "reverse" ? [{ code: "rov", label: "ROV", percent: 0.2, minimum: 65 }, { code: "owner_risk", label: "Owner risk", percent: 0.1, minimum: 100 }] : [] });
+  if (!fujiyamaLane) {
+    const carrierRisk = payload.risk_type === "carrier";
+    const riskFee = carrierRisk ? Math.max(80, Math.round(invoiceValue * 0.003 * 100) / 100) : Math.max(50, Math.round(invoiceValue * 0.001 * 100) / 100);
+    result.lines.push({ code: carrierRisk ? "carrier_risk" : "owner_risk", label: carrierRisk ? "Carrier risk fee" : "Owner risk fee", amount: riskFee });
+    result.total = Number(result.total) + riskFee;
+  }
   const quoteId = crypto.randomUUID(); const breakdown = JSON.stringify(result);
   await env.DB.prepare("INSERT INTO pricing_quotes (id, client_id, version_id, account_scope, origin_zone, destination_zone, chargeable_weight_kg, client_breakdown_json, expires_at, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+15 minutes'), ?)").bind(quoteId, clientId, version.id, account, result.originZone, result.destinationZone, result.chargeableWeightKg, breakdown, createdByUserId).run();
   return { id: quoteId, version_id: version.id, account_scope: account, origin_zone: result.originZone, destination_zone: result.destinationZone, chargeable_weight_kg: result.chargeableWeightKg, client_breakdown_json: breakdown };
@@ -571,7 +608,7 @@ async function delhiveryB2bBearer(env: Env, credentialValue: string | undefined,
   if (!credential.username || !credential.password) return configuredToken ?? null;
   const cacheKey = delhiveryTokenCacheKey(accountName);
   const now = Math.floor(Date.now() / 1000);
-  const usable = (token: string | null | undefined, expiresAt?: number | null) => Boolean(delhiveryLooksLikeJwt(token) && (expiresAt ?? delhiveryJwtExpiry(token) ?? 0) > now + 300);
+  const usable = (token: string | null | undefined, expiresAt?: number | null) => Boolean(delhiveryLooksLikeJwt(token ?? undefined) && (expiresAt ?? delhiveryJwtExpiry(token ?? "") ?? 0) > now + 300);
   if (!forceRefresh && env.DELHIVERY_TOKEN_CACHE) {
     const cached = await env.DELHIVERY_TOKEN_CACHE.get<{ token?: string; expiresAt?: number }>(cacheKey, "json");
     if (usable(cached?.token, cached?.expiresAt)) return cached!.token!;
@@ -595,7 +632,7 @@ async function delhiveryB2bBearer(env: Env, credentialValue: string | undefined,
           const body = JSON.parse(responseText) as Record<string, unknown>;
           const token = findProviderToken(body, new Set(["jwt", "token", "access_token", "bearer_token"]));
           if (!delhiveryLooksLikeJwt(token ?? undefined)) continue;
-          const expiresAt = delhiveryJwtExpiry(token) ?? now + 86400;
+          const expiresAt = delhiveryJwtExpiry(token ?? "") ?? now + 86400;
           if (env.DELHIVERY_TOKEN_CACHE) {
             await env.DELHIVERY_TOKEN_CACHE.put(cacheKey, JSON.stringify({ token, expiresAt }), { expirationTtl: Math.max(60, expiresAt - now) });
           }
@@ -616,11 +653,12 @@ function delhiveryWarehouseName(origin: { name: string; state?: string; pincode:
   return `${base} ${state} ${origin.pincode}`.replace(/\s+/g, " ").slice(0, 50).trim();
 }
 
-async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: string, origin: { name: string; line: string; city: string; state: string; pincode: string; phone: string }, requestIdValue: string, timeoutMs: number, b2bBaseUrl = env.DELHIVERY_B2B_API_BASE_URL ?? "https://ltl-clients-api.delhivery.com") {
-  const existing = await env.DB.prepare("SELECT name FROM warehouses WHERE client_id = ? AND address = ? AND city = ? AND pincode = ? LIMIT 1")
-    .bind(clientId, origin.line, origin.city, origin.pincode)
-    .first<{ name: string }>();
+async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: string, origin: { name: string; line: string; city: string; state: string; pincode: string; phone: string }, requestIdValue: string, timeoutMs: number, b2bBaseUrl = env.DELHIVERY_B2B_API_BASE_URL ?? "https://ltl-clients-api.delhivery.com", providerAccountId?: string | null) {
+  const existing = await env.DB.prepare("SELECT id, name, provider_status, provider_account_id FROM warehouses WHERE client_id = ? AND address = ? AND city = ? AND pincode = ? ORDER BY CASE WHEN provider = 'delhivery' AND provider_account_id = ? AND provider_status = 'active' THEN 0 ELSE 1 END, updated_at DESC LIMIT 1")
+    .bind(clientId, origin.line, origin.city, origin.pincode, providerAccountId ?? "")
+    .first<{ id: string; name: string; provider_status: string | null; provider_account_id: string | null }>();
   const name = existing?.name?.trim() || delhiveryWarehouseName(origin);
+  if (existing?.provider_status === "active" && existing.provider_account_id === (providerAccountId ?? null)) return { ok: true as const, name, reused: true as const };
   // Delhivery B2B manifestation validates this against the B2B warehouse
   // registry. A local PSS warehouse row is not proof that the provider knows
   // the location, so always make the provider-side create call when booking.
@@ -681,12 +719,134 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   // available to manifestation. Give the provider a short propagation window
   // before using the warehouse in the shipment request.
   await new Promise((resolve) => setTimeout(resolve, 1500));
-  if (!existing) {
-    await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, pincode, contact) VALUES (?, ?, ?, ?, ?, ?, ?)")
-      .bind(crypto.randomUUID(), clientId, name, origin.line, origin.city, origin.pincode, origin.phone)
+  if (existing) {
+    await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_status = 'active', provider_reference = COALESCE(provider_reference, ?), status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+      .bind(providerAccountId ?? null, name, existing.id, clientId)
+      .run();
+  } else {
+    await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, pincode, contact, provider, provider_account_id, provider_status, provider_reference) VALUES (?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'active', ?)")
+      .bind(crypto.randomUUID(), clientId, name, origin.line, origin.city, origin.pincode, origin.phone, providerAccountId ?? null, name)
       .run();
   }
-  return { ok: true as const, name };
+  return { ok: true as const, name, reused: false as const };
+}
+
+type DelhiveryFacility = { id: string; code: string; name: string; pincode: string };
+
+function delhiveryFacilityRows(value: unknown): Array<Record<string, unknown>> {
+  if (!value || typeof value !== "object") return [];
+  const body = value as Record<string, unknown>;
+  const data = body.data && typeof body.data === "object" ? body.data as Record<string, unknown> : body;
+  const rows = data.results ?? data.facilities ?? data.items ?? body.results;
+  return Array.isArray(rows) ? rows.filter((row): row is Record<string, unknown> => Boolean(row && typeof row === "object")) : [];
+}
+
+function delhiveryFacilityField(row: Record<string, unknown>, keys: string[]) {
+  for (const key of keys) {
+    const value = row[key];
+    if (typeof value === "string" || typeof value === "number") {
+      const normalized = String(value).trim();
+      if (normalized) return normalized;
+    }
+  }
+  return "";
+}
+
+async function resolveDelhiveryFacility(
+  env: Env,
+  token: string,
+  baseUrl: string,
+  clientId: string,
+  payload: Record<string, unknown>,
+  requestIdValue: string,
+  timeoutMs: number,
+): Promise<{ ok: true; facility: DelhiveryFacility } | { ok: false; error: string }> {
+  const warehouseId = typeof payload.warehouse_id === "string" ? payload.warehouse_id.trim() : "";
+  const warehouseSelect = "SELECT id, name, address, city, pincode, provider_reference, provider_status FROM warehouses WHERE client_id = ?";
+  const localWarehouse = warehouseId
+    ? await env.DB.prepare(`${warehouseSelect} AND id = ? LIMIT 1`).bind(clientId, warehouseId).first<{ id: string; name: string; address: string; city: string; pincode: string; provider_reference: string | null; provider_status: string | null }>()
+    : await env.DB.prepare(`${warehouseSelect} AND pincode = ? ORDER BY CASE WHEN provider = 'delhivery' AND provider_status = 'active' THEN 0 ELSE 1 END, updated_at DESC LIMIT 1`).bind(clientId, String(payload.pincode ?? "").trim()).first<{ id: string; name: string; address: string; city: string; pincode: string; provider_reference: string | null; provider_status: string | null }>();
+  const name = String(payload.delhivery_pickup_location ?? payload.pickup_location ?? localWarehouse?.name ?? "").trim();
+  const pincode = String(payload.pincode ?? localWarehouse?.pincode ?? "").trim();
+  const directId = String(payload.provider_facility_id ?? "").trim();
+  const directCode = String(payload.provider_facility_code ?? "").trim();
+  if (directId && directCode) return { ok: true, facility: { id: directId, code: directCode, name, pincode } };
+  if (!name && !localWarehouse?.provider_reference) return { ok: false, error: "A Delhivery pickup facility is required before scheduling this pickup" };
+
+  const endpoint = `${String(baseUrl).replace(/\/$/, "")}/web/api/company/configurations/facilities_and_addresses_v3/list`;
+  let response: Response;
+  try {
+    response = await providerFetch(endpoint, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json", accept: "application/json", "x-request-id": requestIdValue },
+      body: JSON.stringify({ page: 1, page_size: 50, search_term: name, search_on: ["facility_name"], ...(name ? { filter_facility_name: [name] } : {}) }),
+    }, timeoutMs);
+  } catch (caught) {
+    return { ok: false, error: caught instanceof Error ? caught.message : "Delhivery facility lookup failed" };
+  }
+  const responseText = await providerResponseText(response, timeoutMs);
+  if (!response.ok) return { ok: false, error: `Delhivery facility lookup failed (${response.status}): ${responseText.slice(0, 240)}` };
+  let parsed: unknown = null;
+  try { parsed = JSON.parse(responseText); } catch { parsed = null; }
+  const normalizedName = name.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const rows = delhiveryFacilityRows(parsed);
+  const match = rows.find((row) => {
+    const rowStatus = String(row.status ?? row.facility_status ?? row.state ?? "ACTIVE").toLowerCase();
+    if (["inactive", "disabled", "deleted", "deactivated"].includes(rowStatus)) return false;
+    const rowPin = delhiveryFacilityField(row, ["pincode", "pin_code", "postal_code"]);
+    const rowName = delhiveryFacilityField(row, ["facility_name", "name", "client_warehouse_name", "warehouse_name"]);
+    const nameMatches = !normalizedName || rowName.toLowerCase().replace(/[^a-z0-9]/g, "").includes(normalizedName) || normalizedName.includes(rowName.toLowerCase().replace(/[^a-z0-9]/g, ""));
+    return nameMatches && (!pincode || !rowPin || rowPin === pincode);
+  });
+  if (!match) return { ok: false, error: `Delhivery pickup facility '${name || pincode}' is not active or could not be resolved` };
+  const facility = {
+    id: delhiveryFacilityField(match, ["facility_id", "id", "client_warehouse_uuid", "uuid"]),
+    code: delhiveryFacilityField(match, ["facility_code", "code", "facility_name", "name"]),
+    name: delhiveryFacilityField(match, ["facility_name", "name", "client_warehouse_name", "warehouse_name"]) || name,
+    pincode: delhiveryFacilityField(match, ["pincode", "pin_code", "postal_code"]) || pincode,
+  };
+  if (!facility.id || !facility.code) return { ok: false, error: "Delhivery returned an incomplete pickup facility record" };
+  if (localWarehouse) {
+    await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_reference = ?, provider_status = 'active', status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+      .bind(facility.id, localWarehouse.id, clientId).run();
+  }
+  return { ok: true, facility };
+}
+
+function normalizeDelhiveryPickupSlots(value: unknown) {
+  const body = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const data = body.data && typeof body.data === "object" ? body.data as Record<string, unknown> : body;
+  const toSlots = (candidate: unknown) => {
+    if (!Array.isArray(candidate)) return [] as string[];
+    return candidate.map((slot) => {
+      if (typeof slot === "string") return slot.trim();
+      if (!slot || typeof slot !== "object") return "";
+      const item = slot as Record<string, unknown>;
+      const start = String(item.start_time ?? item.start ?? item.from ?? "").trim();
+      const end = String(item.end_time ?? item.end ?? item.to ?? "").trim();
+      return start && end ? `${start} - ${end}` : start;
+    }).filter(Boolean);
+  };
+  const today = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata" }).format(new Date());
+  const tomorrowDate = new Date(`${today}T12:00:00+05:30`);
+  tomorrowDate.setUTCDate(tomorrowDate.getUTCDate() + 1);
+  const tomorrow = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata" }).format(tomorrowDate);
+  const rawDates = data.pickup_dates ?? data.available_dates ?? data.dates;
+  const dateEntries = Array.isArray(rawDates) ? rawDates.map((item) => {
+    if (typeof item === "string") return { date: item, slots: [] as string[] };
+    if (!item || typeof item !== "object") return { date: "", slots: [] as string[] };
+    const row = item as Record<string, unknown>;
+    return { date: String(row.date ?? row.pickup_date ?? ""), slots: toSlots(row.slots ?? row.pickup_slots ?? row.time_slots ?? row.windows ?? row.available_slots) };
+  }).filter((item) => validPickupDate(item.date)) : [];
+  const todaySlots = toSlots(data.pickup_slots_for_today ?? data.slots_for_today ?? data.today_slots);
+  const nextSlots = toSlots(data.pickup_slots_for_next_day ?? data.slots_for_next_day ?? data.next_day_slots);
+  const orderedDates = Array.from(new Set(dateEntries.length ? dateEntries.map((item) => item.date) : [today, tomorrow]));
+  const hasEmbeddedSlots = dateEntries.some((item) => item.slots.length > 0);
+  return orderedDates.map((date, index) => {
+    const embedded = dateEntries.find((item) => item.date === date)?.slots ?? [];
+    const slots = hasEmbeddedSlots ? embedded : index === 0 ? todaySlots : nextSlots;
+    return { date, slots };
+  }).filter((item) => item.slots.length > 0);
 }
 
 function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>) {
@@ -887,14 +1047,38 @@ function delhiveryCreatePayload(env: Env, payload: Record<string, unknown>) {
   return { shipments: [shipment] };
 }
 
+function normalizePickupAwbNumbers(value: unknown) {
+  if (Array.isArray(value)) return value.map((item) => String(item).trim()).filter(Boolean);
+  const text = String(value ?? "").trim();
+  return text ? text.split(/[\s,]+/).map((item) => item.trim()).filter(Boolean) : [];
+}
+
 function delhiveryPickupPayload(env: Env, payload: Record<string, unknown>, useDelhiveryB2b = false) {
   const pickupLocation = String(payload.delhivery_pickup_location ?? payload.pickup_location ?? env.DELHIVERY_DEFAULT_PICKUP_LOCATION ?? "").trim();
-  const pickupDate = String(payload.scheduled_date ?? "").trim();
-  const rawWindow = String(payload.window ?? payload.pickup_time ?? "10:00:00").trim();
-  const pickupTime = (rawWindow.match(/\b\d{1,2}:\d{2}(?::\d{2})?\b/)?.[0] ?? "10:00:00").split(":").map((part) => part.padStart(2, "0"));
-  if (!pickupLocation || !/^\d{4}-\d{2}-\d{2}$/.test(pickupDate)) return null;
-  if (useDelhiveryB2b) return { client_warehouse: pickupLocation, pickup_date: pickupDate, start_time: `${pickupTime[0]}:${pickupTime[1]}:${pickupTime[2] ?? "00"}`, expected_package_count: Math.max(1, Number(payload.expected_package_count ?? payload.package_count ?? 1)) };
-  return { pickup_time: `${pickupTime[0]}:${pickupTime[1]}:${pickupTime[2] ?? "00"}`, pickup_date: pickupDate, pickup_location: pickupLocation, expected_package_count: Math.max(1, Number(payload.expected_package_count ?? payload.package_count ?? 1)) };
+  const pickupDate = String(payload.scheduled_date ?? payload.pickup_date ?? "").trim();
+  const rawWindow = String(payload.window ?? payload.pickup_time ?? "").trim();
+  const times = rawWindow.match(/\b\d{1,2}:\d{2}(?::\d{2})?\b/g) ?? [];
+  const normalizeTime = (value: string | undefined) => (value ?? "").split(":").map((part) => part.padStart(2, "0")).slice(0, 3).concat(["00", "00"]).slice(0, 3).join(":");
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(pickupDate)) return null;
+  if (useDelhiveryB2b) {
+    const awbValue = payload.awb_number ?? payload.master_awb ?? payload.provider_reference ?? payload.tracking_number;
+    const awbNumbers = normalizePickupAwbNumbers(awbValue);
+    const facilityId = String(payload.provider_facility_id ?? payload.facility_id ?? "").trim();
+    const facilityCode = String(payload.provider_facility_code ?? payload.facility_code ?? "").trim();
+    if (!facilityId || !facilityCode || !awbNumbers.length) return null;
+    return {
+      facility_id: facilityId,
+      facility_code: facilityCode,
+      pickup_date: pickupDate,
+      start_time: normalizeTime(times[0]),
+      end_time: normalizeTime(times[1] ?? times[0]),
+      awb_number: awbNumbers,
+      expected_package_count: Math.max(1, Number(payload.expected_package_count ?? payload.package_count ?? payload.pieces ?? awbNumbers.length ?? 1)),
+      pincode: String(payload.pincode ?? "").trim() || undefined,
+    };
+  }
+  if (!pickupLocation) return null;
+  return { pickup_time: normalizeTime(times[0]), pickup_date: pickupDate, pickup_location: pickupLocation, expected_package_count: Math.max(1, Number(payload.expected_package_count ?? payload.package_count ?? 1)) };
 }
 
 function providerSafePickupDate(dateValue: string) {
@@ -912,22 +1096,15 @@ function providerSafePickupDate(dateValue: string) {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit" }).format(next);
 }
 
-function delhiveryPickupOptions() {
-  const now = new Date();
-  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", hour12: false }).formatToParts(now).filter((part) => part.type !== "literal").map((part) => [part.type, part.value]));
-  const today = `${parts.year}-${parts.month}-${parts.day}`;
-  const afterCutoff = Number(parts.hour) >= 14;
-  const slots = ["09:00 AM – 11:00 AM", "11:00 AM – 01:00 PM", "02:00 PM – 04:00 PM", "04:00 PM – 06:00 PM"];
-  const dates: Array<{ date: string; slots: string[]; reason: string }> = [];
-  for (let offset = 0; dates.length < 3 && offset < 8; offset += 1) {
-    const candidate = new Date(`${today}T12:00:00+05:30`);
-    candidate.setUTCDate(candidate.getUTCDate() + offset);
-    const date = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit" }).format(candidate);
-    const weekday = new Intl.DateTimeFormat("en-US", { timeZone: "Asia/Kolkata", weekday: "short" }).format(candidate);
-    if (weekday === "Sun" || (offset === 0 && afterCutoff)) continue;
-    dates.push({ date, slots, reason: offset === 0 ? "same_day_before_cutoff" : "next_operational_day" });
-  }
-  return { dates, source: "delhivery_pickup_policy", cutoff_time: "14:00", timezone: "Asia/Kolkata", note: "Final acceptance remains subject to the Delhivery pickup location's configured working days and slot capacity." };
+function normalizePickupPhone(value: unknown) {
+  const digits = String(value ?? "").replace(/\D/g, "");
+  return digits.length === 10 ? digits : null;
+}
+
+function validPickupDate(value: string) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const parsed = new Date(`${value}T00:00:00Z`);
+  return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
 }
 
 function findProviderReference(value: unknown, keys: Set<string>, depth = 0): string | null {
@@ -1340,7 +1517,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (["tracking", "labels", "lr_copy", "document"].includes(operation) && !trackingNumber) return { enabled: false, status: "invalid_request" as const, reason: "A provider tracking reference is required" };
   if (provider === "delhivery" && operation === "shipments" && String(env.DELHIVERY_ENABLE_SHIPMENT_CREATION) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "Delhivery shipment creation is safety-disabled until live billing approval" };
   if (provider === "delhivery" && operation === "pickups" && String(env.DELHIVERY_ENABLE_PICKUP_CREATION) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "Delhivery pickup creation is safety-disabled until live operations approval" };
-  if (provider === "delhivery" && !new Set(["tracking", "shipments", "pickups", "serviceability", "labels", "lr_copy", "document"]).has(operation)) return { enabled: false, status: "unsupported" as const, reason: "Delhivery operation is not supported" };
+  if (provider === "delhivery" && !new Set(["tracking", "shipments", "pickups", "pickup_slots", "serviceability", "labels", "lr_copy", "document"]).has(operation)) return { enabled: false, status: "unsupported" as const, reason: "Delhivery operation is not supported" };
   if (provider === "ekart" && operation === "pickups") return { enabled: false, status: "unsupported" as const, reason: "Ekart pickup contract is not verified" };
   if (provider === "ekart" && String(env.EKART_ENABLE_PROVIDER_CALLS) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "Ekart is configured but disabled until the agreed provider scope is approved" };
   if (provider === "ekart" && operation !== "tracking" && operation !== "shipments") return { enabled: false, status: "unsupported" as const, reason: "Ekart operation is not supported" };
@@ -1417,16 +1594,19 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (!base || (provider === "trackon" ? !trackon : provider === "rivigo" ? !rivigo : !credential)) return { enabled: false, status: "not_configured" as const };
   const providerTimeoutMs = Math.min(timeoutMsOverride ?? (provider === "delhivery" && operation === "shipments" ? 30000 : 10000), provider === "delhivery" && operation === "shipments" ? 30000 : 10000);
   const delhiveryB2bAccountName = account?.account_name ?? defaultDelhiveryAccountName;
-  const delhiveryB2bToken = useDelhiveryB2b ? await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs) : null;
+  let delhiveryB2bToken = useDelhiveryB2b ? await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs) : null;
   if (provider === "delhivery" && useDelhiveryB2b && !delhiveryB2bToken) return { enabled: true, status: "failed" as const, error: "Delhivery B2B authentication failed" };
   let delhiveryPickupLocation = "";
   if (provider === "delhivery" && operation === "shipments" && useDelhiveryB2b && clientId && delhiveryB2bToken) {
     const origin = delhiveryAddress(payload.origin_address, String(payload.origin ?? "PSS Logistics"));
     if (!origin) return { enabled: true, status: "invalid_request" as const, reason: "A complete consignor address is required to create or select the pickup warehouse" };
-    let warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base);
+    let warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId);
     if (!warehouse.ok && /\b401\b|invalid token|unauthorized|token decode|not enough segments/i.test(warehouse.error)) {
       const refreshedToken = await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs, true);
-      if (refreshedToken) warehouse = await ensureDelhiveryWarehouse(env, clientId, refreshedToken, origin, requestIdValue, providerTimeoutMs, base);
+      if (refreshedToken) {
+        delhiveryB2bToken = refreshedToken;
+        warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId);
+      }
     }
     if (!warehouse.ok) return { enabled: true, status: "failed" as const, error: warehouse.error };
     delhiveryPickupLocation = warehouse.name;
@@ -1449,21 +1629,29 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (provider === "ekart" && operation === "shipments" && !ekartCreate) return { enabled: false, status: "invalid_request" as const, reason: "Origin and destination addresses require valid six-digit pincodes and ten-digit phone numbers" };
   let providerPayload: Record<string, unknown> = account?.provider === "delhivery" ? { ...payload, delhivery_client_name: account.account_name } : payload;
   if (delhiveryPickupLocation) providerPayload.delhivery_pickup_location = delhiveryPickupLocation;
-  if (provider === "delhivery" && operation === "pickups" && useDelhiveryB2b && clientId && delhiveryB2bToken && typeof payload.shipment_id === "string") {
-    const shipmentOrigin = await env.DB.prepare("SELECT origin_address_json FROM shipments WHERE id = ? AND client_id = ? LIMIT 1")
-      .bind(payload.shipment_id, clientId)
-      .first<{ origin_address_json: string | null }>();
+  if (provider === "delhivery" && operation === "pickups" && useDelhiveryB2b && clientId && delhiveryB2bToken) {
+    const shipmentOrigin = typeof payload.shipment_id === "string"
+      ? await env.DB.prepare("SELECT origin_address_json FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(payload.shipment_id, clientId).first<{ origin_address_json: string | null }>()
+      : null;
     let origin: ReturnType<typeof delhiveryAddress> = null;
     if (shipmentOrigin?.origin_address_json) {
       try { origin = delhiveryAddress(JSON.parse(shipmentOrigin.origin_address_json), "PSS Logistics"); } catch { origin = null; }
     }
+    if (!origin && typeof payload.location === "string" && typeof payload.pincode === "string") {
+      origin = delhiveryAddress({ name: payload.contact_name, line: payload.location, city: payload.city, state: payload.state, pincode: payload.pincode, phone: payload.contact_phone }, "PSS Logistics");
+    }
+    if (!origin) return { enabled: true, status: "invalid_request" as const, reason: "A complete pickup address is required before Delhivery can register the warehouse" };
     if (origin) {
-      let warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base);
+      let warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId);
       if (!warehouse.ok && /\b401\b|invalid token|unauthorized|token decode|not enough segments/i.test(warehouse.error)) {
         const refreshedToken = await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs, true);
-        if (refreshedToken) warehouse = await ensureDelhiveryWarehouse(env, clientId, refreshedToken, origin, requestIdValue, providerTimeoutMs, base);
+      if (refreshedToken) {
+        delhiveryB2bToken = refreshedToken;
+        warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId);
       }
-      if (warehouse.ok) providerPayload = { ...providerPayload, delhivery_pickup_location: warehouse.name };
+      }
+      if (!warehouse.ok) return { enabled: true, status: "failed" as const, error: warehouse.error };
+      providerPayload = { ...providerPayload, delhivery_pickup_location: warehouse.name };
     }
   }
   if (provider === "delhivery" && operation === "shipments" && clientId) {
@@ -1481,6 +1669,20 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         // Ignore malformed optional preferences; the provider payload validation will report a missing KYC value.
       }
     }
+  }
+  let delhiveryFacility: DelhiveryFacility | null = null;
+  if (provider === "delhivery" && useDelhiveryB2b && clientId && delhiveryB2bToken && ["pickups", "pickup_slots"].includes(operation)) {
+    let facility = await resolveDelhiveryFacility(env, delhiveryB2bToken, base, clientId, providerPayload, requestIdValue, providerTimeoutMs);
+    if (!facility.ok && /\b401\b|invalid token|unauthorized|token decode|not enough segments/i.test(facility.error)) {
+      const refreshedToken = await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs, true);
+      if (refreshedToken) {
+        delhiveryB2bToken = refreshedToken;
+        facility = await resolveDelhiveryFacility(env, delhiveryB2bToken, base, clientId, providerPayload, requestIdValue, providerTimeoutMs);
+      }
+    }
+    if (!facility.ok) return { enabled: true, status: "failed" as const, error: facility.error };
+    delhiveryFacility = facility.facility;
+    providerPayload = { ...providerPayload, provider_facility_id: delhiveryFacility.id, provider_facility_code: delhiveryFacility.code };
   }
   const delhiveryCreate = provider === "delhivery" && operation === "shipments" ? useDelhiveryB2b ? delhiveryB2bManifestPayload(env, providerPayload) : delhiveryCreatePayload(env, providerPayload) : null;
   if (provider === "delhivery" && operation === "shipments" && !delhiveryCreate) return { enabled: false, status: "invalid_request" as const, reason: "Delhivery requires valid origin/destination addresses, a registered client name, and a pickup location" };
@@ -1509,8 +1711,10 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
           : `${base.replace(/\/$/, "")}/packages/json/?waybill=${encodeURIComponent(trackingNumber)}&ref_ids=${encodeURIComponent(String(payload.order_id ?? ""))}`
     : provider === "delhivery" && operation === "shipments"
       ? useDelhiveryB2b ? `${base.replace(/\/$/, "")}/manifest` : `${delhiveryOrigin}/api/cmu/create.json`
-      : provider === "delhivery" && operation === "pickups"
-        ? useDelhiveryB2b ? `${base.replace(/\/$/, "")}/pickup_requests/` : "https://track.delhivery.com/fm/request/new/"
+       : provider === "delhivery" && operation === "pickups"
+         ? useDelhiveryB2b ? `${base.replace(/\/$/, "")}/v2/web/api/orders/pickup_request` : "https://track.delhivery.com/fm/request/new/"
+       : provider === "delhivery" && operation === "pickup_slots"
+         ? `${base.replace(/\/$/, "")}/web/api/forward_orders/pickup_slots/${encodeURIComponent(String(delhiveryFacility?.code ?? ""))}?facility_id=${encodeURIComponent(String(delhiveryFacility?.id ?? ""))}`
         : provider === "delhivery" && operation === "serviceability"
           ? `${delhiveryOrigin}/c/api/pin-codes/json/?filter_codes=${encodeURIComponent(String(payload.destination_pincode ?? ""))}`
     : provider === "ekart"
@@ -1538,8 +1742,8 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       : trackonUrl!;
   const requestBody = provider === "delhivery" && operation === "shipments"
     ? useDelhiveryB2b ? delhiveryB2bManifestForm(delhiveryCreate as Record<string, unknown>, providerPayload.invoice_documents) : `format=json&data=${encodeURIComponent(JSON.stringify(delhiveryCreate))}`
-    : provider === "delhivery" && operation === "pickups"
-      ? JSON.stringify(delhiveryPickup)
+     : provider === "delhivery" && operation === "pickups"
+       ? JSON.stringify(delhiveryPickup)
       : provider === "ekart" && operation === "shipments"
         ? JSON.stringify(ekartCreate)
       : provider === "ekart" ? JSON.stringify({ tracking_id: trackingNumber })
@@ -1552,14 +1756,14 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         : provider === "rivigo" && operation === "shipments" ? JSON.stringify(rivigoCreate)
         : provider === "rivigo" && operation === "updates" ? JSON.stringify(payload)
         : provider === "rivigo" && operation === "cancellations" ? JSON.stringify(payload.cnotes_list ? { cnotesList: payload.cnotes_list } : {})
-        : provider === "delhivery" && ["tracking", "serviceability", "labels", "lr_copy", "document"].includes(operation) ? ""
+         : provider === "delhivery" && ["tracking", "serviceability", "pickup_slots", "labels", "lr_copy", "document"].includes(operation) ? ""
         : operation === "tracking" ? JSON.stringify({ Appkey: trackon!.appKey, userId: trackon!.userId, password: trackon!.password, AWBNo: trackingNumber })
           : operation === "shipments" ? JSON.stringify(trackonPayload(payload, trackon!))
             : JSON.stringify({ Appkey: trackon!.appKey, userId: trackon!.userId, password: trackon!.password, AWBNo: trackingNumber });
   if (provider === "delhivery" && operation === "shipments" && !useDelhiveryB2b) headers["content-type"] = "application/x-www-form-urlencoded";
   if (provider === "delhivery" && operation === "shipments" && useDelhiveryB2b) delete headers["content-type"];
   let response: Response | null = null; let lastError = "provider_request_failed";
-  const readOnlyProviderCall = operation === "tracking" || operation === "serviceability";
+   const readOnlyProviderCall = operation === "tracking" || operation === "serviceability" || operation === "pickup_slots";
   const maxAttempts = readOnlyProviderCall ? (provider === "delhivery" && useDelhiveryB2b ? 2 : 1) : 3;
   // Courier tracking/serviceability are read-only, but provider APIs can take
   // longer than a browser request under normal network load. Keep a bounded
@@ -1572,7 +1776,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       // XpressBees documents tracking as POST even though it is a read-only
       // lookup. Keep the generic GET behavior for Delhivery/Trackon tracking,
       // but send the XpressBees AWB body with POST to avoid provider HTTP 405.
-      const isGet = (["tracking", "serviceability", "labels", "lr_copy", "document"].includes(operation) && provider !== "xpressbees" && provider !== "rivigo") || (provider === "trackon" && operation === "labels");
+       const isGet = (["tracking", "serviceability", "pickup_slots", "labels", "lr_copy", "document"].includes(operation) && provider !== "xpressbees" && provider !== "rivigo") || (provider === "trackon" && operation === "labels");
       const method = provider === "rivigo" && operation === "cancellations" ? "DELETE" : provider === "rivigo" && operation === "updates" ? "PUT" : isGet ? "GET" : "POST";
       response = await providerFetch(url, { method, headers, body: isGet ? undefined : requestBody }, attemptTimeoutMs);
       if (provider === "delhivery" && useDelhiveryB2b && response.status === 401 && attempt === 0 && credential) {
@@ -1648,6 +1852,9 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   }
   let parsedProviderBody: unknown = null;
   try { parsedProviderBody = JSON.parse(responseBody); } catch { parsedProviderBody = null; }
+  if (response.ok && provider === "delhivery" && operation === "pickup_slots") {
+    return { enabled: true, status: "accepted" as const, providerStatus: response.status, dates: normalizeDelhiveryPickupSlots(parsedProviderBody) };
+  }
   // Delhivery B2B manifestation is asynchronous. The initial POST /manifest
   // acknowledges the request with a job id; the LR and AWB are returned by a
   // subsequent GET /manifest status request. Do not classify an accepted job
@@ -1737,7 +1944,12 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       if (labelUrls.length) {
         try {
           const labelArtifacts: Array<{ content_base64: string; content_type: string }> = [];
-          for (const labelUrl of labelUrls) {
+          const requestedCopies = Math.max(1, Number(payload.boxes ?? payload.pieces ?? 1) + 1);
+          const boxCount = Math.max(1, Number(payload.boxes ?? payload.pieces ?? 1));
+          // get_urls can return the box label followed by a document asset.
+          // The client needs box labels only; the extra required copy is made
+          // from the label image rather than turning the document into page 2.
+          for (const labelUrl of labelUrls.slice(0, boxCount)) {
             const labelResponse = await providerFetch(labelUrl, { method: "GET", headers: { accept: "application/json,image/*,application/pdf" } }, attemptTimeoutMs);
             if (!labelResponse.ok) throw new Error(`label_content_http_${labelResponse.status}`);
             const labelContentType = labelResponse.headers.get("content-type") ?? "application/octet-stream";
@@ -1753,7 +1965,6 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
             }
           }
           if (labelArtifacts.length) {
-            const requestedCopies = Math.max(1, Number(payload.boxes ?? payload.pieces ?? 1) + 1);
             while (labelArtifacts.length < requestedCopies) labelArtifacts.push(labelArtifacts[labelArtifacts.length % Math.max(1, labelArtifacts.length)]);
             artifact = { artifacts: labelArtifacts.slice(0, requestedCopies), content_type: labelArtifacts[0].content_type, copies: requestedCopies };
           }
@@ -1762,11 +1973,21 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         }
       }
     }
+    if (operation === "document" && clientId && typeof payload.shipment_id === "string") {
+      const pod = await persistDelhiveryPod(env, clientId, payload.shipment_id, trackingNumber, artifact, responseBytes, response, requestIdValue);
+      return { enabled: true, status: pod.stored || pod.reason === "already_exists" ? "accepted" as const : "failed" as const, providerStatus: response.status, artifact, pod_document_id: pod.document_id, error: pod.stored || pod.reason === "already_exists" ? undefined : pod.reason };
+    }
     return { enabled: true, status: "accepted" as const, providerStatus: response.status, artifact };
   }
   if (response.ok && provider === "delhivery" && operation === "pickups" && typeof payload.pickup_id === "string") {
     const pickupReference = findProviderReference(parsedProviderBody, new Set(["pickup_id", "pickup_request_id", "pur_id", "pur", "pur_number", "pickup_request", "pickup_request_no", "request_id", "request_no"]));
     if (pickupReference) await env.DB.prepare("UPDATE pickup_requests SET provider = 'delhivery', provider_reference = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(pickupReference, payload.pickup_id, clientId ?? "").run();
+    const providerState = findProviderReference(parsedProviderBody, new Set(["status", "provider_status", "state", "pickup_status"]));
+    const providerSlotId = findProviderReference(parsedProviderBody, new Set(["slot_id", "pickup_slot_id", "provider_slot_id", "slot", "time_slot_id"]));
+    const acceptedDate = findProviderReference(parsedProviderBody, new Set(["pickup_date", "pickupDate", "scheduled_date", "scheduledDate", "pickup_scheduled_date"]));
+    const acceptedWindow = findProviderReference(parsedProviderBody, new Set(["pickup_time", "pickupTime", "time_slot", "timeSlot", "pickup_window", "pickupWindow", "requested_time_slot"]));
+    const providerPending = Boolean(providerState && /pending|queued|processing|created|in_progress/i.test(providerState));
+    return { enabled: true, status: "accepted" as const, providerStatus: providerState ?? response.status, providerPending, providerReference: pickupReference, providerSlotId, acceptedDate: acceptedDate && validPickupDate(acceptedDate) ? acceptedDate : null, acceptedWindow };
   }
   if (response.ok && provider === "delhivery" && operation === "serviceability") {
     const code = Array.isArray((parsedProviderBody as Record<string, unknown> | null)?.delivery_codes) ? (parsedProviderBody as { delivery_codes: Array<Record<string, unknown>> }).delivery_codes[0] : null;
@@ -1807,6 +2028,12 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     ? "Delhivery warehouse is not active yet. The pickup location must be registered and activated before booking."
     : response.ok ? undefined : `${lastError}: ${providerError}`;
   return { enabled: true, status: response.ok ? "accepted" as const : "failed" as const, providerStatus: response.status, normalized_status: normalizedTracking?.status, tracking: normalizedTracking ? { status: normalizedTracking.status, location: normalizedTracking.location, description: normalizedTracking.description, event_time: normalizedTracking.eventTime } : undefined, amount: provider === "xpressbees" && operation === "quotes" ? findProviderAmount(parsedProviderBody) : undefined, provider_account_id: account?.id, account_name: account?.account_name, confidence_score: account?.confidence_score, priority: account?.priority, rate_card_id: account?.rate_card_id ?? undefined, error: normalizedError };
+}
+
+async function recordPickupAttempt(env: Env, details: { pickupId: string; clientId: string; provider: string; providerAccountId?: string | null; requestId?: string | null; idempotencyKey?: string | null; requestedDate?: string | null; requestedWindow?: string | null; status: string; providerStatus?: string | number | null; providerReference?: string | null; providerErrorCode?: string | null; errorMessage?: string | null }) {
+  await env.DB.prepare("INSERT INTO pickup_request_attempts (id, pickup_id, client_id, provider, provider_account_id, request_id, idempotency_key, requested_date, requested_time_slot, status, provider_status, provider_reference, provider_error_code, error_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    .bind(crypto.randomUUID(), details.pickupId, details.clientId, details.provider, details.providerAccountId ?? null, details.requestId ?? null, details.idempotencyKey ?? null, details.requestedDate ?? null, details.requestedWindow ?? null, details.status, details.providerStatus == null ? null : String(details.providerStatus), details.providerReference ?? null, details.providerErrorCode ?? null, details.errorMessage ?? null)
+    .run();
 }
 
 async function safeProviderRequest(env: Env, provider: CourierProvider, operation: string, payload: Record<string, unknown>, requestIdValue: string, clientId?: string, idempotencyKey?: string, timeoutMsOverride?: number) {
@@ -1896,13 +2123,30 @@ function delhiveryWebhookDetails(payload: Record<string, unknown>) {
   const statusObject = shipment.Status && typeof shipment.Status === "object" ? shipment.Status as Record<string, unknown> : shipment.status && typeof shipment.status === "object" ? shipment.status as Record<string, unknown> : {};
   const rawStatus = typeof shipment.Status === "string" ? shipment.Status : statusObject.Status ?? statusObject.status ?? shipment.status ?? payload.status ?? payload.event_type;
   const reference = String(shipment.AWB ?? shipment.awb ?? shipment.waybill ?? shipment.Waybill ?? shipment.ReferenceNo ?? shipment.reference_no ?? payload.awb ?? payload.waybill ?? payload.tracking_number ?? payload.provider_reference ?? payload.shipment_id ?? "").trim();
+  const dateCandidate = findProviderReference(payload, new Set(["pickup_date", "pickupDate", "scheduled_date", "scheduledDate", "pickup_scheduled_date"]));
+  const dateMatch = dateCandidate?.match(/(\d{4}-\d{2}-\d{2})/);
+  const requestedDate = dateMatch && validPickupDate(dateMatch[1]) ? dateMatch[1] : null;
+  const requestedTimeSlot = findProviderReference(payload, new Set(["pickup_time", "pickupTime", "start_time", "startTime", "time_slot", "timeSlot", "pickup_window", "pickupWindow", "requested_time_slot"]));
   return {
     reference,
     rawStatus,
+    requestedDate,
+    requestedTimeSlot: requestedTimeSlot?.slice(0, 80) || null,
     description: String(statusObject.Instructions ?? statusObject.description ?? shipment.Instructions ?? shipment.description ?? payload.description ?? payload.message ?? "Delhivery status update").slice(0, 500),
     location: String(statusObject.StatusLocation ?? statusObject.location ?? shipment.StatusLocation ?? shipment.location ?? payload.location ?? payload.city ?? "").slice(0, 200),
     eventTime: typeof (statusObject.StatusDateTime ?? shipment.StatusDateTime ?? payload.event_time ?? payload.timestamp) === "string" ? String(statusObject.StatusDateTime ?? shipment.StatusDateTime ?? payload.event_time ?? payload.timestamp) : null,
   };
+}
+
+function pickupStatusFromProviderEvent(rawStatus: unknown) {
+  const value = String(rawStatus ?? "").trim().toLowerCase().replaceAll("-", "_").replaceAll(" ", "_");
+  if (!value) return null;
+  if (value.includes("cancel")) return "cancelled";
+  if (value.includes("fail") || value.includes("exception") || value.includes("reject") || value.includes("undeliver")) return "failed";
+  if (value.includes("picked") || value.includes("pickup_complete") || value.includes("collected")) return "picked_up";
+  if (value.includes("driver") || value.includes("assign") || value.includes("en_route") || value.includes("out_for_pickup")) return value.includes("en_route") || value.includes("out_for_pickup") ? "en_route" : "driver_assigned";
+  if (value.includes("schedule") || value.includes("manifest") || value.includes("book") || value.includes("accept") || value.includes("confirm")) return "scheduled";
+  return null;
 }
 
 function delhiveryDocumentUrl(payload: Record<string, unknown>) {
@@ -1921,6 +2165,44 @@ function delhiveryDocumentContentType(url: URL, response: Response) {
   return null;
 }
 
+function bytesFromBase64(value: string) {
+  const normalized = value.replace(/^data:[^;]+;base64,/, "").replace(/\s/g, "");
+  if (!normalized || !/^[A-Za-z0-9+/=]+$/.test(normalized)) return null;
+  try {
+    const decoded = atob(normalized);
+    return Uint8Array.from(decoded, (character) => character.charCodeAt(0));
+  } catch {
+    return null;
+  }
+}
+
+async function persistDelhiveryPod(env: Env, clientId: string, shipmentId: string, trackingNumber: string, artifact: unknown, responseBytes: Uint8Array | null, response: Response, requestIdValue: string) {
+  const existing = await env.DB.prepare("SELECT id FROM shipment_documents WHERE shipment_id = ? AND lower(original_filename) LIKE 'delhivery-pod-%' ORDER BY created_at DESC LIMIT 1").bind(shipmentId).first<{ id: string }>();
+  if (existing) return { stored: false, document_id: existing.id, reason: "already_exists" };
+  let bytes = responseBytes;
+  let contentType = (response.headers.get("content-type") ?? "").split(";", 1)[0].trim().toLowerCase();
+  if (!bytes || contentType.includes("json")) {
+    const base64 = findProviderContentBase64(artifact);
+    bytes = base64 ? bytesFromBase64(base64) : null;
+    contentType = findProviderToken(artifact, new Set(["content_type", "contentType", "mime_type", "mimeType"]))?.toLowerCase().split(";", 1)[0].trim() ?? contentType;
+  }
+  if (!bytes || !["application/pdf", "image/jpeg", "image/png", "image/webp"].includes(contentType) || !documentSignatureMatches(contentType, bytes)) {
+    console.warn(JSON.stringify({ request_id: requestIdValue, shipment_id: shipmentId, pod_persist: "invalid_provider_document" }));
+    return { stored: false, reason: "invalid_provider_document" };
+  }
+  const documentId = crypto.randomUUID();
+  const extension = contentType === "application/pdf" ? "pdf" : contentType === "image/png" ? "png" : contentType === "image/webp" ? "webp" : "jpg";
+  const objectKey = `clients/${clientId}/shipments/${shipmentId}/${documentId}-delhivery-pod.${extension}`;
+  await env.FILES.put(objectKey, bytes, { httpMetadata: { contentType } });
+  try {
+    await env.DB.prepare("INSERT INTO shipment_documents (id, shipment_id, client_id, object_key, original_filename, content_type, file_size_bytes, uploaded_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").bind(documentId, shipmentId, clientId, objectKey, `delhivery-pod-${trackingNumber}.${extension}`, contentType, bytes.byteLength, "automation:delhivery:fujiyama").run();
+  } catch (caught) {
+    await env.FILES.delete(objectKey).catch(() => undefined);
+    throw caught;
+  }
+  return { stored: true, document_id: documentId };
+}
+
 async function handleProviderWebhook(request: Request, env: Env, provider: "delhivery" | "ekart" | "trackon", requestIdValue: string, headers: HeadersInit) {
   const rawBody = await request.text();
   if (rawBody.length > 1024 * 1024) return error("PAYLOAD_TOO_LARGE", "Webhook payload is too large", 413, requestIdValue, headers);
@@ -1937,6 +2219,13 @@ async function handleProviderWebhook(request: Request, env: Env, provider: "delh
     const status = normalizeProviderShipmentStatus(delhiveryDetails?.rawStatus ?? payload.status ?? payload.current_status ?? payload.event_type);
     const description = delhiveryDetails?.description ?? String(payload.description ?? payload.message ?? `Webhook event ${eventId}`); const location = delhiveryDetails?.location ?? String(payload.location ?? payload.city ?? "");
     const shipment = reference ? await env.DB.prepare("SELECT id FROM shipments WHERE id = ? OR tracking_number = ? OR provider_reference = ? LIMIT 1").bind(reference, reference, reference).first<{ id: string }>() : null;
+     const pickupStatus = provider === "delhivery" ? pickupStatusFromProviderEvent(delhiveryDetails?.rawStatus ?? payload.status ?? payload.event_type) : null;
+     const pickup = provider === "delhivery" && reference ? await env.DB.prepare("SELECT id, shipment_id FROM pickup_requests WHERE provider = 'delhivery' AND (provider_reference = ? OR provider_request_id = ? OR id = ?) LIMIT 1").bind(reference, reference, reference).first<{ id: string; shipment_id: string | null }>() : null;
+     if (pickupStatus && pickup) {
+       await env.DB.prepare("UPDATE pickup_requests SET status = ?, provider_status = ?, provider_reference = COALESCE(?, provider_reference), requested_date = COALESCE(?, requested_date), requested_time_slot = COALESCE(?, requested_time_slot), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status IN ('requested', 'provider_pending', 'scheduled', 'driver_assigned', 'en_route')")
+         .bind(pickupStatus, String(delhiveryDetails?.rawStatus ?? payload.status ?? payload.event_type ?? ""), reference || null, delhiveryDetails?.requestedDate ?? null, delhiveryDetails?.requestedTimeSlot ?? null, pickup.id)
+         .run();
+     }
     if (shipment) {
       const current = await env.DB.prepare("SELECT status FROM shipments WHERE id = ? LIMIT 1").bind(shipment.id).first<{ status: string }>();
       if (!current || !validShipmentTransition(String(current.status).toLowerCase(), status)) {
@@ -1949,7 +2238,17 @@ async function handleProviderWebhook(request: Request, env: Env, provider: "delh
       const deliveredAt = status.includes("deliver") ? new Date().toISOString() : null;
       await env.DB.prepare("UPDATE shipments SET provider = ?, provider_reference = COALESCE(?, provider_reference), status = ?, delivered_at = COALESCE(?, delivered_at), updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(provider, reference || null, status, deliveredAt, shipment.id).run();
       await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, location, description, created_by_user_id, event_time, created_at) VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipment.id, status, location, description, `webhook:${provider}`, delhiveryDetails?.eventTime ?? null).run();
+       if (provider === "delhivery") {
+         if (pickupStatus && !pickup) {
+          await env.DB.prepare("UPDATE pickup_requests SET status = ?, provider_status = ?, provider_reference = COALESCE(?, provider_reference), requested_date = COALESCE(?, requested_date), requested_time_slot = COALESCE(?, requested_time_slot), updated_at = CURRENT_TIMESTAMP WHERE shipment_id = ? AND provider = 'delhivery' AND status IN ('requested', 'provider_pending', 'scheduled', 'driver_assigned', 'en_route')")
+            .bind(pickupStatus, String(delhiveryDetails?.rawStatus ?? payload.status ?? payload.event_type ?? ""), reference || null, delhiveryDetails?.requestedDate ?? null, delhiveryDetails?.requestedTimeSlot ?? null, shipment.id)
+            .run();
+        }
+      }
       await env.DB.prepare("UPDATE webhook_events SET status = 'processed', processed_at = CURRENT_TIMESTAMP WHERE provider = ? AND event_id = ?").bind(provider, eventId).run();
+    } else if (pickup) {
+      await env.DB.prepare("UPDATE webhook_events SET status = 'processed', processed_at = CURRENT_TIMESTAMP WHERE provider = ? AND event_id = ?").bind(provider, eventId).run();
+      return json({ ok: true, accepted: true, matched: true, applied: Boolean(pickupStatus), request_id: requestIdValue }, 200, headers);
     } else {
       // The event is authenticated and accepted, but cannot be applied until a
       // matching local shipment exists. Keep it received for reconciliation.
@@ -2005,6 +2304,37 @@ async function handleDelhiveryDocumentWebhook(request: Request, env: Env, reques
     await env.DB.prepare("UPDATE webhook_events SET status = ?, processed_at = ? WHERE provider = 'delhivery' AND event_id = ?").bind(shipment && (!documentUrl || documentStored) ? "processed" : "received", shipment && (!documentUrl || documentStored) ? new Date().toISOString() : null, eventId).run();
   }
   return json({ ok: true, accepted: true, document_event: true, document_stored: documentStored, request_id: requestIdValue }, 202, headers);
+}
+
+async function refreshFujiyamaDelhivery(env: Env, cron: string) {
+  const active = await env.DB.prepare("SELECT id, client_id, tracking_number, provider_reference, provider_account_id FROM shipments WHERE client_id = ? AND provider = 'delhivery' AND provider_account_id = ? AND tracking_number IS NOT NULL AND tracking_number <> '' AND status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery', 'exception', 'rto') ORDER BY updated_at ASC LIMIT 50").bind(FUJIYAMA_CLIENT_ID, FUJIYAMA_DELHIVERY_ACCOUNT_ID).all<{ id: string; client_id: string; tracking_number: string; provider_reference: string | null; provider_account_id: string }>();
+  const delivered = await env.DB.prepare("SELECT id, client_id, tracking_number, provider_reference, provider_account_id FROM shipments WHERE client_id = ? AND provider = 'delhivery' AND provider_account_id = ? AND tracking_number IS NOT NULL AND tracking_number <> '' AND status = 'delivered' ORDER BY updated_at ASC LIMIT 50").bind(FUJIYAMA_CLIENT_ID, FUJIYAMA_DELHIVERY_ACCOUNT_ID).all<{ id: string; client_id: string; tracking_number: string; provider_reference: string | null; provider_account_id: string }>();
+  const refreshRows = [...active.results, ...delivered.results];
+  let trackingSucceeded = 0;
+  let trackingFailed = 0;
+  for (let index = 0; index < refreshRows.length; index += 5) {
+    const batch = refreshRows.slice(index, index + 5);
+    const results = await Promise.all(batch.map(async (shipment) => {
+      const result = await safeProviderRequest(env, "delhivery", "tracking", { shipment_id: shipment.id, tracking_number: shipment.tracking_number, provider_reference: shipment.provider_reference, provider_account_id: shipment.provider_account_id }, `cron:${cron}:fujiyama:tracking:${shipment.id}`, shipment.client_id, undefined, 10000);
+      return result.status === "accepted";
+    }));
+    trackingSucceeded += results.filter(Boolean).length;
+    trackingFailed += results.filter((value) => !value).length;
+  }
+
+  const podCandidates = await env.DB.prepare("SELECT s.id, s.client_id, s.tracking_number, s.provider_reference, s.provider_account_id FROM shipments s WHERE s.client_id = ? AND s.provider = 'delhivery' AND s.provider_account_id = ? AND s.status = 'delivered' AND s.tracking_number IS NOT NULL AND s.tracking_number <> '' AND NOT EXISTS (SELECT 1 FROM shipment_documents d WHERE d.shipment_id = s.id AND lower(d.original_filename) LIKE 'delhivery-pod-%') ORDER BY s.updated_at ASC LIMIT 20").bind(FUJIYAMA_CLIENT_ID, FUJIYAMA_DELHIVERY_ACCOUNT_ID).all<{ id: string; client_id: string; tracking_number: string; provider_reference: string | null; provider_account_id: string }>();
+  let podSucceeded = 0;
+  let podFailed = 0;
+  for (let index = 0; index < podCandidates.results.length; index += 3) {
+    const batch = podCandidates.results.slice(index, index + 3);
+    const results = await Promise.all(batch.map(async (shipment) => {
+      const result = await safeProviderRequest(env, "delhivery", "document", { shipment_id: shipment.id, tracking_number: shipment.tracking_number, provider_reference: shipment.provider_reference, provider_account_id: shipment.provider_account_id, doc_type: "LM_POD" }, `cron:${cron}:fujiyama:pod:${shipment.id}`, shipment.client_id, undefined, 15000);
+      return result.status === "accepted";
+    }));
+    podSucceeded += results.filter(Boolean).length;
+    podFailed += results.filter((value) => !value).length;
+  }
+  console.log(JSON.stringify({ job: "fujiyama_delhivery_refresh", cron, tracking_candidates: refreshRows.length, tracking_succeeded: trackingSucceeded, tracking_failed: trackingFailed, pod_candidates: podCandidates.results.length, pod_succeeded: podSucceeded, pod_failed: podFailed }));
 }
 
 const worker = {
@@ -2284,7 +2614,11 @@ const worker = {
         const requestedClient = new URL(request.url).searchParams.get("client_id");
         const clientId = requireClient(auth, requestedClient);
         if (!clientId || !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
-        const rows = await env.DB.prepare(`
+         const internalProviderView = hasRole(auth, ["employee", "admin", "super_admin"]) || auth.system;
+         const providerAccountVisibility = internalProviderView
+           ? "pa.status = 'active' AND (pa.client_id = ? OR pa.client_id IS NULL)"
+           : "pa.status = 'active' AND (pa.client_id = ? OR (pa.client_id IS NULL AND p.client_id = ? AND p.enabled = 1))";
+         const rows = await env.DB.prepare(`
           SELECT pa.id, pa.provider, pa.account_name, pa.account_type, pa.client_id,
                   pa.capabilities_json, pa.credential_secret_name, pa.status,
                  CASE WHEN p.provider_account_id IS NULL THEN CASE WHEN pa.status = 'active' THEN 1 ELSE 0 END ELSE p.enabled END AS enabled,
@@ -2295,8 +2629,9 @@ const worker = {
           FROM provider_accounts pa
           LEFT JOIN provider_account_client_policies p
             ON p.provider_account_id = pa.id AND p.client_id = ?
-           WHERE pa.status = 'active' AND p.provider_account_id IS NOT NULL AND p.enabled = 1 AND (pa.client_id = ? OR pa.client_id IS NULL)
-          ORDER BY pa.provider, enabled DESC, priority ASC, confidence_score DESC, pa.account_name`).bind(clientId, clientId).all();
+           -- Include disabled policies so Super Admin can manage the complete client/courier matrix.
+           WHERE ${providerAccountVisibility}
+           ORDER BY pa.provider, enabled DESC, priority ASC, confidence_score DESC, pa.account_name`).bind(...(internalProviderView ? [clientId, clientId] : [clientId, clientId, clientId])).all();
         const secretBag = env as unknown as Record<string, unknown>;
         const configured = (row: Record<string, unknown>) => {
           const secretName = String(row.credential_secret_name ?? "");
@@ -2393,8 +2728,8 @@ const worker = {
         const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 50), 1), 100);
         const internalShipmentView = hasRole(auth, ["employee", "admin", "super_admin"]) || auth.system;
         const shipmentColumns = internalShipmentView
-          ? "s.id, s.pss_reference, s.client_id, s.created_by_user_id, s.tracking_number, s.status, s.provider, s.provider_account_id, s.provider_reference, (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = s.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, s.description, s.origin, s.destination, s.origin_address_json, s.destination_address_json, s.consignee, s.total_weight_kg, s.declared_value, s.pieces, s.edd, s.delivered_at, s.created_at, s.updated_at"
-          : "s.id, s.pss_reference, s.client_id, s.created_by_user_id, s.tracking_number, s.status, s.provider, s.provider_reference, (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = s.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, s.description, s.origin, s.destination, s.origin_address_json, s.destination_address_json, s.consignee, s.total_weight_kg, s.declared_value, s.pieces, s.edd, s.delivered_at, s.created_at, s.updated_at";
+          ? "s.id, s.pss_reference, s.client_id, s.created_by_user_id, s.tracking_number, s.status, s.provider, s.provider_account_id, s.provider_reference, (SELECT sd.id FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS pod_document_id, (SELECT sd.original_filename FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS pod_filename, (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = s.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, (SELECT pr.status FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_status, (SELECT pr.requested_date FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_scheduled_date, (SELECT pr.requested_time_slot FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_time_slot, (SELECT c.provider_status FROM pricing_provider_costs c WHERE c.shipment_id = s.id LIMIT 1) AS provider_confirmation_status, s.description, s.origin, s.destination, s.origin_address_json, s.destination_address_json, s.consignee, s.total_weight_kg, s.declared_value, s.pieces, s.edd, s.delivered_at, s.created_at, s.updated_at"
+          : "s.id, s.pss_reference, s.client_id, s.created_by_user_id, s.tracking_number, s.status, s.provider, s.provider_reference, (SELECT sd.id FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS pod_document_id, (SELECT sd.original_filename FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS pod_filename, (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = s.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, (SELECT pr.status FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_status, (SELECT pr.requested_date FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_scheduled_date, (SELECT pr.requested_time_slot FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_time_slot, (SELECT c.provider_status FROM pricing_provider_costs c WHERE c.shipment_id = s.id LIMIT 1) AS provider_confirmation_status, s.description, s.origin, s.destination, s.origin_address_json, s.destination_address_json, s.consignee, s.total_weight_kg, s.declared_value, s.pieces, s.edd, s.delivered_at, s.created_at, s.updated_at";
         const rows = auth.system ? await env.DB.prepare(`SELECT ${shipmentColumns} FROM shipments s ORDER BY s.created_at DESC LIMIT ?`).bind(limit).all() : auth.clientIds.size ? await env.DB.prepare(`SELECT ${shipmentColumns} FROM shipments s WHERE s.client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY s.created_at DESC LIMIT ?`).bind(...[...auth.clientIds], limit).all() : { results: [] };
         if (url.searchParams.get("include_tracking") === "1") {
           const shipments = rows.results as Array<Record<string, unknown>>;
@@ -2465,9 +2800,10 @@ const worker = {
           if (Number(wallet?.balance ?? 0) < pricingAmount) return error("INSUFFICIENT_WALLET_BALANCE", "The client wallet does not have enough balance for this PSS booking", 409, id, headers);
         }
         const shipmentId = crypto.randomUUID();
+        const requestedProviderAccountId = typeof payload.provider_account_id === "string" && payload.provider_account_id.trim() ? payload.provider_account_id.trim() : null;
         let pssReference = String(Date.now());
         while (await env.DB.prepare("SELECT 1 FROM shipments WHERE pss_reference = ? LIMIT 1").bind(pssReference).first()) pssReference = String(Number(pssReference) + 1);
-        await env.DB.prepare("INSERT INTO shipments (id, pss_reference, client_id, created_by_user_id, provider, provider_account_id, status, description, origin, destination, origin_address_json, destination_address_json, consignee, total_weight_kg, declared_value, pieces, edd) VALUES (?, ?, ?, ?, ?, NULL, 'booked', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(shipmentId, pssReference, clientId, auth.userId ?? `api:${clientId}`, provider, description, origin, destination, JSON.stringify(originAddress), JSON.stringify(destinationAddress), String(destinationAddress.name), weight, declaredValue, pieces, typeof payload.edd === "string" ? payload.edd : null).run();
+        await env.DB.prepare("INSERT INTO shipments (id, pss_reference, client_id, created_by_user_id, provider, provider_account_id, status, description, origin, destination, origin_address_json, destination_address_json, consignee, total_weight_kg, declared_value, pieces, edd) VALUES (?, ?, ?, ?, ?, ?, 'booked', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(shipmentId, pssReference, clientId, auth.userId ?? `api:${clientId}`, provider, requestedProviderAccountId, description, origin, destination, JSON.stringify(originAddress), JSON.stringify(destinationAddress), String(destinationAddress.name), weight, declaredValue, pieces, typeof payload.edd === "string" ? payload.edd : null).run();
         await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'booked', 'Shipment created', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipmentId, auth.userId ?? `api:${clientId}`).run();
         const storedDocuments = await persistShipmentDocuments(env, clientId, shipmentId, payload.invoice_documents, auth.userId ?? `api:${clientId}`);
         if (!storedDocuments.ok) {
@@ -2590,7 +2926,7 @@ const worker = {
       if (shipmentGet && request.method === "GET") {
         if (!hasScope(auth, route.endsWith("/tracking") ? "tracking.read" : "shipments.read")) return error("FORBIDDEN", "Shipment read scope required", 403, id, headers);
         const internalShipmentView = hasRole(auth, ["employee", "admin", "super_admin"]) || auth.system;
-        const shipment = await env.DB.prepare(`SELECT id, pss_reference, client_id, created_by_user_id, tracking_number, status, provider, ${internalShipmentView ? "provider_account_id, provider_reference," : "provider_reference,"} description, origin, destination, origin_address_json, destination_address_json, consignee, total_weight_kg, declared_value, pieces, edd, delivered_at, created_at, updated_at FROM shipments WHERE id = ? LIMIT 1`).bind(shipmentGet[1]).first<Record<string, unknown> & { client_id: string; provider: string | null; tracking_number: string | null; provider_reference?: string | null }>();
+        const shipment = await env.DB.prepare(`SELECT id, pss_reference, client_id, created_by_user_id, tracking_number, status, provider, ${internalShipmentView ? "provider_account_id, provider_reference," : "provider_reference,"} (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = shipments.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, (SELECT pr.status FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_status, (SELECT pr.requested_date FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_scheduled_date, (SELECT pr.requested_time_slot FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_time_slot, (SELECT c.provider_status FROM pricing_provider_costs c WHERE c.shipment_id = shipments.id LIMIT 1) AS provider_confirmation_status, description, origin, destination, origin_address_json, destination_address_json, consignee, total_weight_kg, declared_value, pieces, edd, delivered_at, created_at, updated_at FROM shipments WHERE id = ? LIMIT 1`).bind(shipmentGet[1]).first<Record<string, unknown> & { client_id: string; provider: string | null; tracking_number: string | null; provider_reference?: string | null }>();
         if (!shipment || !canAccessClient(auth, shipment.client_id)) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
         if (route.endsWith("/tracking")) {
           const events = await env.DB.prepare("SELECT * FROM tracking_events WHERE shipment_id = ? ORDER BY event_time ASC LIMIT 100").bind(shipmentGet[1]).all();
@@ -2610,12 +2946,31 @@ const worker = {
 
       if (route === "/pickup-slots" && request.method === "GET") {
         if (!hasScope(auth, "pickups.read")) return error("FORBIDDEN", "Pickup read scope required", 403, id, headers);
-        return json({ ok: true, data: delhiveryPickupOptions() }, 200, headers);
+        const query = new URL(request.url).searchParams;
+        const requestedProvider = String(query.get("provider") ?? "delhivery").trim().toLowerCase();
+        const requestedAccountId = String(query.get("provider_account_id") ?? "").trim();
+        const requestedPincode = String(query.get("pincode") ?? "").trim();
+         const requestedWarehouseId = String(query.get("warehouse_id") ?? "").trim();
+         const requestedFacilityCode = String(query.get("facility_code") ?? "").trim();
+        const requestedClient = requireClient(auth, query.get("client_id"));
+        if (requestedProvider !== "delhivery") return error("UNSUPPORTED_PROVIDER", "Provider-backed pickup availability is not configured for this courier", 409, id, headers);
+        if (!requestedAccountId || !/^\d{6}$/.test(requestedPincode)) return error("VALIDATION_ERROR", "Provider account and a valid pickup PIN code are required", 400, id, headers);
+        if (!requestedClient || !canAccessClient(auth, requestedClient)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
+        const account = await env.DB.prepare("SELECT pa.id FROM provider_accounts pa LEFT JOIN provider_account_client_policies p ON p.provider_account_id = pa.id AND p.client_id = ? WHERE pa.id = ? AND pa.provider = ? AND pa.status = 'active' AND (pa.client_id = ? OR (p.client_id = ? AND p.enabled = 1)) LIMIT 1").bind(requestedClient, requestedAccountId, requestedProvider, requestedClient, requestedClient).first<{ id: string }>();
+        if (!account) return error("PROVIDER_ACCOUNT_UNAVAILABLE", "The selected courier account is not active for this client", 409, id, headers);
+         const providerResult = await providerRequest(env, "delhivery", "pickup_slots", {
+           provider_account_id: requestedAccountId,
+           warehouse_id: requestedWarehouseId || undefined,
+           facility_code: requestedFacilityCode || undefined,
+           pincode: requestedPincode,
+         }, id, requestedClient, undefined, 15000);
+         if (providerResult.status !== "accepted") return error("PROVIDER_REQUEST_FAILED", String((providerResult as { error?: string; reason?: string }).error ?? (providerResult as { reason?: string }).reason ?? "Delhivery pickup slots could not be loaded"), 502, id, headers);
+         return json({ ok: true, data: { dates: (providerResult as { dates?: Array<{ date: string; slots: string[] }> }).dates ?? [], source: "delhivery", timezone: "Asia/Kolkata" } }, 200, headers);
       }
 
       if (route === "/pickups" && request.method === "GET") {
         if (!hasScope(auth, "pickups.read")) return error("FORBIDDEN", "Pickup read scope required", 403, id, headers);
-        const pickupColumns = "id, client_id, shipment_id, requested_date, requested_time_slot, pickup_address, status, assigned_to_user_id, contact_name, contact_phone, notes, created_at, updated_at";
+         const pickupColumns = "id, client_id, shipment_id, requested_date, requested_time_slot, pickup_address, contact_name, contact_phone, contact_email, city, state, pincode, country, pieces, total_weight_kg, status, assigned_to_user_id, notes, provider, provider_account_id, warehouse_id, provider_reference, provider_status, provider_request_id, provider_slot_id, provider_error_code, idempotency_key, failure_reason, created_at, updated_at";
         const rows = auth.system ? await env.DB.prepare(`SELECT ${pickupColumns} FROM pickup_requests ORDER BY requested_date DESC LIMIT 100`).all() : auth.clientIds.size ? await env.DB.prepare(`SELECT ${pickupColumns} FROM pickup_requests WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY requested_date DESC LIMIT 100`).bind(...auth.clientIds).all() : { results: [] };
         return json({ ok: true, data: rows.results }, 200, headers);
       }
@@ -2624,32 +2979,71 @@ const worker = {
         if (!hasScope(auth, "pickups.create")) return error("FORBIDDEN", "Pickup creation scope required", 403, id, headers);
         const payload = await bodyJson(request); const requestHash = await payloadFingerprint(payload); const clientId = requireClient(auth, payload.client_id);
         if (!clientId || !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
-        if (typeof payload.scheduled_date !== "string" || typeof payload.location !== "string") return error("VALIDATION_ERROR", "Pickup date and location are required", 400, id, headers);
-        const normalizedScheduledDate = providerSafePickupDate(payload.scheduled_date);
-        const providerPayload: Record<string, unknown> = { ...payload, scheduled_date: normalizedScheduledDate };
+        const provider = ["delhivery", "ekart", "trackon", "xpressbees", "rivigo"].includes(String(payload.provider)) ? payload.provider as CourierProvider : null;
+        if (!provider) return error("VALIDATION_ERROR", "Select a courier before scheduling the pickup", 400, id, headers);
+         const requestedDateInput = payload.requested_date ?? payload.scheduled_date;
+         const requestedWindowInput = payload.requested_time_slot ?? payload.window;
+         const pickupAddressInput = payload.pickup_address ?? payload.location;
+         if (typeof requestedDateInput !== "string" || !requestedDateInput.trim()) return error("VALIDATION_ERROR", "Pickup date is required", 400, id, headers);
+         if (!validPickupDate(requestedDateInput.trim())) return error("VALIDATION_ERROR", "Pickup date must use a valid YYYY-MM-DD date", 400, id, headers);
+         if (typeof pickupAddressInput !== "string" || !pickupAddressInput.trim()) return error("VALIDATION_ERROR", "Pickup address is required", 400, id, headers);
+        if (typeof payload.contact_name !== "string" || !payload.contact_name.trim()) return error("VALIDATION_ERROR", "Pickup contact name is required", 400, id, headers);
+        const normalizedContactPhone = normalizePickupPhone(payload.contact_phone);
+        if (!normalizedContactPhone) return error("VALIDATION_ERROR", "Pickup contact phone must contain a valid ten-digit number", 400, id, headers);
+        if (payload.contact_email !== undefined && payload.contact_email !== null && (typeof payload.contact_email !== "string" || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(payload.contact_email.trim()))) return error("VALIDATION_ERROR", "Pickup contact email is invalid", 400, id, headers);
+        if (typeof payload.city !== "string" || !payload.city.trim()) return error("VALIDATION_ERROR", "Pickup city is required", 400, id, headers);
+        if (typeof payload.state !== "string" || !payload.state.trim()) return error("VALIDATION_ERROR", "Pickup state is required", 400, id, headers);
+        if (typeof payload.country !== "string" || !payload.country.trim()) return error("VALIDATION_ERROR", "Pickup country is required", 400, id, headers);
+        if (typeof payload.pincode !== "string" || !/^\d{6}$/.test(payload.pincode.trim())) return error("VALIDATION_ERROR", "A valid six-digit pickup PIN code is required", 400, id, headers);
+         if (typeof requestedWindowInput !== "string" || !requestedWindowInput.trim()) return error("VALIDATION_ERROR", "Pickup time window is required", 400, id, headers);
+         const normalizedScheduledDate = providerSafePickupDate(requestedDateInput);
+        const shipment = typeof payload.shipment_id === "string" ? await env.DB.prepare("SELECT provider, provider_account_id, tracking_number, provider_reference FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(payload.shipment_id, clientId).first<{ provider: string | null; provider_account_id: string | null; tracking_number: string | null; provider_reference: string | null }>() : null;
+        if (payload.shipment_id !== undefined && !shipment) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
+        if (shipment?.provider && shipment.provider !== provider) return error("VALIDATION_ERROR", "The pickup courier must match the shipment courier", 409, id, headers);
+        const pickupAwbNumbers = normalizePickupAwbNumbers(payload.awb_number ?? payload.master_awb);
+        if (provider === "delhivery" && !payload.shipment_id && !pickupAwbNumbers.length) return error("VALIDATION_ERROR", "At least one Delhivery AWB is required for a standalone pickup", 400, id, headers);
+        const providerAccountId = typeof payload.provider_account_id === "string" && payload.provider_account_id.trim() ? payload.provider_account_id.trim() : shipment?.provider_account_id ?? null;
+        if (!providerAccountId) return error("VALIDATION_ERROR", "Select an active courier account before scheduling the pickup", 400, id, headers);
+        const providerAccount = await env.DB.prepare(`SELECT pa.id FROM provider_accounts pa LEFT JOIN provider_account_client_policies p ON p.provider_account_id = pa.id AND p.client_id = ? WHERE pa.id = ? AND pa.provider = ? AND pa.status = 'active' AND (pa.client_id = ? OR (p.client_id = ? AND p.enabled = 1)) LIMIT 1`).bind(clientId, providerAccountId, provider, clientId, clientId).first<{ id: string }>();
+        if (!providerAccount) return error("PROVIDER_ACCOUNT_UNAVAILABLE", "The selected courier account is not active for this client", 409, id, headers);
+        const piecesValue = Number(payload.pieces);
+        if (!Number.isInteger(piecesValue) || piecesValue < 1) return error("VALIDATION_ERROR", "Pickup pieces must be a positive whole number", 400, id, headers);
+        const pieces = piecesValue;
+        const totalWeight = Number(payload.weight ?? payload.total_weight_kg);
+        if (!Number.isFinite(totalWeight) || totalWeight <= 0) return error("VALIDATION_ERROR", "Total pickup weight must be greater than zero", 400, id, headers);
+        const warehouseId = typeof payload.warehouse_id === "string" && payload.warehouse_id.trim() ? payload.warehouse_id.trim() : null;
+        if (warehouseId) {
+          const savedWarehouse = await env.DB.prepare("SELECT id FROM warehouses WHERE id = ? AND client_id = ? LIMIT 1").bind(warehouseId, clientId).first<{ id: string }>();
+          const savedAddress = savedWarehouse ? savedWarehouse : await env.DB.prepare("SELECT id FROM client_addresses WHERE id = ? AND client_id = ? AND address_kind = 'consignor' LIMIT 1").bind(warehouseId, clientId).first<{ id: string }>();
+          if (!savedAddress) return error("NOT_FOUND", "The selected pickup location is not saved for this client", 404, id, headers);
+        }
+         const providerPayload: Record<string, unknown> = { ...payload, provider, provider_account_id: providerAccountId, awb_number: pickupAwbNumbers, scheduled_date: normalizedScheduledDate, requested_date: normalizedScheduledDate, window: String(requestedWindowInput), requested_time_slot: String(requestedWindowInput), location: String(pickupAddressInput).trim(), pickup_address: String(pickupAddressInput).trim(), contact_phone: normalizedContactPhone, pieces, weight: totalWeight };
         if (payload.shipment_id !== undefined && !(await shipmentBelongsToClient(env, payload.shipment_id, clientId))) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
+         if (payload.provider_managed === true && !shipment) return error("VALIDATION_ERROR", "Provider-managed pickup requests must be linked to a shipment", 400, id, headers);
         const key = request.headers.get("Idempotency-Key"); if (!key) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
         const existing = await idempotentResponse(env, key, clientId, "POST /v1/pickups", requestHash); if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
         const pickupId = crypto.randomUUID();
-        await env.DB.prepare("INSERT INTO pickup_requests (id, shipment_id, client_id, created_by_user_id, requested_date, requested_time_slot, pickup_address, contact_name, contact_phone, status, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?)").bind(pickupId, typeof payload.shipment_id === "string" ? payload.shipment_id : null, clientId, auth.userId ?? `api:${clientId}`, normalizedScheduledDate, String(payload.window ?? ""), payload.location, String(payload.contact_name ?? payload.customer ?? "Pickup contact"), String(payload.contact_phone ?? payload.contact ?? ""), typeof payload.notes === "string" ? payload.notes.trim().slice(0, 2000) : null).run();
-        const shipment = typeof payload.shipment_id === "string" ? await env.DB.prepare("SELECT provider, provider_account_id, tracking_number, provider_reference FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(payload.shipment_id, clientId).first<{ provider: string | null; provider_account_id: string | null; tracking_number: string | null; provider_reference: string | null }>() : null;
-        const requestedProvider = ["delhivery", "ekart", "trackon", "xpressbees", "rivigo"].includes(String(payload.provider)) ? payload.provider as CourierProvider : null;
-        const provider = requestedProvider ?? (["delhivery", "ekart", "trackon", "xpressbees", "rivigo"].includes(String(shipment?.provider)) ? shipment?.provider as CourierProvider : null);
-        // Delhivery B2B pickup is created as part of the manifest request. The
-        // separate legacy pickup endpoint is not available for these accounts
-        // and returns 404, so retain the PSS pickup record without duplicating
-        // the provider request when the booking flow marks it provider-managed.
-        const providerManaged = payload.provider_managed === true;
-        const providerResult = provider && !providerManaged ? await safeProviderRequest(env, provider, "pickups", { pickup_id: pickupId, shipment_id: providerPayload.shipment_id, tracking_number: shipment?.tracking_number, provider_reference: shipment?.provider_reference, provider_account_id: providerPayload.provider_account_id ?? shipment?.provider_account_id, ...providerPayload }, id, clientId, key) : providerManaged ? { enabled: true, status: "accepted" as const, providerStatus: 204, managedBy: "shipment_manifest" } : { enabled: false, status: "not_requested" as const };
+         await env.DB.prepare("INSERT INTO pickup_requests (id, shipment_id, client_id, created_by_user_id, requested_date, requested_time_slot, pickup_address, contact_name, contact_phone, contact_email, city, state, pincode, country, pieces, total_weight_kg, status, provider, provider_account_id, warehouse_id, provider_status, provider_slot_id, provider_awb_numbers_json, idempotency_key, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?, ?, ?, 'pending', ?, ?, ?)").bind(pickupId, typeof payload.shipment_id === "string" ? payload.shipment_id : null, clientId, auth.userId ?? `api:${clientId}`, normalizedScheduledDate, String(requestedWindowInput), String(pickupAddressInput).trim(), String(payload.contact_name).trim(), normalizedContactPhone, typeof payload.contact_email === "string" ? payload.contact_email.trim() : null, typeof payload.city === "string" ? payload.city.trim() : null, typeof payload.state === "string" ? payload.state.trim() : null, payload.pincode.trim(), typeof payload.country === "string" && payload.country.trim() ? payload.country.trim() : "India", pieces, totalWeight, provider, providerAccountId, warehouseId, typeof payload.provider_slot_id === "string" ? payload.provider_slot_id.trim() : null, JSON.stringify(pickupAwbNumbers), key, typeof payload.notes === "string" ? payload.notes.trim().slice(0, 2000) : null).run();
+          const providerResult = provider ? await safeProviderRequest(env, provider, "pickups", { pickup_id: pickupId, shipment_id: providerPayload.shipment_id, tracking_number: shipment?.tracking_number, provider_reference: shipment?.provider_reference, provider_account_id: providerPayload.provider_account_id ?? shipment?.provider_account_id, ...providerPayload }, id, clientId, key) : { enabled: false, status: "not_requested" as const };
+         const providerReference = (providerResult as { providerReference?: string | null }).providerReference ?? null;
+         const providerSlotId = (providerResult as { providerSlotId?: string | null }).providerSlotId ?? (typeof payload.provider_slot_id === "string" ? payload.provider_slot_id.trim() : null);
+         const acceptedDate = (providerResult as { acceptedDate?: string | null }).acceptedDate ?? normalizedScheduledDate;
+         const acceptedWindow = (providerResult as { acceptedWindow?: string | null }).acceptedWindow ?? String(requestedWindowInput);
+        const providerStatus = (providerResult as { providerStatus?: string | number | null }).providerStatus ?? providerResult.status;
+        const providerErrorCode = (providerResult as { error_code?: string | null }).error_code ?? (providerResult.status === "accepted" ? null : providerResult.status);
+        const providerErrorMessage = (providerResult as { error?: string; reason?: string }).error ?? (providerResult as { reason?: string }).reason ?? null;
+         await recordPickupAttempt(env, { pickupId, clientId, provider, providerAccountId, requestId: id, idempotencyKey: key, requestedDate: normalizedScheduledDate, requestedWindow: String(requestedWindowInput), status: providerResult.status, providerStatus, providerReference, providerErrorCode, errorMessage: providerErrorMessage }).catch(() => undefined);
         if (provider && providerResult.status !== "accepted") {
           const failureReason = String((providerResult as { error?: string; reason?: string }).error ?? (providerResult as { reason?: string }).reason ?? `The ${provider} pickup request was not accepted`).slice(0, 500);
-          await env.DB.prepare("UPDATE pickup_requests SET status = 'failed', failure_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(failureReason, pickupId, clientId).run();
+          await env.DB.prepare("UPDATE pickup_requests SET status = 'failed', provider_status = ?, provider_request_id = ?, provider_error_code = ?, failure_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(String(providerStatus), id, String(providerErrorCode ?? "provider_request_failed"), failureReason, pickupId, clientId).run();
           const failedResponse = JSON.stringify({ ok: false, error: { code: "PROVIDER_REQUEST_FAILED", message: failureReason }, data: { id: pickupId, client_id: clientId, status: "failed", provider, provider_status: providerResult.status }, request_id: id });
           await saveIdempotent(env, key, clientId, "POST /v1/pickups", 502, failedResponse, requestHash);
           await audit(env, ctx, auth, id, "pickup.provider_failed", "pickup", pickupId, { client_id: clientId, provider, reason: failureReason });
           return new Response(failedResponse, { status: 502, headers: { ...headers, "content-type": "application/json" } });
         }
-        const serialized = JSON.stringify({ ok: true, data: { id: pickupId, client_id: clientId, status: "scheduled", provider, provider_status: providerResult.status, scheduled_date: normalizedScheduledDate, rescheduled: normalizedScheduledDate !== payload.scheduled_date }, request_id: id });
+         const pickupStatus = (providerResult as { providerPending?: boolean }).providerPending ? "provider_pending" : "scheduled";
+         await env.DB.prepare("UPDATE pickup_requests SET status = ?, provider_status = ?, provider_request_id = ?, provider_error_code = ?, provider_reference = COALESCE(?, provider_reference), provider_slot_id = COALESCE(?, provider_slot_id), requested_date = ?, requested_time_slot = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(pickupStatus, String(providerStatus), id, null, providerReference, providerSlotId, acceptedDate, acceptedWindow, pickupId, clientId).run();
+          const serialized = JSON.stringify({ ok: true, data: { id: pickupId, client_id: clientId, status: pickupStatus, provider, provider_account_id: providerAccountId, provider_status: providerStatus, provider_reference: providerReference, requested_date: acceptedDate, requested_time_slot: acceptedWindow, scheduled_date: acceptedDate, window: acceptedWindow, rescheduled: acceptedDate !== requestedDateInput }, request_id: id });
         await saveIdempotent(env, key, clientId, "POST /v1/pickups", 201, serialized, requestHash); await audit(env, ctx, auth, id, "pickup.created", "pickup", pickupId, { client_id: clientId });
         return new Response(serialized, { status: 201, headers: { ...headers, "content-type": "application/json" } });
       }
@@ -2658,29 +3052,62 @@ const worker = {
       if (pickupMatch && request.method === "GET") {
         if (!hasScope(auth, "pickups.read")) return error("FORBIDDEN", "Pickup read scope required", 403, id, headers);
         const internalPickupView = hasRole(auth, ["employee", "admin", "super_admin"]) || auth.system;
-        const pickup = await env.DB.prepare(`SELECT id, client_id, shipment_id, requested_date, requested_time_slot, pickup_address, status, assigned_to_user_id, contact_name, contact_phone, notes, ${internalPickupView ? "provider, provider_reference, failure_reason," : ""} created_at, updated_at FROM pickup_requests WHERE id = ? LIMIT 1`).bind(pickupMatch[1]).first<{ client_id: string }>();
+         const pickup = await env.DB.prepare(`SELECT id, client_id, shipment_id, requested_date, requested_time_slot, pickup_address, contact_name, contact_phone, contact_email, city, state, pincode, country, pieces, total_weight_kg, status, assigned_to_user_id, notes, provider, provider_account_id, warehouse_id, provider_reference, provider_status, provider_error_code, provider_slot_id, idempotency_key, failure_reason, ${internalPickupView ? "provider_request_id," : ""} created_at, updated_at FROM pickup_requests WHERE id = ? LIMIT 1`).bind(pickupMatch[1]).first<{ client_id: string }>();
         if (!pickup || !canAccessClient(auth, pickup.client_id)) return error("NOT_FOUND", "Pickup not found", 404, id, headers);
-        return json({ ok: true, data: pickup }, 200, headers);
+         const attempts = await env.DB.prepare("SELECT id, requested_date, requested_time_slot, status, provider_status, provider_reference, provider_error_code, error_message, created_at FROM pickup_request_attempts WHERE pickup_id = ? ORDER BY created_at DESC LIMIT 25").bind(pickupMatch[1]).all();
+         return json({ ok: true, data: { ...pickup, attempts: attempts.results } }, 200, headers);
       }
       if (pickupMatch && request.method === "PATCH") {
-        const pickup = await env.DB.prepare("SELECT client_id, assigned_to_user_id, failure_reason, provider, provider_reference FROM pickup_requests WHERE id = ? LIMIT 1").bind(pickupMatch[1]).first<{ client_id: string; assigned_to_user_id?: string | null; failure_reason?: string | null; provider?: string | null; provider_reference?: string | null }>();
+        const pickup = await env.DB.prepare("SELECT client_id, shipment_id, requested_date, requested_time_slot, pickup_address, contact_name, contact_phone, contact_email, city, state, pincode, country, pieces, total_weight_kg, warehouse_id, provider_awb_numbers_json, assigned_to_user_id, failure_reason, provider, provider_account_id, provider_reference FROM pickup_requests WHERE id = ? LIMIT 1").bind(pickupMatch[1]).first<{ client_id: string; shipment_id?: string | null; requested_date: string; requested_time_slot?: string | null; pickup_address: string; contact_name: string; contact_phone: string; contact_email?: string | null; city?: string | null; state?: string | null; pincode?: string | null; country?: string | null; pieces?: number | null; total_weight_kg?: number | null; warehouse_id?: string | null; provider_awb_numbers_json?: string | null; assigned_to_user_id?: string | null; failure_reason?: string | null; provider?: string | null; provider_account_id?: string | null; provider_reference?: string | null }>();
         if (!pickup || !canAccessClient(auth, pickup.client_id)) return error("NOT_FOUND", "Pickup not found", 404, id, headers);
         const staffUpdate = hasRole(auth, ["employee", "admin", "super_admin"]);
         const payload = await bodyJson(request);
         const requestHash = await payloadFingerprint(payload);
-        const allowedStatuses = new Set(["requested", "scheduled", "assigned", "in_transit", "picked_up", "completed", "cancelled", "failed"]);
+        // Accept the canonical pickup lifecycle names while retaining the
+        // legacy aliases used by older internal callers.
+        const allowedStatuses = new Set(["draft", "requested", "provider_pending", "scheduled", "driver_assigned", "en_route", "picked_up", "completed", "cancelled", "failed", "assigned", "in_transit"]);
         if (payload.status !== undefined && (typeof payload.status !== "string" || !allowedStatuses.has(payload.status))) return error("VALIDATION_ERROR", "Unsupported pickup status", 400, id, headers);
         const clientCancel = !staffUpdate && payload.status === "cancelled" && Object.keys(payload).every((key) => key === "status") && hasScope(auth, "pickups.read");
+        const clientReschedule = !staffUpdate && (payload.retry === true || payload.requested_date !== undefined || payload.requested_time_slot !== undefined) && hasScope(auth, "pickups.manage");
         if (!staffUpdate && !hasScope(auth, "pickups.manage") && !clientCancel) return error("FORBIDDEN", "Pickup update permission required", 403, id, headers);
-        if (!staffUpdate && !clientCancel) return error("FORBIDDEN", "Client users may only cancel their own pickup", 403, id, headers);
+        if (!staffUpdate && !clientCancel && !clientReschedule) return error("FORBIDDEN", "Client users may only cancel or reschedule their own pickup", 403, id, headers);
+        const idempotencyKey = request.headers.get("Idempotency-Key"); if (!idempotencyKey) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
+        const endpoint = `PATCH /v1/pickups/${pickupMatch[1]}`; const existing = await idempotentResponse(env, idempotencyKey, pickup.client_id, endpoint, requestHash); if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
         const updates: string[] = []; const values: unknown[] = [];
-        if (typeof payload.status === "string") { updates.push("status = ?"); values.push(payload.status); }
+        if (typeof payload.status === "string") {
+          const normalizedStatus = payload.status === "assigned" ? "driver_assigned" : payload.status === "in_transit" ? "en_route" : payload.status;
+          updates.push("status = ?"); values.push(normalizedStatus);
+        }
+        const wantsProviderRetry = payload.retry === true || payload.requested_date !== undefined || payload.requested_time_slot !== undefined;
+        if (wantsProviderRetry) {
+          if (!pickup.provider || !pickup.provider_account_id) return error("PROVIDER_ACCOUNT_UNAVAILABLE", "This pickup has no active provider account and cannot be retried", 409, id, headers);
+          const retryAccount = await env.DB.prepare("SELECT pa.id FROM provider_accounts pa LEFT JOIN provider_account_client_policies p ON p.provider_account_id = pa.id AND p.client_id = ? WHERE pa.id = ? AND pa.provider = ? AND pa.status = 'active' AND (pa.client_id = ? OR (p.client_id = ? AND p.enabled = 1)) LIMIT 1").bind(pickup.client_id, pickup.provider_account_id, pickup.provider, pickup.client_id, pickup.client_id).first<{ id: string }>();
+          if (!retryAccount) return error("PROVIDER_ACCOUNT_UNAVAILABLE", "The pickup courier account is no longer active for this client", 409, id, headers);
+          if (payload.requested_date !== undefined && (typeof payload.requested_date !== "string" || !validPickupDate(payload.requested_date.trim()))) return error("VALIDATION_ERROR", "Pickup date must use a valid YYYY-MM-DD date", 400, id, headers);
+          const requestedDate = typeof payload.requested_date === "string" && payload.requested_date.trim() ? providerSafePickupDate(payload.requested_date.trim()) : pickup.requested_date;
+          const requestedWindow = typeof payload.requested_time_slot === "string" && payload.requested_time_slot.trim() ? payload.requested_time_slot.trim() : pickup.requested_time_slot ?? "";
+           const manifestManaged = Boolean(pickup.shipment_id && pickup.provider === "delhivery");
+           const providerResult = manifestManaged
+             ? { enabled: true, status: "accepted" as const, providerStatus: "manifest_managed", providerPending: true, providerReference: pickup.provider_reference ?? null }
+           : await safeProviderRequest(env, pickup.provider as CourierProvider, "pickups", { pickup_id: pickupMatch[1], shipment_id: pickup.shipment_id, provider_account_id: pickup.provider_account_id, provider_reference: pickup.provider_reference, awb_number: (() => { try { return JSON.parse(pickup.provider_awb_numbers_json ?? "[]"); } catch { return []; } })(), scheduled_date: requestedDate, window: requestedWindow, location: pickup.pickup_address, contact_name: pickup.contact_name, contact_phone: pickup.contact_phone, contact_email: pickup.contact_email, city: pickup.city, state: pickup.state, pincode: pickup.pincode, country: pickup.country, pieces: pickup.pieces, weight: pickup.total_weight_kg }, id, pickup.client_id, request.headers.get("Idempotency-Key") ?? undefined);
+          const retryProviderReference = (providerResult as { providerReference?: string | null }).providerReference ?? null;
+          const retryProviderSlotId = (providerResult as { providerSlotId?: string | null }).providerSlotId ?? null;
+          const retryProviderStatus = (providerResult as { providerStatus?: string | number | null }).providerStatus ?? providerResult.status;
+          const retryErrorCode = (providerResult as { error_code?: string | null }).error_code ?? (providerResult.status === "accepted" ? null : providerResult.status);
+          const retryErrorMessage = (providerResult as { error?: string; reason?: string }).error ?? (providerResult as { reason?: string }).reason ?? null;
+          await recordPickupAttempt(env, { pickupId: pickupMatch[1], clientId: pickup.client_id, provider: pickup.provider, providerAccountId: pickup.provider_account_id, requestId: id, idempotencyKey: idempotencyKey, requestedDate, requestedWindow, status: providerResult.status, providerStatus: retryProviderStatus, providerReference: retryProviderReference, providerErrorCode: retryErrorCode, errorMessage: retryErrorMessage }).catch(() => undefined);
+          if (providerResult.status !== "accepted") {
+            const retryFailure = String(retryErrorMessage ?? "The provider did not accept the pickup retry").slice(0, 500);
+            await env.DB.prepare("UPDATE pickup_requests SET status = 'failed', provider_status = ?, provider_error_code = ?, failure_reason = ?, provider_request_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(String(retryProviderStatus), String(retryErrorCode ?? "provider_request_failed"), retryFailure, id, pickupMatch[1], pickup.client_id).run();
+            return error("PROVIDER_REQUEST_FAILED", retryFailure, 502, id, headers);
+          }
+           const retryStatus = (providerResult as { providerPending?: boolean }).providerPending ? "provider_pending" : "scheduled";
+          updates.push("requested_date = ?", "requested_time_slot = ?", "status = ?", "provider_status = ?", "provider_error_code = ?", "provider_reference = COALESCE(provider_reference, ?)", "provider_slot_id = COALESCE(?, provider_slot_id)", "failure_reason = ?"); values.push(requestedDate, requestedWindow, retryStatus, String(retryProviderStatus), null, retryProviderReference, retryProviderSlotId, null);
+        }
         if (staffUpdate && payload.assigned_to_user_id !== undefined) { if (payload.assigned_to_user_id !== null && typeof payload.assigned_to_user_id !== "string") return error("VALIDATION_ERROR", "Assigned employee must be a user ID", 400, id, headers); if (!(await employeeCanBeAssigned(env, auth, payload.assigned_to_user_id, pickup.client_id))) return error("FORBIDDEN", "Assigned employee is not active or is outside the client scope", 403, id, headers); updates.push("assigned_to_user_id = ?"); values.push(payload.assigned_to_user_id || null); }
         if (staffUpdate && payload.failure_reason !== undefined) { if (payload.failure_reason !== null && typeof payload.failure_reason !== "string") return error("VALIDATION_ERROR", "Failure reason must be text", 400, id, headers); updates.push("failure_reason = ?"); values.push(typeof payload.failure_reason === "string" ? payload.failure_reason.trim() || null : null); }
         if (staffUpdate && payload.provider_reference !== undefined) { if (payload.provider_reference !== null && typeof payload.provider_reference !== "string") return error("VALIDATION_ERROR", "Provider reference must be text", 400, id, headers); updates.push("provider_reference = ?"); values.push(payload.provider_reference || null); }
-        if (!updates.length) return error("VALIDATION_ERROR", "A pickup status, assignment, failure reason, or provider reference is required", 400, id, headers);
-        const idempotencyKey = request.headers.get("Idempotency-Key"); if (!idempotencyKey) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
-        const endpoint = `PATCH /v1/pickups/${pickupMatch[1]}`; const existing = await idempotentResponse(env, idempotencyKey, pickup.client_id, endpoint, requestHash); if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
+        if (!updates.length) return error("VALIDATION_ERROR", "A pickup status, retry/reschedule, assignment, failure reason, or provider reference is required", 400, id, headers);
         await env.DB.prepare(`UPDATE pickup_requests SET ${updates.join(", ")}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(...values, pickupMatch[1]).run(); const changed = Object.fromEntries(updates.map((field, index) => [field.split(" = ")[0], values[index]])); await audit(env, ctx, auth, id, "pickup.updated", "pickup", pickupMatch[1], { ...changed, client_id: pickup.client_id });
         const serialized = JSON.stringify({ ok: true, data: { id: pickupMatch[1], ...changed }, request_id: id }); await saveIdempotent(env, idempotencyKey, pickup.client_id, endpoint, 200, serialized, requestHash);
         return new Response(serialized, { status: 200, headers: { ...headers, "content-type": "application/json" } });
@@ -3851,6 +4278,9 @@ const worker = {
       console.error(JSON.stringify({ request_id: id, error: message, route }));
       return error(message === "PAYLOAD_TOO_LARGE" ? "PAYLOAD_TOO_LARGE" : message === "INVALID_JSON" ? "INVALID_JSON" : "INTERNAL_ERROR", publicMessage, message === "PAYLOAD_TOO_LARGE" ? 413 : message === "INVALID_JSON" ? 400 : 500, id, headers);
     }
+  },
+  async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
+    ctx.waitUntil(refreshFujiyamaDelhivery(env, controller.cron));
   },
 };
 

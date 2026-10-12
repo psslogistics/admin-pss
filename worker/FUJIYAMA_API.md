@@ -5,17 +5,20 @@ the PSS Worker and are never sent to Fujiyama.
 
 ## Authentication
 
-Use the one-time secret returned when Super Admin creates a live API key for
-the Fujiyama client. Send it on every request as:
+Use separate one-time live secrets for tracking and booking:
 
 ```http
-Authorization: ApiKey <FUJIYAMA_PSS_LIVE_KEY>
+Authorization: ApiKey <FUJIYAMA_TRACKING_API_KEY>
 ```
 
-The key must contain only these scopes:
+and:
 
-- `tracking.read`
-- `shipments.create`
+```http
+Authorization: ApiKey <FUJIYAMA_BOOKING_API_KEY>
+```
+
+The tracking key contains only `tracking.read`; the booking key contains only
+`shipments.create`.
 
 The key is tenant-scoped to Fujiyama's client record. It cannot read or create
 records for another client.
@@ -34,7 +37,7 @@ returns HTTP 200 with `found: false` and an empty `events` array.
 ```bash
 curl --fail-with-body --request GET \
   'https://pss-api.psslogisticsadmin.workers.dev/v1/fujiyama/tracking?trackingType=VENDOR-AWB&awb=314893714' \
-  --header 'Authorization: ApiKey <FUJIYAMA_PSS_LIVE_KEY>'
+  --header 'Authorization: ApiKey <FUJIYAMA_TRACKING_API_KEY>'
 ```
 
 The response is a normalized PSS response. Delhivery's raw response and
@@ -49,10 +52,11 @@ and Delhivery B2B flow as the client panel. Send a unique
 ```bash
 curl --fail-with-body --request POST \
   'https://pss-api.psslogisticsadmin.workers.dev/v1/fujiyama/bookings' \
-  --header 'Authorization: ApiKey <FUJIYAMA_PSS_LIVE_KEY>' \
+  --header 'Authorization: ApiKey <FUJIYAMA_BOOKING_API_KEY>' \
   --header 'Content-Type: application/json' \
   --header 'Idempotency-Key: fujiyama-order-<YOUR_UNIQUE_ID>' \
   --data '{
+    "lane": "forward",
     "description": "Solar inverter",
     "origin": "New Delhi",
     "destination": "Mumbai",
@@ -77,14 +81,13 @@ curl --fail-with-body --request POST \
     "pieces": 1,
     "declared_value": 1000,
     "provider": "delhivery",
-    "pricing_quote_id": "<OPTIONAL_PSS_QUOTE_ID>",
-    "provider_account_id": "<OPTIONAL_ASSIGNED_DELHIVERY_ACCOUNT_ID>"
+    "invoice_documents": [{"name":"invoice.pdf","content_type":"application/pdf","body_base64":"<BASE64_INVOICE>"}]
   }'
 ```
 
-For production booking, Fujiyama should first request a PSS quote and send the
-returned `pricing_quote_id`. The Worker recalculates and validates the quote
-before debiting the Fujiyama wallet. The Delhivery/provider amount is never
+Use `lane: "reverse"` for a return shipment to Noida. The Worker applies the
+corresponding Fujiyama rate card, recalculates pricing, checks the wallet, and
+then submits the Delhivery B2B booking. The Delhivery/provider amount is never
 returned as the client billing amount.
 
 ## Key lifecycle

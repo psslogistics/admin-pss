@@ -39,6 +39,7 @@ export type PricingInput = {
   destinationZoneOverride?: string;
   oda?: boolean;
   opa?: boolean;
+  riskCharges?: Array<{ code: string; label: string; percent: number; minimum: number }>;
 };
 
 export type PricingLine = { code: string; label: string; amount: number; marker?: "*" };
@@ -174,9 +175,16 @@ export function calculatePssRate(input: PricingInput): PricingResult {
   }
   const subtotal = roundMoney(context.subtotal);
   const gstPercent = input.gstPercent ?? 18;
-  const gst = roundMoney(subtotal * gstPercent / 100);
+  const riskCharges = input.riskCharges ?? [{ code: "owner_risk", label: "Owner risk fee", percent: 0.1, minimum: 50 }];
+  for (const riskCharge of riskCharges) {
+    const amount = Math.max(riskCharge.minimum, roundMoney((input.invoiceValue ?? 0) * riskCharge.percent / 100));
+    lines.push({ code: riskCharge.code, label: riskCharge.label, amount });
+    context.subtotal = roundMoney(context.subtotal + amount);
+  }
+  const finalSubtotal = roundMoney(context.subtotal);
+  const gst = roundMoney(finalSubtotal * gstPercent / 100);
   lines.push({ code: "gst", label: `GST ${gstPercent}%`, amount: gst });
-  return { versionId: input.versionId, account: input.account, oda: Boolean(input.oda), opa: Boolean(input.opa), originZone, destinationZone, lane: `${originZone}->${destinationZone}`, chargeableWeightKg, lines, subtotal, gst, total: roundMoney(subtotal + gst) };
+  return { versionId: input.versionId, account: input.account, oda: Boolean(input.oda), opa: Boolean(input.opa), originZone, destinationZone, lane: `${originZone}->${destinationZone}`, chargeableWeightKg, lines, subtotal: finalSubtotal, gst, total: roundMoney(finalSubtotal + gst) };
 }
 
 export function defaultRateRows(account: PricingAccount): Array<{ origin_zone: string; destination_zone: string; rate_per_kg: number }> {

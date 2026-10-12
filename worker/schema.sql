@@ -84,6 +84,21 @@ CREATE TABLE IF NOT EXISTS pickup_requests (
   failure_reason TEXT,
   provider TEXT,
   provider_reference TEXT,
+  provider_account_id TEXT,
+  warehouse_id TEXT,
+  contact_email TEXT,
+  city TEXT,
+  state TEXT,
+  pincode TEXT,
+  country TEXT NOT NULL DEFAULT 'India',
+  pieces INTEGER NOT NULL DEFAULT 1,
+  total_weight_kg REAL,
+  provider_status TEXT,
+  provider_request_id TEXT,
+  provider_slot_id TEXT,
+  provider_awb_numbers_json TEXT,
+  provider_error_code TEXT,
+  idempotency_key TEXT,
   FOREIGN KEY (shipment_id) REFERENCES shipments(id) ON DELETE CASCADE
 );
 
@@ -91,6 +106,28 @@ CREATE INDEX IF NOT EXISTS idx_pickup_requests_client_date
   ON pickup_requests(client_id, requested_date);
 CREATE INDEX IF NOT EXISTS idx_pickup_requests_assignee_status
   ON pickup_requests(assigned_to_user_id, status, requested_date);
+
+CREATE TABLE IF NOT EXISTS pickup_request_attempts (
+  id TEXT PRIMARY KEY,
+  pickup_id TEXT NOT NULL,
+  client_id TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  provider_account_id TEXT,
+  request_id TEXT,
+  idempotency_key TEXT,
+  requested_date TEXT,
+  requested_time_slot TEXT,
+  status TEXT NOT NULL,
+  provider_status TEXT,
+  provider_reference TEXT,
+  provider_error_code TEXT,
+  error_message TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (pickup_id) REFERENCES pickup_requests(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_pickup_attempts_pickup_created
+  ON pickup_request_attempts(pickup_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS shipment_documents (
   id TEXT PRIMARY KEY,
@@ -299,6 +336,10 @@ CREATE TABLE IF NOT EXISTS warehouses (
   pincode TEXT,
   contact TEXT,
   status TEXT NOT NULL DEFAULT 'active',
+  provider TEXT,
+  provider_account_id TEXT,
+  provider_status TEXT,
+  provider_reference TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -425,6 +466,7 @@ CREATE INDEX IF NOT EXISTS idx_tickets_client_status ON support_tickets(client_i
 CREATE INDEX IF NOT EXISTS idx_messages_ticket_time ON support_messages(ticket_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notifications_user_read ON notifications(recipient_user_id, is_read, created_at);
 CREATE INDEX IF NOT EXISTS idx_warehouses_client_status ON warehouses(client_id, status);
+CREATE INDEX IF NOT EXISTS idx_warehouses_provider_identity ON warehouses(client_id, provider, provider_account_id, provider_status);
 CREATE INDEX IF NOT EXISTS idx_addresses_client_status ON client_addresses(client_id, status);
 CREATE INDEX IF NOT EXISTS idx_billing_client_status ON billing_records(client_id, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_wallet_client_time ON wallet_transactions(client_id, created_at);
