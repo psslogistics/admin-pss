@@ -173,9 +173,11 @@ export function calculatePssRate(input: PricingInput): PricingResult {
     context["subtotal"] = roundMoney(context.subtotal + amount);
     if (rule.code === "docket") context.freight_plus_docket = roundMoney(context.freight + amount);
   }
-  const subtotal = roundMoney(context.subtotal);
   const gstPercent = input.gstPercent ?? 18;
-  const riskCharges = input.riskCharges ?? [{ code: "owner_risk", label: "Owner risk fee", percent: 0.1, minimum: 50 }];
+  // Risk responsibility is selected by the calling workflow. Keeping the
+  // engine default empty prevents a route from adding owner/carrier risk a
+  // second time after the base quote has been calculated.
+  const riskCharges = input.riskCharges ?? [];
   for (const riskCharge of riskCharges) {
     const amount = Math.max(riskCharge.minimum, roundMoney((input.invoiceValue ?? 0) * riskCharge.percent / 100));
     lines.push({ code: riskCharge.code, label: riskCharge.label, amount });

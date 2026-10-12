@@ -54,7 +54,7 @@ type Auth = {
 };
 
 const json = (body: unknown, status = 200, headers: HeadersInit = {}) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...headers } });
-const error = (code: string, message: string, status: number, requestId: string, headers: HeadersInit = {}) => json({ ok: false, error: { code, message }, request_id: requestId }, status, headers);
+const error = (code: string, message: string, status: number, requestId: string, headers: HeadersInit = {}) => { const normalized = code.toUpperCase(); const category = status === 401 ? "auth" : status === 403 ? "permission" : normalized.includes("CONFIG") || normalized.includes("CREDENTIAL") ? "configuration" : normalized.includes("PROVIDER") || normalized.includes("DELHIVERY") ? "provider" : status >= 500 ? "server" : status === 408 || status === 429 ? "network" : "request"; const retryable = status === 408 || status === 409 || status === 429 || status >= 500 || category === "provider"; return json({ ok: false, error: { code, category, message, user_safe_message: message, technical_message: message, provider_code: category === "provider" ? code : undefined, request_id: requestId, retryable, stale_data: false }, request_id: requestId }, status, headers); };
 const requestId = (request: Request) => request.headers.get("cf-ray") ?? crypto.randomUUID();
 const userAuthInFlight = new Map<string, Promise<Auth | null>>();
 const userAuthCache = new Map<string, { expiresAt: number; value: Auth | null }>();
@@ -1897,10 +1897,9 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     }
   }
   if (response.ok && provider === "delhivery" && useDelhiveryB2b && operation === "tracking" && clientId && typeof payload.shipment_id === "string") {
-    const liveReference = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["lrnum", "lr_num", "lr_number", "lr_no", "lrn", "lrn_number", "waybill", "waybill_number", "awb", "awb_number"])))
-      ?? responseBody.match(/(?:lr(?:n|[_ ]?(?:number|num|no))?|awb|waybill)[^A-Za-z0-9]{0,12}(\d{6,20})/i)?.[1]
-      ?? null;
-    if (liveReference) await env.DB.prepare("UPDATE shipments SET tracking_number = ?, provider_reference = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(liveReference, liveReference, payload.shipment_id, clientId).run();
+    const liveLr = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["lrnum", "lr_num", "lr_number", "lr_no", "lrn", "lrn_number", "lr"]))) ?? null;
+    const liveAwb = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["master_awb", "master_awb_number", "masterawb", "master_waybill", "awb", "awb_number", "waybill", "waybill_number", "waybill_no"]))) ?? null;
+    if (liveLr || liveAwb) await env.DB.prepare("UPDATE shipments SET lr_number = COALESCE(?, lr_number), master_awb = COALESCE(?, master_awb), tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(provider_reference, ?), provider_sync_status = 'confirmed', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(liveLr, liveAwb, liveLr ?? liveAwb, liveAwb ?? liveLr, payload.shipment_id, clientId).run();
   }
   if (response.ok && provider === "delhivery" && operation === "shipments" && clientId && typeof payload.shipment_id === "string") {
     // A PUR is a pickup-request identifier, not an LR. Keep extraction
@@ -1909,17 +1908,21 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     // shipment booking reference.
     const b2bLrReference = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["lrnum", "lr_num", "lr_number", "lr_no", "lrn", "lrn_number", "lr"])));
     const b2bAwbReference = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["master_awb", "master_awb_number", "masterawb", "master_waybill", "awb", "awb_number", "waybill", "waybill_number", "waybill_no"])));
-    const textReference = useDelhiveryB2b
-      ? responseBody.match(/(?:lr(?:n|[_ ]?(?:number|num|no))?|awb|waybill)[^A-Za-z0-9]{0,12}(\d{6,20})/i)?.[1] ?? null
-      : null;
-    const createdReference = useDelhiveryB2b ? b2bLrReference ?? textReference ?? b2bAwbReference : findProviderReference(parsedProviderBody, new Set(["waybill", "awb", "tracking_number", "trackingid", "shipment_id"]));
+    const providerBookingId = findProviderReference(parsedProviderBody, new Set(["job_id", "jobid", "manifest_job_id", "request_id", "requestid"]));
+    const createdReference = useDelhiveryB2b ? b2bLrReference ?? b2bAwbReference : findProviderReference(parsedProviderBody, new Set(["waybill", "awb", "tracking_number", "trackingid", "shipment_id"]));
     const providerReference = useDelhiveryB2b ? b2bAwbReference ?? createdReference : createdReference;
+    if (useDelhiveryB2b && !createdReference && providerBookingId) {
+      const pending = "Delhivery accepted the booking and returned a provider job ID. LR/AWB is still being confirmed.";
+      await env.DB.prepare("UPDATE shipments SET provider_booking_id = COALESCE(?, provider_booking_id), provider_sync_status = 'pending', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(providerBookingId, payload.shipment_id, clientId).run();
+      await env.DB.prepare("UPDATE integration_requests SET status = 'accepted', error_code = NULL, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(pending, integrationId).run();
+      return { enabled: true, status: "accepted" as const, providerStatus: response.status, providerPending: true, providerBookingId, message: pending };
+    }
     if (useDelhiveryB2b && !createdReference) {
       const failure = "Delhivery accepted the request but returned no LR or AWB. The pickup request was not treated as a shipment booking.";
       await env.DB.prepare("UPDATE integration_requests SET status = 'failed', error_code = 'PROVIDER_REFERENCE_MISSING', error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(failure, integrationId).run();
       return { enabled: true, status: "failed" as const, providerStatus: response.status, error: failure };
     }
-    if (createdReference) await env.DB.prepare("UPDATE shipments SET tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(provider_reference, ?), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(createdReference, providerReference, payload.shipment_id, clientId).run();
+    if (createdReference) await env.DB.prepare("UPDATE shipments SET lr_number = COALESCE(?, lr_number), master_awb = COALESCE(?, master_awb), box_awbs_json = COALESCE(?, box_awbs_json), provider_booking_id = COALESCE(?, provider_booking_id), provider_sync_status = 'confirmed', tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(provider_reference, ?), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(useDelhiveryB2b ? b2bLrReference : null, useDelhiveryB2b ? b2bAwbReference : null, useDelhiveryB2b && b2bAwbReference ? JSON.stringify([b2bAwbReference]) : null, providerBookingId, createdReference, providerReference, payload.shipment_id, clientId).run();
   }
   if (response.ok && provider === "trackon" && operation === "shipments" && clientId && typeof payload.shipment_id === "string") {
     const createdReference = findProviderReference(parsedProviderBody, new Set(["docketno", "docket_no", "awbno", "awb"])) ?? responseBody.match(/Docket\s*No\.\s*:\s*([A-Za-z0-9]+)/i)?.[1] ?? null;
@@ -2513,7 +2516,7 @@ const worker = {
               provider_account_id: shipment.provider_account_id ?? undefined,
             }, id, auth.clientId, undefined, 5000)
           : { enabled: false, status: "not_requested" as const };
-        const events = await env.DB.prepare("SELECT status, location, description, event_time FROM tracking_events WHERE shipment_id = ? ORDER BY event_time ASC LIMIT 100").bind(shipment.id).all<{ status: string; location: string | null; description: string | null; event_time: string | null }>();
+        const events = await env.DB.prepare("SELECT status, location, description, event_time FROM tracking_events WHERE shipment_id = ? ORDER BY event_time ASC").bind(shipment.id).all<{ status: string; location: string | null; description: string | null; event_time: string | null }>();
         const latest = events.results.at(-1);
         const liveTracking = (providerResult as { tracking?: { status?: string; location?: string; description?: string; event_time?: string | null } }).tracking;
         return json({ ok: true, data: {
@@ -2588,7 +2591,7 @@ const worker = {
         // used by the public tracker. Mutations and webhook records remain
         // untouched by this reconciliation.
         await env.DB.prepare("UPDATE integration_requests SET status = 'failed', error_code = 'PROVIDER_TIMEOUT_STALE', error_message = 'Read-only provider request remained pending beyond the terminalization window' WHERE status = 'pending' AND operation IN ('tracking', 'serviceability') AND updated_at < datetime('now', '-10 seconds')").run();
-        const recentRequests = await env.DB.prepare("SELECT provider, status, error_code, updated_at FROM integration_requests WHERE provider IN ('delhivery', 'ekart', 'trackon', 'xpressbees', 'rivigo') ORDER BY updated_at DESC, CASE WHEN status = 'pending' THEN 1 ELSE 0 END ASC, id DESC LIMIT 100").all<{ provider: CourierProvider; status: string; error_code: string | null; updated_at: string | null }>();
+        const recentRequests = await env.DB.prepare("SELECT provider, status, error_code, updated_at FROM integration_requests WHERE provider IN ('delhivery', 'ekart', 'trackon', 'xpressbees', 'rivigo') ORDER BY updated_at DESC, CASE WHEN status = 'pending' THEN 1 ELSE 0 END ASC, id DESC").all<{ provider: CourierProvider; status: string; error_code: string | null; updated_at: string | null }>();
         const providerHealth = (provider: CourierProvider) => {
           const latest = recentRequests.results.find((item) => item.provider === provider);
           const pendingAge = latest?.status === "pending" && latest.updated_at ? Date.now() - Date.parse(latest.updated_at) : 0;
@@ -2711,26 +2714,25 @@ const worker = {
       if (route === "/integration-requests" && request.method === "GET") {
         if (!hasScope(auth, "integrations.read")) return error("FORBIDDEN", "Integration visibility permission required", 403, id, headers);
         const rows = auth.system
-          ? await env.DB.prepare("SELECT id, provider, client_id, operation, provider_request_id, status, attempt_count, error_code, error_message, created_at, updated_at FROM integration_requests ORDER BY updated_at DESC LIMIT 100").all()
+          ? await env.DB.prepare("SELECT id, provider, client_id, operation, provider_request_id, status, attempt_count, error_code, error_message, created_at, updated_at FROM integration_requests ORDER BY updated_at DESC").all()
           : auth.clientIds.size
-            ? await env.DB.prepare(`SELECT id, provider, client_id, operation, provider_request_id, status, attempt_count, error_code, error_message, created_at, updated_at FROM integration_requests WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY updated_at DESC LIMIT 100`).bind(...auth.clientIds).all()
+            ? await env.DB.prepare(`SELECT id, provider, client_id, operation, provider_request_id, status, attempt_count, error_code, error_message, created_at, updated_at FROM integration_requests WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY updated_at DESC`).bind(...auth.clientIds).all()
             : { results: [] };
         return json({ ok: true, data: rows.results }, 200, headers);
       }
       if (route === "/webhook-events" && request.method === "GET") {
         if (!hasScope(auth, "webhooks.read") || !auth.system) return error("FORBIDDEN", "Only organization administrators may view webhook events", 403, id, headers);
-        const rows = await env.DB.prepare("SELECT id, provider, event_id, event_type, signature_valid, status, processed_at, created_at FROM webhook_events ORDER BY created_at DESC LIMIT 100").all();
+        const rows = await env.DB.prepare("SELECT id, provider, event_id, event_type, signature_valid, status, processed_at, created_at FROM webhook_events ORDER BY created_at DESC").all();
         return json({ ok: true, data: rows.results }, 200, headers);
       }
 
       if (route === "/shipments" && request.method === "GET") {
         if (!hasScope(auth, "shipments.read")) return error("FORBIDDEN", "Shipment read scope required", 403, id, headers);
-        const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 50), 1), 100);
         const internalShipmentView = hasRole(auth, ["employee", "admin", "super_admin"]) || auth.system;
         const shipmentColumns = internalShipmentView
-          ? "s.id, s.pss_reference, s.client_id, s.created_by_user_id, s.tracking_number, s.status, s.provider, s.provider_account_id, s.provider_reference, (SELECT sd.id FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS pod_document_id, (SELECT sd.original_filename FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS pod_filename, (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = s.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, (SELECT pr.status FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_status, (SELECT pr.requested_date FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_scheduled_date, (SELECT pr.requested_time_slot FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_time_slot, (SELECT c.provider_status FROM pricing_provider_costs c WHERE c.shipment_id = s.id LIMIT 1) AS provider_confirmation_status, s.description, s.origin, s.destination, s.origin_address_json, s.destination_address_json, s.consignee, s.total_weight_kg, s.declared_value, s.pieces, s.edd, s.delivered_at, s.created_at, s.updated_at"
-          : "s.id, s.pss_reference, s.client_id, s.created_by_user_id, s.tracking_number, s.status, s.provider, s.provider_reference, (SELECT sd.id FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS pod_document_id, (SELECT sd.original_filename FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS pod_filename, (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = s.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, (SELECT pr.status FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_status, (SELECT pr.requested_date FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_scheduled_date, (SELECT pr.requested_time_slot FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_time_slot, (SELECT c.provider_status FROM pricing_provider_costs c WHERE c.shipment_id = s.id LIMIT 1) AS provider_confirmation_status, s.description, s.origin, s.destination, s.origin_address_json, s.destination_address_json, s.consignee, s.total_weight_kg, s.declared_value, s.pieces, s.edd, s.delivered_at, s.created_at, s.updated_at";
-        const rows = auth.system ? await env.DB.prepare(`SELECT ${shipmentColumns} FROM shipments s ORDER BY s.created_at DESC LIMIT ?`).bind(limit).all() : auth.clientIds.size ? await env.DB.prepare(`SELECT ${shipmentColumns} FROM shipments s WHERE s.client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY s.created_at DESC LIMIT ?`).bind(...[...auth.clientIds], limit).all() : { results: [] };
+          ? "s.id, s.pss_reference, s.client_id, s.created_by_user_id, s.tracking_number, s.lr_number, s.master_awb, s.box_awbs_json, s.provider_booking_id, s.provider_pickup_id, s.provider_sync_status, s.status, s.provider, s.provider_account_id, s.provider_reference, (SELECT sd.id FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS pod_document_id, (SELECT sd.original_filename FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS pod_filename, (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = s.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, (SELECT pr.status FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_status, (SELECT pr.requested_date FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_scheduled_date, (SELECT pr.requested_time_slot FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_time_slot, (SELECT c.provider_status FROM pricing_provider_costs c WHERE c.shipment_id = s.id LIMIT 1) AS provider_confirmation_status, s.description, s.origin, s.destination, s.origin_address_json, s.destination_address_json, s.consignee, s.total_weight_kg, s.declared_value, s.pieces, s.edd, s.delivered_at, s.created_at, s.updated_at"
+          : "s.id, s.pss_reference, s.client_id, s.created_by_user_id, s.tracking_number, s.lr_number, s.master_awb, s.box_awbs_json, s.provider_booking_id, s.provider_pickup_id, s.provider_sync_status, s.status, s.provider, s.provider_reference, (SELECT sd.id FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS pod_document_id, (SELECT sd.original_filename FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS pod_filename, (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = s.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, (SELECT pr.status FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_status, (SELECT pr.requested_date FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_scheduled_date, (SELECT pr.requested_time_slot FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_time_slot, (SELECT c.provider_status FROM pricing_provider_costs c WHERE c.shipment_id = s.id LIMIT 1) AS provider_confirmation_status, s.description, s.origin, s.destination, s.origin_address_json, s.destination_address_json, s.consignee, s.total_weight_kg, s.declared_value, s.pieces, s.edd, s.delivered_at, s.created_at, s.updated_at";
+        const rows = auth.system ? await env.DB.prepare(`SELECT ${shipmentColumns} FROM shipments s ORDER BY s.created_at DESC`).all() : auth.clientIds.size ? await env.DB.prepare(`SELECT ${shipmentColumns} FROM shipments s WHERE s.client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY s.created_at DESC`).bind(...[...auth.clientIds]).all() : { results: [] };
         if (url.searchParams.get("include_tracking") === "1") {
           const shipments = rows.results as Array<Record<string, unknown>>;
           const shipmentIds = shipments.map((shipment) => String(shipment.id));
@@ -2830,7 +2832,7 @@ const worker = {
           await env.DB.prepare("UPDATE shipments SET status = 'exception', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(shipmentId, clientId).run();
           await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'exception', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipmentId, `Provider booking failed: ${failureReason}`, auth.userId ?? `api:${clientId}`).run();
           if (pricingQuote) { await env.DB.prepare("INSERT INTO wallet_transactions (id, client_id, type, amount, reference, status, balance_after) VALUES (?, ?, 'credit', ?, ?, 'posted', 0)").bind(crypto.randomUUID(), clientId, pricingAmount, `REVERSAL-${shipmentId}`).run(); await env.DB.prepare("UPDATE billing_records SET status = 'void', updated_at = CURRENT_TIMESTAMP WHERE shipment_id = ? AND client_id = ?").bind(shipmentId, clientId).run(); await recalculateWalletBalances(env, clientId); }
-          const failedResponse = JSON.stringify({ ok: false, error: { code: "PROVIDER_REQUEST_FAILED", message: failureReason }, data: { id: shipmentId, client_id: clientId, status: "exception", provider, pricing_amount: pricingAmount || null }, request_id: id });
+          const failedResponse = JSON.stringify({ ok: false, error: { code: "PROVIDER_REQUEST_FAILED", category: "provider", message: "The shipment could not be booked with the courier. You can retry after checking the provider status.", user_safe_message: "The courier did not accept this booking. Your shipment was not booked; retry the booking after correcting the provider issue.", technical_message: failureReason, provider_code: "PROVIDER_REQUEST_FAILED", request_id: id, retryable: true, stale_data: false }, data: { id: shipmentId, client_id: clientId, status: "exception", provider, pricing_amount: pricingAmount || null }, request_id: id });
           await saveIdempotent(env, key, clientId, "POST /v1/shipments", 502, failedResponse, requestHash);
           await audit(env, ctx, auth, id, "shipment.provider_failed", "shipment", shipmentId, { client_id: clientId, provider, reason: failureReason });
           return new Response(failedResponse, { status: 502, headers: { ...headers, "content-type": "application/json" } });
@@ -2895,7 +2897,7 @@ const worker = {
         if (!hasScope(auth, "documents.read")) return error("FORBIDDEN", "Document read scope required", 403, id, headers);
         const shipment = await env.DB.prepare("SELECT client_id FROM shipments WHERE id = ? LIMIT 1").bind(shipmentDocuments[1]).first<{ client_id: string }>();
         if (!shipment || !canAccessClient(auth, shipment.client_id)) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
-        const documents = await env.DB.prepare("SELECT id, shipment_id, original_filename, content_type, file_size_bytes, uploaded_by_user_id, created_at FROM shipment_documents WHERE shipment_id = ? ORDER BY created_at DESC LIMIT 100").bind(shipmentDocuments[1]).all();
+        const documents = await env.DB.prepare("SELECT id, shipment_id, original_filename, content_type, file_size_bytes, uploaded_by_user_id, created_at FROM shipment_documents WHERE shipment_id = ? ORDER BY created_at DESC").bind(shipmentDocuments[1]).all();
         return json({ ok: true, data: documents.results }, 200, headers);
       }
 
@@ -2926,10 +2928,10 @@ const worker = {
       if (shipmentGet && request.method === "GET") {
         if (!hasScope(auth, route.endsWith("/tracking") ? "tracking.read" : "shipments.read")) return error("FORBIDDEN", "Shipment read scope required", 403, id, headers);
         const internalShipmentView = hasRole(auth, ["employee", "admin", "super_admin"]) || auth.system;
-        const shipment = await env.DB.prepare(`SELECT id, pss_reference, client_id, created_by_user_id, tracking_number, status, provider, ${internalShipmentView ? "provider_account_id, provider_reference," : "provider_reference,"} (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = shipments.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, (SELECT pr.status FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_status, (SELECT pr.requested_date FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_scheduled_date, (SELECT pr.requested_time_slot FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_time_slot, (SELECT c.provider_status FROM pricing_provider_costs c WHERE c.shipment_id = shipments.id LIMIT 1) AS provider_confirmation_status, description, origin, destination, origin_address_json, destination_address_json, consignee, total_weight_kg, declared_value, pieces, edd, delivered_at, created_at, updated_at FROM shipments WHERE id = ? LIMIT 1`).bind(shipmentGet[1]).first<Record<string, unknown> & { client_id: string; provider: string | null; tracking_number: string | null; provider_reference?: string | null }>();
+        const shipment = await env.DB.prepare(`SELECT id, pss_reference, client_id, created_by_user_id, tracking_number, lr_number, master_awb, box_awbs_json, provider_booking_id, provider_pickup_id, provider_sync_status, status, provider, ${internalShipmentView ? "provider_account_id, provider_reference," : "provider_reference,"} (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = shipments.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, (SELECT pr.status FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_status, (SELECT pr.requested_date FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_scheduled_date, (SELECT pr.requested_time_slot FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_time_slot, (SELECT c.provider_status FROM pricing_provider_costs c WHERE c.shipment_id = shipments.id LIMIT 1) AS provider_confirmation_status, description, origin, destination, origin_address_json, destination_address_json, consignee, total_weight_kg, declared_value, pieces, edd, delivered_at, created_at, updated_at FROM shipments WHERE id = ? LIMIT 1`).bind(shipmentGet[1]).first<Record<string, unknown> & { client_id: string; provider: string | null; tracking_number: string | null; provider_reference?: string | null }>();
         if (!shipment || !canAccessClient(auth, shipment.client_id)) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
         if (route.endsWith("/tracking")) {
-          const events = await env.DB.prepare("SELECT * FROM tracking_events WHERE shipment_id = ? ORDER BY event_time ASC LIMIT 100").bind(shipmentGet[1]).all();
+          const events = await env.DB.prepare("SELECT * FROM tracking_events WHERE shipment_id = ? ORDER BY event_time ASC").bind(shipmentGet[1]).all();
           const provider = ["delhivery", "ekart", "trackon", "xpressbees", "rivigo"].includes(String(shipment.provider)) ? shipment.provider as CourierProvider : null;
           // Client-facing shipment reads intentionally omit provider_account_id from
           // the response, but the provider lookup must still use the shipment's
@@ -2971,7 +2973,7 @@ const worker = {
       if (route === "/pickups" && request.method === "GET") {
         if (!hasScope(auth, "pickups.read")) return error("FORBIDDEN", "Pickup read scope required", 403, id, headers);
          const pickupColumns = "id, client_id, shipment_id, requested_date, requested_time_slot, pickup_address, contact_name, contact_phone, contact_email, city, state, pincode, country, pieces, total_weight_kg, status, assigned_to_user_id, notes, provider, provider_account_id, warehouse_id, provider_reference, provider_status, provider_request_id, provider_slot_id, provider_error_code, idempotency_key, failure_reason, created_at, updated_at";
-        const rows = auth.system ? await env.DB.prepare(`SELECT ${pickupColumns} FROM pickup_requests ORDER BY requested_date DESC LIMIT 100`).all() : auth.clientIds.size ? await env.DB.prepare(`SELECT ${pickupColumns} FROM pickup_requests WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY requested_date DESC LIMIT 100`).bind(...auth.clientIds).all() : { results: [] };
+        const rows = auth.system ? await env.DB.prepare(`SELECT ${pickupColumns} FROM pickup_requests ORDER BY requested_date DESC`).all() : auth.clientIds.size ? await env.DB.prepare(`SELECT ${pickupColumns} FROM pickup_requests WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY requested_date DESC`).bind(...auth.clientIds).all() : { results: [] };
         return json({ ok: true, data: rows.results }, 200, headers);
       }
 
@@ -3036,13 +3038,14 @@ const worker = {
         if (provider && providerResult.status !== "accepted") {
           const failureReason = String((providerResult as { error?: string; reason?: string }).error ?? (providerResult as { reason?: string }).reason ?? `The ${provider} pickup request was not accepted`).slice(0, 500);
           await env.DB.prepare("UPDATE pickup_requests SET status = 'failed', provider_status = ?, provider_request_id = ?, provider_error_code = ?, failure_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(String(providerStatus), id, String(providerErrorCode ?? "provider_request_failed"), failureReason, pickupId, clientId).run();
-          const failedResponse = JSON.stringify({ ok: false, error: { code: "PROVIDER_REQUEST_FAILED", message: failureReason }, data: { id: pickupId, client_id: clientId, status: "failed", provider, provider_status: providerResult.status }, request_id: id });
+          const failedResponse = JSON.stringify({ ok: false, error: { code: "PROVIDER_REQUEST_FAILED", category: "provider", message: failureReason, user_safe_message: `The ${provider} pickup was not accepted. The request is marked failed and can be retried after correcting the provider issue.`, technical_message: failureReason, provider_code: String(providerErrorCode ?? "provider_request_failed"), request_id: id, retryable: true, stale_data: false }, data: { id: pickupId, client_id: clientId, status: "failed", provider, provider_status: providerResult.status, provider_reference: providerReference }, request_id: id });
           await saveIdempotent(env, key, clientId, "POST /v1/pickups", 502, failedResponse, requestHash);
           await audit(env, ctx, auth, id, "pickup.provider_failed", "pickup", pickupId, { client_id: clientId, provider, reason: failureReason });
           return new Response(failedResponse, { status: 502, headers: { ...headers, "content-type": "application/json" } });
         }
          const pickupStatus = (providerResult as { providerPending?: boolean }).providerPending ? "provider_pending" : "scheduled";
          await env.DB.prepare("UPDATE pickup_requests SET status = ?, provider_status = ?, provider_request_id = ?, provider_error_code = ?, provider_reference = COALESCE(?, provider_reference), provider_slot_id = COALESCE(?, provider_slot_id), requested_date = ?, requested_time_slot = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(pickupStatus, String(providerStatus), id, null, providerReference, providerSlotId, acceptedDate, acceptedWindow, pickupId, clientId).run();
+          if (typeof payload.shipment_id === "string" && providerReference) await env.DB.prepare("UPDATE shipments SET provider_pickup_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(providerReference, payload.shipment_id, clientId).run();
           const serialized = JSON.stringify({ ok: true, data: { id: pickupId, client_id: clientId, status: pickupStatus, provider, provider_account_id: providerAccountId, provider_status: providerStatus, provider_reference: providerReference, requested_date: acceptedDate, requested_time_slot: acceptedWindow, scheduled_date: acceptedDate, window: acceptedWindow, rescheduled: acceptedDate !== requestedDateInput }, request_id: id });
         await saveIdempotent(env, key, clientId, "POST /v1/pickups", 201, serialized, requestHash); await audit(env, ctx, auth, id, "pickup.created", "pickup", pickupId, { client_id: clientId });
         return new Response(serialized, { status: 201, headers: { ...headers, "content-type": "application/json" } });
@@ -3178,13 +3181,15 @@ const worker = {
         const addCollection = (key: string, table: string, order: string, scope: string) => {
           if (!includeCollection(key) || !hasScope(auth, scope)) return;
           const columns = summaryColumns[table] ?? "*";
+          const unlimitedCollections = new Set(["shipments", "pickups", "billing", "exceptions", "ndr", "returns", "weights"]);
+          const collectionLimit = unlimitedCollections.has(key) ? "" : " LIMIT 100";
           if (auth.system) {
-            entries.push({ key, statement: env.DB.prepare(`SELECT ${columns} FROM ${table} ORDER BY ${order} LIMIT 100`) });
+            entries.push({ key, statement: env.DB.prepare(`SELECT ${columns} FROM ${table} ORDER BY ${order}${collectionLimit}`) });
             return;
           }
           if (!auth.clientIds.size) return;
           const placeholders = [...auth.clientIds].map(() => "?").join(",");
-          entries.push({ key, statement: env.DB.prepare(`SELECT ${columns} FROM ${table} WHERE client_id IN (${placeholders}) ORDER BY ${order} LIMIT 100`).bind(...auth.clientIds) });
+          entries.push({ key, statement: env.DB.prepare(`SELECT ${columns} FROM ${table} WHERE client_id IN (${placeholders}) ORDER BY ${order}${collectionLimit}`).bind(...auth.clientIds) });
         };
         addCollection("shipments", "shipments", "created_at DESC", "shipments.read");
         addCollection("pickups", "pickup_requests", "requested_date DESC", "pickups.read");
@@ -3242,7 +3247,6 @@ const worker = {
 
       if (route === "/reports/shipments" && request.method === "GET") {
         if (!hasScope(auth, "reports.read")) return error("FORBIDDEN", "Report read scope required", 403, id, headers);
-        const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 100), 1), 500);
         const summarySql = "SELECT status, COUNT(*) AS shipments, SUM(CASE WHEN edd IS NOT NULL AND date(COALESCE(delivered_at, CURRENT_TIMESTAMP)) > date(edd) THEN 1 ELSE 0 END) AS delayed FROM shipments";
         const detailSql = "SELECT id, client_id, tracking_number, status, edd, delivered_at, CASE WHEN edd IS NULL THEN 0 ELSE MAX(0, CAST(julianday(date(COALESCE(delivered_at, CURRENT_TIMESTAMP))) - julianday(date(edd)) AS INTEGER)) END AS delay_days FROM shipments";
         const summary = auth.system
@@ -3251,9 +3255,9 @@ const worker = {
             ? await env.DB.prepare(`${summarySql} WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) GROUP BY status ORDER BY status`).bind(...auth.clientIds).all()
             : { results: [] };
         const details = auth.system
-          ? await env.DB.prepare(`${detailSql} ORDER BY created_at DESC LIMIT ?`).bind(limit).all()
+          ? await env.DB.prepare(`${detailSql} ORDER BY created_at DESC`).all()
           : auth.clientIds.size
-            ? await env.DB.prepare(`${detailSql} WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY created_at DESC LIMIT ?`).bind(...auth.clientIds, limit).all()
+            ? await env.DB.prepare(`${detailSql} WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY created_at DESC`).bind(...auth.clientIds).all()
             : { results: [] };
         return json({ ok: true, data: summary.results, details: details.results }, 200, headers);
       }
@@ -3272,9 +3276,9 @@ const worker = {
           weight_reconciliations: "id, client_id, shipment_id, measured_weight_kg, billable_weight_kg, status, updated_at, created_at",
         };
         const scoped = (table: string) => auth.system
-          ? env.DB.prepare(`SELECT ${columnsByTable[table] ?? "*"} FROM ${table} ORDER BY created_at DESC LIMIT 500`)
+          ? env.DB.prepare(`SELECT ${columnsByTable[table] ?? "*"} FROM ${table} ORDER BY created_at DESC`)
           : clientIds.length
-            ? env.DB.prepare(`SELECT ${columnsByTable[table] ?? "*"} FROM ${table} WHERE client_id IN (${clientIds.map(() => "?").join(",")}) ORDER BY created_at DESC LIMIT 500`).bind(...clientIds)
+            ? env.DB.prepare(`SELECT ${columnsByTable[table] ?? "*"} FROM ${table} WHERE client_id IN (${clientIds.map(() => "?").join(",")}) ORDER BY created_at DESC`).bind(...clientIds)
             : null;
         const entries: Array<{ key: string; statement: ReturnType<typeof env.DB.prepare> }> = [];
         const add = (key: string, table: string, scope: string) => {
@@ -3322,7 +3326,7 @@ const worker = {
       };
       if (route === "/billing" && request.method === "GET") {
         if (!hasScope(auth, "billing.read")) return error("FORBIDDEN", "Permission required", 403, id, headers);
-        const rows = auth.system ? await env.DB.prepare("SELECT b.*, s.account_scope, s.origin_zone, s.destination_zone, s.chargeable_weight_kg, s.client_breakdown_json, w.provider_weight_received_at, w.client_dispute_deadline_at FROM billing_records b LEFT JOIN pricing_shipment_snapshots s ON s.shipment_id = b.shipment_id LEFT JOIN weight_reconciliations w ON w.shipment_id = b.shipment_id ORDER BY b.created_at DESC LIMIT 100").all() : auth.clientIds.size ? await env.DB.prepare(`SELECT b.*, s.account_scope, s.origin_zone, s.destination_zone, s.chargeable_weight_kg, s.client_breakdown_json, w.provider_weight_received_at, w.client_dispute_deadline_at FROM billing_records b LEFT JOIN pricing_shipment_snapshots s ON s.shipment_id = b.shipment_id LEFT JOIN weight_reconciliations w ON w.shipment_id = b.shipment_id WHERE b.client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY b.created_at DESC LIMIT 100`).bind(...auth.clientIds).all() : { results: [] };
+        const rows = auth.system ? await env.DB.prepare("SELECT b.*, s.account_scope, s.origin_zone, s.destination_zone, s.chargeable_weight_kg, s.client_breakdown_json, w.provider_weight_received_at, w.client_dispute_deadline_at FROM billing_records b LEFT JOIN pricing_shipment_snapshots s ON s.shipment_id = b.shipment_id LEFT JOIN weight_reconciliations w ON w.shipment_id = b.shipment_id ORDER BY b.created_at DESC").all() : auth.clientIds.size ? await env.DB.prepare(`SELECT b.*, s.account_scope, s.origin_zone, s.destination_zone, s.chargeable_weight_kg, s.client_breakdown_json, w.provider_weight_received_at, w.client_dispute_deadline_at FROM billing_records b LEFT JOIN pricing_shipment_snapshots s ON s.shipment_id = b.shipment_id LEFT JOIN weight_reconciliations w ON w.shipment_id = b.shipment_id WHERE b.client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY b.created_at DESC`).bind(...auth.clientIds).all() : { results: [] };
         const data = await Promise.all(rows.results.map(async (row) => { const record = row as Record<string, unknown>; let pricing: unknown = null; if (typeof record.client_breakdown_json === "string") { try { pricing = JSON.parse(record.client_breakdown_json); } catch { pricing = null; } } const adjustments = record.shipment_id ? await env.DB.prepare("SELECT component_code, previous_amount, new_amount, reason, actor_user_id, created_at FROM pricing_overrides WHERE shipment_id = ? ORDER BY created_at ASC").bind(record.shipment_id).all() : { results: [] }; const amendments = record.shipment_id ? await env.DB.prepare("SELECT id, amendment_type, previous_amount, new_amount, reason, weight_received_at, ticket_deadline_at, actor_user_id, created_at FROM billing_amendments WHERE shipment_id = ? ORDER BY created_at ASC").bind(record.shipment_id).all() : { results: [] }; const lineItems = record.id ? await env.DB.prepare("SELECT id, code, label, amount, marker, display_order, created_at FROM billing_line_items WHERE billing_id = ? ORDER BY display_order ASC, code ASC").bind(record.id).all() : { results: [] }; const safe = { ...record }; delete safe.client_breakdown_json; return { ...safe, pricing, line_items: lineItems.results, adjustments: adjustments.results, amendments: amendments.results }; }));
         return json({ ok: true, data }, 200, headers);
       }
@@ -3332,7 +3336,7 @@ const worker = {
         const employeeColumns = `${clientColumns}, w.provider_dispute_status`;
         const internalColumns = `${employeeColumns}, w.provider_recovery_amount, w.retained_recovery_amount, t.client_credit_amount`;
         const columns = hasScope(auth, "provider_cost.view") || hasScope(auth, "weight_dispute.resolve") ? internalColumns : hasRole(auth, ["employee", "admin", "super_admin"]) ? employeeColumns : clientColumns;
-        const rows = auth.system ? await env.DB.prepare(`SELECT ${columns} FROM weight_reconciliations w LEFT JOIN weight_reconciliation_tickets t ON t.reconciliation_id = w.id ORDER BY w.updated_at DESC LIMIT 100`).all() : auth.clientIds.size ? await env.DB.prepare(`SELECT ${columns} FROM weight_reconciliations w LEFT JOIN weight_reconciliation_tickets t ON t.reconciliation_id = w.id WHERE w.client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY w.updated_at DESC LIMIT 100`).bind(...auth.clientIds).all() : { results: [] };
+        const rows = auth.system ? await env.DB.prepare(`SELECT ${columns} FROM weight_reconciliations w LEFT JOIN weight_reconciliation_tickets t ON t.reconciliation_id = w.id ORDER BY w.updated_at DESC`).all() : auth.clientIds.size ? await env.DB.prepare(`SELECT ${columns} FROM weight_reconciliations w LEFT JOIN weight_reconciliation_tickets t ON t.reconciliation_id = w.id WHERE w.client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY w.updated_at DESC`).bind(...auth.clientIds).all() : { results: [] };
         return json({ ok: true, data: rows.results }, 200, headers);
       }
       const collection = collectionRoutes[route];
@@ -3342,7 +3346,9 @@ const worker = {
         const select = collection.table === "return_shipments" && !internalCollectionView
           ? "id, shipment_id, client_id, reason, status, created_at, updated_at"
           : "*";
-        const rows = auth.system ? await env.DB.prepare(`SELECT ${select} FROM ${collection.table} ORDER BY ${collection.order} LIMIT 100`).all() : auth.clientIds.size ? await env.DB.prepare(`SELECT ${select} FROM ${collection.table} WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY ${collection.order} LIMIT 100`).bind(...auth.clientIds).all() : { results: [] };
+        const unlimitedCollection = ["ndr_cases", "exception_cases", "return_shipments"].includes(collection.table);
+        const collectionLimit = unlimitedCollection ? "" : " LIMIT 100";
+        const rows = auth.system ? await env.DB.prepare(`SELECT ${select} FROM ${collection.table} ORDER BY ${collection.order}${collectionLimit}`).all() : auth.clientIds.size ? await env.DB.prepare(`SELECT ${select} FROM ${collection.table} WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY ${collection.order}${collectionLimit}`).bind(...auth.clientIds).all() : { results: [] };
         return json({ ok: true, data: rows.results }, 200, headers);
       }
       if ((route === "/billing" || route === "/wallet") && request.method === "POST") {
@@ -3673,7 +3679,7 @@ const worker = {
           if (forwardRatePerKg === undefined) return error("RTO_SOURCE_INVALID", "The original shipment pricing snapshot is invalid", 409, id, headers);
         }
          const oda = Boolean(originPin.oda || destinationPin.oda);
-         const result = calculatePssRate({ account, originCity: originPin.facility_city, destinationCity: destinationPin.facility_city, originState: originPin.facility_state, destinationState: destinationPin.facility_state, actualWeightKg, volumetricWeightKg, invoiceValue, rto, forwardRatePerKg, forwardOriginZoneOverride: rtoSource?.origin_zone, forwardDestinationZoneOverride: rtoSource?.destination_zone, minimumWeightKg: Number(version.minimum_weight_kg ?? 20), gstPercent: Number(version.gst_percent ?? 18), versionId: version.id, oda, opa: false, rateMatrix, chargeRules: rules.results.map((rule) => ({ code: rule.code, label: rule.label, kind: rule.calculation_type, value: Number(rule.value), basis: rule.basis, minimum: rule.minimum_value === null ? undefined : Number(rule.minimum_value), maximum: rule.maximum_value === null ? undefined : Number(rule.maximum_value), enabled: Boolean(rule.enabled), marker: rule.marker ?? undefined, condition: rule.condition ?? undefined, displayOrder: Number(rule.display_order ?? 0) })) });
+         const result = calculatePssRate({ account, originCity: originPin.facility_city, destinationCity: destinationPin.facility_city, originState: originPin.facility_state, destinationState: destinationPin.facility_state, actualWeightKg, volumetricWeightKg, invoiceValue, rto, forwardRatePerKg, forwardOriginZoneOverride: rtoSource?.origin_zone, forwardDestinationZoneOverride: rtoSource?.destination_zone, minimumWeightKg: Number(version.minimum_weight_kg ?? 20), gstPercent: Number(version.gst_percent ?? 18), versionId: version.id, oda, opa: false, rateMatrix, riskCharges: [], chargeRules: rules.results.map((rule) => ({ code: rule.code, label: rule.label, kind: rule.calculation_type, value: Number(rule.value), basis: rule.basis, minimum: rule.minimum_value === null ? undefined : Number(rule.minimum_value), maximum: rule.maximum_value === null ? undefined : Number(rule.maximum_value), enabled: Boolean(rule.enabled), marker: rule.marker ?? undefined, condition: rule.condition ?? undefined, displayOrder: Number(rule.display_order ?? 0) })) });
         const carrierRisk = payload.risk_type === "carrier";
         const riskFee = carrierRisk
           ? Math.max(80, Math.round(invoiceValue * 0.003 * 100) / 100)
