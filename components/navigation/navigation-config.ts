@@ -29,12 +29,13 @@ export const navigationGroups: NavigationGroup[] = [
   {
     label: "Operations",
     items: [
+      { title: "Shipments", href: "/dashboard/shipments", icon: "shipments", permission: "admin.shipments.assigned.view" },
       { title: "Booking", href: "/dashboard/booking", icon: "createShipment", permission: "admin.booking.view" },
       { title: "Tracking", href: "/dashboard/tracking", icon: "shipment", permission: "admin.tracking.view" },
       { title: "Pickup", href: "/dashboard/pickup", icon: "pickups", permission: "admin.pickup.view" },
       { title: "Reports", href: "/dashboard/reports", icon: "reports", permission: "admin.reports.view" },
       { title: "Rate Cards", href: "/dashboard/rate-cards", icon: "reports", permission: "admin.rate_cards.view" },
-      { title: "Weight Reconciliation", href: "/dashboard/weight-reconciliation", icon: "reports", permission: "admin.reports.view" },
+      { title: "Weight Reconciliation", href: "/dashboard/weight-reconciliation", icon: "reports", permission: "admin.weight.view" },
     ],
   },
   {
