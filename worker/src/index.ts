@@ -2876,7 +2876,7 @@ const worker = {
       const shipmentUpdate = route.match(/^\/shipments\/([^/]+)$/);
       if (shipmentUpdate && request.method === "PATCH") {
         if (!hasRole(auth, ["employee", "admin", "super_admin"])) return error("FORBIDDEN", "Employee or administrator role required", 403, id, headers);
-        const current = await env.DB.prepare("SELECT client_id, status FROM shipments WHERE id = ? LIMIT 1").bind(shipmentUpdate[1]).first<{ client_id: string; status: string }>();
+        const current = await env.DB.prepare("SELECT client_id, status, weight_override_kg FROM shipments WHERE id = ? LIMIT 1").bind(shipmentUpdate[1]).first<{ client_id: string; status: string; weight_override_kg: number | null }>();
         if (!current || !canAccessClient(auth, current.client_id)) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
         const payload = await bodyJson(request);
         const requestHash = await payloadFingerprint(payload);
@@ -2890,8 +2890,11 @@ const worker = {
         const key = request.headers.get("Idempotency-Key"); if (!key) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
         const endpoint = `PATCH /v1/shipments/${shipmentUpdate[1]}`; const existing = await idempotentResponse(env, key, current.client_id, endpoint, requestHash); if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
         const normalized = updates;
+        const weightUpdate = normalized.find((update) => update.field === "total_weight_kg");
+        if (weightUpdate && (!Number.isFinite(Number(weightUpdate.value)) || Number(weightUpdate.value) <= 0)) return error("VALIDATION_ERROR", "Weight must be greater than 0", 400, id, headers);
+        const weightMeta = weightUpdate ? ", weight_override_kg = ?, weight_source = 'manual', weight_updated_at = CURRENT_TIMESTAMP" : "";
         const deliveredClause = status === "delivered" ? ", delivered_at = COALESCE(delivered_at, CURRENT_TIMESTAMP)" : "";
-        await env.DB.prepare(`UPDATE shipments SET ${normalized.map((update) => `${update.field} = ?`).join(", ")}, updated_at = CURRENT_TIMESTAMP${deliveredClause} WHERE id = ?`).bind(...normalized.map((update) => update.value), shipmentUpdate[1]).run();
+        await env.DB.prepare(`UPDATE shipments SET ${normalized.map((update) => `${update.field} = ?`).join(", ")}${weightMeta}, updated_at = CURRENT_TIMESTAMP${deliveredClause} WHERE id = ?`).bind(...normalized.map((update) => update.value), ...(weightUpdate ? [Number(weightUpdate.value)] : []), shipmentUpdate[1]).run();
         if (status) await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipmentUpdate[1], status, "Shipment updated", auth.userId ?? `api:${current.client_id}`).run();
         await audit(env, ctx, auth, id, "shipment.updated", "shipment", shipmentUpdate[1], { client_id: current.client_id, fields: normalized.map((update) => update.field) });
         const serialized = JSON.stringify({ ok: true, data: { id: shipmentUpdate[1], ...Object.fromEntries(normalized.map((update) => [update.field, update.value])), ...(status === "delivered" ? { delivered_at: "CURRENT_TIMESTAMP" } : {}) }, request_id: id }); await saveIdempotent(env, key, current.client_id, endpoint, 200, serialized, requestHash);
