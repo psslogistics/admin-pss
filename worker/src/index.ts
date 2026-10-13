@@ -3732,6 +3732,7 @@ const worker = {
         let selectedProviderAccountName = "";
         let accountValue = internalPricingRequest ? String(payload.account_code ?? "").trim().toLowerCase() : "other";
         if (typeof payload.provider_account_id === "string" && payload.provider_account_id.trim()) {
+          await ensureDefaultClientProviderPolicies(env, clientId, auth.userId ?? `client:${clientId}`);
            const providerAccount = await env.DB.prepare(`SELECT pa.account_name FROM provider_accounts pa JOIN provider_account_client_policies p ON p.provider_account_id = pa.id AND p.client_id = ? AND p.enabled = 1 WHERE pa.id = ? AND pa.provider = 'delhivery' AND pa.status = 'active' AND (pa.client_id = ? OR p.client_id = ?) LIMIT 1`).bind(clientId, payload.provider_account_id.trim(), clientId, clientId).first<{ account_name: string }>();
           if (!providerAccount) return error("PROVIDER_ACCOUNT_NOT_ASSIGNED", "This Delhivery account is not assigned to the client", 403, id, headers);
           selectedProviderAccountName = String(providerAccount.account_name ?? "");
