@@ -2752,8 +2752,14 @@ const worker = {
         const totalCount = Object.values(statusCounts).reduce((sum, count) => sum + count, 0);
         const pageResults = rows.results.length > pageSize ? rows.results.slice(0, pageSize) : rows.results;
         const pagination = { limit: pageSize, offset, next_offset: offset + pageResults.length, has_more: rows.results.length > pageSize, total: totalCount, status_counts: statusCounts };
+        const pageClientIds = [...new Set(pageResults.map((shipment) => String((shipment as Record<string, unknown>).client_id ?? "")).filter(Boolean))];
+        const clientNameRows = auth.accessToken && pageClientIds.length
+          ? await supabaseGet<{ id: string; legal_name: string }>(env, `client_accounts?id=in.(${pageClientIds.map((clientId) => encodeURIComponent(clientId)).join(",")})&select=id,legal_name`, auth.accessToken)
+          : [];
+        const clientNames = new Map(clientNameRows.map((client) => [client.id, client.legal_name]));
+        const namedPageResults = pageResults.map((shipment) => ({ ...shipment, client_name: clientNames.get(String((shipment as Record<string, unknown>).client_id ?? "")) ?? (shipment as Record<string, unknown>).client_id }));
         if (url.searchParams.get("include_tracking") === "1") {
-          const shipments = pageResults as Array<Record<string, unknown>>;
+          const shipments = namedPageResults as Array<Record<string, unknown>>;
           const shipmentIds = shipments.map((shipment) => String(shipment.id));
           const events = shipmentIds.length
             ? await env.DB.prepare(`SELECT shipment_id, status, location, description, event_time FROM tracking_events WHERE shipment_id IN (${shipmentIds.map(() => "?").join(",")}) ORDER BY event_time ASC`).bind(...shipmentIds).all()
@@ -2768,7 +2774,7 @@ const worker = {
           const data = shipments.map((shipment) => ({ ...shipment, tracking_events: eventsByShipment.get(String(shipment.id)) ?? [] }));
           return json({ ok: true, data, pagination }, 200, headers);
         }
-        return json({ ok: true, data: pageResults, pagination }, 200, headers);
+        return json({ ok: true, data: namedPageResults, pagination }, 200, headers);
       }
 
       if (route === "/shipments" && request.method === "POST") {
@@ -2960,7 +2966,10 @@ const worker = {
           const providerResult = provider ? await safeProviderRequest(env, provider, "tracking", { shipment_id: String(shipment.id), tracking_number: shipment.tracking_number, provider_reference: shipment.provider_reference, provider_account_id: providerAccountId }, id, shipment.client_id) : { enabled: false, status: "not_requested" as const };
           return json({ ok: true, data: events.results, provider_status: providerResult.status }, 200, headers);
         }
-        return json({ ok: true, data: shipment }, 200, headers);
+        const clientName = auth.accessToken
+          ? (await supabaseGet<{ id: string; legal_name: string }>(env, `client_accounts?id=eq.${encodeURIComponent(shipment.client_id)}&select=id,legal_name`, auth.accessToken))[0]?.legal_name
+          : undefined;
+        return json({ ok: true, data: { ...shipment, client_name: clientName ?? shipment.client_id } }, 200, headers);
       }
 
       if (route === "/pickup-slots" && request.method === "GET") {
