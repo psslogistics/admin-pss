@@ -4017,8 +4017,13 @@ const worker = {
               : [await safeProviderRequest(env, account.provider, "serviceability", { origin_pincode: origin, destination_pincode: destination, provider_account_id: account.id }, id, serviceabilityClientId), null];
             const originRecord = originResult as Record<string, unknown>;
             const destinationRecord = (destinationResult ?? originResult) as Record<string, unknown>;
-            const datasetFallback = account.provider === "delhivery"
-              && [originResult, destinationResult].some((item) => item?.status === "failed")
+            // Delhivery's B2B PIN API can return HTTP 200 with an empty or
+            // incomplete delivery_codes payload. The managed PSS dataset is
+            // the authoritative B2B coverage fallback in that case, not only
+            // when the upstream request throws.
+            const delhiveryResponseVerified = account.provider !== "delhivery"
+              || (originResult.status === "accepted" && Boolean((originResult as { serviceable?: boolean; pickup?: boolean }).serviceable ?? (originResult as { pickup?: boolean }).pickup) && destinationResult?.status === "accepted" && Boolean((destinationResult as { serviceable?: boolean }).serviceable));
+            const datasetFallback = account.provider === "delhivery" && !delhiveryResponseVerified
               ? await Promise.all([pricingPincode(env, origin), pricingPincode(env, destination)])
               : [null, null] as const;
             if (account.provider === "delhivery" && datasetFallback[0] && datasetFallback[1]) {
