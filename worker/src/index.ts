@@ -849,6 +849,35 @@ function normalizeDelhiveryPickupSlots(value: unknown) {
   }).filter((item) => item.slots.length > 0);
 }
 
+/**
+ * Delhivery's public B2B contract accepts a pickup date and start time when a
+ * pickup request is created, but does not expose a public first-mile slot
+ * availability endpoint. Keep the booking flow usable by offering request
+ * windows; Delhivery remains authoritative when the request is submitted.
+ */
+function delhiveryRequestedPickupSlots() {
+  const now = new Date();
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hour12: false,
+  }).formatToParts(now);
+  const current = Object.fromEntries(parts.filter((part) => part.type !== "literal").map((part) => [part.type, part.value]));
+  const today = `${current.year}-${current.month}-${current.day}`;
+  const nextDate = new Date(`${today}T12:00:00+05:30`);
+  nextDate.setUTCDate(nextDate.getUTCDate() + 1);
+  const tomorrow = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit" }).format(nextDate);
+  const windows = ["09:00 AM - 11:00 AM", "11:00 AM - 01:00 PM", "02:00 PM - 04:00 PM", "04:00 PM - 06:00 PM"];
+  const minutes = Number(current.hour ?? 0) * 60 + Number(current.minute ?? 0);
+  const starts = [540, 660, 840, 960];
+  const todayWindows = windows.filter((_, index) => minutes < starts[index]);
+  return {
+    dates: [...(todayWindows.length ? [{ date: today, slots: todayWindows }] : []), { date: tomorrow, slots: windows }],
+    source: "request_windows",
+    note: "These are request windows. Delhivery confirms or reschedules the pickup when the booking is submitted.",
+    timezone: "Asia/Kolkata",
+  };
+}
+
 function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>) {
   const origin = delhiveryAddress(payload.origin_address, String(payload.origin ?? "PSS Logistics"));
   const destination = delhiveryAddress(payload.destination_address, String(payload.consignee ?? "Consignee"));
@@ -2981,22 +3010,19 @@ const worker = {
         const requestedProvider = String(query.get("provider") ?? "delhivery").trim().toLowerCase();
         const requestedAccountId = String(query.get("provider_account_id") ?? "").trim();
         const requestedPincode = String(query.get("pincode") ?? "").trim();
-         const requestedWarehouseId = String(query.get("warehouse_id") ?? "").trim();
-         const requestedFacilityCode = String(query.get("facility_code") ?? "").trim();
         const requestedClient = requireClient(auth, query.get("client_id"));
         if (requestedProvider !== "delhivery") return error("UNSUPPORTED_PROVIDER", "Provider-backed pickup availability is not configured for this courier", 409, id, headers);
         if (!requestedAccountId || !/^\d{6}$/.test(requestedPincode)) return error("VALIDATION_ERROR", "Provider account and a valid pickup PIN code are required", 400, id, headers);
         if (!requestedClient || !canAccessClient(auth, requestedClient)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
         const account = await env.DB.prepare("SELECT pa.id FROM provider_accounts pa LEFT JOIN provider_account_client_policies p ON p.provider_account_id = pa.id AND p.client_id = ? WHERE pa.id = ? AND pa.provider = ? AND pa.status = 'active' AND (pa.client_id = ? OR (p.client_id = ? AND p.enabled = 1)) LIMIT 1").bind(requestedClient, requestedAccountId, requestedProvider, requestedClient, requestedClient).first<{ id: string }>();
         if (!account) return error("PROVIDER_ACCOUNT_UNAVAILABLE", "The selected courier account is not active for this client", 409, id, headers);
-         const providerResult = await providerRequest(env, "delhivery", "pickup_slots", {
-           provider_account_id: requestedAccountId,
-           warehouse_id: requestedWarehouseId || undefined,
-           facility_code: requestedFacilityCode || undefined,
-           pincode: requestedPincode,
-         }, id, requestedClient, undefined, 15000);
-         if (providerResult.status !== "accepted") return error("PROVIDER_REQUEST_FAILED", String((providerResult as { error?: string; reason?: string }).error ?? (providerResult as { reason?: string }).reason ?? "Delhivery pickup slots could not be loaded"), 502, id, headers);
-         return json({ ok: true, data: { dates: (providerResult as { dates?: Array<{ date: string; slots: string[] }> }).dates ?? [], source: "delhivery", timezone: "Asia/Kolkata" } }, 200, headers);
+         // Delhivery does not publish a first-mile slot-availability route for
+         // B2B. The old implementation called an internal panel endpoint
+         // (/web/api/company/configurations/...) which returns 404 in
+         // production before a slot request is even attempted. Return valid
+         // request windows and let Delhivery accept or reschedule them during
+         // the actual booking/pickup request.
+         return json({ ok: true, data: delhiveryRequestedPickupSlots() }, 200, headers);
       }
 
       if (route === "/pickups" && request.method === "GET") {

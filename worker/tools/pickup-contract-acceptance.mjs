@@ -14,7 +14,7 @@ const checks = [
   ["provider slot references are persisted", source.includes("providerSlotId") && source.includes("provider_slot_id = COALESCE")],
   ["standalone provider AWBs persist across retries", source.includes("provider_awb_numbers_json") && source.includes("normalizePickupAwbNumbers") && migration.includes("provider_awb_numbers_json")],
   ["phone/date/email validation exists", source.includes("normalizePickupPhone") && source.includes("validPickupDate") && source.includes("Pickup contact email is invalid")],
-  ["Delhivery pickup slots use the provider endpoint", source.includes("/web/api/forward_orders/pickup_slots/") && source.includes("pickup_slots_for_today") && source.includes("pickup_slots_for_next_day")],
+  ["Delhivery pickup selection uses request windows when availability is not published", source.includes("delhiveryRequestedPickupSlots") && source.includes("request_windows") && source.includes("does not publish a first-mile slot-availability route")],
   ["structured provider date and slot responses are preserved", source.includes("row.slots") && source.includes("hasEmbeddedSlots")],
   ["Delhivery pickup creation uses the B2B pickup endpoint", source.includes("/v2/web/api/orders/pickup_request") && source.includes("expected_package_count") && source.includes("awb_number")],
   ["legacy pickup endpoint is not used for B2B", !source.includes("/pickup_requests/")],
