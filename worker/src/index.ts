@@ -2915,7 +2915,7 @@ const worker = {
       const shipmentArtifact = route.match(/^\/shipments\/([^/]+)\/(label|sticker|lr-copy|document)$/);
       if (shipmentArtifact && request.method === "GET") {
         if (!hasScope(auth, "tracking.read") && !hasScope(auth, "documents.read")) return error("FORBIDDEN", "Tracking or document read scope required", 403, id, headers);
-        const shipment = await env.DB.prepare("SELECT s.id, s.client_id, s.provider, s.tracking_number, s.provider_reference, s.provider_account_id, s.pieces, (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = s.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference FROM shipments s WHERE s.id = ? LIMIT 1").bind(shipmentArtifact[1]).first<{ id: string; client_id: string; provider: string | null; tracking_number: string | null; provider_reference: string | null; provider_account_id: string | null; pieces: number | null; pickup_reference: string | null }>();
+        const shipment = await env.DB.prepare("SELECT s.id, s.client_id, s.provider, s.pss_reference, s.lr_number, s.tracking_number, s.provider_reference, s.provider_account_id, s.pieces, (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = s.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference FROM shipments s WHERE s.id = ? LIMIT 1").bind(shipmentArtifact[1]).first<{ id: string; client_id: string; provider: string | null; pss_reference: string | null; lr_number: string | null; tracking_number: string | null; provider_reference: string | null; provider_account_id: string | null; pieces: number | null; pickup_reference: string | null }>();
         if (!shipment || !canAccessClient(auth, shipment.client_id)) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
         if (shipment.provider !== "delhivery") return error("UNSUPPORTED_PROVIDER_OPERATION", "Provider documents are currently available only for Delhivery", 409, id, headers);
         const url = new URL(request.url);
@@ -2926,9 +2926,7 @@ const worker = {
         // Delhivery's B2B label endpoint validates its path parameter as an
         // active LR number (LRN), not the master AWB. LR copy/document also
         // use the LR number. Keep the PUR and master AWB out of these paths.
-        const providerReference = operation === "labels"
-          ? shipment.tracking_number ?? shipment.provider_reference
-          : shipment.tracking_number ?? shipment.provider_reference;
+        const providerReference = shipment.tracking_number ?? shipment.lr_number ?? shipment.provider_reference ?? shipment.pss_reference;
         if (!providerReference) return error("PROVIDER_REFERENCE_UNAVAILABLE", "The Delhivery LR/AWB is not available yet; the PUR cannot be used for downloads", 409, id, headers);
         const payload = { shipment_id: shipment.id, tracking_number: providerReference, provider_reference: providerReference, provider_account_id: shipment.provider_account_id, label_size: requestedSize, boxes: Math.max(1, Number(shipment.pieces ?? 1)), lr_copy_type: url.searchParams.get("lr_copy_type") ?? undefined, doc_type: url.searchParams.get("doc_type") ?? "LM_POD" };
         const providerResult = await safeProviderRequest(env, "delhivery", operation, payload, id, shipment.client_id);
