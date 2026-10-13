@@ -37,7 +37,7 @@ export default function EmployeeShell({ children }: { children: React.ReactNode 
   const signOut = async () => {
     setProfileOpen(false);
     await createClient().auth.signOut({ scope: "global" });
-    router.replace("/login");
+    router.replace("/sign-in");
     router.refresh();
   };
 
