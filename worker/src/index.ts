@@ -476,6 +476,13 @@ async function ensureDefaultClientPricing(env: Env, clientId: string, actor = "s
   await env.DB.batch(statements);
   return env.DB.prepare("SELECT id, status, effective_at, minimum_weight_kg, volumetric_divisor, gst_percent FROM pricing_versions WHERE client_id = ? AND provider = 'delhivery' AND service_level = 'b2b' AND status = 'active' AND datetime(effective_at) <= CURRENT_TIMESTAMP ORDER BY datetime(effective_at) DESC LIMIT 1").bind(clientId).first<{ id: string; status: string; effective_at: string; minimum_weight_kg: number; volumetric_divisor: number; gst_percent: number }>();
 }
+async function ensureDefaultClientProviderPolicies(env: Env, clientId: string, actor = "system") {
+  const accounts = await env.DB.prepare("SELECT id, credential_secret_name FROM provider_accounts WHERE provider = 'delhivery' AND status = 'active' AND account_name IN ('PSSLOGISTICS10 B2BC', 'PSSCHANDIGARHCARGO6 B2BC', 'PSSBOOKCFT10 B2BC')").all<{ id: string; credential_secret_name: string }>();
+  const secretBag = env as unknown as Record<string, unknown>;
+  const configured = accounts.results.filter((account) => typeof secretBag[account.credential_secret_name] === "string" && String(secretBag[account.credential_secret_name]).trim());
+  if (!configured.length) return;
+  await env.DB.batch(configured.map((account) => env.DB.prepare("INSERT OR IGNORE INTO provider_account_client_policies (provider_account_id, client_id, enabled, priority, confidence_score, rate_card_id, notes, updated_by_user_id, updated_at) VALUES (?, ?, 1, 100, 0, NULL, 'Default Delhivery B2B account assignment', ?, CURRENT_TIMESTAMP)").bind(account.id, clientId, actor)));
+}
 const FUJIYAMA_CLIENT_ID = "bb308dde-aae8-4503-ac7b-f91cd80ada78";
 const FUJIYAMA_DELHIVERY_ACCOUNT_ID = "dlv-psslogistics10-b2bc";
 const FUJIYAMA_FORWARD_RATES: Record<string, number> = { N1: 5.5, N2: 6.2, N3: 6.5, N4: 6.9, C1: 7.9, C2: 8.6, E1: 10.5, E2: 11.2, NE1: 15.9, NE2: 18.8, S1: 8.8, S2: 9.4, S3: 9.8, S4: 10.5, W1: 7.9, W2: 8.7 };
@@ -2674,6 +2681,7 @@ const worker = {
         const requestedClient = new URL(request.url).searchParams.get("client_id");
         const clientId = requireClient(auth, requestedClient);
         if (!clientId || !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
+        await ensureDefaultClientProviderPolicies(env, clientId, auth.userId ?? `client:${clientId}`);
          const internalProviderView = hasRole(auth, ["employee", "admin", "super_admin"]) || auth.system;
          const providerAccountVisibility = internalProviderView
            ? "pa.status = 'active' AND (pa.client_id = ? OR pa.client_id IS NULL)"
