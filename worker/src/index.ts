@@ -3332,6 +3332,21 @@ const worker = {
         const notifications = rowsFor("notifications");
         const tasks = rowsFor("tasks");
         const preferences = rowsFor("preferences")[0] ?? null;
+        const shipmentStats = { total: 0, delayed: 0, statuses: {} as Record<string, number>, providers: {} as Record<string, number> };
+        if (hasScope(auth, "shipments.read")) {
+          const shipmentScope = auth.system ? "" : auth.clientIds.size ? ` WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")})` : " WHERE 1 = 0";
+          const shipmentParams = auth.system ? [] : [...auth.clientIds];
+          const stats = await env.DB.batch<Record<string, unknown>>([
+            env.DB.prepare(`SELECT COUNT(*) AS total FROM shipments${shipmentScope}`).bind(...shipmentParams),
+            env.DB.prepare(`SELECT status, COUNT(*) AS count FROM shipments${shipmentScope} GROUP BY status`).bind(...shipmentParams),
+            env.DB.prepare(`SELECT COUNT(*) AS count FROM shipments${shipmentScope}${shipmentScope ? " AND" : " WHERE"} edd IS NOT NULL AND date(edd) < date('now') AND lower(COALESCE(status, '')) NOT IN ('delivered', 'cancelled')`).bind(...shipmentParams),
+            env.DB.prepare(`SELECT COALESCE(provider, 'unknown') AS provider, COUNT(*) AS count FROM shipments${shipmentScope} GROUP BY provider`).bind(...shipmentParams),
+          ]);
+          shipmentStats.total = Number(stats[0]?.results?.[0]?.total ?? 0);
+          shipmentStats.delayed = Number(stats[2]?.results?.[0]?.count ?? 0);
+          for (const row of stats[1]?.results ?? []) shipmentStats.statuses[String(row.status ?? "unknown")] = Number(row.count ?? 0);
+          for (const row of stats[3]?.results ?? []) shipmentStats.providers[String(row.provider ?? "unknown")] = Number(row.count ?? 0);
+        }
         const data = {
           shipments,
           pickups,
@@ -3345,6 +3360,7 @@ const worker = {
           notifications,
           tasks,
           preferences,
+          shipment_stats: shipmentStats,
           permissions: [...auth.permissions],
         };
         dashboardSummaryCache.set(scopeKey, { expiresAt: Date.now() + SUMMARY_CACHE_TTL_MS, data });
