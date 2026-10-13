@@ -2856,7 +2856,7 @@ const worker = {
         await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'booked', 'Shipment created', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipmentId, auth.userId ?? `api:${clientId}`).run();
         const storedDocuments = await persistShipmentDocuments(env, clientId, shipmentId, payload.invoice_documents, auth.userId ?? `api:${clientId}`);
         if (!storedDocuments.ok) {
-          await env.DB.prepare("UPDATE shipments SET status = 'exception', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(shipmentId, clientId).run();
+          await env.DB.prepare("UPDATE shipments SET status = 'exception', provider_sync_status = 'failed', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(shipmentId, clientId).run();
           return error("INVOICE_DOCUMENT_INVALID", storedDocuments.error, 400, id, headers);
         }
         if (pricingQuote) await env.DB.prepare("INSERT INTO weight_reconciliations (id, client_id, shipment_id, declared_weight_kg, declared_volumetric_weight_kg, initial_billable_weight_kg, measured_weight_kg, billable_weight_kg, client_dispute_deadline_at, status) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, NULL, 'pending')").bind(crypto.randomUUID(), clientId, shipmentId, weight, volumetricWeightFromPayload(payload), pricingQuote.chargeable_weight_kg, pricingQuote.chargeable_weight_kg).run();
