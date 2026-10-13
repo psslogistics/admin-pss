@@ -6,6 +6,17 @@ const STALE_SESSION_CACHE_TTL_MS = 120_000;
 const MAX_SESSION_CACHE_BYTES = 1_500_000;
 const getCache = new Map<string, { expiresAt: number; value: unknown }>();
 const getInFlight = new Map<string, Promise<unknown>>();
+let authExpiryInFlight: Promise<void> | null = null;
+const expireAuthSession = () => {
+  if (authExpiryInFlight) return authExpiryInFlight;
+  authExpiryInFlight = (async () => {
+    getCache.clear();
+    getInFlight.clear();
+    try { await createClient().auth.signOut({ scope: "local" }); } catch { /* the local session may already be invalid */ }
+    if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent("pss-auth-expired"));
+  })().finally(() => { authExpiryInFlight = null; });
+  return authExpiryInFlight;
+};
 let sessionInFlight: ReturnType<ReturnType<typeof createClient>["auth"]["getSession"]> | null = null;
 const isSessionCachedRead = (path: string) => path.startsWith("/v1/dashboard/summary") || path === "/v1/provider-capabilities" || path === "/v1/provider-account-policies";
 const sessionKey = (userId: string, path: string) => `pss-api:${userId}:${path}`;
@@ -21,7 +32,7 @@ export async function pssApi<T>(path: string, init: RequestInit = {}): Promise<T
     sessionInFlight = createClient().auth.getSession().finally(() => { sessionInFlight = null; });
   }
   const { data: { session } } = await sessionInFlight;
-  if (!session?.access_token) throw new Error("Your session has expired. Please sign in again.");
+  if (!session?.access_token) { await expireAuthSession(); throw new Error("Your session has expired. Please sign in again."); }
   const baseUrl = process.env.NEXT_PUBLIC_PSS_API_URL;
   if (!baseUrl) throw new Error("PSS API is not configured.");
   const mutating = ["POST", "PUT", "PATCH", "DELETE"].includes((init.method ?? "GET").toUpperCase());
@@ -55,8 +66,10 @@ export async function pssApi<T>(path: string, init: RequestInit = {}): Promise<T
       const refreshed = await createClient().auth.refreshSession();
       const refreshedToken = refreshed.data.session?.access_token;
       if (refreshedToken) response = await fetch(endpoint, { ...init, signal: controller.signal, headers: requestHeaders(refreshedToken) });
+      else { await expireAuthSession(); throw new PssApiError("Your session has expired. Please sign in again.", 401, { error: { category: "auth", user_safe_message: "Your session has expired. Please sign in again." } }); }
     }
     const payload = await response.json().catch(() => ({})) as T & { error?: { message?: string; user_safe_message?: string } };
+    if (response.status === 401) { await expireAuthSession(); throw new PssApiError("Your session has expired. Please sign in again.", 401, payload); }
     if (!response.ok) throw new PssApiError(payload.error?.user_safe_message || payload.error?.message || `Request failed (${response.status}).`, response.status, payload);
     if (!mutating) {
       const expiresAt = Date.now() + GET_CACHE_TTL_MS;

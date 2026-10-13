@@ -41,6 +41,15 @@ export default function EmployeeShell({ children }: { children: React.ReactNode 
     router.refresh();
   };
 
+  useEffect(() => {
+    const handleAuthExpired = () => {
+      router.replace("/sign-in?reason=session-expired");
+      router.refresh();
+    };
+    window.addEventListener("pss-auth-expired", handleAuthExpired);
+    return () => window.removeEventListener("pss-auth-expired", handleAuthExpired);
+  }, [router]);
+
   useEffect(() => { const saved = localStorage.getItem("pss-theme"); const next = saved === "dark" || saved === "light" ? saved : window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"; document.documentElement.classList.toggle("dark", next === "dark"); const timer = window.setTimeout(() => { setTheme(next); setThemeReady(true); }, 0); return () => window.clearTimeout(timer); }, []);
   useEffect(() => { if (!profileOpen) return; const close = (event: MouseEvent) => { if (profileRef.current && !profileRef.current.contains(event.target as Node)) setProfileOpen(false); }; document.addEventListener("mousedown", close); return () => document.removeEventListener("mousedown", close); }, [profileOpen]);
   useEffect(() => { if (!searchOpen) return; searchRef.current?.focus(); const close = (event: KeyboardEvent) => { if (event.key === "Escape") setSearchOpen(false); }; window.addEventListener("keydown", close); return () => window.removeEventListener("keydown", close); }, [searchOpen]);
