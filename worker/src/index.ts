@@ -442,6 +442,40 @@ async function pricingPincode(env: Env, pincode: string) {
   if (!/^\d{6}$/.test(pincode)) return null;
   return env.DB.prepare("SELECT pincode, facility_city, facility_state, oda FROM delhivery_b2b_pincode_zones WHERE pincode = ? LIMIT 1").bind(pincode).first<{ pincode: string; facility_city: string; facility_state: string; oda: number }>();
 }
+/**
+ * Provision the built-in PSS B2B card when a client has no published version.
+ *
+ * Client creation is owned by the Master app (Supabase), while pricing is
+ * persisted in Worker D1. Keeping this operation idempotent at the Worker
+ * boundary makes both new and already-created clients self-healing without
+ * replacing a rate card that an administrator has explicitly published.
+ */
+async function ensureDefaultClientPricing(env: Env, clientId: string, actor = "system") {
+  const existing = await env.DB.prepare("SELECT id, status, effective_at, minimum_weight_kg, volumetric_divisor, gst_percent FROM pricing_versions WHERE client_id = ? AND provider = 'delhivery' AND service_level = 'b2b' AND status = 'active' AND datetime(effective_at) <= CURRENT_TIMESTAMP ORDER BY datetime(effective_at) DESC LIMIT 1").bind(clientId).first<{ id: string; status: string; effective_at: string; minimum_weight_kg: number; volumetric_divisor: number; gst_percent: number }>();
+  if (existing) return existing;
+
+  const versionId = crypto.randomUUID();
+  const effectiveAt = new Date().toISOString();
+  const statements = [
+    env.DB.prepare("INSERT OR IGNORE INTO pricing_versions (id, client_id, provider, service_level, status, effective_at, source_rate_card_id, minimum_weight_kg, volumetric_divisor, gst_percent, created_by_user_id, published_by_user_id) VALUES (?, ?, 'delhivery', 'b2b', 'active', ?, NULL, 20, 5000, 18, ?, ?)").bind(versionId, clientId, effectiveAt, actor, actor),
+  ];
+  for (const account of ["04", "08", "other"] as PricingAccount[]) {
+    for (const row of defaultRateRows(account)) {
+      statements.push(env.DB.prepare("INSERT OR IGNORE INTO pricing_rate_matrix (id, version_id, account_scope, origin_zone, destination_zone, rate_per_kg) VALUES (?, ?, ?, ?, ?, ?)").bind(crypto.randomUUID(), versionId, account, row.origin_zone, row.destination_zone, row.rate_per_kg));
+    }
+  }
+  const defaultRules: Array<{ code: string; label: string; kind: ChargeRule["kind"]; value: number; basis: ChargeRule["basis"]; minimum?: number; marker?: "*"; condition?: "oda_or_opa"; displayOrder: number }> = [
+    { code: "docket", label: "Docket / LR charge", kind: "fixed", value: 50, basis: "freight", displayOrder: 10 },
+    { code: "fuel", label: "Fuel surcharge", kind: "percent", value: 10, basis: "freight", displayOrder: 20 },
+    { code: "oda", label: "ODA surcharge", kind: "per_kg", value: 3, basis: "chargeable_weight", minimum: 750, condition: "oda_or_opa", marker: "*", displayOrder: 40 },
+    { code: "minimum_freight", label: "Minimum waybill freight", kind: "minimum", value: 500, basis: "subtotal", displayOrder: 60 },
+  ];
+  for (const rule of defaultRules) {
+    statements.push(env.DB.prepare("INSERT OR IGNORE INTO pricing_charge_rules (id, version_id, code, label, calculation_type, value, basis, minimum_value, enabled, marker, condition, display_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)").bind(crypto.randomUUID(), versionId, rule.code, rule.label, rule.kind, rule.value, rule.basis ?? "freight", rule.minimum ?? null, rule.marker ?? null, rule.condition ?? null, rule.displayOrder));
+  }
+  await env.DB.batch(statements);
+  return env.DB.prepare("SELECT id, status, effective_at, minimum_weight_kg, volumetric_divisor, gst_percent FROM pricing_versions WHERE client_id = ? AND provider = 'delhivery' AND service_level = 'b2b' AND status = 'active' AND datetime(effective_at) <= CURRENT_TIMESTAMP ORDER BY datetime(effective_at) DESC LIMIT 1").bind(clientId).first<{ id: string; status: string; effective_at: string; minimum_weight_kg: number; volumetric_divisor: number; gst_percent: number }>();
+}
 const FUJIYAMA_CLIENT_ID = "bb308dde-aae8-4503-ac7b-f91cd80ada78";
 const FUJIYAMA_DELHIVERY_ACCOUNT_ID = "dlv-psslogistics10-b2bc";
 const FUJIYAMA_FORWARD_RATES: Record<string, number> = { N1: 5.5, N2: 6.2, N3: 6.5, N4: 6.9, C1: 7.9, C2: 8.6, E1: 10.5, E2: 11.2, NE1: 15.9, NE2: 18.8, S1: 8.8, S2: 9.4, S3: 9.8, S4: 10.5, W1: 7.9, W2: 8.7 };
@@ -477,9 +511,10 @@ async function createShipmentPricingQuote(env: Env, clientId: string, payload: R
   const version = versionIdOverride
     ? await env.DB.prepare("SELECT id, minimum_weight_kg, gst_percent FROM pricing_versions WHERE id = ? AND client_id = ? AND provider = 'delhivery' AND service_level = 'b2b' LIMIT 1").bind(versionIdOverride, clientId).first<{ id: string; minimum_weight_kg: number; gst_percent: number }>()
     : await env.DB.prepare("SELECT id, minimum_weight_kg, gst_percent FROM pricing_versions WHERE client_id = ? AND provider = 'delhivery' AND service_level = 'b2b' AND status = 'active' AND datetime(effective_at) <= CURRENT_TIMESTAMP ORDER BY datetime(effective_at) DESC LIMIT 1").bind(clientId).first<{ id: string; minimum_weight_kg: number; gst_percent: number }>();
-  if (!version) throw new Error("PRICING_NOT_CONFIGURED");
-  const rules = await env.DB.prepare("SELECT code, label, calculation_type, value, basis, minimum_value, maximum_value, enabled, marker, condition, display_order FROM pricing_charge_rules WHERE version_id = ? ORDER BY display_order ASC, code ASC").bind(version.id).all<{ code: string; label: string; calculation_type: ChargeRule["kind"]; value: number; basis: ChargeRule["basis"]; minimum_value: number | null; maximum_value: number | null; enabled: number; marker: "*" | null; condition: "oda_or_opa" | null; display_order: number }>();
-  const matrixRows = await env.DB.prepare("SELECT origin_zone, destination_zone, rate_per_kg FROM pricing_rate_matrix WHERE version_id = ? AND account_scope = ?").bind(version.id, account).all<{ origin_zone: string; destination_zone: string; rate_per_kg: number }>();
+  const activeVersion = version ?? await ensureDefaultClientPricing(env, clientId, createdByUserId);
+  if (!activeVersion) throw new Error("PRICING_NOT_CONFIGURED");
+  const rules = await env.DB.prepare("SELECT code, label, calculation_type, value, basis, minimum_value, maximum_value, enabled, marker, condition, display_order FROM pricing_charge_rules WHERE version_id = ? ORDER BY display_order ASC, code ASC").bind(activeVersion.id).all<{ code: string; label: string; calculation_type: ChargeRule["kind"]; value: number; basis: ChargeRule["basis"]; minimum_value: number | null; maximum_value: number | null; enabled: number; marker: "*" | null; condition: "oda_or_opa" | null; display_order: number }>();
+  const matrixRows = await env.DB.prepare("SELECT origin_zone, destination_zone, rate_per_kg FROM pricing_rate_matrix WHERE version_id = ? AND account_scope = ?").bind(activeVersion.id, account).all<{ origin_zone: string; destination_zone: string; rate_per_kg: number }>();
   const [originPin, destinationPin] = await Promise.all([pricingPincode(env, origin.pincode), pricingPincode(env, destination.pincode)]);
   const originCity = originPin?.facility_city ?? origin.city; const destinationCity = destinationPin?.facility_city ?? destination.city;
   const originState = originPin?.facility_state ?? origin.state; const destinationState = destinationPin?.facility_state ?? destination.state;
@@ -517,7 +552,7 @@ async function createShipmentPricingQuote(env: Env, clientId: string, payload: R
     : fujiyamaLane === "reverse"
       ? Object.fromEntries(Object.entries(FUJIYAMA_REVERSE_RATES).map(([zone, rate]) => [`${zone}->North`, rate]))
       : Object.fromEntries(matrixRows.results.map((row) => [`${row.origin_zone}->${row.destination_zone}`, Number(row.rate_per_kg)]));
-  const result = calculatePssRate({ account, originCity, destinationCity, originState, destinationState, actualWeightKg, volumetricWeightKg, invoiceValue, rto: fujiyamaLane ? false : rto, forwardRatePerKg: fujiyamaLane ? undefined : forwardRatePerKg, forwardOriginZoneOverride: rtoSource?.origin_zone, forwardDestinationZoneOverride: rtoSource?.destination_zone, originZoneOverride: fujiyamaOriginZone ?? undefined, destinationZoneOverride: fujiyamaDestinationZone ?? undefined, minimumWeightKg: Number(version.minimum_weight_kg ?? 20), gstPercent: Number(version.gst_percent ?? 18), versionId: version.id, oda, opa: false, rateMatrix: laneMatrix, chargeRules: fujiyamaRules, riskCharges: fujiyamaLane === "forward" ? [{ code: "rov", label: "ROV", percent: 0.3, minimum: 80 }] : fujiyamaLane === "reverse" ? [{ code: "rov", label: "ROV", percent: 0.2, minimum: 65 }, { code: "owner_risk", label: "Owner risk", percent: 0.1, minimum: 100 }] : [] });
+  const result = calculatePssRate({ account, originCity, destinationCity, originState, destinationState, actualWeightKg, volumetricWeightKg, invoiceValue, rto: fujiyamaLane ? false : rto, forwardRatePerKg: fujiyamaLane ? undefined : forwardRatePerKg, forwardOriginZoneOverride: rtoSource?.origin_zone, forwardDestinationZoneOverride: rtoSource?.destination_zone, originZoneOverride: fujiyamaOriginZone ?? undefined, destinationZoneOverride: fujiyamaDestinationZone ?? undefined, minimumWeightKg: Number(activeVersion.minimum_weight_kg ?? 20), gstPercent: Number(activeVersion.gst_percent ?? 18), versionId: activeVersion.id, oda, opa: false, rateMatrix: laneMatrix, chargeRules: fujiyamaRules, riskCharges: fujiyamaLane === "forward" ? [{ code: "rov", label: "ROV", percent: 0.3, minimum: 80 }] : fujiyamaLane === "reverse" ? [{ code: "rov", label: "ROV", percent: 0.2, minimum: 65 }, { code: "owner_risk", label: "Owner risk", percent: 0.1, minimum: 100 }] : [] });
   if (!fujiyamaLane) {
     const carrierRisk = payload.risk_type === "carrier";
     const riskFee = carrierRisk ? Math.max(80, Math.round(invoiceValue * 0.003 * 100) / 100) : Math.max(50, Math.round(invoiceValue * 0.001 * 100) / 100);
@@ -525,8 +560,8 @@ async function createShipmentPricingQuote(env: Env, clientId: string, payload: R
     result.total = Number(result.total) + riskFee;
   }
   const quoteId = crypto.randomUUID(); const breakdown = JSON.stringify(result);
-  await env.DB.prepare("INSERT INTO pricing_quotes (id, client_id, version_id, account_scope, origin_zone, destination_zone, chargeable_weight_kg, client_breakdown_json, expires_at, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+15 minutes'), ?)").bind(quoteId, clientId, version.id, account, result.originZone, result.destinationZone, result.chargeableWeightKg, breakdown, createdByUserId).run();
-  return { id: quoteId, version_id: version.id, account_scope: account, origin_zone: result.originZone, destination_zone: result.destinationZone, chargeable_weight_kg: result.chargeableWeightKg, client_breakdown_json: breakdown };
+  await env.DB.prepare("INSERT INTO pricing_quotes (id, client_id, version_id, account_scope, origin_zone, destination_zone, chargeable_weight_kg, client_breakdown_json, expires_at, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+15 minutes'), ?)").bind(quoteId, clientId, activeVersion.id, account, result.originZone, result.destinationZone, result.chargeableWeightKg, breakdown, createdByUserId).run();
+  return { id: quoteId, version_id: activeVersion.id, account_scope: account, origin_zone: result.originZone, destination_zone: result.destinationZone, chargeable_weight_kg: result.chargeableWeightKg, client_breakdown_json: breakdown };
 }
 
 type DelhiveryB2bCredential = { username?: string; password?: string; token?: string; jwt?: string };
@@ -3711,9 +3746,10 @@ const worker = {
         const previewOnly = payload.preview_only === true;
         if (!Number.isFinite(actualWeightKg) || actualWeightKg <= 0 || !Number.isFinite(volumetricWeightKg) || volumetricWeightKg < 0 || !Number.isFinite(invoiceValue) || invoiceValue < 0) return error("VALIDATION_ERROR", "Valid weight and invoice values are required", 400, id, headers);
         const version = await env.DB.prepare("SELECT id, minimum_weight_kg, gst_percent FROM pricing_versions WHERE client_id = ? AND provider = 'delhivery' AND service_level = 'b2b' AND status = 'active' AND datetime(effective_at) <= CURRENT_TIMESTAMP ORDER BY datetime(effective_at) DESC LIMIT 1").bind(clientId).first<{ id: string; minimum_weight_kg: number; gst_percent: number }>();
-        if (!version) return error("PRICING_NOT_CONFIGURED", "A published Delhivery B2B PSS rate card is not configured for this client", 409, id, headers);
-        const rules = await env.DB.prepare("SELECT code, label, calculation_type, value, basis, minimum_value, maximum_value, enabled, marker, condition, display_order FROM pricing_charge_rules WHERE version_id = ? ORDER BY display_order ASC, code ASC").bind(version.id).all<{ code: string; label: string; calculation_type: ChargeRule["kind"]; value: number; basis: ChargeRule["basis"]; minimum_value: number | null; maximum_value: number | null; enabled: number; marker: "*" | null; condition: "oda_or_opa" | null; display_order: number }>();
-        const matrixRows = await env.DB.prepare("SELECT origin_zone, destination_zone, rate_per_kg FROM pricing_rate_matrix WHERE version_id = ? AND account_scope = ?").bind(version.id, account).all<{ origin_zone: string; destination_zone: string; rate_per_kg: number }>();
+        const activeVersion = version ?? await ensureDefaultClientPricing(env, clientId, auth.userId ?? `api:${clientId}`);
+        if (!activeVersion) return error("PRICING_NOT_CONFIGURED", "A published Delhivery B2B PSS rate card is not configured for this client", 409, id, headers);
+        const rules = await env.DB.prepare("SELECT code, label, calculation_type, value, basis, minimum_value, maximum_value, enabled, marker, condition, display_order FROM pricing_charge_rules WHERE version_id = ? ORDER BY display_order ASC, code ASC").bind(activeVersion.id).all<{ code: string; label: string; calculation_type: ChargeRule["kind"]; value: number; basis: ChargeRule["basis"]; minimum_value: number | null; maximum_value: number | null; enabled: number; marker: "*" | null; condition: "oda_or_opa" | null; display_order: number }>();
+        const matrixRows = await env.DB.prepare("SELECT origin_zone, destination_zone, rate_per_kg FROM pricing_rate_matrix WHERE version_id = ? AND account_scope = ?").bind(activeVersion.id, account).all<{ origin_zone: string; destination_zone: string; rate_per_kg: number }>();
         const rateMatrix = Object.fromEntries(matrixRows.results.map((row) => [`${row.origin_zone}->${row.destination_zone}`, Number(row.rate_per_kg)]));
         const [originPin, destinationPin] = await Promise.all([pricingPincode(env, originPincode), pricingPincode(env, destinationPincode)]);
         if (!originPin || !destinationPin) return error("PINCODE_NOT_FOUND", "One or both pincodes are not present in the active Delhivery B2B dataset", 404, id, headers);
@@ -3727,7 +3763,7 @@ const worker = {
           if (forwardRatePerKg === undefined) return error("RTO_SOURCE_INVALID", "The original shipment pricing snapshot is invalid", 409, id, headers);
         }
          const oda = Boolean(originPin.oda || destinationPin.oda);
-         const result = calculatePssRate({ account, originCity: originPin.facility_city, destinationCity: destinationPin.facility_city, originState: originPin.facility_state, destinationState: destinationPin.facility_state, actualWeightKg, volumetricWeightKg, invoiceValue, rto, forwardRatePerKg, forwardOriginZoneOverride: rtoSource?.origin_zone, forwardDestinationZoneOverride: rtoSource?.destination_zone, minimumWeightKg: Number(version.minimum_weight_kg ?? 20), gstPercent: Number(version.gst_percent ?? 18), versionId: version.id, oda, opa: false, rateMatrix, riskCharges: [], chargeRules: rules.results.map((rule) => ({ code: rule.code, label: rule.label, kind: rule.calculation_type, value: Number(rule.value), basis: rule.basis, minimum: rule.minimum_value === null ? undefined : Number(rule.minimum_value), maximum: rule.maximum_value === null ? undefined : Number(rule.maximum_value), enabled: Boolean(rule.enabled), marker: rule.marker ?? undefined, condition: rule.condition ?? undefined, displayOrder: Number(rule.display_order ?? 0) })) });
+         const result = calculatePssRate({ account, originCity: originPin.facility_city, destinationCity: destinationPin.facility_city, originState: originPin.facility_state, destinationState: destinationPin.facility_state, actualWeightKg, volumetricWeightKg, invoiceValue, rto, forwardRatePerKg, forwardOriginZoneOverride: rtoSource?.origin_zone, forwardDestinationZoneOverride: rtoSource?.destination_zone, minimumWeightKg: Number(activeVersion.minimum_weight_kg ?? 20), gstPercent: Number(activeVersion.gst_percent ?? 18), versionId: activeVersion.id, oda, opa: false, rateMatrix, riskCharges: [], chargeRules: rules.results.map((rule) => ({ code: rule.code, label: rule.label, kind: rule.calculation_type, value: Number(rule.value), basis: rule.basis, minimum: rule.minimum_value === null ? undefined : Number(rule.minimum_value), maximum: rule.maximum_value === null ? undefined : Number(rule.maximum_value), enabled: Boolean(rule.enabled), marker: rule.marker ?? undefined, condition: rule.condition ?? undefined, displayOrder: Number(rule.display_order ?? 0) })) });
         const carrierRisk = payload.risk_type === "carrier";
         const riskFee = carrierRisk
           ? Math.max(80, Math.round(invoiceValue * 0.003 * 100) / 100)
@@ -3736,7 +3772,7 @@ const worker = {
         result.total = Number(result.total) + riskFee;
         if (previewOnly) return json({ ok: true, data: { quote_id: null, provider: "delhivery", service_level: "b2b", client_id: clientId, provider_account_id: typeof payload.provider_account_id === "string" ? payload.provider_account_id : null, provider_account_name: selectedProviderAccountName || null, account_code: account, ...result } }, 200, headers);
         const quoteId = crypto.randomUUID();
-        await env.DB.prepare("INSERT INTO pricing_quotes (id, client_id, version_id, account_scope, origin_zone, destination_zone, chargeable_weight_kg, client_breakdown_json, expires_at, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+15 minutes'), ?)").bind(quoteId, clientId, version.id, account, result.originZone, result.destinationZone, result.chargeableWeightKg, JSON.stringify(result), auth.userId ?? `api:${clientId}`).run();
+        await env.DB.prepare("INSERT INTO pricing_quotes (id, client_id, version_id, account_scope, origin_zone, destination_zone, chargeable_weight_kg, client_breakdown_json, expires_at, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+15 minutes'), ?)").bind(quoteId, clientId, activeVersion.id, account, result.originZone, result.destinationZone, result.chargeableWeightKg, JSON.stringify(result), auth.userId ?? `api:${clientId}`).run();
         return json({ ok: true, data: { quote_id: quoteId, provider: "delhivery", service_level: "b2b", client_id: clientId, ...result } }, 200, headers);
       }
       if (route === "/pricing/assigned" && request.method === "GET") {
@@ -3744,12 +3780,13 @@ const worker = {
         const clientId = requireClient(auth, null);
         if (!clientId || !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
         const version = await env.DB.prepare("SELECT id, status, effective_at, minimum_weight_kg, volumetric_divisor, gst_percent FROM pricing_versions WHERE client_id = ? AND provider = 'delhivery' AND service_level = 'b2b' AND status = 'active' AND datetime(effective_at) <= CURRENT_TIMESTAMP ORDER BY datetime(effective_at) DESC LIMIT 1").bind(clientId).first();
-        if (!version) return error("PRICING_NOT_CONFIGURED", "A published PSS rate card is not configured for this client", 409, id, headers);
+        const activeVersion = version ?? await ensureDefaultClientPricing(env, clientId, auth.userId ?? `client:${clientId}`);
+        if (!activeVersion) return error("PRICING_NOT_CONFIGURED", "A published PSS rate card is not configured for this client", 409, id, headers);
         const [matrixRows, chargeRules] = await Promise.all([
-          env.DB.prepare("SELECT origin_zone, destination_zone, rate_per_kg FROM pricing_rate_matrix WHERE version_id = ? AND account_scope = 'other' ORDER BY origin_zone, destination_zone").bind((version as Record<string, unknown>).id).all(),
-          env.DB.prepare("SELECT code, label, calculation_type, value, basis, minimum_value, maximum_value, enabled, marker FROM pricing_charge_rules WHERE version_id = ? ORDER BY display_order, code").bind((version as Record<string, unknown>).id).all(),
+          env.DB.prepare("SELECT origin_zone, destination_zone, rate_per_kg FROM pricing_rate_matrix WHERE version_id = ? AND account_scope = 'other' ORDER BY origin_zone, destination_zone").bind((activeVersion as Record<string, unknown>).id).all(),
+          env.DB.prepare("SELECT code, label, calculation_type, value, basis, minimum_value, maximum_value, enabled, marker FROM pricing_charge_rules WHERE version_id = ? ORDER BY display_order, code").bind((activeVersion as Record<string, unknown>).id).all(),
         ]);
-        return json({ ok: true, data: { version, rate_matrices: { other: matrixRows.results }, charge_rules: chargeRules.results } }, 200, headers);
+        return json({ ok: true, data: { version: activeVersion, rate_matrices: { other: matrixRows.results }, charge_rules: chargeRules.results } }, 200, headers);
       }
       if (route === "/pricing/versions" && request.method === "GET") {
         if (!hasScope(auth, "pricing.read")) return error("FORBIDDEN", "Pricing view permission required", 403, id, headers);
