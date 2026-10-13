@@ -1090,20 +1090,13 @@ function delhiveryPickupPayload(env: Env, payload: Record<string, unknown>, useD
   const normalizeTime = (value: string | undefined) => (value ?? "").split(":").map((part) => part.padStart(2, "0")).slice(0, 3).concat(["00", "00"]).slice(0, 3).join(":");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(pickupDate)) return null;
   if (useDelhiveryB2b) {
-    const awbValue = payload.awb_number ?? payload.master_awb ?? payload.provider_reference ?? payload.tracking_number;
-    const awbNumbers = normalizePickupAwbNumbers(awbValue);
-    const facilityId = String(payload.provider_facility_id ?? payload.facility_id ?? "").trim();
-    const facilityCode = String(payload.provider_facility_code ?? payload.facility_code ?? "").trim();
-    if (!facilityId || !facilityCode || !awbNumbers.length) return null;
+    const startTime = normalizeTime(times[0]);
+    if (!pickupLocation || !startTime) return null;
     return {
-      facility_id: facilityId,
-      facility_code: facilityCode,
+      client_warehouse: pickupLocation,
       pickup_date: pickupDate,
-      start_time: normalizeTime(times[0]),
-      end_time: normalizeTime(times[1] ?? times[0]),
-      awb_number: awbNumbers,
-      expected_package_count: Math.max(1, Number(payload.expected_package_count ?? payload.package_count ?? payload.pieces ?? awbNumbers.length ?? 1)),
-      pincode: String(payload.pincode ?? "").trim() || undefined,
+      start_time: startTime,
+      expected_package_count: Math.max(1, Number(payload.expected_package_count ?? payload.package_count ?? payload.pieces ?? 1)),
     };
   }
   if (!pickupLocation) return null;
@@ -1700,7 +1693,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     }
   }
   let delhiveryFacility: DelhiveryFacility | null = null;
-  if (provider === "delhivery" && useDelhiveryB2b && clientId && delhiveryB2bToken && ["pickups", "pickup_slots"].includes(operation)) {
+  if (provider === "delhivery" && useDelhiveryB2b && clientId && delhiveryB2bToken && operation === "pickup_slots") {
     let facility = await resolveDelhiveryFacility(env, delhiveryB2bToken, base, clientId, providerPayload, requestIdValue, providerTimeoutMs);
     if (!facility.ok && /\b401\b|invalid token|unauthorized|token decode|not enough segments/i.test(facility.error)) {
       const refreshedToken = await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs, true);
@@ -1741,7 +1734,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     : provider === "delhivery" && operation === "shipments"
       ? useDelhiveryB2b ? `${base.replace(/\/$/, "")}/manifest` : `${delhiveryOrigin}/api/cmu/create.json`
        : provider === "delhivery" && operation === "pickups"
-         ? useDelhiveryB2b ? `${base.replace(/\/$/, "")}/v2/web/api/orders/pickup_request` : "https://track.delhivery.com/fm/request/new/"
+         ? useDelhiveryB2b ? `${base.replace(/\/$/, "")}/pickup_requests/` : "https://track.delhivery.com/fm/request/new/"
        : provider === "delhivery" && operation === "pickup_slots"
          ? `${base.replace(/\/$/, "")}/web/api/forward_orders/pickup_slots/${encodeURIComponent(String(delhiveryFacility?.code ?? ""))}?facility_id=${encodeURIComponent(String(delhiveryFacility?.id ?? ""))}`
         : provider === "delhivery" && operation === "serviceability"
