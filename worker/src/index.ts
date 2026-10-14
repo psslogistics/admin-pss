@@ -721,6 +721,23 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
     .bind(clientId, origin.line, origin.city, origin.pincode, providerAccountId ?? "")
     .first<{ id: string; name: string; provider_status: string | null; provider_account_id: string | null }>();
   const name = existing?.name?.trim() || delhiveryWarehouseName(origin);
+  // Reuse the provider's canonical warehouse whenever it already exists.
+  // Creation is only allowed after a genuine provider-side "not found"; this
+  // keeps every address/account on the same generic path without duplicates.
+  const existingFacility = await resolveDelhiveryFacility(env, token, b2bBaseUrl, clientId, { delhivery_pickup_location: name, pincode: origin.pincode }, requestIdValue, timeoutMs);
+  if (existingFacility.ok) {
+    if (existing) {
+      await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_reference = ?, provider_status = 'active', status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+        .bind(providerAccountId ?? null, existingFacility.facility.id, existing.id, clientId).run();
+    } else {
+      await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, pincode, contact, provider, provider_account_id, provider_status, provider_reference) VALUES (?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'active', ?)")
+        .bind(crypto.randomUUID(), clientId, existingFacility.facility.name || name, origin.line, origin.city, origin.pincode, origin.phone, providerAccountId ?? null, existingFacility.facility.id).run();
+    }
+    return { ok: true as const, name: existingFacility.facility.name || name, reused: true as const };
+  }
+  if (!/not active or could not be resolved/i.test(existingFacility.error)) {
+    return { ok: false as const, error: existingFacility.error };
+  }
   // Delhivery B2B manifestation validates this against the B2B warehouse
   // registry. A local PSS warehouse row is not proof that the provider knows
   // the location, so always make the provider-side create call when booking.
