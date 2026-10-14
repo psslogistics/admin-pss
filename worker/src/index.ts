@@ -3620,7 +3620,12 @@ const worker = {
         const recordId = crypto.randomUUID();
         if (route === "/warehouses") {
           if (typeof payload.name !== "string" || typeof payload.address !== "string") return error("VALIDATION_ERROR", "Warehouse name and address are required", 400, id, headers);
-          await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, pincode, contact) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(recordId, clientId, payload.name, payload.address, String(payload.city ?? ""), String(payload.pincode ?? ""), String(payload.contact ?? "")).run();
+          const providerAccountId = typeof payload.provider_account_id === "string" && payload.provider_account_id.trim() ? payload.provider_account_id.trim() : null;
+          if (providerAccountId) {
+            const account = await env.DB.prepare("SELECT pa.id FROM provider_accounts pa LEFT JOIN provider_account_client_policies p ON p.provider_account_id = pa.id AND p.client_id = ? WHERE pa.id = ? AND pa.provider = 'delhivery' AND pa.status = 'active' AND (pa.client_id = ? OR (pa.client_id IS NULL AND p.client_id = ? AND p.enabled = 1)) LIMIT 1").bind(clientId, providerAccountId, clientId, clientId).first<{ id: string }>();
+            if (!account) return error("PROVIDER_ACCOUNT_NOT_ALLOWED", "The selected Delhivery account is not enabled for this client", 403, id, headers);
+          }
+          await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, pincode, contact, provider, provider_account_id, provider_status) VALUES (?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, NULL)").bind(recordId, clientId, payload.name, payload.address, String(payload.city ?? ""), String(payload.pincode ?? ""), String(payload.contact ?? ""), providerAccountId).run();
         } else {
           if (typeof payload.label !== "string" || typeof payload.address !== "string") return error("VALIDATION_ERROR", "Address label and address are required", 400, id, headers);
           const addressKind = payload.address_kind === "consignee" ? "consignee" : "consignor";
