@@ -1661,7 +1661,10 @@ function providerOdaFlag(value: Record<string, unknown> | null | undefined): boo
 
 async function providerRequest(env: Env, provider: CourierProvider, operation: string, payload: Record<string, unknown>, requestIdValue: string, clientId?: string, idempotencyKey?: string, timeoutMsOverride?: number) {
   if (String(env.ENABLE_PROVIDER_CALLS) !== "true") return { enabled: false, status: "disabled" as const };
-  const trackingNumber = String(payload.tracking_number ?? payload.provider_reference ?? "").trim();
+  // B2B Delhivery tracks by LR number. Historical Fujiyama imports stored the
+  // same value in tracking_number, but new bookings can also have a provider
+  // reference or master AWB. Prefer the explicit LR whenever one is present.
+  const trackingNumber = String(payload.lr_number ?? payload.tracking_number ?? payload.provider_reference ?? "").trim();
   if (["tracking", "labels", "lr_copy", "document"].includes(operation) && !trackingNumber) return { enabled: false, status: "invalid_request" as const, reason: "A provider tracking reference is required" };
   if (provider === "delhivery" && operation === "shipments" && String(env.DELHIVERY_ENABLE_SHIPMENT_CREATION) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "Delhivery shipment creation is safety-disabled until live billing approval" };
   if (provider === "delhivery" && operation === "pickups" && String(env.DELHIVERY_ENABLE_PICKUP_CREATION) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "Delhivery pickup creation is safety-disabled until live operations approval" };
@@ -1985,6 +1988,11 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   const providerFailureDetail = !response.ok ? responseBody.replace(/\s+/g, " ").trim().slice(0, 300) : null;
   await env.DB.prepare("UPDATE integration_requests SET status = ?, error_code = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(response.ok ? "succeeded" : "failed", response.ok ? null : `HTTP_${response.status}`, response.ok ? null : `${lastError}${providerFailureDetail ? `: ${providerFailureDetail}` : ""}`.slice(0, 500), integrationId).run();
   let normalizedTracking: NormalizedProviderTracking | null = null;
+  if (operation === "tracking" && clientId && typeof payload.shipment_id === "string") {
+    const syncError = response.ok ? null : `${lastError}${providerFailureDetail ? `: ${providerFailureDetail}` : ""}`.slice(0, 500);
+    await env.DB.prepare("UPDATE shipments SET provider_last_attempt_at = CURRENT_TIMESTAMP, provider_last_error_code = ?, provider_last_error_message = ?, provider_last_success_at = CASE WHEN ? IS NULL THEN CURRENT_TIMESTAMP ELSE provider_last_success_at END WHERE id = ? AND client_id = ?")
+      .bind(response.ok ? null : `HTTP_${response.status}`, syncError, syncError, payload.shipment_id, clientId).run();
+  }
   if (response.ok && operation === "tracking") {
     try { normalizedTracking = normalizeProviderTracking(JSON.parse(responseBody)); } catch { normalizedTracking = null; }
     if (normalizedTracking && clientId && typeof payload.shipment_id === "string") {
@@ -2458,28 +2466,30 @@ async function handleDelhiveryDocumentWebhook(request: Request, env: Env, reques
 }
 
 async function refreshFujiyamaDelhivery(env: Env, cron: string) {
-  const active = await env.DB.prepare("SELECT id, client_id, tracking_number, provider_reference, provider_account_id FROM shipments WHERE client_id = ? AND provider = 'delhivery' AND provider_account_id = ? AND tracking_number IS NOT NULL AND tracking_number <> '' AND status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery', 'exception', 'rto') ORDER BY updated_at ASC LIMIT 50").bind(FUJIYAMA_CLIENT_ID, FUJIYAMA_DELHIVERY_ACCOUNT_ID).all<{ id: string; client_id: string; tracking_number: string; provider_reference: string | null; provider_account_id: string }>();
-  const delivered = await env.DB.prepare("SELECT id, client_id, tracking_number, provider_reference, provider_account_id FROM shipments WHERE client_id = ? AND provider = 'delhivery' AND provider_account_id = ? AND tracking_number IS NOT NULL AND tracking_number <> '' AND status = 'delivered' ORDER BY updated_at ASC LIMIT 50").bind(FUJIYAMA_CLIENT_ID, FUJIYAMA_DELHIVERY_ACCOUNT_ID).all<{ id: string; client_id: string; tracking_number: string; provider_reference: string | null; provider_account_id: string }>();
+  const columns = "id, client_id, tracking_number, lr_number, provider_reference, provider_account_id";
+  const order = "ORDER BY CASE WHEN provider_last_attempt_at IS NULL THEN 0 ELSE 1 END, provider_last_attempt_at ASC, updated_at ASC LIMIT 50";
+  const active = await env.DB.prepare(`SELECT ${columns} FROM shipments WHERE client_id = ? AND provider = 'delhivery' AND provider_account_id = ? AND COALESCE(lr_number, tracking_number, provider_reference) IS NOT NULL AND status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery', 'exception', 'rto') ${order}`).bind(FUJIYAMA_CLIENT_ID, FUJIYAMA_DELHIVERY_ACCOUNT_ID).all<{ id: string; client_id: string; tracking_number: string; lr_number: string | null; provider_reference: string | null; provider_account_id: string }>();
+  const delivered = await env.DB.prepare(`SELECT ${columns} FROM shipments WHERE client_id = ? AND provider = 'delhivery' AND provider_account_id = ? AND COALESCE(lr_number, tracking_number, provider_reference) IS NOT NULL AND status = 'delivered' ${order}`).bind(FUJIYAMA_CLIENT_ID, FUJIYAMA_DELHIVERY_ACCOUNT_ID).all<{ id: string; client_id: string; tracking_number: string; lr_number: string | null; provider_reference: string | null; provider_account_id: string }>();
   const refreshRows = [...active.results, ...delivered.results];
   let trackingSucceeded = 0;
   let trackingFailed = 0;
   for (let index = 0; index < refreshRows.length; index += 5) {
     const batch = refreshRows.slice(index, index + 5);
     const results = await Promise.all(batch.map(async (shipment) => {
-      const result = await safeProviderRequest(env, "delhivery", "tracking", { shipment_id: shipment.id, tracking_number: shipment.tracking_number, provider_reference: shipment.provider_reference, provider_account_id: shipment.provider_account_id }, `cron:${cron}:fujiyama:tracking:${shipment.id}`, shipment.client_id, undefined, 10000);
+      const result = await safeProviderRequest(env, "delhivery", "tracking", { shipment_id: shipment.id, tracking_number: shipment.tracking_number, lr_number: shipment.lr_number, provider_reference: shipment.provider_reference, provider_account_id: shipment.provider_account_id }, `cron:${cron}:fujiyama:tracking:${shipment.id}`, shipment.client_id, undefined, 10000);
       return result.status === "accepted";
     }));
     trackingSucceeded += results.filter(Boolean).length;
     trackingFailed += results.filter((value) => !value).length;
   }
 
-  const podCandidates = await env.DB.prepare("SELECT s.id, s.client_id, s.tracking_number, s.provider_reference, s.provider_account_id FROM shipments s WHERE s.client_id = ? AND s.provider = 'delhivery' AND s.provider_account_id = ? AND s.status = 'delivered' AND s.tracking_number IS NOT NULL AND s.tracking_number <> '' AND NOT EXISTS (SELECT 1 FROM shipment_documents d WHERE d.shipment_id = s.id AND lower(d.original_filename) LIKE 'delhivery-pod-%') ORDER BY s.updated_at ASC LIMIT 20").bind(FUJIYAMA_CLIENT_ID, FUJIYAMA_DELHIVERY_ACCOUNT_ID).all<{ id: string; client_id: string; tracking_number: string; provider_reference: string | null; provider_account_id: string }>();
+  const podCandidates = await env.DB.prepare("SELECT s.id, s.client_id, s.tracking_number, s.lr_number, s.provider_reference, s.provider_account_id FROM shipments s WHERE s.client_id = ? AND s.provider = 'delhivery' AND s.provider_account_id = ? AND s.status = 'delivered' AND COALESCE(s.lr_number, s.tracking_number, s.provider_reference) IS NOT NULL AND NOT EXISTS (SELECT 1 FROM shipment_documents d WHERE d.shipment_id = s.id AND lower(d.original_filename) LIKE 'delhivery-pod-%') ORDER BY s.updated_at ASC LIMIT 20").bind(FUJIYAMA_CLIENT_ID, FUJIYAMA_DELHIVERY_ACCOUNT_ID).all<{ id: string; client_id: string; tracking_number: string; lr_number: string | null; provider_reference: string | null; provider_account_id: string }>();
   let podSucceeded = 0;
   let podFailed = 0;
   for (let index = 0; index < podCandidates.results.length; index += 3) {
     const batch = podCandidates.results.slice(index, index + 3);
     const results = await Promise.all(batch.map(async (shipment) => {
-      const result = await safeProviderRequest(env, "delhivery", "document", { shipment_id: shipment.id, tracking_number: shipment.tracking_number, provider_reference: shipment.provider_reference, provider_account_id: shipment.provider_account_id, doc_type: "LM_POD" }, `cron:${cron}:fujiyama:pod:${shipment.id}`, shipment.client_id, undefined, 15000);
+      const result = await safeProviderRequest(env, "delhivery", "document", { shipment_id: shipment.id, tracking_number: shipment.tracking_number, lr_number: shipment.lr_number, provider_reference: shipment.provider_reference, provider_account_id: shipment.provider_account_id, doc_type: "LM_POD" }, `cron:${cron}:fujiyama:pod:${shipment.id}`, shipment.client_id, undefined, 15000);
       return result.status === "accepted";
     }));
     podSucceeded += results.filter(Boolean).length;
@@ -2500,14 +2510,14 @@ const worker = {
       if (await publicRateLimited(env, request, "/public/track")) return error("RATE_LIMITED", "Too many tracking requests", 429, id, withCors(request, env));
       const reference = url.searchParams.get("reference")?.trim();
       if (!reference || reference.length > 128) return error("VALIDATION_ERROR", "A tracking reference is required", 400, id, withCors(request, env));
-      type PublicShipment = { id: string; tracking_number: string | null; provider_reference: string | null; provider: string | null; provider_account_id: string | null; status: string; edd: string | null; delivered_at: string | null; updated_at: string | null };
+      type PublicShipment = { id: string; tracking_number: string | null; lr_number: string | null; provider_reference: string | null; provider: string | null; provider_account_id: string | null; status: string; edd: string | null; delivered_at: string | null; updated_at: string | null };
       // Resolve PSS, courier, and provider references in one indexed read so
       // public tracking does not pay for up to three sequential D1 round trips.
-      const shipment = await env.DB.prepare("SELECT id, tracking_number, provider_reference, provider, provider_account_id, status, edd, delivered_at, updated_at FROM shipments WHERE id = ? OR tracking_number = ? OR provider_reference = ? LIMIT 1").bind(reference, reference, reference).first<PublicShipment>();
+      const shipment = await env.DB.prepare("SELECT id, tracking_number, lr_number, provider_reference, provider, provider_account_id, status, edd, delivered_at, updated_at FROM shipments WHERE id = ? OR tracking_number = ? OR lr_number = ? OR provider_reference = ? LIMIT 1").bind(reference, reference, reference, reference).first<PublicShipment>();
       if (shipment) {
         const events = await env.DB.prepare("SELECT status, location, description, event_time FROM tracking_events WHERE shipment_id = ? ORDER BY event_time ASC LIMIT 20").bind(shipment.id).all();
         if (shipment.provider === "delhivery" && shipment.provider_account_id) {
-          const providerResult = await safeProviderRequest(env, "delhivery", "tracking", { shipment_id: shipment.id, tracking_number: shipment.tracking_number, provider_reference: shipment.provider_reference, provider_account_id: shipment.provider_account_id }, id, undefined, undefined, 5000);
+          const providerResult = await safeProviderRequest(env, "delhivery", "tracking", { shipment_id: shipment.id, tracking_number: shipment.tracking_number, lr_number: shipment.lr_number, provider_reference: shipment.provider_reference, provider_account_id: shipment.provider_account_id }, id, undefined, undefined, 5000);
           const tracking = (providerResult as { tracking?: { status?: string; location?: string; description?: string; event_time?: string | null } }).tracking;
           if (providerResult.status === "accepted" && tracking?.status) {
             return json({ ok: true, data: { tracking_number: shipment.tracking_number ?? shipment.provider_reference, status: tracking.status, edd: shipment.edd, delivered_at: tracking.status === "delivered" ? tracking.event_time ?? null : shipment.delivered_at, updated_at: tracking.event_time ?? shipment.updated_at, events: [{ status: tracking.status, location: tracking.location ?? "", description: tracking.description ?? "", event_time: tracking.event_time ?? null }] }, provider: "delhivery", provider_status: providerResult.status, request_id: id }, 200, withCors(request, env, { "cache-control": "private, no-store" }));
@@ -2617,7 +2627,7 @@ const worker = {
         if (!awb || awb.length > 128) return error("VALIDATION_ERROR", "A valid AWB is required", 400, id, headers);
         if (trackingType !== "VENDOR-AWB") return error("VALIDATION_ERROR", "trackingType must be VENDOR-AWB", 400, id, headers);
         const shipment = auth.clientId
-          ? await env.DB.prepare("SELECT id, tracking_number, provider_reference, provider_account_id, status, provider, destination, edd, delivered_at FROM shipments WHERE client_id = ? AND (tracking_number = ? OR provider_reference = ?) ORDER BY updated_at DESC LIMIT 1").bind(auth.clientId, awb, awb).first<{ id: string; tracking_number: string | null; provider_reference: string | null; provider_account_id: string | null; status: string | null; provider: string | null; destination: string | null; edd: string | null; delivered_at: string | null }>()
+          ? await env.DB.prepare("SELECT id, tracking_number, lr_number, provider_reference, provider_account_id, status, provider, destination, edd, delivered_at FROM shipments WHERE client_id = ? AND (tracking_number = ? OR lr_number = ? OR provider_reference = ?) ORDER BY updated_at DESC LIMIT 1").bind(auth.clientId, awb, awb, awb).first<{ id: string; tracking_number: string | null; lr_number: string | null; provider_reference: string | null; provider_account_id: string | null; status: string | null; provider: string | null; destination: string | null; edd: string | null; delivered_at: string | null }>()
           : null;
         if (!shipment) {
           const assignedAccounts = await env.DB.prepare(`
@@ -2633,7 +2643,7 @@ const worker = {
             LIMIT 20`).bind(auth.clientId, auth.clientId).all<{ id: string }>();
           const directResults = await Promise.all(assignedAccounts.results.map(async (account) => {
             try {
-              const providerResult = await safeProviderRequest(env, "delhivery", "tracking", { tracking_number: awb, provider_account_id: account.id }, id, auth.clientId ?? undefined, undefined, 5000);
+              const providerResult = await safeProviderRequest(env, "delhivery", "tracking", { tracking_number: awb, lr_number: awb, provider_account_id: account.id }, id, auth.clientId ?? undefined, undefined, 5000);
               const tracking = (providerResult as { tracking?: { status?: string; location?: string; description?: string; event_time?: string | null } }).tracking;
               return { status: String(providerResult.status), tracking };
             } catch { return { status: "failed", tracking: undefined }; }
@@ -2660,6 +2670,7 @@ const worker = {
           ? await safeProviderRequest(env, "delhivery", "tracking", {
               shipment_id: shipment.id,
               tracking_number: shipment.tracking_number ?? awb,
+              lr_number: shipment.lr_number ?? awb,
               provider_reference: shipment.provider_reference ?? awb,
               provider_account_id: shipment.provider_account_id ?? undefined,
             }, id, auth.clientId, undefined, 5000)
@@ -3096,7 +3107,7 @@ const worker = {
         // Delhivery's B2B label endpoint validates its path parameter as an
         // active LR number (LRN), not the master AWB. LR copy/document also
         // use the LR number. Keep the PUR and master AWB out of these paths.
-        const providerReference = shipment.tracking_number ?? shipment.lr_number ?? shipment.provider_reference;
+        const providerReference = shipment.lr_number ?? shipment.tracking_number ?? shipment.provider_reference;
         if (!providerReference) return error("PROVIDER_REFERENCE_UNAVAILABLE", "The Delhivery LR/AWB is not available yet; the PUR cannot be used for downloads", 409, id, headers);
         const payload = { shipment_id: shipment.id, tracking_number: providerReference, provider_reference: providerReference, provider_account_id: shipment.provider_account_id, label_size: requestedSize, boxes: Math.max(1, Number(shipment.pieces ?? 1)), lr_copy_type: url.searchParams.get("lr_copy_type") ?? undefined, doc_type: url.searchParams.get("doc_type") ?? "LM_POD" };
         const providerResult = await safeProviderRequest(env, "delhivery", operation, payload, id, shipment.client_id);
@@ -3120,7 +3131,7 @@ const worker = {
           const providerAccountId = typeof shipment.provider_account_id === "string"
             ? shipment.provider_account_id
             : (await env.DB.prepare("SELECT provider_account_id FROM shipments WHERE id = ? LIMIT 1").bind(String(shipment.id)).first<{ provider_account_id: string | null }>())?.provider_account_id ?? null;
-          const providerResult = provider ? await safeProviderRequest(env, provider, "tracking", { shipment_id: String(shipment.id), tracking_number: shipment.tracking_number, provider_reference: shipment.provider_reference, provider_account_id: providerAccountId }, id, shipment.client_id) : { enabled: false, status: "not_requested" as const };
+          const providerResult = provider ? await safeProviderRequest(env, provider, "tracking", { shipment_id: String(shipment.id), tracking_number: shipment.tracking_number, lr_number: shipment.lr_number, provider_reference: shipment.provider_reference, provider_account_id: providerAccountId }, id, shipment.client_id) : { enabled: false, status: "not_requested" as const };
           return json({ ok: true, data: events.results, provider_status: providerResult.status }, 200, headers);
         }
         const clientName = auth.accessToken
