@@ -781,8 +781,14 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   // activated by its FMS team. Never treat an HTTP success from the create
   // endpoint as proof that manifestation is allowed: verify the provider's
   // active facility list before booking.
-  await new Promise((resolve) => setTimeout(resolve, 1500));
-  const facility = await resolveDelhiveryFacility(env, token, b2bBaseUrl, clientId, { delhivery_pickup_location: name, pincode: origin.pincode }, requestIdValue, timeoutMs);
+  // Delhivery acknowledges warehouse registration before its facility-search
+  // index catches up. Verify repeatedly so a valid active warehouse is not
+  // reported as inactive during that propagation window.
+  let facility = await resolveDelhiveryFacility(env, token, b2bBaseUrl, clientId, { delhivery_pickup_location: name, pincode: origin.pincode }, requestIdValue, timeoutMs);
+  for (let attempt = 1; !facility.ok && attempt < 5; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 1500 * attempt));
+    facility = await resolveDelhiveryFacility(env, token, b2bBaseUrl, clientId, { delhivery_pickup_location: name, pincode: origin.pincode }, requestIdValue, timeoutMs);
+  }
   if (!facility.ok) {
     return { ok: false as const, error: `Delhivery warehouse '${name}' is registered but not active yet. Activate it with your Delhivery account POC, then retry booking.` };
   }
@@ -847,11 +853,12 @@ async function resolveDelhiveryFacility(
   const normalizedName = name.toLowerCase().replace(/[^a-z0-9]/g, "");
   const findMatch = (rows: Record<string, unknown>[]) => rows.find((row) => {
     const rowStatus = String(row.status ?? row.facility_status ?? row.state ?? "ACTIVE").toLowerCase();
-    if (["inactive", "disabled", "deleted", "deactivated"].includes(rowStatus)) return false;
+    const activeFlag = row.is_active ?? row.active ?? row.enabled ?? row.is_enabled;
+    if (["inactive", "disabled", "deleted", "deactivated"].includes(rowStatus) || activeFlag === false || activeFlag === 0 || String(activeFlag).toLowerCase() === "false") return false;
     const rowPin = delhiveryFacilityField(row, ["pincode", "pin_code", "postal_code"]);
     const rowName = delhiveryFacilityField(row, ["facility_name", "name", "client_warehouse_name", "warehouse_name"]);
     const nameMatches = !normalizedName || rowName.toLowerCase().replace(/[^a-z0-9]/g, "").includes(normalizedName) || normalizedName.includes(rowName.toLowerCase().replace(/[^a-z0-9]/g, ""));
-    return nameMatches && (!pincode || !rowPin || rowPin === pincode);
+    return nameMatches && (!pincode || !rowPin || rowPin.replace(/\D/g, "") === pincode.replace(/\D/g, ""));
   });
   const lookupBodies = [
     { page: 1, page_size: 50, search_term: name, search_on: ["facility_name"], ...(name ? { filter_facility_name: [name] } : {}) },
@@ -867,6 +874,10 @@ async function resolveDelhiveryFacility(
       // the same request shape for accounts whose API ignores search_on.
       { page: 1, page_size: 100, search_term: pincode },
     ] : []),
+    // As a final bounded fallback, fetch the first page and match locally.
+    // This covers accounts whose search endpoint returns an empty result while
+    // the console still exposes the active facility.
+    { page: 1, page_size: 100 },
   ];
   let match: Record<string, unknown> | undefined;
   for (const body of lookupBodies) {
