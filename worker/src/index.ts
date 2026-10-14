@@ -858,7 +858,12 @@ async function resolveDelhiveryFacility(
     { page: 1, page_size: 100, search_term: name, search_on: ["facility_name"] },
     // Some Delhivery accounts index newly-created facilities by pincode before
     // their facility-name search becomes consistent.
-    ...(pincode ? [{ page: 1, page_size: 100, search_term: pincode, search_on: ["pincode"] }] : []),
+    ...(pincode ? [
+      { page: 1, page_size: 100, search_term: pincode, search_on: ["pincode"] },
+      // The web console searches this field without sending search_on. Keep
+      // the same request shape for accounts whose API ignores search_on.
+      { page: 1, page_size: 100, search_term: pincode },
+    ] : []),
   ];
   let match: Record<string, unknown> | undefined;
   for (const body of lookupBodies) {
