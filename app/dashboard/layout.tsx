@@ -12,5 +12,5 @@ export default async function DashboardLayout({ children }: { children: React.Re
     workspace: actor.employee?.workspace_slug || "",
     role: actor.roles.filter((item) => item.is_active && item.role).map((item) => item.role?.role_code || item.role?.scope).filter(Boolean).join(" · ") || "Employee",
   };
-  return <EmployeeProvider initialIdentity={initialIdentity}><EmployeeShell>{children}</EmployeeShell></EmployeeProvider>;
+  return <EmployeeProvider initialIdentity={initialIdentity} initialPermissions={actor.permissions}><EmployeeShell>{children}</EmployeeShell></EmployeeProvider>;
 }

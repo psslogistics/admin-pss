@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { PackageSearch, RefreshCw, Search } from "lucide-react";
 import { useEmployee } from "@/components/dashboard/employee-provider";
 import { getPssErrorDetails, pssApi } from "@/lib/pss-api";
@@ -17,16 +17,19 @@ export default function AssignedShipments() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
-  const load = () => {
+  const load = useCallback(() => {
     setLoading(true);
     setError("");
     void pssApi<{ data?: ShipmentRow[] }>("/v1/shipments")
       .then((result) => setRows(result.data ?? []))
       .catch((caught) => setError(getPssErrorDetails(caught, "Shipment records are temporarily unavailable.").message))
       .finally(() => setLoading(false));
-  };
+  }, []);
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    const timer = window.setTimeout(() => load(), 0);
+    return () => window.clearTimeout(timer);
+  }, [load]);
 
   const visible = useMemo(() => rows.filter((row) => {
     if (!profile.assignedClientIds.includes(row.client_id)) return false;

@@ -5,12 +5,13 @@ import { createClient } from '@/lib/supabase/server'
 const getEmployeeAccess = cache(async () => {
   const supabase = await createClient(); const claimsResult = await supabase.auth.getClaims(); const userId = claimsResult.data?.claims?.sub;
   if (!userId) redirect('/sign-in');
-  const [{ data, error: profileError }, { data: employeeProfile, error: employeeProfileError }, { data: assignments, error: assignmentsError }] = await Promise.all([
+  const [{ data, error: profileError }, { data: employeeProfile, error: employeeProfileError }, { data: assignments, error: assignmentsError }, { data: authContext, error: authContextError }] = await Promise.all([
     supabase.from('profiles').select('id,email,display_name,status,must_change_password').eq('id', userId).maybeSingle(),
     supabase.from('employee_profiles').select('employee_code,workspace_slug,employment_status').eq('user_id', userId).maybeSingle(),
     supabase.from('user_roles').select('is_active,role_id').eq('user_id', userId),
+    supabase.rpc('get_auth_context'),
   ]);
-  if (profileError || employeeProfileError || assignmentsError) redirect('/access-denied?reason=database');
+  if (profileError || employeeProfileError || assignmentsError || authContextError) redirect('/access-denied?reason=database');
   const roleIds = (assignments ?? []).map((item) => item.role_id);
   const { data: roleRows, error: rolesError } = roleIds.length ? await supabase.from('roles').select('id,role_code,scope').in('id', roleIds) : { data: [], error: null };
   if (rolesError) redirect('/access-denied?reason=database');
@@ -21,7 +22,16 @@ const getEmployeeAccess = cache(async () => {
     if (!employeeProfile || employeeProfile.employment_status !== 'active') redirect('/access-denied?reason=employee-inactive');
   }
   if (data.must_change_password === true) redirect('/reset-password?required=1');
-  return { userId, profile: data, employee: employeeProfile, roles };
+  const context = (authContext && typeof authContext === 'object' ? authContext : {}) as {
+    permissions?: Array<{ permission_key?: string }>; permission_overrides?: Array<{ permission_key?: string; mode?: string }>;
+  };
+  const permissions = new Set((context.permissions ?? []).map((item) => item.permission_key).filter((item): item is string => Boolean(item)));
+  for (const override of context.permission_overrides ?? []) {
+    if (!override.permission_key) continue;
+    if (override.mode === 'grant') permissions.add(override.permission_key);
+    if (override.mode === 'revoke') permissions.delete(override.permission_key);
+  }
+  return { userId, profile: data, employee: employeeProfile, roles, permissions: [...permissions] };
 });
 
 export async function requireEmployeeAccess() { return getEmployeeAccess(); }

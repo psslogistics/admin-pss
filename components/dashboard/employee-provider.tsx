@@ -19,11 +19,11 @@ function permissionSet(rows: Array<{ permission_key?: string }>, allowed: Set<st
   return [...new Set(rows.map((row) => row.permission_key).filter((key): key is PermissionKey => Boolean(key && allowed.has(key) && isAdminPermission(key))))];
 }
 
-export function EmployeeProvider({ children, initialIdentity }: { children: React.ReactNode; initialIdentity?: InitialIdentity }) {
+export function EmployeeProvider({ children, initialIdentity, initialPermissions = [] }: { children: React.ReactNode; initialIdentity?: InitialIdentity; initialPermissions?: string[] }) {
   const initialState = useMemo<EmployeeState>(() => {
     if (!initialIdentity) return defaultState();
-    return { ...defaultState(), employeeId: initialIdentity.id, profile: { ...emptyProfile, id: initialIdentity.id, name: initialIdentity.name, initials: initials(initialIdentity.name), role: initialIdentity.role, email: initialIdentity.email, employeeId: initialIdentity.employeeId, workspace: initialIdentity.workspace } };
-  }, [initialIdentity]);
+    return { ...defaultState(), employeeId: initialIdentity.id, profile: { ...emptyProfile, id: initialIdentity.id, name: initialIdentity.name, initials: initials(initialIdentity.name), role: initialIdentity.role, email: initialIdentity.email, employeeId: initialIdentity.employeeId, workspace: initialIdentity.workspace, permissions: initialPermissions.filter((permission): permission is PermissionKey => isAdminPermission(permission)) } };
+  }, [initialIdentity, initialPermissions]);
   const [state, setState] = useState<EmployeeState>(initialState);
   const [clients, setClients] = useState<AssignedClient[]>([]);
   const [hydrated, setHydrated] = useState(false);
@@ -70,7 +70,7 @@ export function EmployeeProvider({ children, initialIdentity }: { children: Reac
         supabase.from("employee_permission_overrides").select("permission_key,mode").eq("employee_user_id", user.id),
         summaryPromise,
       ]);
-      const allowed = new Set((catalogue ?? []).map((item) => item.permission_key));
+      const allowed = new Set([...initialPermissions, ...(catalogue ?? []).map((item) => item.permission_key)]);
       const summaryPermissions = summaryResult.data?.permissions;
       const apiPermissions = Array.isArray(summaryPermissions) ? summaryPermissions : null;
       const roleBasedPermissions = permissionSet((rolePermissions ?? []) as Array<{ permission_key?: string }>, allowed);
@@ -78,11 +78,17 @@ export function EmployeeProvider({ children, initialIdentity }: { children: Reac
       // erase permissions when a stale deployment or transient API response
       // returns an empty list. Supabase is the same authenticated source used
       // by the server-side permission gate, so retain it as the safe fallback.
-      const effectivePermissions = new Set(roleBasedPermissions);
+      // The server layout already passed the same auth-context snapshot used
+      // by the route guard. Keep it as the authoritative base so RLS on the
+      // permission catalogue cannot make a permitted screen render as denied.
+      const effectivePermissions = new Set(initialPermissions.filter((permission): permission is PermissionKey => isAdminPermission(permission)));
       // Keep the Worker response as a fallback for deployments where the
       // Supabase permission query is unavailable. Do not replace the complete
       // role catalogue with a partial Worker response.
-      if (!roleBasedPermissions.length && apiPermissions?.length) {
+      if (!effectivePermissions.size && roleBasedPermissions.length) {
+        for (const permission of roleBasedPermissions) effectivePermissions.add(permission);
+      }
+      if (!effectivePermissions.size && apiPermissions?.length) {
         for (const permission of apiPermissions) {
           if (allowed.has(permission) && isAdminPermission(permission)) effectivePermissions.add(permission);
         }
@@ -132,7 +138,7 @@ export function EmployeeProvider({ children, initialIdentity }: { children: Reac
     }
     void loadEmployee().catch((error) => { if (!cancelled) { const details = getPssErrorDetails(error, "The production workspace is temporarily unavailable."); setBootstrapError(`Production workspace could not be loaded: ${details.message}`); setHydrated(true); } });
     return () => { cancelled = true; };
-  }, []);
+  }, [initialIdentity, initialPermissions]);
   const commit = useCallback((change: (current: EmployeeState) => EmployeeState) => setState((current) => change(current)), []);
   const addActivity = useCallback(async (_title: string, _detail: string, _tone: EmployeeActivity["tone"] = "blue") => { try { await pssApi("/v1/activity", { method: "POST", headers: { "Idempotency-Key": crypto.randomUUID() }, body: JSON.stringify({ action: _title, entity_type: "employee_workspace", details: { detail: _detail, tone: _tone } }) }); const result = await pssApi<{ data: Array<Record<string, unknown>> }>("/v1/activity"); commit((current) => ({ ...current, activity: result.data.map((row) => ({ id: String(row.id), title: String(row.action ?? "Activity"), detail: String(row.entity_type ?? "") + (row.entity_id ? ` · ${String(row.entity_id)}` : ""), time: row.created_at ? new Date(String(row.created_at)).toLocaleString() : "", tone: "blue" as EmployeeActivity["tone"] })) })); return {}; } catch (error) { return { error: actionError(error, "Activity could not be saved.") }; } }, [commit]);
   const saveTask = useCallback(async (task: EmployeeTask) => { try { const result = await pssApi<{ data: { id: string } }>("/v1/tasks", { method: "POST", headers: { "Idempotency-Key": crypto.randomUUID() }, body: JSON.stringify({ title: task.title, description: task.context, client_id: task.clientId, due_at: task.dueAt ?? task.due, priority: task.priority.toLowerCase() }) }); commit((current) => ({ ...current, tasks: [{ ...task, id: result.data.id }, ...current.tasks] })); return {}; } catch (error) { return { error: actionError(error, "Task could not be saved.") }; } }, [commit]);
