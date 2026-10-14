@@ -18,5 +18,7 @@ assert.equal(canonicalDelhiveryWarehouseName("Warehouse Alpha", "Lucknow", "Utta
 assert.equal(canonicalDelhiveryWarehouseName("Warehouse Alpha · Lucknow · Uttar Pradesh · 226017", "Lucknow", "Uttar Pradesh", "226017"), "Warehouse Alpha Lucknow Uttar Pradesh 226017", "provider name must not duplicate a saved-label suffix");
 assert.equal(delhiveryFacilityMatches({ ...active, name: "Warehouse Alpha Lucknow Uttar Pradesh 226017" }, "Warehouse Alpha Lucknow Uttar Pradesh 226017", "201310"), true, "canonical active warehouse should match exactly");
 assert.equal(delhiveryFacilityMatches({ ...active, name: "Warehouse Alpha Lucknow Uttar Pradesh 226017" }, "Warehouse Alpha Lucknow Uttar Pradesh 271801", "201310"), false, "same base name at a different selected location must not match");
+assert.equal(delhiveryFacilityMatches({ ...active, name: "Warehouse Alpha" }, "Warehouse Alpha Lucknow Uttar Pradesh 226017", "201310", null, "Warehouse Alpha"), true, "provider base name should match the selected local warehouse");
+assert.equal(delhiveryFacilityMatches({ ...active, name: "Warehouse Beta" }, "Warehouse Alpha Lucknow Uttar Pradesh 226017", "201310", null, "Warehouse Alpha"), false, "different provider base name must not match the selected local warehouse");
 
-console.log("Exact warehouse flow matrix passed (14 cases)");
+console.log("Exact warehouse flow matrix passed (16 cases)");

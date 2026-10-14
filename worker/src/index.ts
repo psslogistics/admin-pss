@@ -912,7 +912,7 @@ async function resolveDelhiveryFacility(
   // Delhivery web console uses a separate gateway/authentication contract, so
   // never send the B2B token to that console endpoint as a fallback.
   const lookupBases = [String(baseUrl).replace(/\/$/, "")];
-  const findMatch = (rows: Record<string, unknown>[]) => rows.find((row) => delhiveryFacilityMatches(row, name, pincode, localWarehouse?.provider_reference));
+  const findMatch = (rows: Record<string, unknown>[]) => rows.find((row) => delhiveryFacilityMatches(row, name, pincode, localWarehouse?.provider_reference, localWarehouse?.name));
   const lookupBodies = [
     { page: 1, page_size: 50, search_term: name, search_on: ["facility_name"], ...(name ? { filter_facility_name: [name] } : {}) },
     // Delhivery may reject an exact facility filter when the registered name

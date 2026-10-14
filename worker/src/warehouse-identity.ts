@@ -21,7 +21,7 @@ export function canonicalDelhiveryWarehouseName(name: string, city?: string, sta
   return [base, suffix].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
 }
 
-export function delhiveryFacilityMatches(row: Record<string, unknown>, requestedName: string, requestedPincode: string, storedProviderReference?: string | null) {
+export function delhiveryFacilityMatches(row: Record<string, unknown>, requestedName: string, requestedPincode: string, storedProviderReference?: string | null, localWarehouseName?: string | null) {
   const rowStatus = String(row.status ?? row.facility_status ?? row.state ?? "ACTIVE").toLowerCase();
   const activeFlag = row.is_active ?? row.active ?? row.enabled ?? row.is_enabled;
   if (["inactive", "disabled", "deleted", "deactivated"].includes(rowStatus) || activeFlag === false || activeFlag === 0 || String(activeFlag).toLowerCase() === "false") return false;
@@ -29,6 +29,13 @@ export function delhiveryFacilityMatches(row: Record<string, unknown>, requested
   const rowName = providerField(row, ["facility_name", "name", "client_warehouse_name", "warehouse_name"]);
   const rowId = providerField(row, ["facility_id", "id", "client_warehouse_uuid", "uuid"]);
   if (storedProviderReference && rowId && rowId !== storedProviderReference) return false;
-  const nameMatches = normalizeDelhiveryWarehouseIdentity(rowName) === normalizeDelhiveryWarehouseIdentity(requestedName);
+  const normalizedRowName = normalizeDelhiveryWarehouseIdentity(rowName);
+  const nameMatches = normalizedRowName === normalizeDelhiveryWarehouseIdentity(requestedName)
+    // Delhivery's console/API can return the saved facility name without the
+    // canonical city/state/PIN suffix that PSS sends during registration.
+    // The selected local warehouse is still the identity anchor; the PIN
+    // check below prevents a same-name facility at another location from
+    // being reused.
+    || Boolean(localWarehouseName && normalizedRowName === normalizeDelhiveryWarehouseIdentity(localWarehouseName));
   return nameMatches && (!requestedPincode || !rowPin || rowPin.replace(/\D/g, "") === requestedPincode.replace(/\D/g, ""));
 }
