@@ -13,6 +13,14 @@ export function normalizeDelhiveryWarehouseIdentity(value: string) {
   return value.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
+export function canonicalDelhiveryWarehouseName(name: string, city?: string, state?: string, pincode?: string) {
+  const clean = (value: unknown) => String(value ?? "").replace(/[^A-Za-z0-9]+/g, " ").replace(/\s+/g, " ").trim();
+  const base = clean(name) || "PSS Warehouse";
+  const suffix = [clean(city), clean(state), clean(pincode)].filter(Boolean).join(" ");
+  if (suffix && base.toLowerCase().endsWith(suffix.toLowerCase())) return base;
+  return [base, suffix].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+}
+
 export function delhiveryFacilityMatches(row: Record<string, unknown>, requestedName: string, requestedPincode: string, storedProviderReference?: string | null) {
   const rowStatus = String(row.status ?? row.facility_status ?? row.state ?? "ACTIVE").toLowerCase();
   const activeFlag = row.is_active ?? row.active ?? row.enabled ?? row.is_enabled;

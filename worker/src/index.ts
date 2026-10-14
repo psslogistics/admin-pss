@@ -1,5 +1,5 @@
 import { calculatePssRate, defaultRateRows, type ChargeRule, type PricingAccount } from "./pricing-engine";
-import { delhiveryFacilityMatches } from "./warehouse-identity";
+import { canonicalDelhiveryWarehouseName, delhiveryFacilityMatches } from "./warehouse-identity";
 
 type DelhiveryTokenCache = {
   get<T>(key: string, type: "json"): Promise<T | null>;
@@ -716,13 +716,7 @@ function delhiveryWarehouseName(origin: { name: string; city?: string; state?: s
   // not by an address-only lookup. Keep the Client-selected name as the base,
   // then append the complete location identity used by Delhivery's registry.
   // This also normalizes Client labels that already contain ` · city · state · pin`.
-  const clean = (value: unknown) => String(value ?? "").replace(/[^A-Za-z0-9]+/g, " ").replace(/\s+/g, " ").trim();
-  const base = clean(origin.name) || "PSS Warehouse";
-  const suffix = [clean(origin.city), clean(origin.state), clean(origin.pincode)].filter(Boolean).join(" ");
-  const normalizedBase = base.toLowerCase();
-  const normalizedSuffix = suffix.toLowerCase();
-  if (normalizedSuffix && normalizedBase.endsWith(normalizedSuffix)) return base;
-  return [base, suffix].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+  return canonicalDelhiveryWarehouseName(origin.name, origin.city, origin.state, origin.pincode);
 }
 
 async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: string, origin: { name: string; line: string; city: string; state: string; pincode: string; phone: string }, requestIdValue: string, timeoutMs: number, b2bBaseUrl = env.DELHIVERY_B2B_API_BASE_URL ?? "https://ltl-clients-api.delhivery.com", providerAccountId?: string | null, selectedWarehouseId?: string | null) {
@@ -829,30 +823,10 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   if (!response.ok) {
     if (!providerAlreadyRegistered) return { ok: false as const, error: `Delhivery warehouse creation failed (${response.status}): ${responseText.slice(0, 240)}` };
   }
-  // The B2B token can create/idempotently reuse a warehouse, but it cannot
-  // read the console-only facility index. Treat an accepted registration or
-  // an explicit duplicate response as the provider's authoritative
-  // create-or-use result and continue with this exact client-selected name.
-  // Delhivery remains the final authority during /manifest; a rejected
-  // manifestation is surfaced as a provider error rather than mislabelled as
-  // a local activation failure.
-  if (response.ok || providerAlreadyRegistered) {
-    if (existing) {
-      await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_reference = COALESCE(?, provider_reference), provider_name = COALESCE(?, provider_name), provider_error = NULL, provider_activated_at = COALESCE(provider_activated_at, CURRENT_TIMESTAMP), provider_status = 'active', status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
-        .bind(providerAccountId ?? null, createdProviderReference, createdProviderName || providerName, existing.id, clientId).run();
-    } else {
-      await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status, provider_reference, provider_name, provider_activated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'active', ?, ?, CURRENT_TIMESTAMP)")
-        .bind(crypto.randomUUID(), clientId, localName, origin.line, origin.city, origin.state, origin.pincode, origin.phone, origin.name, providerAccountId ?? null, createdProviderReference, createdProviderName || providerName).run();
-    }
-    return { ok: true as const, name: createdProviderName || providerName, reused: providerAlreadyRegistered as boolean };
-  }
-  // Delhivery may acknowledge warehouse creation before the warehouse is
-  // activated by its FMS team. Never treat an HTTP success from the create
-  // endpoint as proof that manifestation is allowed: verify the provider's
-  // active facility list before booking.
-  // Delhivery acknowledges warehouse registration before its facility-search
-  // index catches up. Verify repeatedly so a valid active warehouse is not
-  // reported as inactive during that propagation window.
+  // A successful or duplicate create response is registration evidence only,
+  // never activation evidence. Re-fetch the exact provider identity before
+  // allowing manifestation; this prevents account-wide or pincode-only
+  // substitutions and makes the pending state explicit.
   let facility = await resolveDelhiveryFacility(env, token, b2bBaseUrl, clientId, { warehouse_id: existing?.id, delhivery_pickup_location: providerName, pincode: origin.pincode }, requestIdValue, timeoutMs);
   for (let attempt = 1; !facility.ok && attempt < 5; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 1500 * attempt));
@@ -863,6 +837,9 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
     if (existing) {
       await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_reference = COALESCE(?, provider_reference), provider_name = COALESCE(?, provider_name), provider_status = 'pending', provider_error = ?, status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
         .bind(providerAccountId ?? null, createdProviderReference, createdProviderName || providerName, "Delhivery warehouse was created or located but is awaiting provider activation", existing.id, clientId).run();
+    } else {
+      await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status, provider_reference, provider_name, provider_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'pending', ?, ?, ?)")
+        .bind(crypto.randomUUID(), clientId, localName, origin.line, origin.city, origin.state, origin.pincode, origin.phone, origin.name, providerAccountId ?? null, createdProviderReference, createdProviderName || providerName, "Delhivery warehouse was created or located but is awaiting provider activation").run();
     }
     return { ok: false as const, code: "WAREHOUSE_ACTIVATION_PENDING" as const, error: "The selected Delhivery warehouse is awaiting provider activation. Retry booking after Delhivery marks it active." };
   }
@@ -935,18 +912,6 @@ async function resolveDelhiveryFacility(
     // contains an account suffix such as "B2B". Retry broadly and resolve the
     // canonical active name locally using the warehouse name and pincode.
     { page: 1, page_size: 100, search_term: name, search_on: ["facility_name"] },
-    // Some Delhivery accounts index newly-created facilities by pincode before
-    // their facility-name search becomes consistent.
-    ...(pincode ? [
-      { page: 1, page_size: 100, search_term: pincode, search_on: ["pincode"] },
-      // The web console searches this field without sending search_on. Keep
-      // the same request shape for accounts whose API ignores search_on.
-      { page: 1, page_size: 100, search_term: pincode },
-    ] : []),
-    // As a final bounded fallback, fetch the first page and match locally.
-    // This covers accounts whose search endpoint returns an empty result while
-    // the console still exposes the active facility.
-    { page: 1, page_size: 100 },
   ];
   let match: Record<string, unknown> | undefined;
   let lastLookupError = "";

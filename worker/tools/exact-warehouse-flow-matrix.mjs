@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { delhiveryFacilityMatches, normalizeDelhiveryWarehouseIdentity } from "../src/warehouse-identity.ts";
+import { canonicalDelhiveryWarehouseName, delhiveryFacilityMatches, normalizeDelhiveryWarehouseIdentity } from "../src/warehouse-identity.ts";
 
 const active = { id: "provider-1", name: "Warehouse Alpha", pincode: "201310", status: "ACTIVE" };
 
@@ -14,5 +14,9 @@ assert.notEqual("client-a|account-a|warehouse-1", "client-b|account-a|warehouse-
 assert.notEqual("client-a|account-a|warehouse-1", "client-a|account-a|warehouse-2", "same address across local warehouses must have distinct identity keys");
 assert.notEqual("client-a|account-a|warehouse-1", "client-a|account-b|warehouse-1", "same name under another account must have distinct identity keys");
 assert.equal(delhiveryFacilityMatches({ ...active, enabled: false }, "Warehouse Alpha", "201310"), false, "provider-deactivated warehouse must block booking");
+assert.equal(canonicalDelhiveryWarehouseName("Warehouse Alpha", "Lucknow", "Uttar Pradesh", "226017"), "Warehouse Alpha Lucknow Uttar Pradesh 226017", "provider name must include the complete selected location identity");
+assert.equal(canonicalDelhiveryWarehouseName("Warehouse Alpha · Lucknow · Uttar Pradesh · 226017", "Lucknow", "Uttar Pradesh", "226017"), "Warehouse Alpha Lucknow Uttar Pradesh 226017", "provider name must not duplicate a saved-label suffix");
+assert.equal(delhiveryFacilityMatches({ ...active, name: "Warehouse Alpha Lucknow Uttar Pradesh 226017" }, "Warehouse Alpha Lucknow Uttar Pradesh 226017", "201310"), true, "canonical active warehouse should match exactly");
+assert.equal(delhiveryFacilityMatches({ ...active, name: "Warehouse Alpha Lucknow Uttar Pradesh 226017" }, "Warehouse Alpha Lucknow Uttar Pradesh 271801", "201310"), false, "same base name at a different selected location must not match");
 
-console.log("Exact warehouse flow matrix passed (10 cases)");
+console.log("Exact warehouse flow matrix passed (14 cases)");

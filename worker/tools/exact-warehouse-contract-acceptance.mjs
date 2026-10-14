@@ -18,6 +18,8 @@ const required = [
   ["saved warehouse keeps the consignor state", "state"],
   ["pending creation preserves returned provider mapping", "provider_reference = COALESCE(?, provider_reference)"],
   ["stored provider mapping constrains lookup", "delhiveryFacilityMatches(row, name, pincode, localWarehouse?.provider_reference)"],
+  ["canonical provider warehouse identity", "canonicalDelhiveryWarehouseName"],
+  ["create response is followed by exact activation lookup", "A successful or duplicate create response is registration evidence only"],
 ];
 
 for (const [label, needle] of required) {
@@ -30,6 +32,10 @@ if (source.includes("activeFallback") || source.includes("Reuse that provider wa
 
 if (source.includes("if (directId && directCode) return")) {
   throw new Error("Caller-supplied provider facility bypass remains");
+}
+
+if (source.includes('search_on: ["pincode"]') || source.includes("{ page: 1, page_size: 100 },")) {
+  throw new Error("Pincode-only or account-wide provider lookup fallback remains");
 }
 
 console.log(`Exact warehouse contract passed (${required.length} checks)`);
