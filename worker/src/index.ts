@@ -616,7 +616,23 @@ function delhiveryB2bCredential(value: string | undefined): DelhiveryB2bCredenti
     if (parsed && typeof parsed === "object") return {
       username: typeof (parsed.username ?? parsed.user_name ?? parsed.email ?? parsed.client_email) === "string" ? String(parsed.username ?? parsed.user_name ?? parsed.email ?? parsed.client_email).trim() : undefined,
       password: typeof (parsed.password ?? parsed.pass ?? parsed.secret) === "string" ? String(parsed.password ?? parsed.pass ?? parsed.secret) : undefined,
-      token: normalizeDelhiveryToken(parsed.token ?? parsed.api_token ?? parsed.access_token ?? parsed.bearer_token),
+      // Delhivery credentials have existed in several operator-managed JSON
+      // shapes. Keep the token account-scoped, but accept the documented API
+      // token aliases so warehouse registration is actually automated when
+      // the production token was stored under a descriptive key.
+      token: normalizeDelhiveryToken(
+        parsed.token
+        ?? parsed.api_token
+        ?? parsed.apiKey
+        ?? parsed.api_key
+        ?? parsed.warehouse_api_token
+        ?? parsed.warehouse_token
+        ?? parsed.production_api_token
+        ?? parsed.client_token
+        ?? parsed.auth_token
+        ?? parsed.access_token
+        ?? parsed.bearer_token,
+      ),
       jwt: normalizeDelhiveryJwt(parsed.jwt),
     };
   } catch { /* A raw value may be a previously issued bearer token. */ }
