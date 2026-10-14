@@ -2472,8 +2472,16 @@ async function handleDelhiveryDocumentWebhook(request: Request, env: Env, reques
 async function refreshFujiyamaDelhivery(env: Env, cron: string) {
   const columns = "id, client_id, tracking_number, lr_number, provider_reference, provider_account_id";
   const order = "ORDER BY CASE WHEN provider_last_attempt_at IS NULL THEN 0 ELSE 1 END, provider_last_attempt_at ASC, updated_at ASC LIMIT 50";
-  const active = await env.DB.prepare(`SELECT ${columns} FROM shipments WHERE client_id = ? AND provider = 'delhivery' AND provider_account_id = ? AND COALESCE(lr_number, tracking_number, provider_reference) IS NOT NULL AND status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery', 'exception', 'rto') ${order}`).bind(FUJIYAMA_CLIENT_ID, FUJIYAMA_DELHIVERY_ACCOUNT_ID).all<{ id: string; client_id: string; tracking_number: string; lr_number: string | null; provider_reference: string | null; provider_account_id: string }>();
-  const delivered = await env.DB.prepare(`SELECT ${columns} FROM shipments WHERE client_id = ? AND provider = 'delhivery' AND provider_account_id = ? AND COALESCE(lr_number, tracking_number, provider_reference) IS NOT NULL AND status = 'delivered' ${order}`).bind(FUJIYAMA_CLIENT_ID, FUJIYAMA_DELHIVERY_ACCOUNT_ID).all<{ id: string; client_id: string; tracking_number: string; lr_number: string | null; provider_reference: string | null; provider_account_id: string }>();
+  const latestEvent = "(SELECT lower(COALESCE(te.location, '') || ' ' || COALESCE(te.description, '')) FROM tracking_events te WHERE te.shipment_id = shipments.id ORDER BY te.event_time DESC LIMIT 1)";
+  // The Worker wakes every 10 minutes, but each shipment is selected only at
+  // its state-specific cadence. Last-mile centre scans are identified from
+  // the latest normalized provider event without changing the public status.
+  const due = `(provider_last_attempt_at IS NULL OR
+    (status = 'out_for_delivery' AND datetime(provider_last_attempt_at) <= datetime('now', '-10 minutes')) OR
+    (status = 'in_transit' AND ${latestEvent} GLOB '*last[- ]mile*' AND datetime(provider_last_attempt_at) <= datetime('now', '-1 hour')) OR
+    (status IN ('booked', 'picked_up', 'in_transit', 'exception', 'rto') AND NOT (status = 'in_transit' AND ${latestEvent} GLOB '*last[- ]mile*') AND datetime(provider_last_attempt_at) <= datetime('now', '-4 hours'))) `;
+  const active = await env.DB.prepare(`SELECT ${columns} FROM shipments WHERE client_id = ? AND provider = 'delhivery' AND provider_account_id = ? AND COALESCE(lr_number, tracking_number, provider_reference) IS NOT NULL AND status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery', 'exception', 'rto') AND ${due} ${order}`).bind(FUJIYAMA_CLIENT_ID, FUJIYAMA_DELHIVERY_ACCOUNT_ID).all<{ id: string; client_id: string; tracking_number: string; lr_number: string | null; provider_reference: string | null; provider_account_id: string }>();
+  const delivered = await env.DB.prepare(`SELECT ${columns} FROM shipments WHERE client_id = ? AND provider = 'delhivery' AND provider_account_id = ? AND COALESCE(lr_number, tracking_number, provider_reference) IS NOT NULL AND status = 'delivered' AND (provider_last_attempt_at IS NULL OR datetime(provider_last_attempt_at) <= datetime('now', '-4 hours')) ${order}`).bind(FUJIYAMA_CLIENT_ID, FUJIYAMA_DELHIVERY_ACCOUNT_ID).all<{ id: string; client_id: string; tracking_number: string; lr_number: string | null; provider_reference: string | null; provider_account_id: string }>();
   const refreshRows = [...active.results, ...delivered.results];
   let trackingSucceeded = 0;
   let trackingFailed = 0;
