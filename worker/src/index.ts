@@ -718,10 +718,19 @@ function delhiveryWarehouseName(origin: { name: string; state?: string; pincode:
 
 async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: string, origin: { name: string; line: string; city: string; state: string; pincode: string; phone: string }, requestIdValue: string, timeoutMs: number, b2bBaseUrl = env.DELHIVERY_B2B_API_BASE_URL ?? "https://ltl-clients-api.delhivery.com", providerAccountId?: string | null, selectedWarehouseId?: string | null) {
   const existing = selectedWarehouseId
-    ? await env.DB.prepare("SELECT id, name, provider_status, provider_account_id, provider_reference FROM warehouses WHERE client_id = ? AND id = ? LIMIT 1")
+    ? await env.DB.prepare("SELECT id, name, provider, provider_status, provider_account_id, provider_reference FROM warehouses WHERE client_id = ? AND id = ? LIMIT 1")
       .bind(clientId, selectedWarehouseId)
-      .first<{ id: string; name: string; provider_status: string | null; provider_account_id: string | null; provider_reference: string | null }>()
+      .first<{ id: string; name: string; provider: string | null; provider_status: string | null; provider_account_id: string | null; provider_reference: string | null }>()
     : null;
+  if (selectedWarehouseId && !existing) {
+    return { ok: false as const, code: "WAREHOUSE_NOT_FOUND" as const, error: "The selected pickup warehouse no longer exists for this client. Select it again before booking." };
+  }
+  if (existing?.provider && existing.provider !== "delhivery") {
+    return { ok: false as const, code: "WAREHOUSE_PROVIDER_MISMATCH" as const, error: "The selected pickup warehouse is mapped to a different courier provider." };
+  }
+  if (existing?.provider_account_id && providerAccountId && existing.provider_account_id !== providerAccountId) {
+    return { ok: false as const, code: "WAREHOUSE_ACCOUNT_MISMATCH" as const, error: "The selected pickup warehouse is mapped to a different Delhivery account. Select a warehouse assigned to this account." };
+  }
   const name = existing?.name?.trim() || delhiveryWarehouseName(origin);
   const warehouseCreateIdempotencyKey = `pss-warehouse-${await sha256(`${clientId}|${providerAccountId ?? ""}|${existing?.id ?? name}|${origin.pincode}`)}`;
   // Reuse the provider's canonical warehouse whenever it already exists.
@@ -3231,8 +3240,7 @@ const worker = {
         const warehouseId = typeof payload.warehouse_id === "string" && payload.warehouse_id.trim() ? payload.warehouse_id.trim() : null;
         if (warehouseId) {
           const savedWarehouse = await env.DB.prepare("SELECT id FROM warehouses WHERE id = ? AND client_id = ? LIMIT 1").bind(warehouseId, clientId).first<{ id: string }>();
-          const savedAddress = savedWarehouse ? savedWarehouse : await env.DB.prepare("SELECT id FROM client_addresses WHERE id = ? AND client_id = ? AND address_kind = 'consignor' LIMIT 1").bind(warehouseId, clientId).first<{ id: string }>();
-          if (!savedAddress) return error("NOT_FOUND", "The selected pickup location is not saved for this client", 404, id, headers);
+          if (!savedWarehouse) return error("WAREHOUSE_NOT_FOUND", "The selected pickup warehouse is not saved for this client", 404, id, headers);
         }
          const providerPayload: Record<string, unknown> = { ...payload, provider, provider_account_id: providerAccountId, awb_number: pickupAwbNumbers, scheduled_date: normalizedScheduledDate, requested_date: normalizedScheduledDate, window: String(requestedWindowInput), requested_time_slot: String(requestedWindowInput), location: String(pickupAddressInput).trim(), pickup_address: String(pickupAddressInput).trim(), contact_phone: normalizedContactPhone, pieces, weight: totalWeight };
         if (payload.shipment_id !== undefined && !(await shipmentBelongsToClient(env, payload.shipment_id, clientId))) return error("NOT_FOUND", "Shipment not found", 404, id, headers);

@@ -10,6 +10,8 @@ const required = [
   ["provider name is persisted", "provider_name"],
   ["provider error is persisted", "provider_error"],
   ["activation timestamp is persisted", "provider_activated_at"],
+  ["cross-account warehouse reuse is blocked", "WAREHOUSE_ACCOUNT_MISMATCH"],
+  ["pickup IDs resolve only to warehouses", "The selected pickup warehouse is not saved for this client"],
 ];
 
 for (const [label, needle] of required) {
