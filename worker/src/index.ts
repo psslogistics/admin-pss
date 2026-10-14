@@ -672,7 +672,14 @@ function delhiveryWarehouseApiToken(env: Env, accountName: string, primaryCreden
       ? String(secretBag.DELHIVERY_PSSLOGISTICS10B2BC)
       : undefined;
   const aliasToken = delhiveryB2bCredential(accountSecret)?.token;
-  return aliasToken && !delhiveryLooksLikeJwt(aliasToken) ? aliasToken : null;
+  if (aliasToken && !delhiveryLooksLikeJwt(aliasToken)) return aliasToken;
+
+  // The original production setup stored this account's warehouse token in
+  // DELHIVERY_API_TOKEN before account-scoped credentials were introduced.
+  // Keep this compatibility path explicitly restricted to PSSLOGISTICS10;
+  // never use a provider-global token for another Delhivery account.
+  const legacyToken = delhiveryB2bCredential(env.DELHIVERY_API_TOKEN)?.token;
+  return legacyToken && !delhiveryLooksLikeJwt(legacyToken) ? legacyToken : null;
 }
 
 function delhiveryAccountIsB2b(accountName: string) {
