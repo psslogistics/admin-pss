@@ -790,7 +790,16 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
     facility = await resolveDelhiveryFacility(env, token, b2bBaseUrl, clientId, { delhivery_pickup_location: name, pincode: origin.pincode }, requestIdValue, timeoutMs);
   }
   if (!facility.ok) {
-    return { ok: false as const, error: `Delhivery warehouse '${name}' is registered but not active yet. Activate it with your Delhivery account POC, then retry booking.` };
+    // The console can show an active warehouse while the facility-list API
+    // still omits it from its search index. Do not manufacture an inactive
+    // error in that case: the manifestation endpoint is the authoritative
+    // booking check and will return the real provider reason if it rejects.
+    if (!/not active or could not be resolved/i.test(facility.error)) return { ok: false as const, error: facility.error };
+    if (existing) {
+      await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_status = 'pending', status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+        .bind(providerAccountId ?? null, existing.id, clientId).run();
+    }
+    return { ok: true as const, name, reused: true as const };
   }
   if (existing) {
     await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_status = 'active', provider_reference = COALESCE(provider_reference, ?), status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
