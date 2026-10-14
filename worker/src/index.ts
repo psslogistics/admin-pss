@@ -795,7 +795,7 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
       .bind(crypto.randomUUID(), clientId, name, origin.line, origin.city, origin.pincode, origin.phone, providerAccountId ?? null, facility.facility.id)
       .run();
   }
-  return { ok: true as const, name, reused: false as const };
+  return { ok: true as const, name: facility.facility.name || name, reused: false as const };
 }
 
 type DelhiveryFacility = { id: string; code: string; name: string; pincode: string };
