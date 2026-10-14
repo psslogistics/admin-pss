@@ -803,8 +803,11 @@ type DelhiveryFacility = { id: string; code: string; name: string; pincode: stri
 function delhiveryFacilityRows(value: unknown): Array<Record<string, unknown>> {
   if (!value || typeof value !== "object") return [];
   const body = value as Record<string, unknown>;
-  const data = body.data && typeof body.data === "object" ? body.data as Record<string, unknown> : body;
-  const rows = data.results ?? data.facilities ?? data.items ?? body.results;
+  const nestedData = body.data;
+  const data = nestedData && typeof nestedData === "object" && !Array.isArray(nestedData) ? nestedData as Record<string, unknown> : body;
+  const rows = Array.isArray(nestedData)
+    ? nestedData
+    : data.results ?? data.facilities ?? data.items ?? data.rows ?? data.records ?? data.data ?? body.results;
   return Array.isArray(rows) ? rows.filter((row): row is Record<string, unknown> => Boolean(row && typeof row === "object")) : [];
 }
 
