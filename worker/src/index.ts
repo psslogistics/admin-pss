@@ -910,6 +910,15 @@ async function resolveDelhiveryFacility(
     { page: 1, page_size: 100 },
   ];
   let match: Record<string, unknown> | undefined;
+  let activeFallback: Record<string, unknown> | undefined;
+  const isActiveFacility = (row: Record<string, unknown>) => {
+    const rowStatus = String(row.status ?? row.facility_status ?? row.state ?? "ACTIVE").toLowerCase();
+    const activeFlag = row.is_active ?? row.active ?? row.enabled ?? row.is_enabled;
+    return !["inactive", "disabled", "deleted", "deactivated"].includes(rowStatus)
+      && activeFlag !== false
+      && activeFlag !== 0
+      && String(activeFlag).toLowerCase() !== "false";
+  };
   for (const body of lookupBodies) {
     let response: Response;
     try {
@@ -925,9 +934,16 @@ async function resolveDelhiveryFacility(
     if (!response.ok) return { ok: false, error: `Delhivery facility lookup failed (${response.status}): ${responseText.slice(0, 240)}` };
     let parsed: unknown = null;
     try { parsed = JSON.parse(responseText); } catch { parsed = null; }
-    match = findMatch(delhiveryFacilityRows(parsed));
+    const rows = delhiveryFacilityRows(parsed);
+    if (!activeFallback) activeFallback = rows.find(isActiveFacility);
+    match = findMatch(rows);
     if (match) break;
   }
+  // A Delhivery account can already have an active warehouse under a
+  // different saved address/name. Reuse that provider warehouse globally;
+  // exact address matching is preferred, but must not block booking when the
+  // account has an active facility that Delhivery will accept.
+  match ??= activeFallback;
   if (!match) return { ok: false, error: `Delhivery pickup facility '${name || pincode}' is not active or could not be resolved` };
   const facility = {
     id: delhiveryFacilityField(match, ["facility_id", "id", "client_warehouse_uuid", "uuid"]),
