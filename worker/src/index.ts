@@ -83,7 +83,18 @@ function timingSafeEqual(left: string, right: string) { const a = textBytes(left
 async function hmac(secret: string, payload: string) { const key = await crypto.subtle.importKey("raw", textBytes(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]); return hex(new Uint8Array(await crypto.subtle.sign("HMAC", key, textBytes(payload)))); }
 function documentSignatureMatches(contentType: string, bytes: Uint8Array) {
   const startsWith = (...values: number[]) => values.every((value, index) => bytes[index] === value);
-  if (contentType === "application/pdf") return startsWith(0x25, 0x50, 0x44, 0x46);
+  if (contentType === "application/pdf") {
+    // PDF producers may emit a short whitespace/BOM preamble before the
+    // %PDF header. The PDF specification permits the header within the first
+    // 1024 bytes, so checking only byte 0 rejects otherwise valid documents
+    // such as generated delivery challans.
+    const header = [0x25, 0x50, 0x44, 0x46];
+    const maxOffset = Math.min(1024, bytes.length - header.length);
+    for (let offset = 0; offset <= maxOffset; offset += 1) {
+      if (header.every((value, index) => bytes[offset + index] === value)) return true;
+    }
+    return false;
+  }
   if (contentType === "image/jpeg") return startsWith(0xff, 0xd8, 0xff);
   if (contentType === "image/png") return startsWith(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a);
   if (contentType === "image/webp") return startsWith(0x52, 0x49, 0x46, 0x46) && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50;
