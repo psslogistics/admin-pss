@@ -6,7 +6,15 @@ import { useEmployee } from "@/components/dashboard/employee-provider";
 import { getPssErrorDetails, pssApi } from "@/lib/pss-api";
 import { formatStatusLabel } from "@/lib/display";
 
-type ShipmentRow = { id: string; client_id: string; status?: string; origin?: string; destination?: string; edd?: string; lr_number?: string; master_awb?: string };
+type ShipmentRow = { id: string; pss_reference?: string; client_id: string; status?: string; origin?: string; destination?: string; edd?: string; lr_number?: string; master_awb?: string; tracking_number?: string; provider_reference?: string; pickup_reference?: string; invoice_number?: string; provider_booking_id?: string; provider_pickup_id?: string; box_awbs_json?: string };
+
+function boxAwbs(value?: string) {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? parsed.map((item) => typeof item === "string" ? item.trim() : typeof item === "object" && item !== null && "awb" in item ? String((item as { awb?: unknown }).awb ?? "").trim() : "").filter(Boolean) : [];
+  } catch { return []; }
+}
 
 export default function AssignedShipments() {
   const { profile, getVisibleClients } = useEmployee();
@@ -20,7 +28,7 @@ export default function AssignedShipments() {
   const load = useCallback(() => {
     setLoading(true);
     setError("");
-    void pssApi<{ data?: ShipmentRow[] }>("/v1/shipments")
+    void pssApi<{ data?: ShipmentRow[] }>("/v1/shipments?view=tracking&include_tracking=1")
       .then((result) => setRows(result.data ?? []))
       .catch((caught) => setError(getPssErrorDetails(caught, "Shipment records are temporarily unavailable.").message))
       .finally(() => setLoading(false));
@@ -34,7 +42,7 @@ export default function AssignedShipments() {
   const visible = useMemo(() => rows.filter((row) => {
     if (!profile.assignedClientIds.includes(row.client_id)) return false;
     if (clientId && row.client_id !== clientId) return false;
-    const haystack = `${row.id} ${row.origin ?? ""} ${row.destination ?? ""} ${row.status ?? ""} ${row.lr_number ?? ""} ${row.master_awb ?? ""}`.toLowerCase();
+    const haystack = `${row.id} ${row.pss_reference ?? ""} ${row.origin ?? ""} ${row.destination ?? ""} ${row.status ?? ""} ${row.lr_number ?? ""} ${row.master_awb ?? ""} ${row.tracking_number ?? ""} ${row.provider_reference ?? ""} ${row.pickup_reference ?? ""} ${row.invoice_number ?? ""}`.toLowerCase();
     return haystack.includes(query.toLowerCase());
   }), [clientId, profile.assignedClientIds, query, rows]);
 
@@ -48,6 +56,6 @@ export default function AssignedShipments() {
       <select aria-label="Filter shipments by assigned client" value={clientId} onChange={(event) => setClientId(event.target.value)} className="h-10 rounded-lg border border-input bg-background px-3 text-sm"><option value="">All assigned clients</option>{clients.map((client) => <option key={client.id} value={client.id}>{client.name}</option>)}</select>
     </section>
     {error && <div role="alert" className="flex items-center justify-between gap-3 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive"><span>{error}</span><button type="button" onClick={load} className="rounded border border-destructive/30 px-2 py-1 font-semibold">Retry</button></div>}
-    {loading ? <div className="rounded-xl border border-dashed border-border p-10 text-center text-sm text-muted-foreground">Loading assigned shipments…</div> : visible.length ? <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">{visible.map((shipment) => <article key={shipment.id} className="rounded-xl border border-border/70 bg-card p-4 shadow-xs"><div className="flex items-start justify-between gap-3"><div><p className="text-sm font-semibold">{shipment.id}</p><p className="mt-1 text-xs text-muted-foreground">{shipment.origin || "Origin"} → {shipment.destination || "Destination"}</p><p className="mt-1 text-[11px] text-muted-foreground">{clients.find((client) => client.id === shipment.client_id)?.name ?? "Assigned client"}</p></div><span className="rounded-full bg-muted px-2 py-1 text-[10px] font-semibold">{formatStatusLabel(shipment.status, "Booked")}</span></div><div className="mt-3 space-y-1 rounded-lg bg-muted/30 p-2 text-[10px] text-muted-foreground">{shipment.lr_number && <p><strong className="mr-2 text-foreground">LR/LRN</strong>{shipment.lr_number}</p>}{shipment.master_awb && <p><strong className="mr-2 text-foreground">Master AWB</strong>{shipment.master_awb}</p>}<p><strong className="mr-2 text-foreground">ETA</strong>{shipment.edd || "Not provided"}</p></div></article>)}</div> : <div className="rounded-xl border border-dashed border-border p-10 text-center text-sm text-muted-foreground">No assigned shipments match this search.</div>}
+    {loading ? <div className="rounded-xl border border-dashed border-border p-10 text-center text-sm text-muted-foreground">Loading assigned shipments…</div> : visible.length ? <section className="overflow-hidden rounded-xl border border-border/70 bg-card shadow-xs"><div className="border-b border-border/70 px-4 py-3 text-xs text-muted-foreground">Showing {visible.length} shipment{visible.length === 1 ? "" : "s"} within your assigned client scope.</div><div className="overflow-x-auto"><table className="w-full min-w-[980px] text-left text-xs"><thead className="bg-muted/50 text-[10px] uppercase tracking-wider text-muted-foreground"><tr>{["PSS shipment", "Courier references", "Client / route", "Status", "ETA"].map((heading) => <th key={heading} className="px-4 py-3 font-semibold">{heading}</th>)}</tr></thead><tbody className="divide-y divide-border/70">{visible.map((shipment) => { const awbs = boxAwbs(shipment.box_awbs_json); return <tr key={shipment.id} className="transition hover:bg-accent/30"><td className="px-4 py-3 font-mono font-semibold">{shipment.pss_reference ?? shipment.id}</td><td className="px-4 py-3 font-mono text-[11px] text-muted-foreground"><div className="space-y-0.5">{shipment.lr_number && <p><span className="mr-1.5 font-sans text-[10px] uppercase tracking-wide text-foreground">LRN</span>{shipment.lr_number}</p>}{(shipment.master_awb || shipment.tracking_number || shipment.provider_reference) && <p><span className="mr-1.5 font-sans text-[10px] uppercase tracking-wide text-foreground">AWB</span>{shipment.master_awb || shipment.tracking_number || shipment.provider_reference}</p>}{awbs.length ? <p><span className="mr-1.5 font-sans text-[10px] uppercase tracking-wide text-foreground">Box AWB</span>{awbs.join(", ")}</p> : null}{shipment.invoice_number && <p><span className="mr-1.5 font-sans text-[10px] uppercase tracking-wide text-foreground">Invoice</span>{shipment.invoice_number}</p>}{shipment.pickup_reference && <p><span className="mr-1.5 font-sans text-[10px] uppercase tracking-wide text-foreground">PUR</span>{shipment.pickup_reference}</p>}{!shipment.lr_number && !shipment.master_awb && !shipment.tracking_number && !shipment.provider_reference && <p className="font-sans">Provider references pending</p>}</div></td><td className="px-4 py-3"><p className="font-semibold">{clients.find((client) => client.id === shipment.client_id)?.name ?? "Assigned client"}</p><p className="mt-1 text-[11px] text-muted-foreground">{shipment.origin || "Origin"} → {shipment.destination || "Destination"}</p></td><td className="px-4 py-3"><span className="rounded-full bg-muted px-2 py-1 text-[10px] font-semibold">{formatStatusLabel(shipment.status, "Booked")}</span></td><td className="px-4 py-3 text-muted-foreground">{shipment.edd || "Not provided"}</td></tr>; })}</tbody></table></div></section> : <div className="rounded-xl border border-dashed border-border p-10 text-center text-sm text-muted-foreground">No assigned shipments match this search.</div>}
   </div>;
 }
