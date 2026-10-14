@@ -1949,8 +1949,13 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (provider === "delhivery" && operation === "pickups" && !delhiveryPickup) return { enabled: false, status: "invalid_request" as const, reason: "Delhivery requires a valid pickup date and registered pickup location" };
   const rivigoCreate = provider === "rivigo" && operation === "shipments" ? rivigoBookingPayload(payload, rivigo!) : null;
   if (provider === "rivigo" && operation === "shipments" && !rivigoCreate) return { enabled: false, status: "invalid_request" as const, reason: "Rivigo requires valid origin/destination addresses, positive weight, and at least one box" };
+  // Scheduled Fujiyama tracking is a high-volume read-only job. Keep the
+  // shipment outcome and meaningful tracking events in D1, but avoid creating
+  // an integration audit row for every unchanged cron poll. Interactive and
+  // mutation requests remain fully audited.
+  const persistIntegration = !(provider === "delhivery" && operation === "tracking" && requestIdValue.startsWith("cron:"));
   const integrationId = crypto.randomUUID();
-  await env.DB.prepare("INSERT INTO integration_requests (id, provider, client_id, operation, idempotency_key, provider_request_id, status, attempt_count) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0)").bind(integrationId, provider, clientId ?? null, operation, idempotencyKey ?? null, requestIdValue).run();
+  if (persistIntegration) await env.DB.prepare("INSERT INTO integration_requests (id, provider, client_id, operation, idempotency_key, provider_request_id, status, attempt_count) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0)").bind(integrationId, provider, clientId ?? null, operation, idempotencyKey ?? null, requestIdValue).run();
   const delhiveryOrigin = provider === "delhivery" ? new URL(base).origin : "";
   const trackonUrl = provider === "trackon" ? operation === "tracking" ? env.TRACKON_TRACKING_URL : operation === "shipments" ? env.TRACKON_BOOKING_URL : env.TRACKON_LABEL_URL : undefined;
   if (provider === "trackon" && !trackonUrl) return { enabled: false, status: "not_configured" as const, reason: `Trackon ${operation} endpoint is not configured` };
@@ -2030,7 +2035,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   // failures from a five-second cutoff.
   const attemptTimeoutMs = providerTimeoutMs;
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    await env.DB.prepare("UPDATE integration_requests SET attempt_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(attempt + 1, integrationId).run();
+    if (persistIntegration) await env.DB.prepare("UPDATE integration_requests SET attempt_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(attempt + 1, integrationId).run();
     try {
       // XpressBees documents tracking as POST even though it is a read-only
       // lookup. Keep the generic GET behavior for Delhivery/Trackon tracking,
@@ -2091,7 +2096,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     const retryDelay = retryAfter && /^\d+$/.test(retryAfter) ? Math.min(Number(retryAfter) * 1000, 5000) : 200 * (attempt + 1);
     await new Promise((resolve) => setTimeout(resolve, retryDelay));
   }
-  if (!response) { await env.DB.prepare("UPDATE integration_requests SET status = 'failed', error_code = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind("PROVIDER_REQUEST_FAILED", lastError, integrationId).run(); return { enabled: true, status: "failed" as const, providerStatus: 0, error: lastError }; }
+  if (!response) { if (persistIntegration) await env.DB.prepare("UPDATE integration_requests SET status = 'failed', error_code = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind("PROVIDER_REQUEST_FAILED", lastError, integrationId).run(); return { enabled: true, status: "failed" as const, providerStatus: 0, error: lastError }; }
   // Consume the provider response without forwarding its raw body to browser clients.
   // Provider payloads can contain customer data or contract-specific fields; only a
   // normalized tracking event is persisted and returned to the internal caller.
@@ -2106,11 +2111,11 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     }
   } catch (caught) {
     const bodyError = caught instanceof Error ? caught.message : "provider_timeout";
-    await env.DB.prepare("UPDATE integration_requests SET status = 'failed', error_code = 'PROVIDER_REQUEST_FAILED', error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(bodyError, integrationId).run();
+    if (persistIntegration) await env.DB.prepare("UPDATE integration_requests SET status = 'failed', error_code = 'PROVIDER_REQUEST_FAILED', error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(bodyError, integrationId).run();
     return { enabled: true, status: "failed" as const, providerStatus: response.status, error: bodyError };
   }
   const providerFailureDetail = !response.ok ? responseBody.replace(/\s+/g, " ").trim().slice(0, 300) : null;
-  await env.DB.prepare("UPDATE integration_requests SET status = ?, error_code = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(response.ok ? "succeeded" : "failed", response.ok ? null : `HTTP_${response.status}`, response.ok ? null : `${lastError}${providerFailureDetail ? `: ${providerFailureDetail}` : ""}`.slice(0, 500), integrationId).run();
+  if (persistIntegration) await env.DB.prepare("UPDATE integration_requests SET status = ?, error_code = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(response.ok ? "succeeded" : "failed", response.ok ? null : `HTTP_${response.status}`, response.ok ? null : `${lastError}${providerFailureDetail ? `: ${providerFailureDetail}` : ""}`.slice(0, 500), integrationId).run();
   let normalizedTracking: NormalizedProviderTracking | null = null;
   if (operation === "tracking" && clientId && typeof payload.shipment_id === "string") {
     const syncError = response.ok ? null : `${lastError}${providerFailureDetail ? `: ${providerFailureDetail}` : ""}`.slice(0, 500);
