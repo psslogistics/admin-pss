@@ -7,11 +7,12 @@ type DelhiveryTokenCache = {
   delete(key: string): Promise<void>;
 };
 
-export interface Env extends Omit<Cloudflare.Env, "SUPABASE_PUBLISHABLE_KEY" | "API_KEY_PEPPER" | "DELHIVERY_API_TOKEN" | "DELHIVERY_B2B_API_BASE_URL" | "DELHIVERY_WEBHOOK_SECRET" | "DELHIVERY_TOKEN_CACHE" | "EKART_API_KEY" | "EKART_API_SECRET" | "EKART_WEBHOOK_SECRET" | "EKART_ENABLE_PROVIDER_CALLS" | "TRACKON_API_BASE_URL" | "TRACKON_CREDENTIALS_JSON" | "TRACKON_WEBHOOK_SECRET" | "TRACKON_BOOKING_URL" | "TRACKON_TRACKING_URL" | "TRACKON_LABEL_URL" | "TRACKON_ENABLE_SHIPMENT_CREATION" | "TRACKON_ENABLE_PICKUP_CREATION" | "XPRESSBEES_API_BASE_URL" | "XPRESSBEES_CREDENTIALS_JSON" | "XPRESSBEES_ENABLE_SHIPMENT_CREATION" | "XPRESSBEES_ENABLE_PICKUP_CREATION" | "RIVIGO_API_BASE_URL" | "RIVIGO_AUTH_URL" | "RIVIGO_TRACKING_URL" | "RIVIGO_CREDENTIALS_JSON" | "RIVIGO_ENABLE_PROVIDER_CALLS"> {
+export interface Env extends Omit<Cloudflare.Env, "SUPABASE_PUBLISHABLE_KEY" | "API_KEY_PEPPER" | "DELHIVERY_API_TOKEN" | "DELHIVERY_B2B_API_BASE_URL" | "DELHIVERY_FACILITY_API_BASE_URL" | "DELHIVERY_WEBHOOK_SECRET" | "DELHIVERY_TOKEN_CACHE" | "EKART_API_KEY" | "EKART_API_SECRET" | "EKART_WEBHOOK_SECRET" | "EKART_ENABLE_PROVIDER_CALLS" | "TRACKON_API_BASE_URL" | "TRACKON_CREDENTIALS_JSON" | "TRACKON_WEBHOOK_SECRET" | "TRACKON_BOOKING_URL" | "TRACKON_TRACKING_URL" | "TRACKON_LABEL_URL" | "TRACKON_ENABLE_SHIPMENT_CREATION" | "TRACKON_ENABLE_PICKUP_CREATION" | "XPRESSBEES_API_BASE_URL" | "XPRESSBEES_CREDENTIALS_JSON" | "XPRESSBEES_ENABLE_SHIPMENT_CREATION" | "XPRESSBEES_ENABLE_PICKUP_CREATION" | "RIVIGO_API_BASE_URL" | "RIVIGO_AUTH_URL" | "RIVIGO_TRACKING_URL" | "RIVIGO_CREDENTIALS_JSON" | "RIVIGO_ENABLE_PROVIDER_CALLS"> {
   SUPABASE_PUBLISHABLE_KEY: string;
   API_KEY_PEPPER?: string;
   DELHIVERY_API_TOKEN?: string;
   DELHIVERY_B2B_API_BASE_URL?: string;
+  DELHIVERY_FACILITY_API_BASE_URL?: string;
   DELHIVERY_WEBHOOK_SECRET?: string;
   DELHIVERY_TOKEN_CACHE?: DelhiveryTokenCache;
   EKART_API_KEY?: string;
@@ -896,7 +897,15 @@ async function resolveDelhiveryFacility(
   const pincode = String(payload.pincode ?? localWarehouse?.pincode ?? "").trim();
   if (!name && !localWarehouse?.provider_reference) return { ok: false, error: "A Delhivery pickup facility is required before scheduling this pickup" };
 
-  const endpoint = `${String(baseUrl).replace(/\/$/, "")}/web/api/company/configurations/facilities_and_addresses_v3/list`;
+  // The B2B booking host and the Delhivery console do not always expose the
+  // same facility index. Query the configured booking host first, then the
+  // console's UCP gateway, while keeping the same exact-name/account matching
+  // rules for every response. This fixes false "activation pending" results
+  // without allowing a pincode-only or unrelated-facility fallback.
+  const lookupBases = Array.from(new Set([
+    String(baseUrl).replace(/\/$/, ""),
+    String(env.DELHIVERY_FACILITY_API_BASE_URL ?? "https://ucp-app-gateway.delhivery.com").replace(/\/$/, ""),
+  ]));
   const findMatch = (rows: Record<string, unknown>[]) => rows.find((row) => delhiveryFacilityMatches(row, name, pincode, localWarehouse?.provider_reference));
   const lookupBodies = [
     { page: 1, page_size: 50, search_term: name, search_on: ["facility_name"], ...(name ? { filter_facility_name: [name] } : {}) },
@@ -918,25 +927,34 @@ async function resolveDelhiveryFacility(
     { page: 1, page_size: 100 },
   ];
   let match: Record<string, unknown> | undefined;
-  for (const body of lookupBodies) {
-    let response: Response;
-    try {
-      response = await providerFetch(endpoint, {
-        method: "POST",
-        headers: { authorization: `Bearer ${token}`, "content-type": "application/json", accept: "application/json", "x-request-id": requestIdValue },
-        body: JSON.stringify(body),
-      }, timeoutMs);
-    } catch (caught) {
-      return { ok: false, error: caught instanceof Error ? caught.message : "Delhivery facility lookup failed" };
+  let lastLookupError = "";
+  for (const lookupBase of lookupBases) {
+    const endpoint = `${lookupBase}/web/api/company/configurations/facilities_and_addresses_v3/list`;
+    for (const body of lookupBodies) {
+      let response: Response;
+      try {
+        response = await providerFetch(endpoint, {
+          method: "POST",
+          headers: { authorization: `Bearer ${token}`, "content-type": "application/json", accept: "application/json", "x-request-id": requestIdValue },
+          body: JSON.stringify(body),
+        }, timeoutMs);
+      } catch (caught) {
+        lastLookupError = caught instanceof Error ? caught.message : "Delhivery facility lookup failed";
+        continue;
+      }
+      const responseText = await providerResponseText(response, timeoutMs);
+      if (!response.ok) {
+        lastLookupError = `Delhivery facility lookup failed (${response.status}): ${responseText.slice(0, 240)}`;
+        continue;
+      }
+      let parsed: unknown = null;
+      try { parsed = JSON.parse(responseText); } catch { parsed = null; }
+      match = findMatch(delhiveryFacilityRows(parsed));
+      if (match) break;
     }
-    const responseText = await providerResponseText(response, timeoutMs);
-    if (!response.ok) return { ok: false, error: `Delhivery facility lookup failed (${response.status}): ${responseText.slice(0, 240)}` };
-    let parsed: unknown = null;
-    try { parsed = JSON.parse(responseText); } catch { parsed = null; }
-    match = findMatch(delhiveryFacilityRows(parsed));
     if (match) break;
   }
-  if (!match) return { ok: false, error: `Delhivery pickup facility '${name || pincode}' is not active or could not be resolved` };
+  if (!match) return { ok: false, error: lastLookupError || `Delhivery pickup facility '${name || pincode}' is not active or could not be resolved` };
   const facility = {
     id: delhiveryFacilityField(match, ["facility_id", "id", "client_warehouse_uuid", "uuid"]),
     code: delhiveryFacilityField(match, ["facility_code", "code", "facility_name", "name"]),

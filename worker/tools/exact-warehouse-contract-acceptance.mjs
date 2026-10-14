@@ -7,6 +7,7 @@ const required = [
   ["client booking requires a selected warehouse", "PICKUP_WAREHOUSE_REQUIRED"],
   ["pending activation is explicit", "WAREHOUSE_ACTIVATION_PENDING"],
   ["provider creation is idempotent", '"Idempotency-Key": warehouseCreateIdempotencyKey'],
+  ["facility lookup checks the Delhivery console gateway", "ucp-app-gateway.delhivery.com"],
   ["provider name is persisted", "provider_name"],
   ["provider error is persisted", "provider_error"],
   ["activation timestamp is persisted", "provider_activated_at"],
