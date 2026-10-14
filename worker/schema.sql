@@ -333,6 +333,7 @@ CREATE TABLE IF NOT EXISTS warehouses (
   name TEXT NOT NULL,
   address TEXT NOT NULL,
   city TEXT,
+  state TEXT,
   pincode TEXT,
   contact TEXT,
   contact_name TEXT,

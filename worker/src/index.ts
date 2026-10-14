@@ -743,8 +743,8 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
       await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_reference = ?, provider_name = ?, provider_error = NULL, provider_activated_at = CURRENT_TIMESTAMP, provider_status = 'active', status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
         .bind(providerAccountId ?? null, existingFacility.facility.id, existingFacility.facility.name || name, existing.id, clientId).run();
     } else {
-      await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, pincode, contact, contact_name, provider, provider_account_id, provider_status, provider_reference, provider_name, provider_activated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'active', ?, ?, CURRENT_TIMESTAMP)")
-        .bind(crypto.randomUUID(), clientId, existingFacility.facility.name || name, origin.line, origin.city, origin.pincode, origin.phone, origin.name, providerAccountId ?? null, existingFacility.facility.id, existingFacility.facility.name || name).run();
+      await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status, provider_reference, provider_name, provider_activated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'active', ?, ?, CURRENT_TIMESTAMP)")
+        .bind(crypto.randomUUID(), clientId, existingFacility.facility.name || name, origin.line, origin.city, origin.state, origin.pincode, origin.phone, origin.name, providerAccountId ?? null, existingFacility.facility.id, existingFacility.facility.name || name).run();
     }
     return { ok: true as const, name: existingFacility.facility.name || name, reused: true as const };
   }
@@ -843,8 +843,8 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
       .bind(providerAccountId ?? null, facility.facility.id, facility.facility.name || name, existing.id, clientId)
       .run();
   } else {
-    await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, pincode, contact, contact_name, provider, provider_account_id, provider_status, provider_reference, provider_name, provider_activated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'active', ?, ?, CURRENT_TIMESTAMP)")
-      .bind(crypto.randomUUID(), clientId, name, origin.line, origin.city, origin.pincode, origin.phone, origin.name, providerAccountId ?? null, facility.facility.id, facility.facility.name || name)
+    await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status, provider_reference, provider_name, provider_activated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'active', ?, ?, CURRENT_TIMESTAMP)")
+      .bind(crypto.randomUUID(), clientId, name, origin.line, origin.city, origin.state, origin.pincode, origin.phone, origin.name, providerAccountId ?? null, facility.facility.id, facility.facility.name || name)
       .run();
   }
   return { ok: true as const, name: facility.facility.name || name, reused: false as const };
@@ -3625,7 +3625,7 @@ const worker = {
             const account = await env.DB.prepare("SELECT pa.id FROM provider_accounts pa LEFT JOIN provider_account_client_policies p ON p.provider_account_id = pa.id AND p.client_id = ? WHERE pa.id = ? AND pa.provider = 'delhivery' AND pa.status = 'active' AND (pa.client_id = ? OR (pa.client_id IS NULL AND p.client_id = ? AND p.enabled = 1)) LIMIT 1").bind(clientId, providerAccountId, clientId, clientId).first<{ id: string }>();
             if (!account) return error("PROVIDER_ACCOUNT_NOT_ALLOWED", "The selected Delhivery account is not enabled for this client", 403, id, headers);
           }
-          await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, pincode, contact, contact_name, provider, provider_account_id, provider_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, NULL)").bind(recordId, clientId, payload.name, payload.address, String(payload.city ?? ""), String(payload.pincode ?? ""), String(payload.contact ?? ""), String(payload.contact_name ?? ""), providerAccountId).run();
+          await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, NULL)").bind(recordId, clientId, payload.name, payload.address, String(payload.city ?? ""), String(payload.state ?? ""), String(payload.pincode ?? ""), String(payload.contact ?? ""), String(payload.contact_name ?? ""), providerAccountId).run();
         } else {
           if (typeof payload.label !== "string" || typeof payload.address !== "string") return error("VALIDATION_ERROR", "Address label and address are required", 400, id, headers);
           const addressKind = payload.address_kind === "consignee" ? "consignee" : "consignor";
