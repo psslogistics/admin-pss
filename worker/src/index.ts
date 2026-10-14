@@ -795,6 +795,10 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   const responseText = await providerResponseText(response, timeoutMs);
   let createdProviderReference: string | null = null;
   let createdProviderName: string | null = null;
+  const providerAlreadyRegistered = !response.ok && (() => {
+    const lower = responseText.toLowerCase();
+    return lower.includes("already exists") || lower.includes("already configured") || lower.includes("duplicate") || lower.includes("warehouse exists");
+  })();
   try {
     const parsedCreateBody = JSON.parse(responseText) as unknown;
     createdProviderReference = findProviderReference(parsedCreateBody, new Set(["facility_id", "warehouse_id", "client_warehouse_uuid", "warehouse_uuid", "facility_uuid"]));
@@ -814,9 +818,24 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
     }
   }
   if (!response.ok) {
-    const lower = responseText.toLowerCase();
-    const alreadyRegistered = lower.includes("already exists") || lower.includes("already configured") || lower.includes("duplicate") || lower.includes("warehouse exists");
-    if (!alreadyRegistered) return { ok: false as const, error: `Delhivery warehouse creation failed (${response.status}): ${responseText.slice(0, 240)}` };
+    if (!providerAlreadyRegistered) return { ok: false as const, error: `Delhivery warehouse creation failed (${response.status}): ${responseText.slice(0, 240)}` };
+  }
+  // The B2B token can create/idempotently reuse a warehouse, but it cannot
+  // read the console-only facility index. Treat an accepted registration or
+  // an explicit duplicate response as the provider's authoritative
+  // create-or-use result and continue with this exact client-selected name.
+  // Delhivery remains the final authority during /manifest; a rejected
+  // manifestation is surfaced as a provider error rather than mislabelled as
+  // a local activation failure.
+  if (response.ok || providerAlreadyRegistered) {
+    if (existing) {
+      await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_reference = COALESCE(?, provider_reference), provider_name = COALESCE(?, provider_name), provider_error = NULL, provider_activated_at = COALESCE(provider_activated_at, CURRENT_TIMESTAMP), provider_status = 'active', status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+        .bind(providerAccountId ?? null, createdProviderReference, createdProviderName || name, existing.id, clientId).run();
+    } else {
+      await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status, provider_reference, provider_name, provider_activated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'active', ?, ?, CURRENT_TIMESTAMP)")
+        .bind(crypto.randomUUID(), clientId, name, origin.line, origin.city, origin.state, origin.pincode, origin.phone, origin.name, providerAccountId ?? null, createdProviderReference, createdProviderName || name).run();
+    }
+    return { ok: true as const, name: createdProviderName || name, reused: providerAlreadyRegistered as boolean };
   }
   // Delhivery may acknowledge warehouse creation before the warehouse is
   // activated by its FMS team. Never treat an HTTP success from the create
