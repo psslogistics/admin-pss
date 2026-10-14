@@ -340,6 +340,9 @@ CREATE TABLE IF NOT EXISTS warehouses (
   provider_account_id TEXT,
   provider_status TEXT,
   provider_reference TEXT,
+  provider_name TEXT,
+  provider_error TEXT,
+  provider_activated_at TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -467,6 +470,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_ticket_time ON support_messages(ticket_i
 CREATE INDEX IF NOT EXISTS idx_notifications_user_read ON notifications(recipient_user_id, is_read, created_at);
 CREATE INDEX IF NOT EXISTS idx_warehouses_client_status ON warehouses(client_id, status);
 CREATE INDEX IF NOT EXISTS idx_warehouses_provider_identity ON warehouses(client_id, provider, provider_account_id, provider_status);
+CREATE INDEX IF NOT EXISTS idx_warehouses_exact_provider_name ON warehouses(client_id, provider, provider_account_id, name);
 CREATE INDEX IF NOT EXISTS idx_addresses_client_status ON client_addresses(client_id, status);
 CREATE INDEX IF NOT EXISTS idx_billing_client_status ON billing_records(client_id, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_wallet_client_time ON wallet_transactions(client_id, created_at);

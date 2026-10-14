@@ -716,34 +716,24 @@ function delhiveryWarehouseName(origin: { name: string; state?: string; pincode:
   return `${base} ${state} ${origin.pincode}`.replace(/\s+/g, " ").slice(0, 50).trim();
 }
 
-async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: string, origin: { name: string; line: string; city: string; state: string; pincode: string; phone: string }, requestIdValue: string, timeoutMs: number, b2bBaseUrl = env.DELHIVERY_B2B_API_BASE_URL ?? "https://ltl-clients-api.delhivery.com", providerAccountId?: string | null) {
-  const existing = await env.DB.prepare("SELECT id, name, provider_status, provider_account_id, provider_reference FROM warehouses WHERE client_id = ? AND address = ? AND city = ? AND pincode = ? ORDER BY CASE WHEN provider = 'delhivery' AND provider_account_id = ? AND provider_status = 'active' THEN 0 ELSE 1 END, updated_at DESC LIMIT 1")
-    .bind(clientId, origin.line, origin.city, origin.pincode, providerAccountId ?? "")
-    .first<{ id: string; name: string; provider_status: string | null; provider_account_id: string | null; provider_reference: string | null }>();
-  const activeAccountWarehouse = providerAccountId
-    ? await env.DB.prepare("SELECT name, provider_reference FROM warehouses WHERE client_id = ? AND provider = 'delhivery' AND provider_account_id = ? AND provider_status = 'active' AND provider_reference IS NOT NULL ORDER BY updated_at DESC LIMIT 1")
-      .bind(clientId, providerAccountId)
-      .first<{ name: string; provider_reference: string }>()
+async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: string, origin: { name: string; line: string; city: string; state: string; pincode: string; phone: string }, requestIdValue: string, timeoutMs: number, b2bBaseUrl = env.DELHIVERY_B2B_API_BASE_URL ?? "https://ltl-clients-api.delhivery.com", providerAccountId?: string | null, selectedWarehouseId?: string | null) {
+  const existing = selectedWarehouseId
+    ? await env.DB.prepare("SELECT id, name, provider_status, provider_account_id, provider_reference FROM warehouses WHERE client_id = ? AND id = ? LIMIT 1")
+      .bind(clientId, selectedWarehouseId)
+      .first<{ id: string; name: string; provider_status: string | null; provider_account_id: string | null; provider_reference: string | null }>()
     : null;
-  if (activeAccountWarehouse && existing?.provider_status !== "active") {
-    if (existing) {
-      await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_reference = ?, provider_status = 'active', status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
-        .bind(providerAccountId, activeAccountWarehouse.provider_reference, existing.id, clientId).run();
-    }
-    return { ok: true as const, name: activeAccountWarehouse.name, reused: true as const };
-  }
   const name = existing?.name?.trim() || delhiveryWarehouseName(origin);
   // Reuse the provider's canonical warehouse whenever it already exists.
   // Creation is only allowed after a genuine provider-side "not found"; this
   // keeps every address/account on the same generic path without duplicates.
-  const existingFacility = await resolveDelhiveryFacility(env, token, b2bBaseUrl, clientId, { delhivery_pickup_location: name, pincode: origin.pincode }, requestIdValue, timeoutMs);
+  const existingFacility = await resolveDelhiveryFacility(env, token, b2bBaseUrl, clientId, { warehouse_id: existing?.id, delhivery_pickup_location: name, pincode: origin.pincode }, requestIdValue, timeoutMs);
   if (existingFacility.ok) {
     if (existing) {
-      await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_reference = ?, provider_status = 'active', status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
-        .bind(providerAccountId ?? null, existingFacility.facility.id, existing.id, clientId).run();
+      await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_reference = ?, provider_name = ?, provider_error = NULL, provider_activated_at = CURRENT_TIMESTAMP, provider_status = 'active', status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+        .bind(providerAccountId ?? null, existingFacility.facility.id, existingFacility.facility.name || name, existing.id, clientId).run();
     } else {
-      await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, pincode, contact, provider, provider_account_id, provider_status, provider_reference) VALUES (?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'active', ?)")
-        .bind(crypto.randomUUID(), clientId, existingFacility.facility.name || name, origin.line, origin.city, origin.pincode, origin.phone, providerAccountId ?? null, existingFacility.facility.id).run();
+      await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, pincode, contact, provider, provider_account_id, provider_status, provider_reference, provider_name, provider_activated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'active', ?, ?, CURRENT_TIMESTAMP)")
+        .bind(crypto.randomUUID(), clientId, existingFacility.facility.name || name, origin.line, origin.city, origin.pincode, origin.phone, providerAccountId ?? null, existingFacility.facility.id, existingFacility.facility.name || name).run();
     }
     return { ok: true as const, name: existingFacility.facility.name || name, reused: true as const };
   }
@@ -813,30 +803,26 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   // Delhivery acknowledges warehouse registration before its facility-search
   // index catches up. Verify repeatedly so a valid active warehouse is not
   // reported as inactive during that propagation window.
-  let facility = await resolveDelhiveryFacility(env, token, b2bBaseUrl, clientId, { delhivery_pickup_location: name, pincode: origin.pincode }, requestIdValue, timeoutMs);
+  let facility = await resolveDelhiveryFacility(env, token, b2bBaseUrl, clientId, { warehouse_id: existing?.id, delhivery_pickup_location: name, pincode: origin.pincode }, requestIdValue, timeoutMs);
   for (let attempt = 1; !facility.ok && attempt < 5; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 1500 * attempt));
-    facility = await resolveDelhiveryFacility(env, token, b2bBaseUrl, clientId, { delhivery_pickup_location: name, pincode: origin.pincode }, requestIdValue, timeoutMs);
+    facility = await resolveDelhiveryFacility(env, token, b2bBaseUrl, clientId, { warehouse_id: existing?.id, delhivery_pickup_location: name, pincode: origin.pincode }, requestIdValue, timeoutMs);
   }
   if (!facility.ok) {
-    // The console can show an active warehouse while the facility-list API
-    // still omits it from its search index. Do not manufacture an inactive
-    // error in that case: the manifestation endpoint is the authoritative
-    // booking check and will return the real provider reason if it rejects.
     if (!delhiveryFacilityNotFound(facility.error)) return { ok: false as const, error: facility.error };
     if (existing) {
-      await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_status = 'pending', status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
-        .bind(providerAccountId ?? null, existing.id, clientId).run();
+      await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_status = 'pending', provider_error = ?, status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+        .bind(providerAccountId ?? null, "Delhivery warehouse was created or located but is awaiting provider activation", existing.id, clientId).run();
     }
-    return { ok: true as const, name, reused: true as const };
+    return { ok: false as const, code: "WAREHOUSE_ACTIVATION_PENDING" as const, error: "The selected Delhivery warehouse is awaiting provider activation. Retry booking after Delhivery marks it active." };
   }
   if (existing) {
-    await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_status = 'active', provider_reference = COALESCE(provider_reference, ?), status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
-      .bind(providerAccountId ?? null, facility.facility.id, existing.id, clientId)
+    await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_status = 'active', provider_reference = COALESCE(provider_reference, ?), provider_name = ?, provider_error = NULL, provider_activated_at = CURRENT_TIMESTAMP, status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+      .bind(providerAccountId ?? null, facility.facility.id, facility.facility.name || name, existing.id, clientId)
       .run();
   } else {
-    await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, pincode, contact, provider, provider_account_id, provider_status, provider_reference) VALUES (?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'active', ?)")
-      .bind(crypto.randomUUID(), clientId, name, origin.line, origin.city, origin.pincode, origin.phone, providerAccountId ?? null, facility.facility.id)
+    await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, pincode, contact, provider, provider_account_id, provider_status, provider_reference, provider_name, provider_activated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'active', ?, ?, CURRENT_TIMESTAMP)")
+      .bind(crypto.randomUUID(), clientId, name, origin.line, origin.city, origin.pincode, origin.phone, providerAccountId ?? null, facility.facility.id, facility.facility.name || name)
       .run();
   }
   return { ok: true as const, name: facility.facility.name || name, reused: false as const };
@@ -883,7 +869,7 @@ async function resolveDelhiveryFacility(
   const warehouseSelect = "SELECT id, name, address, city, pincode, provider_reference, provider_status FROM warehouses WHERE client_id = ?";
   const localWarehouse = warehouseId
     ? await env.DB.prepare(`${warehouseSelect} AND id = ? LIMIT 1`).bind(clientId, warehouseId).first<{ id: string; name: string; address: string; city: string; pincode: string; provider_reference: string | null; provider_status: string | null }>()
-    : await env.DB.prepare(`${warehouseSelect} AND pincode = ? ORDER BY CASE WHEN provider = 'delhivery' AND provider_status = 'active' THEN 0 ELSE 1 END, updated_at DESC LIMIT 1`).bind(clientId, String(payload.pincode ?? "").trim()).first<{ id: string; name: string; address: string; city: string; pincode: string; provider_reference: string | null; provider_status: string | null }>();
+    : null;
   const name = String(payload.delhivery_pickup_location ?? payload.pickup_location ?? localWarehouse?.name ?? "").trim();
   const pincode = String(payload.pincode ?? localWarehouse?.pincode ?? "").trim();
   const directId = String(payload.provider_facility_id ?? "").trim();
@@ -899,7 +885,8 @@ async function resolveDelhiveryFacility(
     if (["inactive", "disabled", "deleted", "deactivated"].includes(rowStatus) || activeFlag === false || activeFlag === 0 || String(activeFlag).toLowerCase() === "false") return false;
     const rowPin = delhiveryFacilityField(row, ["pincode", "pin_code", "postal_code"]);
     const rowName = delhiveryFacilityField(row, ["facility_name", "name", "client_warehouse_name", "warehouse_name"]);
-    const nameMatches = !normalizedName || rowName.toLowerCase().replace(/[^a-z0-9]/g, "").includes(normalizedName) || normalizedName.includes(rowName.toLowerCase().replace(/[^a-z0-9]/g, ""));
+    const normalizedRowName = rowName.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const nameMatches = !normalizedName || normalizedRowName === normalizedName;
     return nameMatches && (!pincode || !rowPin || rowPin.replace(/\D/g, "") === pincode.replace(/\D/g, ""));
   });
   const lookupBodies = [
@@ -922,15 +909,6 @@ async function resolveDelhiveryFacility(
     { page: 1, page_size: 100 },
   ];
   let match: Record<string, unknown> | undefined;
-  let activeFallback: Record<string, unknown> | undefined;
-  const isActiveFacility = (row: Record<string, unknown>) => {
-    const rowStatus = String(row.status ?? row.facility_status ?? row.state ?? "ACTIVE").toLowerCase();
-    const activeFlag = row.is_active ?? row.active ?? row.enabled ?? row.is_enabled;
-    return !["inactive", "disabled", "deleted", "deactivated"].includes(rowStatus)
-      && activeFlag !== false
-      && activeFlag !== 0
-      && String(activeFlag).toLowerCase() !== "false";
-  };
   for (const body of lookupBodies) {
     let response: Response;
     try {
@@ -946,16 +924,9 @@ async function resolveDelhiveryFacility(
     if (!response.ok) return { ok: false, error: `Delhivery facility lookup failed (${response.status}): ${responseText.slice(0, 240)}` };
     let parsed: unknown = null;
     try { parsed = JSON.parse(responseText); } catch { parsed = null; }
-    const rows = delhiveryFacilityRows(parsed);
-    if (!activeFallback) activeFallback = rows.find(isActiveFacility);
-    match = findMatch(rows);
+    match = findMatch(delhiveryFacilityRows(parsed));
     if (match) break;
   }
-  // A Delhivery account can already have an active warehouse under a
-  // different saved address/name. Reuse that provider warehouse globally;
-  // exact address matching is preferred, but must not block booking when the
-  // account has an active facility that Delhivery will accept.
-  match ??= activeFallback;
   if (!match) return { ok: false, error: `Delhivery pickup facility '${name || pincode}' is not active or could not be resolved` };
   const facility = {
     id: delhiveryFacilityField(match, ["facility_id", "id", "client_warehouse_uuid", "uuid"]),
@@ -965,8 +936,8 @@ async function resolveDelhiveryFacility(
   };
   if (!facility.id || !facility.code) return { ok: false, error: "Delhivery returned an incomplete pickup facility record" };
   if (localWarehouse) {
-    await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_reference = ?, provider_status = 'active', status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
-      .bind(facility.id, localWarehouse.id, clientId).run();
+    await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_reference = ?, provider_name = ?, provider_error = NULL, provider_activated_at = CURRENT_TIMESTAMP, provider_status = 'active', status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+      .bind(facility.id, facility.name, localWarehouse.id, clientId).run();
   }
   return { ok: true, facility };
 }
@@ -1783,12 +1754,13 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (provider === "delhivery" && operation === "shipments" && useDelhiveryB2b && clientId && delhiveryB2bToken) {
     const origin = delhiveryAddress(payload.origin_address, String(payload.origin ?? "PSS Logistics"));
     if (!origin) return { enabled: true, status: "invalid_request" as const, reason: "A complete consignor address is required to create or select the pickup warehouse" };
-    let warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId);
+    const selectedWarehouseId = typeof payload.warehouse_id === "string" && payload.warehouse_id.trim() ? payload.warehouse_id.trim() : null;
+    let warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId, selectedWarehouseId);
     if (!warehouse.ok && /\b401\b|invalid token|unauthorized|token decode|not enough segments/i.test(warehouse.error)) {
       const refreshedToken = await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs, true);
       if (refreshedToken) {
         delhiveryB2bToken = refreshedToken;
-        warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId);
+        warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId, selectedWarehouseId);
       }
     }
     if (!warehouse.ok) return { enabled: true, status: "failed" as const, error: warehouse.error };
@@ -1825,12 +1797,13 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     }
     if (!origin) return { enabled: true, status: "invalid_request" as const, reason: "A complete pickup address is required before Delhivery can register the warehouse" };
     if (origin) {
-      let warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId);
+      const selectedWarehouseId = typeof payload.warehouse_id === "string" && payload.warehouse_id.trim() ? payload.warehouse_id.trim() : null;
+      let warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId, selectedWarehouseId);
       if (!warehouse.ok && /\b401\b|invalid token|unauthorized|token decode|not enough segments/i.test(warehouse.error)) {
         const refreshedToken = await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs, true);
       if (refreshedToken) {
         delhiveryB2bToken = refreshedToken;
-        warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId);
+        warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId, selectedWarehouseId);
       }
       }
       if (!warehouse.ok) return { enabled: true, status: "failed" as const, error: warehouse.error };
@@ -3006,6 +2979,12 @@ const worker = {
         if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
         const provider = typeof payload.provider === "string" && ["delhivery", "ekart", "trackon", "xpressbees", "rivigo"].includes(payload.provider) ? payload.provider : (hasRole(auth, ["employee", "admin", "super_admin"]) ? "delhivery" : null);
         if ((auth.kind === "api" || hasRole(auth, ["client"])) && provider !== "delhivery") return error("DELHIVERY_B2B_ONLY", "Client shipment booking is currently limited to Delhivery B2B", 409, id, headers);
+        const selectedWarehouseId = typeof payload.warehouse_id === "string" ? payload.warehouse_id.trim() : "";
+        if (provider === "delhivery" && (auth.kind === "api" || hasRole(auth, ["client"])) && !selectedWarehouseId) return error("PICKUP_WAREHOUSE_REQUIRED", "Select a saved pickup warehouse before booking this Delhivery B2B shipment", 409, id, headers);
+        if (provider === "delhivery" && selectedWarehouseId) {
+          const selectedWarehouse = await env.DB.prepare("SELECT id FROM warehouses WHERE id = ? AND client_id = ? LIMIT 1").bind(selectedWarehouseId, clientId).first<{ id: string }>();
+          if (!selectedWarehouse) return error("WAREHOUSE_NOT_FOUND", "The selected pickup warehouse no longer exists for this client. Select it again before booking.", 404, id, headers);
+        }
         if (provider === "delhivery" && (!Array.isArray(payload.invoice_documents) || payload.invoice_documents.length < 1)) return error("INVOICE_DOCUMENT_REQUIRED", "Upload at least one invoice document before booking this Delhivery B2B shipment", 400, id, headers);
         const pricingQuoteId = typeof payload.pricing_quote_id === "string" ? payload.pricing_quote_id.trim() : "";
         const submittedPricingQuote = pricingQuoteId ? await env.DB.prepare("SELECT id, version_id, account_scope, origin_zone, destination_zone, chargeable_weight_kg, client_breakdown_json, expires_at FROM pricing_quotes WHERE id = ? AND client_id = ? LIMIT 1").bind(pricingQuoteId, clientId).first<PricingQuoteRecord & { expires_at: string }>() : null;
@@ -3061,7 +3040,9 @@ const worker = {
           await env.DB.prepare("UPDATE shipments SET status = 'exception', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(shipmentId, clientId).run();
           await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'exception', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipmentId, `Provider booking failed: ${failureReason}`, auth.userId ?? `api:${clientId}`).run();
           if (pricingQuote) { await env.DB.prepare("INSERT INTO wallet_transactions (id, client_id, type, amount, reference, status, balance_after) VALUES (?, ?, 'credit', ?, ?, 'posted', 0)").bind(crypto.randomUUID(), clientId, pricingAmount, `REVERSAL-${shipmentId}`).run(); await env.DB.prepare("UPDATE billing_records SET status = 'void', updated_at = CURRENT_TIMESTAMP WHERE shipment_id = ? AND client_id = ?").bind(shipmentId, clientId).run(); await recalculateWalletBalances(env, clientId); }
-          const failedResponse = JSON.stringify({ ok: false, error: { code: "PROVIDER_REQUEST_FAILED", category: "provider", message: "The shipment could not be booked with the courier. You can retry after checking the provider status.", user_safe_message: "The courier did not accept this booking. Your shipment was not booked; retry the booking after correcting the provider issue.", technical_message: failureReason, provider_code: "PROVIDER_REQUEST_FAILED", request_id: id, retryable: true, stale_data: false }, data: { id: shipmentId, client_id: clientId, status: "exception", provider, pricing_amount: pricingAmount || null }, request_id: id });
+          const warehousePending = provider === "delhivery" && failureReason.includes("awaiting provider activation");
+          const failureCode = warehousePending ? "WAREHOUSE_ACTIVATION_PENDING" : "PROVIDER_REQUEST_FAILED";
+          const failedResponse = JSON.stringify({ ok: false, error: { code: failureCode, category: "provider", message: warehousePending ? "The selected pickup warehouse is awaiting Delhivery activation." : "The shipment could not be booked with the courier. You can retry after checking the provider status.", user_safe_message: warehousePending ? "Your saved pickup warehouse is awaiting Delhivery activation. Retry booking after Delhivery activates it." : "The courier did not accept this booking. Your shipment was not booked; retry the booking after correcting the provider issue.", technical_message: failureReason, provider_code: failureCode, request_id: id, retryable: true, stale_data: false }, data: { id: shipmentId, client_id: clientId, status: "exception", provider, pricing_amount: pricingAmount || null }, request_id: id });
           await saveIdempotent(env, key, clientId, "POST /v1/shipments", 502, failedResponse, requestHash);
           await audit(env, ctx, auth, id, "shipment.provider_failed", "shipment", shipmentId, { client_id: clientId, provider, reason: failureReason });
           return new Response(failedResponse, { status: 502, headers: { ...headers, "content-type": "application/json" } });

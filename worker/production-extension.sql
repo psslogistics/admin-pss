@@ -52,6 +52,8 @@ CREATE TABLE IF NOT EXISTS support_messages (
 CREATE TABLE IF NOT EXISTS warehouses (
   id TEXT PRIMARY KEY, client_id TEXT NOT NULL, name TEXT NOT NULL, address TEXT NOT NULL,
   city TEXT, pincode TEXT, contact TEXT, status TEXT NOT NULL DEFAULT 'active',
+  provider TEXT, provider_account_id TEXT, provider_status TEXT, provider_reference TEXT,
+  provider_name TEXT, provider_error TEXT, provider_activated_at TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS client_addresses (
@@ -92,6 +94,7 @@ CREATE INDEX IF NOT EXISTS idx_exception_client_status ON exception_cases(client
 CREATE INDEX IF NOT EXISTS idx_returns_client_status ON return_shipments(client_id, status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_support_messages_ticket_time ON support_messages(ticket_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_warehouses_client_status ON warehouses(client_id, status);
+CREATE INDEX IF NOT EXISTS idx_warehouses_exact_provider_name ON warehouses(client_id, provider, provider_account_id, name);
 CREATE INDEX IF NOT EXISTS idx_addresses_client_status ON client_addresses(client_id, status);
 CREATE INDEX IF NOT EXISTS idx_billing_client_status ON billing_records(client_id, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_wallet_client_time ON wallet_transactions(client_id, created_at);
