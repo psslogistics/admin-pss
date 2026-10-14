@@ -841,23 +841,8 @@ async function resolveDelhiveryFacility(
   if (!name && !localWarehouse?.provider_reference) return { ok: false, error: "A Delhivery pickup facility is required before scheduling this pickup" };
 
   const endpoint = `${String(baseUrl).replace(/\/$/, "")}/web/api/company/configurations/facilities_and_addresses_v3/list`;
-  let response: Response;
-  try {
-    response = await providerFetch(endpoint, {
-      method: "POST",
-      headers: { authorization: `Bearer ${token}`, "content-type": "application/json", accept: "application/json", "x-request-id": requestIdValue },
-      body: JSON.stringify({ page: 1, page_size: 50, search_term: name, search_on: ["facility_name"], ...(name ? { filter_facility_name: [name] } : {}) }),
-    }, timeoutMs);
-  } catch (caught) {
-    return { ok: false, error: caught instanceof Error ? caught.message : "Delhivery facility lookup failed" };
-  }
-  const responseText = await providerResponseText(response, timeoutMs);
-  if (!response.ok) return { ok: false, error: `Delhivery facility lookup failed (${response.status}): ${responseText.slice(0, 240)}` };
-  let parsed: unknown = null;
-  try { parsed = JSON.parse(responseText); } catch { parsed = null; }
   const normalizedName = name.toLowerCase().replace(/[^a-z0-9]/g, "");
-  const rows = delhiveryFacilityRows(parsed);
-  const match = rows.find((row) => {
+  const findMatch = (rows: Record<string, unknown>[]) => rows.find((row) => {
     const rowStatus = String(row.status ?? row.facility_status ?? row.state ?? "ACTIVE").toLowerCase();
     if (["inactive", "disabled", "deleted", "deactivated"].includes(rowStatus)) return false;
     const rowPin = delhiveryFacilityField(row, ["pincode", "pin_code", "postal_code"]);
@@ -865,6 +850,32 @@ async function resolveDelhiveryFacility(
     const nameMatches = !normalizedName || rowName.toLowerCase().replace(/[^a-z0-9]/g, "").includes(normalizedName) || normalizedName.includes(rowName.toLowerCase().replace(/[^a-z0-9]/g, ""));
     return nameMatches && (!pincode || !rowPin || rowPin === pincode);
   });
+  const lookupBodies = [
+    { page: 1, page_size: 50, search_term: name, search_on: ["facility_name"], ...(name ? { filter_facility_name: [name] } : {}) },
+    // Delhivery may reject an exact facility filter when the registered name
+    // contains an account suffix such as "B2B". Retry broadly and resolve the
+    // canonical active name locally using the warehouse name and pincode.
+    { page: 1, page_size: 100, search_term: name, search_on: ["facility_name"] },
+  ];
+  let match: Record<string, unknown> | undefined;
+  for (const body of lookupBodies) {
+    let response: Response;
+    try {
+      response = await providerFetch(endpoint, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json", accept: "application/json", "x-request-id": requestIdValue },
+        body: JSON.stringify(body),
+      }, timeoutMs);
+    } catch (caught) {
+      return { ok: false, error: caught instanceof Error ? caught.message : "Delhivery facility lookup failed" };
+    }
+    const responseText = await providerResponseText(response, timeoutMs);
+    if (!response.ok) return { ok: false, error: `Delhivery facility lookup failed (${response.status}): ${responseText.slice(0, 240)}` };
+    let parsed: unknown = null;
+    try { parsed = JSON.parse(responseText); } catch { parsed = null; }
+    match = findMatch(delhiveryFacilityRows(parsed));
+    if (match) break;
+  }
   if (!match) return { ok: false, error: `Delhivery pickup facility '${name || pincode}' is not active or could not be resolved` };
   const facility = {
     id: delhiveryFacilityField(match, ["facility_id", "id", "client_warehouse_uuid", "uuid"]),
