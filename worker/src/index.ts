@@ -766,36 +766,34 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   if (!delhiveryFacilityNotFound(existingFacility.error)) {
     return { ok: false as const, error: existingFacility.error };
   }
-  // Delhivery B2B manifestation validates this against the B2B warehouse
-  // registry. A local PSS warehouse row is not proof that the provider knows
-  // the location, so always make the provider-side create call when booking.
-  // Delhivery's current B2B warehouse contract requires pin_code and the
-  // nested address_details object. Sending the legacy flat fields can make
-  // the provider reject the request before it registers the pickup location.
-  const contactPerson = origin.name || localName;
+  // Delhivery's warehouse registry is the authority used by manifestation.
+  // The documented production warehouse API accepts a flat payload; the
+  // newer LTL facility lookup endpoint is not a substitute for registration
+  // and can leave a location looking registered locally but unconfigured to
+  // the manifest service.
+  const email = delhiveryJwtClaim(token, "client_email") || delhiveryJwtClaim(token, "email") || "support@psslogistics.in";
   const warehousePayload = {
-    name: providerName,
-    pin_code: origin.pincode,
+    phone: origin.phone,
     city: origin.city,
-    state: origin.state,
+    name: providerName,
+    pin: origin.pincode,
+    address: origin.line,
     country: "India",
-    address_details: {
-      address: origin.line,
-      contact_person: contactPerson,
-      phone_number: origin.phone,
-    },
-    same_as_fwd_add: true,
+    email,
+    registered_name: origin.name || providerName,
+    return_address: origin.line,
+    return_pin: origin.pincode,
+    return_city: origin.city,
+    return_state: origin.state,
+    return_country: "India",
   };
-  // Use the same LTL/B2B host and JWT scheme as manifestation. The legacy
-  // track.delhivery.com endpoint expects a different static API token and
-  // returns 401 Invalid token for this account's B2B JWT.
-  const endpoint = `${String(b2bBaseUrl).replace(/\/$/, "")}/client-warehouse/create/`;
+  const endpoint = "https://track.delhivery.com/api/backend/clientwarehouse/create/";
   let response: Response;
   try {
     response = await providerFetch(endpoint, {
       method: "POST",
       headers: {
-        authorization: `Bearer ${token}`,
+        authorization: `Token ${token}`,
         "content-type": "application/json",
         accept: "application/json",
         "x-request-id": requestIdValue,
