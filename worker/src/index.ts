@@ -664,8 +664,14 @@ function delhiveryWarehouseApiToken(env: Env, accountName: string, primaryCreden
   const normalizedAccount = accountName.trim().replace(/\s+/g, " ").toUpperCase();
   if (normalizedAccount !== "PSSLOGISTICS10 B2BC") return null;
   const secretBag = env as unknown as Record<string, unknown>;
-  const aliasCredential = delhiveryB2bCredential(typeof secretBag.DELHIVERY_PSSLOGISTICS10B2BC === "string" ? String(secretBag.DELHIVERY_PSSLOGISTICS10B2BC) : undefined);
-  const aliasToken = aliasCredential?.token;
+  // Keep the account boundary explicit while accepting both the legacy alias
+  // and the current account-token secret name used in production.
+  const accountSecret = typeof secretBag.DELHIVERY_TOKEN_PSSLOGISTICS10_B2BC === "string"
+    ? String(secretBag.DELHIVERY_TOKEN_PSSLOGISTICS10_B2BC)
+    : typeof secretBag.DELHIVERY_PSSLOGISTICS10B2BC === "string"
+      ? String(secretBag.DELHIVERY_PSSLOGISTICS10B2BC)
+      : undefined;
+  const aliasToken = delhiveryB2bCredential(accountSecret)?.token;
   return aliasToken && !delhiveryLooksLikeJwt(aliasToken) ? aliasToken : null;
 }
 
