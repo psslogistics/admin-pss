@@ -856,6 +856,9 @@ async function resolveDelhiveryFacility(
     // contains an account suffix such as "B2B". Retry broadly and resolve the
     // canonical active name locally using the warehouse name and pincode.
     { page: 1, page_size: 100, search_term: name, search_on: ["facility_name"] },
+    // Some Delhivery accounts index newly-created facilities by pincode before
+    // their facility-name search becomes consistent.
+    ...(pincode ? [{ page: 1, page_size: 100, search_term: pincode, search_on: ["pincode"] }] : []),
   ];
   let match: Record<string, unknown> | undefined;
   for (const body of lookupBodies) {
