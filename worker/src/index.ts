@@ -792,6 +792,15 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
     return { ok: false as const, error: caught instanceof Error ? caught.message : "Delhivery warehouse creation failed" };
   }
   const responseText = await providerResponseText(response, timeoutMs);
+  let createdProviderReference: string | null = null;
+  let createdProviderName: string | null = null;
+  try {
+    const parsedCreateBody = JSON.parse(responseText) as unknown;
+    createdProviderReference = findProviderReference(parsedCreateBody, new Set(["facility_id", "warehouse_id", "client_warehouse_uuid", "warehouse_uuid", "facility_uuid"]));
+    createdProviderName = findProviderReference(parsedCreateBody, new Set(["facility_name", "client_warehouse_name", "warehouse_name"]));
+  } catch {
+    // Delhivery can acknowledge registration with an empty or text response.
+  }
   if (response.ok) {
     try {
       const providerBody = JSON.parse(responseText) as Record<string, unknown>;
@@ -823,8 +832,8 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   if (!facility.ok) {
     if (!delhiveryFacilityNotFound(facility.error)) return { ok: false as const, error: facility.error };
     if (existing) {
-      await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_status = 'pending', provider_error = ?, status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
-        .bind(providerAccountId ?? null, "Delhivery warehouse was created or located but is awaiting provider activation", existing.id, clientId).run();
+      await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_reference = COALESCE(?, provider_reference), provider_name = COALESCE(?, provider_name), provider_status = 'pending', provider_error = ?, status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+        .bind(providerAccountId ?? null, createdProviderReference, createdProviderName || name, "Delhivery warehouse was created or located but is awaiting provider activation", existing.id, clientId).run();
     }
     return { ok: false as const, code: "WAREHOUSE_ACTIVATION_PENDING" as const, error: "The selected Delhivery warehouse is awaiting provider activation. Retry booking after Delhivery marks it active." };
   }
