@@ -28,4 +28,8 @@ if (source.includes("activeFallback") || source.includes("Reuse that provider wa
   throw new Error("Unsafe account-wide provider fallback remains");
 }
 
+if (source.includes("if (directId && directCode) return")) {
+  throw new Error("Caller-supplied provider facility bypass remains");
+}
+
 console.log(`Exact warehouse contract passed (${required.length} checks)`);

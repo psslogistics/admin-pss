@@ -894,9 +894,6 @@ async function resolveDelhiveryFacility(
     : null;
   const name = String(payload.delhivery_pickup_location ?? payload.pickup_location ?? localWarehouse?.name ?? "").trim();
   const pincode = String(payload.pincode ?? localWarehouse?.pincode ?? "").trim();
-  const directId = String(payload.provider_facility_id ?? "").trim();
-  const directCode = String(payload.provider_facility_code ?? "").trim();
-  if (directId && directCode) return { ok: true, facility: { id: directId, code: directCode, name, pincode } };
   if (!name && !localWarehouse?.provider_reference) return { ok: false, error: "A Delhivery pickup facility is required before scheduling this pickup" };
 
   const endpoint = `${String(baseUrl).replace(/\/$/, "")}/web/api/company/configurations/facilities_and_addresses_v3/list`;
