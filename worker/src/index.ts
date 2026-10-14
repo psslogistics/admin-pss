@@ -2577,8 +2577,9 @@ async function refreshFujiyamaDelhivery(env: Env, cron: string) {
     (status = 'in_transit' AND ${latestEvent} GLOB '*last[- ]mile*' AND datetime(provider_last_attempt_at) <= datetime('now', '-1 hour')) OR
     (status IN ('booked', 'picked_up', 'in_transit', 'exception', 'rto') AND NOT (status = 'in_transit' AND ${latestEvent} GLOB '*last[- ]mile*') AND datetime(provider_last_attempt_at) <= datetime('now', '-4 hours'))) `;
   const active = await env.DB.prepare(`SELECT ${columns} FROM shipments WHERE client_id = ? AND provider = 'delhivery' AND provider_account_id = ? AND COALESCE(lr_number, tracking_number, provider_reference) IS NOT NULL AND status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery', 'exception', 'rto') AND ${due} ${order}`).bind(FUJIYAMA_CLIENT_ID, FUJIYAMA_DELHIVERY_ACCOUNT_ID).all<{ id: string; client_id: string; tracking_number: string; lr_number: string | null; provider_reference: string | null; provider_account_id: string }>();
-  const delivered = await env.DB.prepare(`SELECT ${columns} FROM shipments WHERE client_id = ? AND provider = 'delhivery' AND provider_account_id = ? AND COALESCE(lr_number, tracking_number, provider_reference) IS NOT NULL AND status = 'delivered' AND (provider_last_attempt_at IS NULL OR datetime(provider_last_attempt_at) <= datetime('now', '-4 hours')) ${order}`).bind(FUJIYAMA_CLIENT_ID, FUJIYAMA_DELHIVERY_ACCOUNT_ID).all<{ id: string; client_id: string; tracking_number: string; lr_number: string | null; provider_reference: string | null; provider_account_id: string }>();
-  const refreshRows = [...active.results, ...delivered.results];
+  // Delivered shipments are terminal for status polling. Keep their separate
+  // POD backfill below, but do not spend tracking calls refreshing them.
+  const refreshRows = active.results;
   let trackingSucceeded = 0;
   let trackingFailed = 0;
   for (let index = 0; index < refreshRows.length; index += 5) {
