@@ -906,6 +906,8 @@ async function resolveDelhiveryFacility(
     if (["inactive", "disabled", "deleted", "deactivated"].includes(rowStatus) || activeFlag === false || activeFlag === 0 || String(activeFlag).toLowerCase() === "false") return false;
     const rowPin = delhiveryFacilityField(row, ["pincode", "pin_code", "postal_code"]);
     const rowName = delhiveryFacilityField(row, ["facility_name", "name", "client_warehouse_name", "warehouse_name"]);
+    const rowId = delhiveryFacilityField(row, ["facility_id", "id", "client_warehouse_uuid", "uuid"]);
+    if (localWarehouse?.provider_reference && rowId && rowId !== localWarehouse.provider_reference) return false;
     const normalizedRowName = rowName.toLowerCase().replace(/[^a-z0-9]/g, "");
     const nameMatches = !normalizedName || normalizedRowName === normalizedName;
     return nameMatches && (!pincode || !rowPin || rowPin.replace(/\D/g, "") === pincode.replace(/\D/g, ""));

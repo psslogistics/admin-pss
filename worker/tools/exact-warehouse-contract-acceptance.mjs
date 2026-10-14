@@ -15,6 +15,7 @@ const required = [
   ["saved warehouse account is validated and persisted", "PROVIDER_ACCOUNT_NOT_ALLOWED"],
   ["saved warehouse keeps the Delhivery account", "provider, provider_account_id, provider_status"],
   ["pending creation preserves returned provider mapping", "provider_reference = COALESCE(?, provider_reference)"],
+  ["stored provider mapping constrains lookup", "rowId !== localWarehouse.provider_reference"],
 ];
 
 for (const [label, needle] of required) {
