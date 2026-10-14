@@ -717,9 +717,21 @@ function delhiveryWarehouseName(origin: { name: string; state?: string; pincode:
 }
 
 async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: string, origin: { name: string; line: string; city: string; state: string; pincode: string; phone: string }, requestIdValue: string, timeoutMs: number, b2bBaseUrl = env.DELHIVERY_B2B_API_BASE_URL ?? "https://ltl-clients-api.delhivery.com", providerAccountId?: string | null) {
-  const existing = await env.DB.prepare("SELECT id, name, provider_status, provider_account_id FROM warehouses WHERE client_id = ? AND address = ? AND city = ? AND pincode = ? ORDER BY CASE WHEN provider = 'delhivery' AND provider_account_id = ? AND provider_status = 'active' THEN 0 ELSE 1 END, updated_at DESC LIMIT 1")
+  const existing = await env.DB.prepare("SELECT id, name, provider_status, provider_account_id, provider_reference FROM warehouses WHERE client_id = ? AND address = ? AND city = ? AND pincode = ? ORDER BY CASE WHEN provider = 'delhivery' AND provider_account_id = ? AND provider_status = 'active' THEN 0 ELSE 1 END, updated_at DESC LIMIT 1")
     .bind(clientId, origin.line, origin.city, origin.pincode, providerAccountId ?? "")
-    .first<{ id: string; name: string; provider_status: string | null; provider_account_id: string | null }>();
+    .first<{ id: string; name: string; provider_status: string | null; provider_account_id: string | null; provider_reference: string | null }>();
+  const activeAccountWarehouse = providerAccountId
+    ? await env.DB.prepare("SELECT name, provider_reference FROM warehouses WHERE client_id = ? AND provider = 'delhivery' AND provider_account_id = ? AND provider_status = 'active' AND provider_reference IS NOT NULL ORDER BY updated_at DESC LIMIT 1")
+      .bind(clientId, providerAccountId)
+      .first<{ name: string; provider_reference: string }>()
+    : null;
+  if (activeAccountWarehouse && existing?.provider_status !== "active") {
+    if (existing) {
+      await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_reference = ?, provider_status = 'active', status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+        .bind(providerAccountId, activeAccountWarehouse.provider_reference, existing.id, clientId).run();
+    }
+    return { ok: true as const, name: activeAccountWarehouse.name, reused: true as const };
+  }
   const name = existing?.name?.trim() || delhiveryWarehouseName(origin);
   // Reuse the provider's canonical warehouse whenever it already exists.
   // Creation is only allowed after a genuine provider-side "not found"; this
