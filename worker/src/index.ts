@@ -735,7 +735,7 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
     }
     return { ok: true as const, name: existingFacility.facility.name || name, reused: true as const };
   }
-  if (!/not active or could not be resolved/i.test(existingFacility.error)) {
+  if (!delhiveryFacilityNotFound(existingFacility.error)) {
     return { ok: false as const, error: existingFacility.error };
   }
   // Delhivery B2B manifestation validates this against the B2B warehouse
@@ -811,7 +811,7 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
     // still omits it from its search index. Do not manufacture an inactive
     // error in that case: the manifestation endpoint is the authoritative
     // booking check and will return the real provider reason if it rejects.
-    if (!/not active or could not be resolved/i.test(facility.error)) return { ok: false as const, error: facility.error };
+    if (!delhiveryFacilityNotFound(facility.error)) return { ok: false as const, error: facility.error };
     if (existing) {
       await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_status = 'pending', status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
         .bind(providerAccountId ?? null, existing.id, clientId).run();
@@ -831,6 +831,10 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
 }
 
 type DelhiveryFacility = { id: string; code: string; name: string; pincode: string };
+
+function delhiveryFacilityNotFound(error: string) {
+  return /not active or could not be resolved|facility lookup failed \(404\)/i.test(error);
+}
 
 function delhiveryFacilityRows(value: unknown): Array<Record<string, unknown>> {
   if (!value || typeof value !== "object") return [];
