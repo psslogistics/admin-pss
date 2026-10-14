@@ -719,7 +719,7 @@ function delhiveryWarehouseName(origin: { name: string; city?: string; state?: s
   return canonicalDelhiveryWarehouseName(origin.name, origin.city, origin.state, origin.pincode);
 }
 
-async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: string, origin: { name: string; line: string; city: string; state: string; pincode: string; phone: string }, requestIdValue: string, timeoutMs: number, b2bBaseUrl = env.DELHIVERY_B2B_API_BASE_URL ?? "https://ltl-clients-api.delhivery.com", providerAccountId?: string | null, selectedWarehouseId?: string | null) {
+async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: string, origin: { name: string; line: string; city: string; state: string; pincode: string; phone: string }, requestIdValue: string, timeoutMs: number, b2bBaseUrl = env.DELHIVERY_B2B_API_BASE_URL ?? "https://ltl-clients-api.delhivery.com", providerAccountId?: string | null, selectedWarehouseId?: string | null, warehouseApiToken?: string | null) {
   const existing = selectedWarehouseId
     ? await env.DB.prepare("SELECT id, name, provider, provider_status, provider_account_id, provider_reference FROM warehouses WHERE client_id = ? AND id = ? LIMIT 1")
       .bind(clientId, selectedWarehouseId)
@@ -787,13 +787,17 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
     return_state: origin.state,
     return_country: "India",
   };
+  const registrationToken = warehouseApiToken && !delhiveryLooksLikeJwt(warehouseApiToken) ? warehouseApiToken : null;
+  if (!registrationToken) {
+    return { ok: false as const, code: "WAREHOUSE_API_TOKEN_REQUIRED" as const, error: "Delhivery warehouse registration requires the production API token for this account. Add it to the selected account credential before booking." };
+  }
   const endpoint = "https://track.delhivery.com/api/backend/clientwarehouse/create/";
   let response: Response;
   try {
     response = await providerFetch(endpoint, {
       method: "POST",
       headers: {
-        authorization: `Token ${token}`,
+        authorization: `Token ${registrationToken}`,
         "content-type": "application/json",
         accept: "application/json",
         "x-request-id": requestIdValue,
@@ -1781,6 +1785,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   const secretBag = env as unknown as Record<string, unknown>;
   const configuredCredential = provider === "delhivery" ? env.DELHIVERY_API_TOKEN : provider === "ekart" ? env.EKART_API_KEY : provider === "xpressbees" ? env.XPRESSBEES_CREDENTIALS_JSON : provider === "rivigo" ? env.RIVIGO_CREDENTIALS_JSON : undefined;
   const credential = account ? (typeof secretBag[account.credential_secret_name] === "string" ? String(secretBag[account.credential_secret_name]) : undefined) : configuredCredential;
+  const parsedDelhiveryCredential = provider === "delhivery" ? delhiveryB2bCredential(credential) : null;
   const trackon = provider === "trackon" ? trackonCredentials(env, credential) : null;
   const rivigo = provider === "rivigo" ? rivigoCredentials(env, credential) : null;
   if (!base || (provider === "trackon" ? !trackon : provider === "rivigo" ? !rivigo : !credential)) return { enabled: false, status: "not_configured" as const };
@@ -1793,12 +1798,12 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     const origin = delhiveryAddress(payload.origin_address, String(payload.origin ?? "PSS Logistics"));
     if (!origin) return { enabled: true, status: "invalid_request" as const, reason: "A complete consignor address is required to create or select the pickup warehouse" };
     const selectedWarehouseId = typeof payload.warehouse_id === "string" && payload.warehouse_id.trim() ? payload.warehouse_id.trim() : null;
-    let warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId, selectedWarehouseId);
+    let warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId, selectedWarehouseId, parsedDelhiveryCredential?.token ?? null);
     if (!warehouse.ok && /\b401\b|invalid token|unauthorized|token decode|not enough segments/i.test(warehouse.error)) {
       const refreshedToken = await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs, true);
       if (refreshedToken) {
         delhiveryB2bToken = refreshedToken;
-        warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId, selectedWarehouseId);
+        warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId, selectedWarehouseId, parsedDelhiveryCredential?.token ?? null);
       }
     }
     if (!warehouse.ok) return { enabled: true, status: "failed" as const, error: warehouse.error };
@@ -1836,12 +1841,12 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     if (!origin) return { enabled: true, status: "invalid_request" as const, reason: "A complete pickup address is required before Delhivery can register the warehouse" };
     if (origin) {
       const selectedWarehouseId = typeof payload.warehouse_id === "string" && payload.warehouse_id.trim() ? payload.warehouse_id.trim() : null;
-      let warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId, selectedWarehouseId);
+      let warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId, selectedWarehouseId, parsedDelhiveryCredential?.token ?? null);
       if (!warehouse.ok && /\b401\b|invalid token|unauthorized|token decode|not enough segments/i.test(warehouse.error)) {
         const refreshedToken = await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs, true);
       if (refreshedToken) {
         delhiveryB2bToken = refreshedToken;
-        warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId, selectedWarehouseId);
+        warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId, selectedWarehouseId, parsedDelhiveryCredential?.token ?? null);
       }
       }
       if (!warehouse.ok) return { enabled: true, status: "failed" as const, error: warehouse.error };
