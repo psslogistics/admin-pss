@@ -19,7 +19,9 @@ const required = [
   ["pending creation preserves returned provider mapping", "provider_reference = COALESCE(?, provider_reference)"],
   ["stored provider mapping and local identity constrain lookup", "delhiveryFacilityMatches(row, name, pincode, localWarehouse?.provider_reference, localWarehouse?.name)"],
   ["canonical provider warehouse identity", "canonicalDelhiveryWarehouseName"],
+  ["provider uses the selected saved warehouse name exactly", "const providerName = localName;"],
   ["create response is followed by exact activation lookup", "A successful or duplicate create response is registration evidence only"],
+  ["registered warehouse can be manifested after list propagation miss", "if (response.ok || providerAlreadyRegistered) return { ok: true"],
 ];
 
 for (const [label, needle] of required) {

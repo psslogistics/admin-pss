@@ -742,7 +742,12 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
       .bind(origin.line, origin.city, origin.state, origin.pincode, origin.phone, origin.name, existing.id, clientId).run();
   }
   const localName = existing?.name?.trim() || delhiveryWarehouseName(origin);
-  const providerName = delhiveryWarehouseName({ ...origin, name: localName });
+  // Delhivery's manifestation contract identifies a pickup location by the
+  // exact warehouse name registered for the account. The Client-selected
+  // warehouse is the authoritative identity; do not append city/state/PIN
+  // here because that creates a different provider warehouse name and can
+  // make an active Delhivery facility appear inactive.
+  const providerName = localName;
   const warehouseCreateIdempotencyKey = `pss-warehouse-${await sha256(`${clientId}|${providerAccountId ?? ""}|${existing?.id ?? localName}|${origin.pincode}`)}`;
   // Reuse the provider's canonical warehouse whenever it already exists.
   // Creation is only allowed after a genuine provider-side "not found"; this
@@ -848,6 +853,11 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
       await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status, provider_reference, provider_name, provider_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'pending', ?, ?, ?)")
         .bind(crypto.randomUUID(), clientId, localName, origin.line, origin.city, origin.state, origin.pincode, origin.phone, origin.name, providerAccountId ?? null, createdProviderReference, createdProviderName || providerName, "Delhivery warehouse was created or located but is awaiting provider activation").run();
     }
+    // A successful/duplicate registration is enough to attempt manifestation
+    // with the exact saved warehouse name. The provider, not this auxiliary
+    // list lookup, is authoritative for activation. This also avoids turning
+    // a list-schema or propagation miss into a false activation failure.
+    if (response.ok || providerAlreadyRegistered) return { ok: true as const, name: providerName, reused: providerAlreadyRegistered as boolean };
     return { ok: false as const, code: "WAREHOUSE_ACTIVATION_PENDING" as const, error: "The selected Delhivery warehouse is awaiting provider activation. Retry booking after Delhivery marks it active." };
   }
   if (existing) {
@@ -2218,9 +2228,12 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     ? undefined
     : findProviderReference(parsedProviderBody, new Set(["message", "error", "errors", "rmk", "remark", "remarks", "reason", "detail"]))
       ?? (responseBody.replace(/\s+/g, " ").trim().slice(0, 300) || lastError);
-  const normalizedError = !response.ok && /warehouse|configured|faas/i.test(String(providerError))
-    ? "Delhivery warehouse is not active yet. The pickup location must be registered and activated before booking."
-    : response.ok ? undefined : `${lastError}: ${providerError}`;
+  const providerErrorText = String(providerError ?? "").replace(/\s+/g, " ").trim().slice(0, 500);
+  const normalizedError = response.ok
+    ? undefined
+    : /client[- ]warehouse.*not active|warehouse.*inactive|wrong\/inactive center/i.test(providerErrorText)
+      ? "Delhivery rejected this booking because the selected pickup warehouse is inactive. Activate that exact saved warehouse for this Delhivery account, then retry."
+      : `${lastError}: ${providerErrorText || "Delhivery rejected the booking"}`;
   return { enabled: true, status: response.ok ? "accepted" as const : "failed" as const, providerStatus: response.status, normalized_status: normalizedTracking?.status, tracking: normalizedTracking ? { status: normalizedTracking.status, location: normalizedTracking.location, description: normalizedTracking.description, event_time: normalizedTracking.eventTime } : undefined, amount: provider === "xpressbees" && operation === "quotes" ? findProviderAmount(parsedProviderBody) : undefined, provider_account_id: account?.id, account_name: account?.account_name, confidence_score: account?.confidence_score, priority: account?.priority, rate_card_id: account?.rate_card_id ?? undefined, error: normalizedError };
 }
 

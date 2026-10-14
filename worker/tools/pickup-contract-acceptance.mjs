@@ -18,7 +18,7 @@ const checks = [
   ["structured provider date and slot responses are preserved", source.includes("row.slots") && source.includes("hasEmbeddedSlots")],
   ["Delhivery pickup creation uses the documented B2B pickup endpoint", source.includes("/pickup_requests/") && source.includes("client_warehouse") && source.includes("expected_package_count")],
   ["B2B pickup booking does not depend on internal facility lookup", source.includes("operation === \"pickup_slots\"") && source.includes("client_warehouse")],
-  ["provider warehouse reuse is tracked", source.includes("provider_status === \"active\"") && source.includes("reused: true") && migration.includes("provider_status")],
+  ["provider warehouse reuse is tracked", source.includes("provider_status = 'active'") && source.includes("reused: true") && migration.includes("provider_status")],
   ["migration carries canonical fields", ["provider_account_id", "warehouse_id", "provider_slot_id", "idempotency_key"].every((field) => migration.includes(field))],
   ["admin does not post incomplete pickup payloads", !adminWorkspace.includes('scheduled_date: new Date().toISOString().slice(0, 10)') && adminWorkspace.includes("Open the full Pickup desk")],
   ["provider webhook persists accepted pickup date and slot", source.includes("requested_date = COALESCE(?, requested_date)") && source.includes("requestedTimeSlot")],
