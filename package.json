@@ -15,7 +15,8 @@
     "start": "next start",
     "lint": "eslint",
     "test:pricing": "node --experimental-strip-types worker/tools/pricing-engine-acceptance.mjs",
-    "test:pickup": "node worker/tools/pickup-contract-acceptance.mjs"
+    "test:pickup": "node worker/tools/pickup-contract-acceptance.mjs",
+    "test:warehouse": "node worker/tools/exact-warehouse-contract-acceptance.mjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.7.0",

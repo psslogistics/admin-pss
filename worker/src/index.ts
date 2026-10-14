@@ -723,17 +723,18 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
       .first<{ id: string; name: string; provider_status: string | null; provider_account_id: string | null; provider_reference: string | null }>()
     : null;
   const name = existing?.name?.trim() || delhiveryWarehouseName(origin);
+  const warehouseCreateIdempotencyKey = `pss-warehouse-${await sha256(`${clientId}|${providerAccountId ?? ""}|${existing?.id ?? name}|${origin.pincode}`)}`;
   // Reuse the provider's canonical warehouse whenever it already exists.
   // Creation is only allowed after a genuine provider-side "not found"; this
   // keeps every address/account on the same generic path without duplicates.
   const existingFacility = await resolveDelhiveryFacility(env, token, b2bBaseUrl, clientId, { warehouse_id: existing?.id, delhivery_pickup_location: name, pincode: origin.pincode }, requestIdValue, timeoutMs);
   if (existingFacility.ok) {
     if (existing) {
-      await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_reference = ?, provider_status = 'active', status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
-        .bind(providerAccountId ?? null, existingFacility.facility.id, existing.id, clientId).run();
+      await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_reference = ?, provider_name = ?, provider_error = NULL, provider_activated_at = CURRENT_TIMESTAMP, provider_status = 'active', status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+        .bind(providerAccountId ?? null, existingFacility.facility.id, existingFacility.facility.name || name, existing.id, clientId).run();
     } else {
-      await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, pincode, contact, provider, provider_account_id, provider_status, provider_reference) VALUES (?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'active', ?)")
-        .bind(crypto.randomUUID(), clientId, existingFacility.facility.name || name, origin.line, origin.city, origin.pincode, origin.phone, providerAccountId ?? null, existingFacility.facility.id).run();
+      await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, pincode, contact, provider, provider_account_id, provider_status, provider_reference, provider_name, provider_activated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'active', ?, ?, CURRENT_TIMESTAMP)")
+        .bind(crypto.randomUUID(), clientId, existingFacility.facility.name || name, origin.line, origin.city, origin.pincode, origin.phone, providerAccountId ?? null, existingFacility.facility.id, existingFacility.facility.name || name).run();
     }
     return { ok: true as const, name: existingFacility.facility.name || name, reused: true as const };
   }
@@ -773,6 +774,8 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
         "content-type": "application/json",
         accept: "application/json",
         "x-request-id": requestIdValue,
+        "Idempotency-Key": warehouseCreateIdempotencyKey,
+        "X-Idempotency-Key": warehouseCreateIdempotencyKey,
       },
       body: JSON.stringify(warehousePayload),
     }, timeoutMs);
@@ -811,18 +814,18 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   if (!facility.ok) {
     if (!delhiveryFacilityNotFound(facility.error)) return { ok: false as const, error: facility.error };
     if (existing) {
-      await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_status = 'pending', status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
-        .bind(providerAccountId ?? null, existing.id, clientId).run();
+      await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_status = 'pending', provider_error = ?, status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+        .bind(providerAccountId ?? null, "Delhivery warehouse was created or located but is awaiting provider activation", existing.id, clientId).run();
     }
     return { ok: false as const, code: "WAREHOUSE_ACTIVATION_PENDING" as const, error: "The selected Delhivery warehouse is awaiting provider activation. Retry booking after Delhivery marks it active." };
   }
   if (existing) {
-    await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_status = 'active', provider_reference = COALESCE(provider_reference, ?), status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
-      .bind(providerAccountId ?? null, facility.facility.id, existing.id, clientId)
+    await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_status = 'active', provider_reference = COALESCE(provider_reference, ?), provider_name = ?, provider_error = NULL, provider_activated_at = CURRENT_TIMESTAMP, status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+      .bind(providerAccountId ?? null, facility.facility.id, facility.facility.name || name, existing.id, clientId)
       .run();
   } else {
-    await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, pincode, contact, provider, provider_account_id, provider_status, provider_reference) VALUES (?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'active', ?)")
-      .bind(crypto.randomUUID(), clientId, name, origin.line, origin.city, origin.pincode, origin.phone, providerAccountId ?? null, facility.facility.id)
+    await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, pincode, contact, provider, provider_account_id, provider_status, provider_reference, provider_name, provider_activated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'active', ?, ?, CURRENT_TIMESTAMP)")
+      .bind(crypto.randomUUID(), clientId, name, origin.line, origin.city, origin.pincode, origin.phone, providerAccountId ?? null, facility.facility.id, facility.facility.name || name)
       .run();
   }
   return { ok: true as const, name: facility.facility.name || name, reused: false as const };
@@ -936,8 +939,8 @@ async function resolveDelhiveryFacility(
   };
   if (!facility.id || !facility.code) return { ok: false, error: "Delhivery returned an incomplete pickup facility record" };
   if (localWarehouse) {
-    await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_reference = ?, provider_status = 'active', status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
-      .bind(facility.id, localWarehouse.id, clientId).run();
+    await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_reference = ?, provider_name = ?, provider_error = NULL, provider_activated_at = CURRENT_TIMESTAMP, provider_status = 'active', status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+      .bind(facility.id, facility.name, localWarehouse.id, clientId).run();
   }
   return { ok: true, facility };
 }
