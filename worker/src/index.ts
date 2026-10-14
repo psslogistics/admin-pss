@@ -721,7 +721,6 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
     .bind(clientId, origin.line, origin.city, origin.pincode, providerAccountId ?? "")
     .first<{ id: string; name: string; provider_status: string | null; provider_account_id: string | null }>();
   const name = existing?.name?.trim() || delhiveryWarehouseName(origin);
-  if (existing?.provider_status === "active" && existing.provider_account_id === (providerAccountId ?? null)) return { ok: true as const, name, reused: true as const };
   // Delhivery B2B manifestation validates this against the B2B warehouse
   // registry. A local PSS warehouse row is not proof that the provider knows
   // the location, so always make the provider-side create call when booking.
@@ -778,17 +777,22 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
     const alreadyRegistered = lower.includes("already exists") || lower.includes("already configured") || lower.includes("duplicate") || lower.includes("warehouse exists");
     if (!alreadyRegistered) return { ok: false as const, error: `Delhivery warehouse creation failed (${response.status}): ${responseText.slice(0, 240)}` };
   }
-  // Delhivery may acknowledge warehouse creation before FAAS makes the name
-  // available to manifestation. Give the provider a short propagation window
-  // before using the warehouse in the shipment request.
+  // Delhivery may acknowledge warehouse creation before the warehouse is
+  // activated by its FMS team. Never treat an HTTP success from the create
+  // endpoint as proof that manifestation is allowed: verify the provider's
+  // active facility list before booking.
   await new Promise((resolve) => setTimeout(resolve, 1500));
+  const facility = await resolveDelhiveryFacility(env, token, b2bBaseUrl, clientId, { delhivery_pickup_location: name, pincode: origin.pincode }, requestIdValue, timeoutMs);
+  if (!facility.ok) {
+    return { ok: false as const, error: `Delhivery warehouse '${name}' is registered but not active yet. Activate it with your Delhivery account POC, then retry booking.` };
+  }
   if (existing) {
     await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_status = 'active', provider_reference = COALESCE(provider_reference, ?), status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
-      .bind(providerAccountId ?? null, name, existing.id, clientId)
+      .bind(providerAccountId ?? null, facility.facility.id, existing.id, clientId)
       .run();
   } else {
     await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, pincode, contact, provider, provider_account_id, provider_status, provider_reference) VALUES (?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'active', ?)")
-      .bind(crypto.randomUUID(), clientId, name, origin.line, origin.city, origin.pincode, origin.phone, providerAccountId ?? null, name)
+      .bind(crypto.randomUUID(), clientId, name, origin.line, origin.city, origin.pincode, origin.phone, providerAccountId ?? null, facility.facility.id)
       .run();
   }
   return { ok: true as const, name, reused: false as const };
