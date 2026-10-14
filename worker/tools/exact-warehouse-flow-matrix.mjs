@@ -20,5 +20,6 @@ assert.equal(delhiveryFacilityMatches({ ...active, name: "Warehouse Alpha Luckno
 assert.equal(delhiveryFacilityMatches({ ...active, name: "Warehouse Alpha Lucknow Uttar Pradesh 226017" }, "Warehouse Alpha Lucknow Uttar Pradesh 271801", "201310"), false, "same base name at a different selected location must not match");
 assert.equal(delhiveryFacilityMatches({ ...active, name: "Warehouse Alpha" }, "Warehouse Alpha Lucknow Uttar Pradesh 226017", "201310", null, "Warehouse Alpha"), true, "provider base name should match the selected local warehouse");
 assert.equal(delhiveryFacilityMatches({ ...active, name: "Warehouse Beta" }, "Warehouse Alpha Lucknow Uttar Pradesh 226017", "201310", null, "Warehouse Alpha"), false, "different provider base name must not match the selected local warehouse");
+assert.equal(delhiveryFacilityMatches({ ...active, name: "Warehouse Alpha" }, "Warehouse Alpha Lucknow Uttar Pradesh 226017", "201310", "stale-provider-id", "Warehouse Alpha", true), true, "active local identity should recover from a stale provider reference");
 
-console.log("Exact warehouse flow matrix passed (16 cases)");
+console.log("Exact warehouse flow matrix passed (17 cases)");

@@ -21,14 +21,14 @@ export function canonicalDelhiveryWarehouseName(name: string, city?: string, sta
   return [base, suffix].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
 }
 
-export function delhiveryFacilityMatches(row: Record<string, unknown>, requestedName: string, requestedPincode: string, storedProviderReference?: string | null, localWarehouseName?: string | null) {
+export function delhiveryFacilityMatches(row: Record<string, unknown>, requestedName: string, requestedPincode: string, storedProviderReference?: string | null, localWarehouseName?: string | null, allowStaleProviderReference = false) {
   const rowStatus = String(row.status ?? row.facility_status ?? row.state ?? "ACTIVE").toLowerCase();
   const activeFlag = row.is_active ?? row.active ?? row.enabled ?? row.is_enabled;
   if (["inactive", "disabled", "deleted", "deactivated"].includes(rowStatus) || activeFlag === false || activeFlag === 0 || String(activeFlag).toLowerCase() === "false") return false;
   const rowPin = providerField(row, ["pincode", "pin_code", "postal_code"]);
   const rowName = providerField(row, ["facility_name", "name", "client_warehouse_name", "warehouse_name"]);
   const rowId = providerField(row, ["facility_id", "id", "client_warehouse_uuid", "uuid"]);
-  if (storedProviderReference && rowId && rowId !== storedProviderReference) return false;
+  if (storedProviderReference && rowId && rowId !== storedProviderReference && !allowStaleProviderReference) return false;
   const normalizedRowName = normalizeDelhiveryWarehouseIdentity(rowName);
   const nameMatches = normalizedRowName === normalizeDelhiveryWarehouseIdentity(requestedName)
     // Delhivery's console/API can return the saved facility name without the

@@ -913,13 +913,14 @@ async function resolveDelhiveryFacility(
   // never send the B2B token to that console endpoint as a fallback.
   const lookupBases = [String(baseUrl).replace(/\/$/, "")];
   const findMatch = (rows: Record<string, unknown>[]) => rows.find((row) => delhiveryFacilityMatches(row, name, pincode, localWarehouse?.provider_reference, localWarehouse?.name));
-  const lookupBodies = [
-    { page: 1, page_size: 50, search_term: name, search_on: ["facility_name"], ...(name ? { filter_facility_name: [name] } : {}) },
+  const lookupNames = [...new Set([localWarehouse?.name?.trim(), name].filter((value): value is string => Boolean(value)))];
+  const lookupBodies = lookupNames.flatMap((lookupName) => [
+    { page: 1, page_size: 50, search_term: lookupName, search_on: ["facility_name"], filter_facility_name: [lookupName] },
     // Delhivery may reject an exact facility filter when the registered name
-    // contains an account suffix such as "B2B". Retry broadly and resolve the
-    // canonical active name locally using the warehouse name and pincode.
-    { page: 1, page_size: 100, search_term: name, search_on: ["facility_name"] },
-  ];
+    // contains an account suffix such as "B2B". Retry broadly for both the
+    // saved Client name and the canonical name sent during registration.
+    { page: 1, page_size: 100, search_term: lookupName, search_on: ["facility_name"] },
+  ]);
   let match: Record<string, unknown> | undefined;
   let lastLookupError = "";
   for (const lookupBase of lookupBases) {
@@ -943,7 +944,15 @@ async function resolveDelhiveryFacility(
       }
       let parsed: unknown = null;
       try { parsed = JSON.parse(responseText); } catch { parsed = null; }
-      match = findMatch(delhiveryFacilityRows(parsed));
+      const rows = delhiveryFacilityRows(parsed);
+      match = findMatch(rows);
+      // A create response can contain a registration/reference ID that is
+      // different from the ID returned by Delhivery's active-facility list.
+      // Once the selected local warehouse name and PIN identify the active
+      // row, refresh that provider mapping instead of preserving a stale ID.
+      if (!match && localWarehouse?.name) {
+        match = rows.find((row) => delhiveryFacilityMatches(row, name, pincode, localWarehouse.provider_reference, localWarehouse.name, true));
+      }
       if (match) break;
     }
     if (match) break;
