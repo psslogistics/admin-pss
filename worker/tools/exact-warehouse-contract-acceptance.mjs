@@ -14,6 +14,7 @@ const required = [
   ["pickup IDs resolve only to warehouses", "The selected pickup warehouse is not saved for this client"],
   ["saved warehouse account is validated and persisted", "PROVIDER_ACCOUNT_NOT_ALLOWED"],
   ["saved warehouse keeps the Delhivery account", "provider, provider_account_id, provider_status"],
+  ["saved warehouse keeps the consignor name", "contact_name"],
   ["pending creation preserves returned provider mapping", "provider_reference = COALESCE(?, provider_reference)"],
   ["stored provider mapping constrains lookup", "delhiveryFacilityMatches(row, name, pincode, localWarehouse?.provider_reference)"],
 ];

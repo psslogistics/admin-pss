@@ -335,6 +335,7 @@ CREATE TABLE IF NOT EXISTS warehouses (
   city TEXT,
   pincode TEXT,
   contact TEXT,
+  contact_name TEXT,
   status TEXT NOT NULL DEFAULT 'active',
   provider TEXT,
   provider_account_id TEXT,
