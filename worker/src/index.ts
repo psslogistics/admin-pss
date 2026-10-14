@@ -443,6 +443,20 @@ function volumetricWeightFromPayload(payload: Record<string, unknown>) {
   return Number.isFinite(length) && Number.isFinite(width) && Number.isFinite(height) && length > 0 && width > 0 && height > 0 ? (length * width * height * Math.max(quantity, 1)) / 5000 : 0;
 }
 
+function normalizeShipmentDimensions(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+    const group = item as Record<string, unknown>;
+    const length = Number(group.length);
+    const width = Number(group.width ?? group.breadth);
+    const height = Number(group.height);
+    const quantity = Number(group.quantity ?? group.boxCount ?? group.box_count ?? 1);
+    if (![length, width, height, quantity].every((number) => Number.isFinite(number) && number > 0) || !Number.isInteger(quantity)) return [];
+    return [{ length, width, height, quantity }];
+  });
+}
+
 type PricingQuoteRecord = { id: string; version_id: string; account_scope: string; origin_zone: string; destination_zone: string; chargeable_weight_kg: number; client_breakdown_json: string };
 function billingLineItemStatements(env: Env, billingId: string, shipmentId: string, clientId: string, breakdownJson: string) {
   let lines: Array<{ code?: unknown; label?: unknown; amount?: unknown; marker?: unknown }> = [];
@@ -3012,11 +3026,11 @@ const worker = {
               ? `status = '${requestedStatus === "canceled" ? "cancelled" : requestedStatus}'`
               : "";
         const shipmentColumns = compactShipmentView || shipmentView === "tracking"
-          ? "s.id, s.pss_reference, s.client_id, s.tracking_number, s.lr_number, s.master_awb, s.status, s.provider, s.origin, s.destination, s.total_weight_kg, s.pieces, s.edd, s.delivered_at, s.created_at, s.updated_at"
+          ? "s.id, s.pss_reference, s.client_id, s.tracking_number, s.lr_number, s.master_awb, s.status, s.provider, s.origin, s.destination, s.total_weight_kg, s.pieces, s.edd, s.delivered_at, s.created_at, s.updated_at, s.dimensions_json"
           : internalShipmentView
           ? "s.id, s.pss_reference, s.client_id, s.created_by_user_id, s.tracking_number, s.lr_number, s.master_awb, s.box_awbs_json, s.provider_booking_id, s.provider_pickup_id, s.provider_sync_status, s.status, s.provider, s.provider_account_id, s.provider_reference, (SELECT sd.id FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS pod_document_id, (SELECT sd.original_filename FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS pod_filename, (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = s.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, (SELECT pr.status FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_status, (SELECT pr.requested_date FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_scheduled_date, (SELECT pr.requested_time_slot FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_time_slot, (SELECT c.provider_status FROM pricing_provider_costs c WHERE c.shipment_id = s.id LIMIT 1) AS provider_confirmation_status, (SELECT te.description FROM tracking_events te WHERE te.shipment_id = s.id AND te.status = 'exception' ORDER BY te.event_time DESC LIMIT 1) AS provider_failure_reason, s.description, s.origin, s.destination, s.origin_address_json, s.destination_address_json, s.consignee, s.total_weight_kg, s.declared_value, s.pieces, s.edd, s.delivered_at, s.created_at, s.updated_at"
           : "s.id, s.pss_reference, s.client_id, s.created_by_user_id, s.tracking_number, s.lr_number, s.master_awb, s.box_awbs_json, s.provider_booking_id, s.provider_pickup_id, s.provider_sync_status, s.status, s.provider, s.provider_reference, (SELECT sd.id FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS pod_document_id, (SELECT sd.original_filename FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS pod_filename, (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = s.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, (SELECT pr.status FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_status, (SELECT pr.requested_date FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_scheduled_date, (SELECT pr.requested_time_slot FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_time_slot, (SELECT c.provider_status FROM pricing_provider_costs c WHERE c.shipment_id = s.id LIMIT 1) AS provider_confirmation_status, (SELECT te.description FROM tracking_events te WHERE te.shipment_id = s.id AND te.status = 'exception' ORDER BY te.event_time DESC LIMIT 1) AS provider_failure_reason, s.description, s.origin, s.destination, s.origin_address_json, s.destination_address_json, s.consignee, s.total_weight_kg, s.declared_value, s.pieces, s.edd, s.delivered_at, s.created_at, s.updated_at";
-        const trackingShipmentColumns = "s.id, s.pss_reference, s.client_id, s.tracking_number, s.lr_number, s.master_awb, s.status, s.provider, s.origin, s.destination, s.total_weight_kg, s.pieces, s.edd, s.delivered_at, s.created_at, s.updated_at";
+        const trackingShipmentColumns = "s.id, s.pss_reference, s.client_id, s.tracking_number, s.lr_number, s.master_awb, s.status, s.provider, s.origin, s.destination, s.total_weight_kg, s.pieces, s.edd, s.delivered_at, s.created_at, s.updated_at, s.dimensions_json";
         const selectedShipmentColumns = shipmentView === "tracking" || !internalShipmentView ? trackingShipmentColumns : shipmentColumns;
         const queryLimit = pageSize + 1;
         const rows = auth.system ? await env.DB.prepare(`SELECT ${selectedShipmentColumns} FROM shipments s${statusFilter ? ` WHERE s.${statusFilter}` : ""} ORDER BY s.created_at DESC LIMIT ${queryLimit} OFFSET ${offset}`).all() : auth.clientIds.size ? await env.DB.prepare(`SELECT ${selectedShipmentColumns} FROM shipments s WHERE s.client_id IN (${[...auth.clientIds].map(() => "?").join(",")})${statusFilter ? ` AND s.${statusFilter}` : ""} ORDER BY s.created_at DESC LIMIT ${queryLimit} OFFSET ${offset}`).bind(...[...auth.clientIds]).all() : { results: [] };
@@ -3062,6 +3076,8 @@ const worker = {
         const weight = Number(payload.total_weight_kg);
         const pieces = Number(payload.pieces);
         const declaredValue = Number(payload.declared_value ?? 0);
+        const shipmentDimensions = normalizeShipmentDimensions(payload.dimensions);
+        const dimensionsJson = shipmentDimensions.length ? JSON.stringify(shipmentDimensions) : null;
         if (!description || description.length > 500 || !origin || origin.length > 500 || !destination || destination.length > 500) return error("VALIDATION_ERROR", "Description, origin, and destination are required", 400, id, headers);
         if (!originAddress || !destinationAddress) return error("VALIDATION_ERROR", "Complete consignor and consignee addresses are required: name, address, city, state, six-digit pincode, and ten-digit phone", 400, id, headers);
         if (!Number.isFinite(weight) || weight <= 0 || weight > 100000) return error("VALIDATION_ERROR", "Weight must be greater than 0 and within the supported limit", 400, id, headers);
@@ -3109,7 +3125,7 @@ const worker = {
         const requestedProviderAccountId = typeof payload.provider_account_id === "string" && payload.provider_account_id.trim() ? payload.provider_account_id.trim() : null;
         let pssReference = String(Date.now());
         while (await env.DB.prepare("SELECT 1 FROM shipments WHERE pss_reference = ? LIMIT 1").bind(pssReference).first()) pssReference = String(Number(pssReference) + 1);
-        await env.DB.prepare("INSERT INTO shipments (id, pss_reference, client_id, created_by_user_id, provider, provider_account_id, status, description, origin, destination, origin_address_json, destination_address_json, consignee, total_weight_kg, declared_value, pieces, edd) VALUES (?, ?, ?, ?, ?, ?, 'booked', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(shipmentId, pssReference, clientId, auth.userId ?? `api:${clientId}`, provider, requestedProviderAccountId, description, origin, destination, JSON.stringify(originAddress), JSON.stringify(destinationAddress), String(destinationAddress.name), weight, declaredValue, pieces, typeof payload.edd === "string" ? payload.edd : null).run();
+        await env.DB.prepare("INSERT INTO shipments (id, pss_reference, client_id, created_by_user_id, provider, provider_account_id, status, description, origin, destination, origin_address_json, destination_address_json, consignee, total_weight_kg, declared_value, pieces, edd, dimensions_json) VALUES (?, ?, ?, ?, ?, ?, 'booked', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(shipmentId, pssReference, clientId, auth.userId ?? `api:${clientId}`, provider, requestedProviderAccountId, description, origin, destination, JSON.stringify(originAddress), JSON.stringify(destinationAddress), String(destinationAddress.name), weight, declaredValue, pieces, typeof payload.edd === "string" ? payload.edd : null, dimensionsJson).run();
         await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'booked', 'Shipment created', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipmentId, auth.userId ?? `api:${clientId}`).run();
         const storedDocuments = await persistShipmentDocuments(env, clientId, shipmentId, payload.invoice_documents, auth.userId ?? `api:${clientId}`);
         if (!storedDocuments.ok) {
