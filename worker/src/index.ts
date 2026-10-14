@@ -2027,6 +2027,22 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         fallbackUrl.searchParams.set("awb_number", trackingNumber);
         response = await providerFetch(fallbackUrl.toString(), { method: "GET", headers }, attemptTimeoutMs);
       }
+      // Delhivery exposes the same B2B tracking contract through two hosts in
+      // different account environments. Login already tries both hosts, but a
+      // token may authenticate successfully while the configured host returns
+      // `No Such Resource` for an otherwise valid LRN. Retry the read-only
+      // tracking request against the alternate host before recording a failure.
+      if (provider === "delhivery" && useDelhiveryB2b && operation === "tracking" && response.status === 404) {
+        const configuredB2bBase = String(env.DELHIVERY_B2B_API_BASE_URL ?? "https://ltl-clients-api.delhivery.com").replace(/\/$/, "");
+        const alternateB2bBase = configuredB2bBase === "https://btob.api.delhivery.com"
+          ? "https://ltl-clients-api.delhivery.com"
+          : "https://btob.api.delhivery.com";
+        const alternateUrl = `${alternateB2bBase}/v2/track/${encodeURIComponent(delhiveryB2bNumber(trackingNumber) ?? String(payload.shipment_id ?? trackingNumber))}`;
+        try {
+          const alternateResponse = await providerFetch(alternateUrl, { method: "GET", headers }, attemptTimeoutMs);
+          if (alternateResponse.ok || alternateResponse.status !== 404) response = alternateResponse;
+        } catch { /* Keep the original provider response if the alternate host is unavailable. */ }
+      }
       // A newly-created Delhivery warehouse can take a moment to propagate in
       // FAAS. Retry its 400 response instead of immediately exposing a false
       // booking failure; other client errors remain non-retryable.
@@ -2602,14 +2618,14 @@ const worker = {
       if (await publicRateLimited(env, request, "/public/track")) return error("RATE_LIMITED", "Too many tracking requests", 429, id, withCors(request, env));
       const reference = url.searchParams.get("reference")?.trim();
       if (!reference || reference.length > 128) return error("VALIDATION_ERROR", "A tracking reference is required", 400, id, withCors(request, env));
-      type PublicShipment = { id: string; tracking_number: string | null; lr_number: string | null; provider_reference: string | null; provider: string | null; provider_account_id: string | null; status: string; edd: string | null; delivered_at: string | null; updated_at: string | null };
+      type PublicShipment = { id: string; client_id: string; tracking_number: string | null; lr_number: string | null; provider_reference: string | null; provider: string | null; provider_account_id: string | null; status: string; edd: string | null; delivered_at: string | null; updated_at: string | null };
       // Resolve PSS, courier, and provider references in one indexed read so
       // public tracking does not pay for up to three sequential D1 round trips.
-      const shipment = await env.DB.prepare("SELECT id, tracking_number, lr_number, provider_reference, provider, provider_account_id, status, edd, delivered_at, updated_at FROM shipments WHERE id = ? OR tracking_number = ? OR lr_number = ? OR provider_reference = ? LIMIT 1").bind(reference, reference, reference, reference).first<PublicShipment>();
+      const shipment = await env.DB.prepare("SELECT id, client_id, tracking_number, lr_number, provider_reference, provider, provider_account_id, status, edd, delivered_at, updated_at FROM shipments WHERE id = ? OR tracking_number = ? OR lr_number = ? OR provider_reference = ? LIMIT 1").bind(reference, reference, reference, reference).first<PublicShipment>();
       if (shipment) {
         const events = await env.DB.prepare("SELECT status, location, description, event_time FROM tracking_events WHERE shipment_id = ? ORDER BY event_time ASC LIMIT 20").bind(shipment.id).all();
         if (shipment.provider === "delhivery" && shipment.provider_account_id) {
-          const providerResult = await safeProviderRequest(env, "delhivery", "tracking", { shipment_id: shipment.id, tracking_number: shipment.tracking_number, lr_number: shipment.lr_number, provider_reference: shipment.provider_reference, provider_account_id: shipment.provider_account_id }, id, undefined, undefined, 5000);
+          const providerResult = await safeProviderRequest(env, "delhivery", "tracking", { shipment_id: shipment.id, tracking_number: shipment.tracking_number, lr_number: shipment.lr_number, provider_reference: shipment.provider_reference, provider_account_id: shipment.provider_account_id }, id, shipment.client_id, undefined, 5000);
           const tracking = (providerResult as { tracking?: { status?: string; location?: string; description?: string; event_time?: string | null } }).tracking;
           if (providerResult.status === "accepted" && tracking?.status) {
             return json({ ok: true, data: { tracking_number: shipment.tracking_number ?? shipment.provider_reference, status: tracking.status, edd: shipment.edd, delivered_at: tracking.status === "delivered" ? tracking.event_time ?? null : shipment.delivered_at, updated_at: tracking.event_time ?? shipment.updated_at, events: [{ status: tracking.status, location: tracking.location ?? "", description: tracking.description ?? "", event_time: tracking.event_time ?? null }] }, provider: "delhivery", provider_status: providerResult.status, request_id: id }, 200, withCors(request, env, { "cache-control": "private, no-store" }));
