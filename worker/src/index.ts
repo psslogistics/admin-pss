@@ -1,4 +1,5 @@
 import { calculatePssRate, defaultRateRows, type ChargeRule, type PricingAccount } from "./pricing-engine";
+import { delhiveryFacilityMatches } from "./warehouse-identity";
 
 type DelhiveryTokenCache = {
   get<T>(key: string, type: "json"): Promise<T | null>;
@@ -899,19 +900,7 @@ async function resolveDelhiveryFacility(
   if (!name && !localWarehouse?.provider_reference) return { ok: false, error: "A Delhivery pickup facility is required before scheduling this pickup" };
 
   const endpoint = `${String(baseUrl).replace(/\/$/, "")}/web/api/company/configurations/facilities_and_addresses_v3/list`;
-  const normalizedName = name.toLowerCase().replace(/[^a-z0-9]/g, "");
-  const findMatch = (rows: Record<string, unknown>[]) => rows.find((row) => {
-    const rowStatus = String(row.status ?? row.facility_status ?? row.state ?? "ACTIVE").toLowerCase();
-    const activeFlag = row.is_active ?? row.active ?? row.enabled ?? row.is_enabled;
-    if (["inactive", "disabled", "deleted", "deactivated"].includes(rowStatus) || activeFlag === false || activeFlag === 0 || String(activeFlag).toLowerCase() === "false") return false;
-    const rowPin = delhiveryFacilityField(row, ["pincode", "pin_code", "postal_code"]);
-    const rowName = delhiveryFacilityField(row, ["facility_name", "name", "client_warehouse_name", "warehouse_name"]);
-    const rowId = delhiveryFacilityField(row, ["facility_id", "id", "client_warehouse_uuid", "uuid"]);
-    if (localWarehouse?.provider_reference && rowId && rowId !== localWarehouse.provider_reference) return false;
-    const normalizedRowName = rowName.toLowerCase().replace(/[^a-z0-9]/g, "");
-    const nameMatches = !normalizedName || normalizedRowName === normalizedName;
-    return nameMatches && (!pincode || !rowPin || rowPin.replace(/\D/g, "") === pincode.replace(/\D/g, ""));
-  });
+  const findMatch = (rows: Record<string, unknown>[]) => rows.find((row) => delhiveryFacilityMatches(row, name, pincode, localWarehouse?.provider_reference));
   const lookupBodies = [
     { page: 1, page_size: 50, search_term: name, search_on: ["facility_name"], ...(name ? { filter_facility_name: [name] } : {}) },
     // Delhivery may reject an exact facility filter when the registered name
