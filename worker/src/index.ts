@@ -56,7 +56,7 @@ type Auth = {
 };
 
 const json = (body: unknown, status = 200, headers: HeadersInit = {}) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...headers } });
-const error = (code: string, message: string, status: number, requestId: string, headers: HeadersInit = {}) => { const normalized = code.toUpperCase(); const category = status === 401 ? "auth" : status === 403 ? "permission" : normalized.includes("CONFIG") || normalized.includes("CREDENTIAL") ? "configuration" : normalized.includes("PROVIDER") || normalized.includes("DELHIVERY") ? "provider" : status >= 500 ? "server" : status === 408 || status === 429 ? "network" : "request"; const retryable = status === 408 || status === 409 || status === 429 || status >= 500 || category === "provider"; return json({ ok: false, error: { code, category, message, user_safe_message: message, technical_message: message, provider_code: category === "provider" ? code : undefined, request_id: requestId, retryable, stale_data: false }, request_id: requestId }, status, headers); };
+const error = (code: string, message: string, status: number, requestId: string, headers: HeadersInit = {}, technicalMessage = message) => { const normalized = code.toUpperCase(); const category = status === 401 ? "auth" : status === 403 ? "permission" : normalized.includes("CONFIG") || normalized.includes("CREDENTIAL") ? "configuration" : normalized.includes("PROVIDER") || normalized.includes("DELHIVERY") ? "provider" : status >= 500 ? "server" : status === 408 || status === 429 ? "network" : "request"; const retryable = status === 408 || status === 409 || status === 429 || status >= 500 || category === "provider"; return json({ ok: false, error: { code, category, message, user_safe_message: message, technical_message: technicalMessage, provider_code: category === "provider" ? code : undefined, request_id: requestId, retryable, stale_data: false }, request_id: requestId }, status, headers); };
 const isD1QuotaError = (message: string) => /D1_ERROR: Your account has exceeded D1's free tier daily row (read|write) limit/i.test(message);
 const requestId = (request: Request) => request.headers.get("cf-ray") ?? crypto.randomUUID();
 const userAuthInFlight = new Map<string, Promise<Auth | null>>();
@@ -4810,7 +4810,7 @@ const worker = {
       const message = caught instanceof Error ? caught.message : "UNKNOWN_ERROR"; const publicMessage = message === "PAYLOAD_TOO_LARGE" ? "Payload too large" : message === "INVALID_JSON" ? "Invalid JSON body" : "Request failed";
       console.error(JSON.stringify({ request_id: id, error: message, route }));
       if (isD1QuotaError(message)) return error("DATABASE_QUOTA_EXCEEDED", "Production data is temporarily unavailable because the database daily limit has been reached. Upgrade the Cloudflare Workers plan or retry after the UTC quota reset.", 503, id, headers);
-      return error(message === "PAYLOAD_TOO_LARGE" ? "PAYLOAD_TOO_LARGE" : message === "INVALID_JSON" ? "INVALID_JSON" : "INTERNAL_ERROR", publicMessage, message === "PAYLOAD_TOO_LARGE" ? 413 : message === "INVALID_JSON" ? 400 : 500, id, headers);
+      return error(message === "PAYLOAD_TOO_LARGE" ? "PAYLOAD_TOO_LARGE" : message === "INVALID_JSON" ? "INVALID_JSON" : "INTERNAL_ERROR", publicMessage, message === "PAYLOAD_TOO_LARGE" ? 413 : message === "INVALID_JSON" ? 400 : 500, id, headers, message);
     }
   },
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
