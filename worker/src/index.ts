@@ -693,6 +693,10 @@ function delhiveryAccountIsB2b(accountName: string) {
   return /(^|[^a-z])b2b(c)?([^a-z]|$)/i.test(accountName) || /^PSS\s+B2B$/i.test(accountName.trim());
 }
 
+function delhiveryWarehouseLog(requestIdValue: string, phase: string, fields: Record<string, unknown> = {}) {
+  console.log(JSON.stringify({ event: "delhivery_warehouse_sync", request_id: requestIdValue, phase, ...fields }));
+}
+
 async function delhiveryWarehouseProviderContext(env: Env, clientId: string, requestedAccountId: string | null, requestIdValue: string, timeoutMs: number) {
   const defaultAccountName = String((env as unknown as Record<string, unknown>).DELHIVERY_DEFAULT_ACCOUNT_NAME ?? "").trim();
   const account = requestedAccountId
@@ -707,7 +711,7 @@ async function delhiveryWarehouseProviderContext(env: Env, clientId: string, req
   if (!token) return { ok: false as const, error: "Delhivery B2B authentication failed" };
   const warehouseApiToken = delhiveryWarehouseApiToken(env, account.account_name, delhiveryB2bCredential(credential));
   if (!warehouseApiToken) return { ok: false as const, error: "Delhivery warehouse registration requires the production API token for this account" };
-  return { ok: true as const, accountId: account.id, token, warehouseApiToken, base: env.DELHIVERY_B2B_API_BASE_URL ?? "https://ltl-clients-api.delhivery.com" };
+  return { ok: true as const, accountId: account.id, accountName: account.account_name, token, warehouseApiToken, base: env.DELHIVERY_B2B_API_BASE_URL ?? "https://ltl-clients-api.delhivery.com" };
 }
 
 function delhiveryJwtExpiry(token: string) {
@@ -830,6 +834,8 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   // here because that creates a different provider warehouse name and can
   // make an active Delhivery facility appear inactive.
   const providerName = localName;
+  const warehouseIdentityHash = await sha256(`${providerName}|${origin.pincode}`);
+  delhiveryWarehouseLog(requestIdValue, "start", { account_id: providerAccountId ?? null, identity_hash: warehouseIdentityHash });
   // A Client-selected warehouse already marked active for this Delhivery
   // account is eligible for manifestation. The facility-list endpoint is an
   // auxiliary projection and can lag or omit rows that the manifest service
@@ -896,6 +902,7 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
       body: JSON.stringify(warehousePayload),
     }, timeoutMs);
   } catch (caught) {
+    delhiveryWarehouseLog(requestIdValue, "registration_exception", { account_id: providerAccountId ?? null, identity_hash: warehouseIdentityHash, error: caught instanceof Error ? caught.message.slice(0, 240) : "unknown" });
     return { ok: false as const, error: caught instanceof Error ? caught.message : "Delhivery warehouse creation failed" };
   }
   const responseText = await providerResponseText(response, timeoutMs);
@@ -906,6 +913,7 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
     const lower = responseText.toLowerCase();
     return lower.includes("already exists") || lower.includes("already configured") || lower.includes("duplicate") || lower.includes("warehouse exists");
   })();
+  delhiveryWarehouseLog(requestIdValue, "registration_response", { account_id: providerAccountId ?? null, identity_hash: warehouseIdentityHash, http_status: response.status, accepted_http: response.ok, already_registered: providerAlreadyRegistered });
   try {
     const parsedCreateBody = JSON.parse(responseText) as unknown;
     createdProviderReference = findProviderReference(parsedCreateBody, new Set(["facility_id", "warehouse_id", "client_warehouse_uuid", "warehouse_uuid", "facility_uuid"]));
@@ -918,7 +926,10 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
       const providerBody = JSON.parse(responseText) as Record<string, unknown>;
       const explicitFailure = providerBody.ok === false || providerBody.success === false || providerBody.error === true;
       const embeddedError = typeof providerBody.error === "string" ? providerBody.error : typeof providerBody.message === "string" && /error|fail|invalid|inactive/i.test(providerBody.message) ? providerBody.message : "";
-      if (explicitFailure || embeddedError) return { ok: false as const, error: `Delhivery warehouse registration was rejected: ${(embeddedError || "provider returned success=false").slice(0, 240)}` };
+      if (explicitFailure || embeddedError) {
+        delhiveryWarehouseLog(requestIdValue, "registration_rejected", { account_id: providerAccountId ?? null, identity_hash: warehouseIdentityHash, error: (embeddedError || "provider returned success=false").slice(0, 240) });
+        return { ok: false as const, error: `Delhivery warehouse registration was rejected: ${(embeddedError || "provider returned success=false").slice(0, 240)}` };
+      }
       registrationAccepted = true;
     } catch {
       // Some Delhivery deployments return an empty/text success response.
@@ -927,7 +938,10 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
     }
   }
   if (!response.ok) {
-    if (!providerAlreadyRegistered) return { ok: false as const, error: `Delhivery warehouse creation failed (${response.status}): ${responseText.slice(0, 240)}` };
+    if (!providerAlreadyRegistered) {
+      delhiveryWarehouseLog(requestIdValue, "registration_failed", { account_id: providerAccountId ?? null, identity_hash: warehouseIdentityHash, error: responseText.slice(0, 240) });
+      return { ok: false as const, error: `Delhivery warehouse creation failed (${response.status}): ${responseText.slice(0, 240)}` };
+    }
     // A duplicate/already-configured response is also registration evidence.
     // The facility-list endpoint can lag or use a different projection than
     // the manifestation API, so let manifestation be the final authority.
@@ -943,6 +957,7 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
     facility = await resolveDelhiveryFacility(env, token, b2bBaseUrl, clientId, { warehouse_id: existing?.id, delhivery_pickup_location: providerName, pincode: origin.pincode }, requestIdValue, timeoutMs);
   }
   if (!facility.ok) {
+    delhiveryWarehouseLog(requestIdValue, "activation_lookup", { account_id: providerAccountId ?? null, identity_hash: warehouseIdentityHash, result: delhiveryFacilityNotFound(facility.error) ? "not_found" : "provider_error", error: facility.error.slice(0, 240) });
     if (!delhiveryFacilityNotFound(facility.error)) return { ok: false as const, error: facility.error };
     if (registrationAccepted) {
       // Delhivery's registration API and B2B facility-list API are eventually
@@ -3951,8 +3966,10 @@ const worker = {
           if (!context.ok) {
             providerStatus = "failed";
             providerError = context.error;
+            delhiveryWarehouseLog(id, "account_context_failed", { requested_account_id: providerAccountId, error: providerError });
             await env.DB.prepare("UPDATE warehouses SET provider_status = 'failed', provider_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(providerError, recordId, clientId).run();
           } else {
+            delhiveryWarehouseLog(id, "account_context_ready", { account_id: context.accountId, account_name: context.accountName });
             const sync = await ensureDelhiveryWarehouse(env, clientId, context.token, {
               name: String(payload.name),
               line: payload.address,
