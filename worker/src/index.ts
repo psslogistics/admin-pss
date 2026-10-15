@@ -2599,6 +2599,9 @@ async function handleDelhiveryDocumentWebhook(request: Request, env: Env, reques
 
 async function refreshFujiyamaDelhivery(env: Env, cron: string) {
   const columns = "id, client_id, tracking_number, lr_number, provider_reference, provider_account_id";
+  // Select in small pages for bounded concurrency, but keep paging through the
+  // complete due queue. The old single-query LIMIT 50 meant the scheduler could
+  // leave the rest of the eligible fleet untouched indefinitely.
   const order = "ORDER BY CASE WHEN provider_last_attempt_at IS NULL THEN 0 ELSE 1 END, provider_last_attempt_at ASC, updated_at ASC LIMIT 50";
   const latestEvent = "(SELECT lower(COALESCE(te.location, '') || ' ' || COALESCE(te.description, '')) FROM tracking_events te WHERE te.shipment_id = shipments.id ORDER BY te.event_time DESC LIMIT 1)";
   // The Worker wakes every 10 minutes, but each shipment is selected only at
@@ -2608,14 +2611,21 @@ async function refreshFujiyamaDelhivery(env: Env, cron: string) {
     (status = 'out_for_delivery' AND datetime(provider_last_attempt_at) <= datetime('now', '-10 minutes')) OR
     (status = 'in_transit' AND ${latestEvent} GLOB '*last[- ]mile*' AND datetime(provider_last_attempt_at) <= datetime('now', '-1 hour')) OR
     (status IN ('booked', 'picked_up', 'in_transit', 'exception', 'rto') AND NOT (status = 'in_transit' AND ${latestEvent} GLOB '*last[- ]mile*') AND datetime(provider_last_attempt_at) <= datetime('now', '-4 hours'))) `;
-  const active = await env.DB.prepare(`SELECT ${columns} FROM shipments WHERE client_id = ? AND provider = 'delhivery' AND provider_account_id = ? AND COALESCE(lr_number, tracking_number, provider_reference) IS NOT NULL AND status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery', 'exception', 'rto') AND ${due} ${order}`).bind(FUJIYAMA_CLIENT_ID, FUJIYAMA_DELHIVERY_ACCOUNT_ID).all<{ id: string; client_id: string; tracking_number: string; lr_number: string | null; provider_reference: string | null; provider_account_id: string }>();
   // Delivered shipments are terminal for status polling. Keep their separate
   // POD backfill below, but do not spend tracking calls refreshing them.
-  const refreshRows = active.results;
+  const refreshRows: Array<{ id: string; client_id: string; tracking_number: string; lr_number: string | null; provider_reference: string | null; provider_account_id: string }> = [];
   let trackingSucceeded = 0;
   let trackingFailed = 0;
-  for (let index = 0; index < refreshRows.length; index += 5) {
-    const batch = refreshRows.slice(index, index + 5);
+  const refreshStartedAt = Date.now();
+  // Leave a small safety margin for the POD pass and response logging. If the
+  // Worker reaches this budget, the next cron invocation continues from the
+  // remaining due rows because each attempted shipment receives a new attempt
+  // timestamp. There is no fleet-wide 50-record ceiling anymore.
+  while (Date.now() - refreshStartedAt < 25000) {
+    const active = await env.DB.prepare(`SELECT ${columns} FROM shipments WHERE client_id = ? AND provider = 'delhivery' AND provider_account_id = ? AND COALESCE(lr_number, tracking_number, provider_reference) IS NOT NULL AND status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery', 'exception', 'rto') AND ${due} ${order}`).bind(FUJIYAMA_CLIENT_ID, FUJIYAMA_DELHIVERY_ACCOUNT_ID).all<{ id: string; client_id: string; tracking_number: string; lr_number: string | null; provider_reference: string | null; provider_account_id: string }>();
+    if (!active.results.length) break;
+    const batch = active.results.slice(0, 5);
+    refreshRows.push(...batch);
     const results = await Promise.all(batch.map(async (shipment) => {
       const result = await safeProviderRequest(env, "delhivery", "tracking", { shipment_id: shipment.id, tracking_number: shipment.tracking_number, lr_number: shipment.lr_number, provider_reference: shipment.provider_reference, provider_account_id: shipment.provider_account_id }, `cron:${cron}:fujiyama:tracking:${shipment.id}`, shipment.client_id, undefined, 10000);
       return result.status === "accepted";
