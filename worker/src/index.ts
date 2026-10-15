@@ -2602,7 +2602,7 @@ async function refreshFujiyamaDelhivery(env: Env, cron: string) {
   // Select in small pages for bounded concurrency, but keep paging through the
   // complete due queue. The old single-query LIMIT 50 meant the scheduler could
   // leave the rest of the eligible fleet untouched indefinitely.
-  const order = "ORDER BY CASE WHEN provider_last_attempt_at IS NULL THEN 0 ELSE 1 END, provider_last_attempt_at ASC, updated_at ASC LIMIT 50";
+  const order = "ORDER BY CASE status WHEN 'out_for_delivery' THEN 0 WHEN 'in_transit' THEN 1 ELSE 2 END, CASE WHEN provider_last_attempt_at IS NULL THEN 0 ELSE 1 END, provider_last_attempt_at ASC, updated_at ASC LIMIT 50";
   const latestEvent = "(SELECT lower(COALESCE(te.location, '') || ' ' || COALESCE(te.description, '')) FROM tracking_events te WHERE te.shipment_id = shipments.id ORDER BY te.event_time DESC LIMIT 1)";
   // The Worker wakes every 10 minutes, but each shipment is selected only at
   // its state-specific cadence. Last-mile centre scans are identified from
