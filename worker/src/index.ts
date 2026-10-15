@@ -3057,6 +3057,9 @@ const worker = {
         const internalShipmentView = hasScope(auth, "shipments.sensitive.read") || auth.system;
         const pageSize = Math.min(Math.max(Number.parseInt(url.searchParams.get("limit") ?? "50", 10) || 50, 1), 50);
         const offset = Math.max(Number.parseInt(url.searchParams.get("offset") ?? "0", 10) || 0, 0);
+        const searchTerm = String(url.searchParams.get("search") ?? "").trim().slice(0, 120);
+        const searchFilter = searchTerm ? "(s.id LIKE ? OR s.pss_reference LIKE ? OR s.tracking_number LIKE ? OR s.lr_number LIKE ? OR s.master_awb LIKE ? OR s.provider_reference LIKE ?)" : "";
+        const searchBinds = searchTerm ? Array(6).fill(`%${searchTerm}%`) : [];
         const requestedStatus = String(url.searchParams.get("status") ?? "").trim().toLowerCase().replaceAll(" ", "_");
         const statusFilter = requestedStatus === "active"
           ? "status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery', 'delayed', 'exception')"
@@ -3073,7 +3076,13 @@ const worker = {
         const trackingShipmentColumns = "s.id, s.pss_reference, s.client_id, s.tracking_number, s.lr_number, s.master_awb, s.provider_reference, s.provider_booking_id, s.provider_pickup_id, s.status, s.provider, s.origin, s.destination, s.total_weight_kg, s.pieces, s.edd, s.delivered_at, s.created_at, s.updated_at, s.dimensions_json, (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = s.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, (SELECT b.invoice_number FROM billing_records b WHERE b.shipment_id = s.id ORDER BY b.created_at DESC LIMIT 1) AS invoice_number";
         const selectedShipmentColumns = shipmentView === "tracking" || !internalShipmentView ? trackingShipmentColumns : shipmentColumns;
         const queryLimit = pageSize + 1;
-        const rows = auth.system ? await env.DB.prepare(`SELECT ${selectedShipmentColumns} FROM shipments s${statusFilter ? ` WHERE s.${statusFilter}` : ""} ORDER BY s.created_at DESC LIMIT ${queryLimit} OFFSET ${offset}`).all() : auth.clientIds.size ? await env.DB.prepare(`SELECT ${selectedShipmentColumns} FROM shipments s WHERE s.client_id IN (${[...auth.clientIds].map(() => "?").join(",")})${statusFilter ? ` AND s.${statusFilter}` : ""} ORDER BY s.created_at DESC LIMIT ${queryLimit} OFFSET ${offset}`).bind(...[...auth.clientIds]).all() : { results: [] };
+        const systemWhere = [statusFilter ? `s.${statusFilter}` : "", searchFilter].filter(Boolean).join(" AND ");
+        const clientWhere = [`s.client_id IN (${[...auth.clientIds].map(() => "?").join(",")})`, statusFilter ? `s.${statusFilter}` : "", searchFilter].filter(Boolean).join(" AND ");
+        const rows = auth.system
+          ? await env.DB.prepare(`SELECT ${selectedShipmentColumns} FROM shipments s${systemWhere ? ` WHERE ${systemWhere}` : ""} ORDER BY s.created_at DESC LIMIT ${queryLimit} OFFSET ${offset}`).bind(...searchBinds).all()
+          : auth.clientIds.size
+            ? await env.DB.prepare(`SELECT ${selectedShipmentColumns} FROM shipments s WHERE ${clientWhere} ORDER BY s.created_at DESC LIMIT ${queryLimit} OFFSET ${offset}`).bind(...[...auth.clientIds, ...searchBinds]).all()
+            : { results: [] };
         const statusRows = auth.system ? await env.DB.prepare("SELECT status, COUNT(*) AS count FROM shipments GROUP BY status").all<{ status: string | null; count: number }>() : auth.clientIds.size ? await env.DB.prepare(`SELECT status, COUNT(*) AS count FROM shipments WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) GROUP BY status`).bind(...[...auth.clientIds]).all<{ status: string | null; count: number }>() : { results: [] as Array<{ status: string | null; count: number }> };
         const statusCounts = Object.fromEntries(statusRows.results.map((item) => [String(item.status ?? "unknown"), Number(item.count ?? 0)]));
         const totalCount = Object.values(statusCounts).reduce((sum, count) => sum + count, 0);
