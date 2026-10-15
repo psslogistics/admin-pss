@@ -2461,6 +2461,114 @@ async function recordPickupAttempt(env: Env, details: { pickupId: string; client
     .run();
 }
 
+const ACTIVE_MANIFEST_PICKUP_STATUSES = ["requested", "provider_pending", "scheduled", "driver_assigned", "en_route"];
+
+function manifestPickupAddress(payload: Record<string, unknown>) {
+  const origin = payload.origin_address && typeof payload.origin_address === "object" ? payload.origin_address as Record<string, unknown> : {};
+  const value = (key: string, fallback?: unknown) => String(origin[key] ?? payload[key] ?? fallback ?? "").trim();
+  return {
+    name: value("name", payload.contact_name ?? payload.pickup_location),
+    line: value("line", payload.pickup_address ?? payload.origin),
+    city: value("city"),
+    state: value("state"),
+    pincode: value("pincode", payload.pincode ?? payload.origin_pincode),
+    country: value("country", "India") || "India",
+    phone: value("phone", payload.contact_phone ?? payload.pickup_phone),
+  };
+}
+
+function pickupAwbsFromJson(value: unknown) {
+  if (typeof value !== "string") return normalizePickupAwbNumbers(value);
+  try { return normalizePickupAwbNumbers(JSON.parse(value)); } catch { return normalizePickupAwbNumbers(value); }
+}
+
+async function ensureManifestPickupGroup(
+  env: Env,
+  details: { shipmentId: string; clientId: string; provider: CourierProvider; providerAccountId: string | null; warehouseId?: string | null; payload: Record<string, unknown>; requestId: string; idempotencyKey?: string | null },
+) {
+  const address = manifestPickupAddress(details.payload);
+  const requestedDate = providerSafePickupDate(String(details.payload.pickup_date ?? details.payload.requested_date ?? details.payload.edd ?? new Date().toISOString().slice(0, 10)));
+  const requestedWindow = String(details.payload.requested_time_slot ?? details.payload.window ?? "09:00 - 11:00").trim();
+  const pieces = Math.max(1, Number(details.payload.pieces ?? 1));
+  const weight = Number(details.payload.total_weight_kg ?? details.payload.weight ?? 0);
+  const warehouse = details.warehouseId
+    ? await env.DB.prepare("SELECT id, name FROM warehouses WHERE id = ? AND client_id = ? LIMIT 1").bind(details.warehouseId, details.clientId).first<{ id: string; name: string }>()
+    : null;
+  const providerWarehouse = String(warehouse?.name ?? details.payload.delhivery_pickup_location ?? details.payload.pickup_location ?? address.name).trim();
+  const shipment = await env.DB.prepare("SELECT tracking_number, lr_number, master_awb, provider_reference FROM shipments WHERE id = ? AND client_id = ? LIMIT 1")
+    .bind(details.shipmentId, details.clientId).first<{ tracking_number: string | null; lr_number: string | null; master_awb: string | null; provider_reference: string | null }>();
+  const shipmentAwbs = normalizePickupAwbNumbers(shipment?.master_awb ?? shipment?.tracking_number ?? shipment?.provider_reference);
+  const activeStatuses = ACTIVE_MANIFEST_PICKUP_STATUSES.map(() => "?").join(", ");
+  const existing = await env.DB.prepare(`SELECT id, shipment_id, status, provider_reference, provider_status, provider_awb_numbers_json, pieces, total_weight_kg
+    FROM pickup_requests
+    WHERE client_id = ? AND provider = ? AND COALESCE(provider_account_id, '') = COALESCE(?, '')
+      AND pincode = ? AND pickup_address = ?
+      AND requested_date = ? AND requested_time_slot = ? AND status IN (${activeStatuses})
+    ORDER BY created_at ASC LIMIT 1`)
+    .bind(details.clientId, details.provider, details.providerAccountId, address.pincode, address.line, requestedDate, requestedWindow, ...ACTIVE_MANIFEST_PICKUP_STATUSES).first<{ id: string; shipment_id: string | null; status: string; provider_reference: string | null; provider_status: string | null; provider_awb_numbers_json: string | null; pieces: number | null; total_weight_kg: number | null }>();
+
+  if (existing) {
+    let groupedAwbs = pickupAwbsFromJson(existing.provider_awb_numbers_json);
+    groupedAwbs = Array.from(new Set([...groupedAwbs, ...shipmentAwbs]));
+    await env.DB.prepare("UPDATE pickup_requests SET pieces = COALESCE(pieces, 0) + ?, total_weight_kg = COALESCE(total_weight_kg, 0) + ?, provider_awb_numbers_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+      .bind(pieces, Number.isFinite(weight) ? weight : 0, JSON.stringify(groupedAwbs), existing.id, details.clientId).run();
+    await env.DB.prepare("INSERT OR IGNORE INTO pickup_request_shipments (pickup_id, shipment_id, client_id) VALUES (?, ?, ?)")
+      .bind(existing.id, details.shipmentId, details.clientId).run();
+    if (existing.provider_reference) await env.DB.prepare("UPDATE shipments SET provider_pickup_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+      .bind(existing.provider_reference, details.shipmentId, details.clientId).run();
+    return { ok: true as const, id: existing.id, status: existing.status, providerReference: existing.provider_reference, grouped: true as const };
+  }
+
+  const pickupId = crypto.randomUUID();
+  await env.DB.prepare("INSERT INTO pickup_requests (id, shipment_id, client_id, created_by_user_id, requested_date, requested_time_slot, pickup_address, contact_name, contact_phone, city, state, pincode, country, pieces, total_weight_kg, status, provider, provider_account_id, warehouse_id, provider_status, provider_awb_numbers_json, idempotency_key, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?, ?, ?, 'pending', ?, ?, ?)")
+    .bind(pickupId, details.shipmentId, details.clientId, `manifest:${details.shipmentId}`, requestedDate, requestedWindow, address.line, address.name || "Consignor", normalizePickupPhone(address.phone) ?? "0000000000", address.city || null, address.state || null, address.pincode, address.country, pieces, Number.isFinite(weight) ? weight : null, details.provider, details.providerAccountId, details.warehouseId ?? null, JSON.stringify(shipmentAwbs), `manifest-pickup-${details.shipmentId}`, "Automatically grouped from manifested shipment using the consignor address")
+    .run();
+  await env.DB.prepare("INSERT OR IGNORE INTO pickup_request_shipments (pickup_id, shipment_id, client_id) VALUES (?, ?, ?)")
+    .bind(pickupId, details.shipmentId, details.clientId).run();
+
+  const providerResult = await safeProviderRequest(env, details.provider, "pickups", {
+    pickup_id: pickupId,
+    shipment_id: details.shipmentId,
+    provider_account_id: details.providerAccountId,
+    delhivery_pickup_location: providerWarehouse,
+    pickup_location: providerWarehouse,
+    scheduled_date: requestedDate,
+    requested_date: requestedDate,
+    window: requestedWindow,
+    requested_time_slot: requestedWindow,
+    location: address.line,
+    pickup_address: address.line,
+    contact_name: address.name || "Consignor",
+    contact_phone: normalizePickupPhone(address.phone) ?? "0000000000",
+    city: address.city,
+    state: address.state,
+    pincode: address.pincode,
+    country: address.country,
+    pieces,
+    weight: Number.isFinite(weight) ? weight : 0,
+    awb_number: shipmentAwbs,
+    provider_managed: true,
+  }, details.requestId, details.clientId, details.idempotencyKey ?? `manifest-pickup-${details.shipmentId}`);
+  const providerReference = (providerResult as { providerReference?: string | null }).providerReference ?? null;
+  const providerStatus = (providerResult as { providerStatus?: string | number | null }).providerStatus ?? providerResult.status;
+  const providerError = (providerResult as { error?: string; reason?: string }).error ?? (providerResult as { reason?: string }).reason ?? null;
+  await recordPickupAttempt(env, { pickupId, clientId: details.clientId, provider: details.provider, providerAccountId: details.providerAccountId, requestId: details.requestId, idempotencyKey: details.idempotencyKey, requestedDate, requestedWindow, status: providerResult.status, providerStatus, providerReference, providerErrorCode: providerResult.status === "accepted" ? null : providerResult.status, errorMessage: providerError }).catch(() => undefined);
+  if (providerResult.status !== "accepted") {
+    const failureReason = String(providerError ?? `The ${details.provider} pickup was not accepted`).slice(0, 500);
+    await env.DB.prepare("UPDATE pickup_requests SET status = 'failed', provider_status = ?, provider_request_id = ?, provider_error_code = ?, failure_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+      .bind(String(providerStatus), details.requestId, String(providerResult.status), failureReason, pickupId, details.clientId).run();
+    return { ok: false as const, id: pickupId, status: "failed", error: failureReason };
+  }
+  const pickupStatus = (providerResult as { providerPending?: boolean }).providerPending ? "provider_pending" : "scheduled";
+  const acceptedDate = (providerResult as { acceptedDate?: string | null }).acceptedDate ?? requestedDate;
+  const acceptedWindow = (providerResult as { acceptedWindow?: string | null }).acceptedWindow ?? requestedWindow;
+  await env.DB.prepare("UPDATE pickup_requests SET status = ?, provider_status = ?, provider_request_id = ?, provider_reference = COALESCE(?, provider_reference), provider_slot_id = COALESCE(?, provider_slot_id), requested_date = ?, requested_time_slot = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+    .bind(pickupStatus, String(providerStatus), details.requestId, providerReference, (providerResult as { providerSlotId?: string | null }).providerSlotId ?? null, acceptedDate, acceptedWindow, pickupId, details.clientId).run();
+  if (providerReference) await env.DB.prepare("UPDATE shipments SET provider_pickup_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+    .bind(providerReference, details.shipmentId, details.clientId).run();
+  return { ok: true as const, id: pickupId, status: pickupStatus, providerReference, grouped: false as const };
+}
+
 async function safeProviderRequest(env: Env, provider: CourierProvider, operation: string, payload: Record<string, unknown>, requestIdValue: string, clientId?: string, idempotencyKey?: string, timeoutMsOverride?: number) {
   try {
     return await providerRequest(env, provider, operation, payload, requestIdValue, clientId, idempotencyKey, timeoutMsOverride);
@@ -2500,6 +2608,17 @@ async function retryPendingDelhiveryBookings(env: Env, cron: string) {
       const invoiceDocuments = await loadShipmentInvoiceDocumentsForRetry(env, shipment.client_id, shipment.id, payload);
       const result = await safeProviderRequest(env, "delhivery", "shipments", { shipment_id: shipment.id, ...payload, invoice_documents: invoiceDocuments, provider_account_id: shipment.provider_account_id ?? payload.provider_account_id }, `cron:${cron}:booking:${shipment.id}`, shipment.client_id, `queued-booking-${shipment.id}`, 25000);
       if (result.status === "accepted") {
+        const acceptedProviderAccountId = (result as { provider_account_id?: string | null }).provider_account_id ?? shipment.provider_account_id ?? (typeof payload.provider_account_id === "string" ? payload.provider_account_id : null);
+        await ensureManifestPickupGroup(env, {
+          shipmentId: shipment.id,
+          clientId: shipment.client_id,
+          provider: "delhivery",
+          providerAccountId: acceptedProviderAccountId,
+          warehouseId: typeof payload.warehouse_id === "string" ? payload.warehouse_id : null,
+          payload,
+          requestId: `cron:${cron}:manifest-pickup:${shipment.id}`,
+          idempotencyKey: `manifest-pickup-${shipment.id}`,
+        });
         await env.DB.prepare("UPDATE shipments SET provider_booking_payload_json = NULL, provider_retry_at = NULL, provider_last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(shipment.id, shipment.client_id).run();
         continue;
       }
@@ -3272,7 +3391,7 @@ const worker = {
           : internalShipmentView
           ? "s.id, s.pss_reference, s.client_id, s.created_by_user_id, s.tracking_number, s.lr_number, s.master_awb, s.box_awbs_json, s.provider_booking_id, s.provider_pickup_id, s.provider_sync_status, s.status, s.provider, s.provider_account_id, s.provider_reference, (SELECT sd.id FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS pod_document_id, (SELECT sd.original_filename FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS pod_filename, (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = s.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, (SELECT pr.status FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_status, (SELECT pr.requested_date FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_scheduled_date, (SELECT pr.requested_time_slot FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_time_slot, (SELECT c.provider_status FROM pricing_provider_costs c WHERE c.shipment_id = s.id LIMIT 1) AS provider_confirmation_status, (SELECT te.description FROM tracking_events te WHERE te.shipment_id = s.id AND te.status = 'exception' ORDER BY te.event_time DESC LIMIT 1) AS provider_failure_reason, s.description, s.origin, s.destination, s.origin_address_json, s.destination_address_json, s.consignee, s.total_weight_kg, s.declared_value, s.pieces, s.edd, s.delivered_at, s.created_at, s.updated_at"
           : "s.id, s.pss_reference, s.client_id, s.created_by_user_id, s.tracking_number, s.lr_number, s.master_awb, s.box_awbs_json, s.provider_booking_id, s.provider_pickup_id, s.provider_sync_status, s.status, s.provider, s.provider_reference, (SELECT sd.id FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS pod_document_id, (SELECT sd.original_filename FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS pod_filename, (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = s.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, (SELECT pr.status FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_status, (SELECT pr.requested_date FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_scheduled_date, (SELECT pr.requested_time_slot FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_time_slot, (SELECT c.provider_status FROM pricing_provider_costs c WHERE c.shipment_id = s.id LIMIT 1) AS provider_confirmation_status, (SELECT te.description FROM tracking_events te WHERE te.shipment_id = s.id AND te.status = 'exception' ORDER BY te.event_time DESC LIMIT 1) AS provider_failure_reason, s.description, s.origin, s.destination, s.origin_address_json, s.destination_address_json, s.consignee, s.total_weight_kg, s.declared_value, s.pieces, s.edd, s.delivered_at, s.created_at, s.updated_at";
-        const trackingShipmentColumns = "s.id, s.pss_reference, s.client_id, s.tracking_number, s.lr_number, s.master_awb, s.box_awbs_json, s.provider_reference, s.provider_booking_id, s.provider_pickup_id, s.provider_sync_status, s.status, s.provider, s.origin, s.destination, s.origin_address_json, s.destination_address_json, s.consignee, s.total_weight_kg, s.pieces, s.edd, s.delivered_at, s.created_at, s.updated_at, s.dimensions_json, (SELECT sd.id FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS pod_document_id, (SELECT sd.id FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) NOT LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS invoice_document_id, (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = s.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, (SELECT b.invoice_number FROM billing_records b WHERE b.shipment_id = s.id ORDER BY b.created_at DESC LIMIT 1) AS invoice_number";
+        const trackingShipmentColumns = "s.id, s.pss_reference, s.client_id, s.tracking_number, s.lr_number, s.master_awb, s.box_awbs_json, s.provider_reference, s.provider_booking_id, s.provider_pickup_id, s.provider_sync_status, s.status, s.provider, s.origin, s.destination, s.origin_address_json, s.destination_address_json, s.consignee, s.total_weight_kg, s.pieces, s.edd, s.delivered_at, s.created_at, s.updated_at, s.dimensions_json, (SELECT sd.id FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS pod_document_id, (SELECT sd.id FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) NOT LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS invoice_document_id, (SELECT pr.provider_reference FROM pickup_requests pr WHERE (pr.shipment_id = s.id OR EXISTS (SELECT 1 FROM pickup_request_shipments prs WHERE prs.pickup_id = pr.id AND prs.shipment_id = s.id)) AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, (SELECT b.invoice_number FROM billing_records b WHERE b.shipment_id = s.id ORDER BY b.created_at DESC LIMIT 1) AS invoice_number";
         const selectedShipmentColumns = shipmentView === "tracking" || !internalShipmentView ? trackingShipmentColumns : shipmentColumns;
         const queryLimit = pageSize + 1;
         const systemWhere = [statusFilter ? `s.${statusFilter}` : "", searchFilter].filter(Boolean).join(" AND ");
@@ -3438,12 +3557,20 @@ const worker = {
           await audit(env, ctx, auth, id, "shipment.provider_failed", "shipment", shipmentId, { client_id: clientId, provider, reason: failureReason });
           return new Response(failedResponse, { status: 502, headers: { ...headers, "content-type": "application/json" } });
         }
+        // A manifest is a provider shipment, but it is not a pickup appointment.
+        // Create or join the pickup group using the consignor/origin address only
+        // after Delhivery has accepted the shipment. This keeps provider booking
+        // and pickup scheduling explicit while making the normal booking flow
+        // safe for arbitrary saved consignor addresses.
+        const manifestPickup = provider === "delhivery"
+          ? await ensureManifestPickupGroup(env, { shipmentId, clientId, provider: provider as CourierProvider, providerAccountId: selectedProviderAccountId ?? requestedProviderAccountId, warehouseId: selectedWarehouseId || null, payload, requestId: id, idempotencyKey: `manifest-pickup-${shipmentId}` })
+          : null;
         // Return the PSS-owned identifiers after the provider call. Delhivery may
         // assign the AWB asynchronously, so read the persisted values instead of
         // trusting an unnormalized provider response. These are the only booking
         // references Fujiyama needs for its follow-up tracking calls.
         const bookedShipment = await env.DB.prepare("SELECT pss_reference, tracking_number, provider_reference FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(shipmentId, clientId).first<{ pss_reference: string; tracking_number: string | null; provider_reference: string | null }>();
-        const serialized = JSON.stringify({ ok: true, data: { id: shipmentId, pss_reference: bookedShipment?.pss_reference ?? pssReference, client_id: clientId, status: "booked", provider, tracking_number: bookedShipment?.tracking_number ?? null, provider_reference: bookedShipment?.provider_reference ?? null, pricing_amount: pricingAmount || null, provider_status: providerResult.status }, request_id: id });
+        const serialized = JSON.stringify({ ok: true, data: { id: shipmentId, pss_reference: bookedShipment?.pss_reference ?? pssReference, client_id: clientId, status: "booked", provider, tracking_number: bookedShipment?.tracking_number ?? null, provider_reference: bookedShipment?.provider_reference ?? null, pricing_amount: pricingAmount || null, provider_status: providerResult.status, pickup_request_id: manifestPickup?.id ?? null, pickup_status: manifestPickup?.status ?? null, pickup_grouped: manifestPickup?.grouped ?? false, pickup_error: manifestPickup && !manifestPickup.ok ? manifestPickup.error : null }, request_id: id });
         await saveIdempotent(env, key, clientId, "POST /v1/shipments", 201, serialized, requestHash);
         await audit(env, ctx, auth, id, "shipment.created", "shipment", shipmentId, { client_id: clientId, provider });
         return new Response(serialized, { status: 201, headers: { ...headers, "content-type": "application/json" } });
@@ -3638,6 +3765,12 @@ const worker = {
          if (payload.provider_managed === true && !shipment) return error("VALIDATION_ERROR", "Provider-managed pickup requests must be linked to a shipment", 400, id, headers);
         const key = request.headers.get("Idempotency-Key"); if (!key) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
         const existing = await idempotentResponse(env, key, clientId, "POST /v1/pickups", requestHash); if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
+        if (payload.provider_managed === true && typeof payload.shipment_id === "string" && shipment) {
+          const grouped = await ensureManifestPickupGroup(env, { shipmentId: payload.shipment_id, clientId, provider, providerAccountId, warehouseId, payload: providerPayload, requestId: id, idempotencyKey: key });
+          const groupedResponse = JSON.stringify({ ok: grouped.ok, data: { id: grouped.id, client_id: clientId, status: grouped.status, provider, provider_account_id: providerAccountId, provider_reference: grouped.providerReference ?? null, grouped: grouped.grouped ?? false }, ...(grouped.ok ? {} : { error: { code: "PROVIDER_REQUEST_FAILED", category: "provider", message: grouped.error, user_safe_message: `The ${provider} pickup was not accepted. Retry it after correcting the provider issue.`, technical_message: grouped.error, provider_code: "PROVIDER_REQUEST_FAILED", request_id: id, retryable: true, stale_data: false } }), request_id: id });
+          await saveIdempotent(env, key, clientId, "POST /v1/pickups", grouped.ok ? 201 : 502, groupedResponse, requestHash);
+          return new Response(groupedResponse, { status: grouped.ok ? 201 : 502, headers: { ...headers, "content-type": "application/json" } });
+        }
         const pickupId = crypto.randomUUID();
          await env.DB.prepare("INSERT INTO pickup_requests (id, shipment_id, client_id, created_by_user_id, requested_date, requested_time_slot, pickup_address, contact_name, contact_phone, contact_email, city, state, pincode, country, pieces, total_weight_kg, status, provider, provider_account_id, warehouse_id, provider_status, provider_slot_id, provider_awb_numbers_json, idempotency_key, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?, ?, ?, 'pending', ?, ?, ?, ?)").bind(pickupId, typeof payload.shipment_id === "string" ? payload.shipment_id : null, clientId, auth.userId ?? `api:${clientId}`, normalizedScheduledDate, String(requestedWindowInput), String(pickupAddressInput).trim(), String(payload.contact_name).trim(), normalizedContactPhone, typeof payload.contact_email === "string" ? payload.contact_email.trim() : null, typeof payload.city === "string" ? payload.city.trim() : null, typeof payload.state === "string" ? payload.state.trim() : null, payload.pincode.trim(), typeof payload.country === "string" && payload.country.trim() ? payload.country.trim() : "India", pieces, totalWeight, provider, providerAccountId, warehouseId, typeof payload.provider_slot_id === "string" ? payload.provider_slot_id.trim() : null, JSON.stringify(pickupAwbNumbers), key, typeof payload.notes === "string" ? payload.notes.trim().slice(0, 2000) : null).run();
           const providerResult = provider ? await safeProviderRequest(env, provider, "pickups", { pickup_id: pickupId, shipment_id: providerPayload.shipment_id, tracking_number: shipment?.tracking_number, provider_reference: shipment?.provider_reference, provider_account_id: providerPayload.provider_account_id ?? shipment?.provider_account_id, ...providerPayload }, id, clientId, key) : { enabled: false, status: "not_requested" as const };

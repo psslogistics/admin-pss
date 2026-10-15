@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 const source = await readFile(new URL("../src/index.ts", import.meta.url), "utf8");
 const schema = await readFile(new URL("../schema.sql", import.meta.url), "utf8");
 const migration = await readFile(new URL("../migrations/20261012_pickup_scheduling_contract.sql", import.meta.url), "utf8");
+const groupingMigration = await readFile(new URL("../migrations/20261015_manifest_pickup_grouping.sql", import.meta.url), "utf8");
 const adminWorkspace = await readFile(new URL("../../components/dashboard/operations-workspace.tsx", import.meta.url), "utf8");
 
 const checks = [
@@ -22,6 +23,8 @@ const checks = [
   ["migration carries canonical fields", ["provider_account_id", "warehouse_id", "provider_slot_id", "idempotency_key"].every((field) => migration.includes(field))],
   ["admin does not post incomplete pickup payloads", !adminWorkspace.includes('scheduled_date: new Date().toISOString().slice(0, 10)') && adminWorkspace.includes("Open the full Pickup desk")],
   ["provider webhook persists accepted pickup date and slot", source.includes("requested_date = COALESCE(?, requested_date)") && source.includes("requestedTimeSlot")],
+  ["manifested shipments are grouped by consignor pickup", source.includes("ensureManifestPickupGroup") && source.includes("pickup_request_shipments") && groupingMigration.includes("CREATE TABLE IF NOT EXISTS pickup_request_shipments")],
+  ["standalone pickup path remains distinct", source.includes("provider_managed === true") && source.includes("Provider-managed pickup requests must be linked to a shipment")],
 ];
 
 const failed = checks.filter(([, passed]) => !passed).map(([name]) => name);
