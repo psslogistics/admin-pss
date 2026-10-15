@@ -883,29 +883,76 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
     return_country: "India",
   };
   const registrationToken = warehouseApiToken && !delhiveryLooksLikeJwt(warehouseApiToken) ? warehouseApiToken : null;
-  if (!registrationToken) {
-    return { ok: false as const, code: "WAREHOUSE_API_TOKEN_REQUIRED" as const, error: "Delhivery warehouse registration requires the production API token for this account. Add it to the selected account credential before booking." };
+  const b2bWarehousePayload = {
+    name: providerName,
+    pin_code: origin.pincode,
+    city: origin.city,
+    state: origin.state,
+    country: "India",
+    address_details: {
+      address: origin.line,
+      contact_person: origin.name || providerName,
+      phone_number: origin.phone,
+    },
+    same_as_fwd_add: true,
+    ret_address: { pin: origin.pincode, address: origin.line },
+  };
+  const registrationAttempts = [
+    {
+      contract: "b2b",
+      endpoint: `${String(b2bBaseUrl).replace(/\/$/, "")}/client-warehouse/create/`,
+      authorization: `Bearer ${token}`,
+      payload: b2bWarehousePayload,
+    },
+    ...(registrationToken ? [{
+      contract: "legacy",
+      endpoint: "https://track.delhivery.com/api/backend/clientwarehouse/create/",
+      authorization: `Token ${registrationToken}`,
+      payload: warehousePayload,
+    }] : []),
+  ];
+  let response: Response | null = null;
+  let responseText = "";
+  let registrationContract = "";
+  let lastRegistrationError = "";
+  for (const attempt of registrationAttempts) {
+    try {
+      const candidate = await providerFetch(attempt.endpoint, {
+        method: "POST",
+        headers: {
+          authorization: attempt.authorization,
+          "content-type": "application/json",
+          accept: "application/json",
+          "x-request-id": requestIdValue,
+          "Idempotency-Key": warehouseCreateIdempotencyKey,
+          "X-Idempotency-Key": warehouseCreateIdempotencyKey,
+        },
+        body: JSON.stringify(attempt.payload),
+      }, timeoutMs);
+      const candidateText = await providerResponseText(candidate, timeoutMs);
+      const alreadyRegistered = !candidate.ok && (() => {
+        const lower = candidateText.toLowerCase();
+        return lower.includes("already exists") || lower.includes("already configured") || lower.includes("duplicate") || lower.includes("warehouse exists");
+      })();
+      delhiveryWarehouseLog(requestIdValue, "registration_attempt", {
+        account_id: providerAccountId ?? null,
+        identity_hash: warehouseIdentityHash,
+        contract: attempt.contract,
+        http_status: candidate.status,
+        accepted_http: candidate.ok,
+        already_registered: alreadyRegistered,
+      });
+      response = candidate;
+      responseText = candidateText;
+      registrationContract = attempt.contract;
+      if (candidate.ok || alreadyRegistered) break;
+      lastRegistrationError = `Delhivery warehouse creation failed (${candidate.status}): ${candidateText.slice(0, 240)}`;
+    } catch (caught) {
+      lastRegistrationError = caught instanceof Error ? caught.message : "Delhivery warehouse creation failed";
+      delhiveryWarehouseLog(requestIdValue, "registration_exception", { account_id: providerAccountId ?? null, identity_hash: warehouseIdentityHash, contract: attempt.contract, error: lastRegistrationError.slice(0, 240) });
+    }
   }
-  const endpoint = "https://track.delhivery.com/api/backend/clientwarehouse/create/";
-  let response: Response;
-  try {
-    response = await providerFetch(endpoint, {
-      method: "POST",
-      headers: {
-        authorization: `Token ${registrationToken}`,
-        "content-type": "application/json",
-        accept: "application/json",
-        "x-request-id": requestIdValue,
-        "Idempotency-Key": warehouseCreateIdempotencyKey,
-        "X-Idempotency-Key": warehouseCreateIdempotencyKey,
-      },
-      body: JSON.stringify(warehousePayload),
-    }, timeoutMs);
-  } catch (caught) {
-    delhiveryWarehouseLog(requestIdValue, "registration_exception", { account_id: providerAccountId ?? null, identity_hash: warehouseIdentityHash, error: caught instanceof Error ? caught.message.slice(0, 240) : "unknown" });
-    return { ok: false as const, error: caught instanceof Error ? caught.message : "Delhivery warehouse creation failed" };
-  }
-  const responseText = await providerResponseText(response, timeoutMs);
+  if (!response) return { ok: false as const, error: lastRegistrationError || "Delhivery warehouse creation failed" };
   let createdProviderReference: string | null = null;
   let createdProviderName: string | null = null;
   let registrationAccepted = false;
@@ -913,7 +960,7 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
     const lower = responseText.toLowerCase();
     return lower.includes("already exists") || lower.includes("already configured") || lower.includes("duplicate") || lower.includes("warehouse exists");
   })();
-  delhiveryWarehouseLog(requestIdValue, "registration_response", { account_id: providerAccountId ?? null, identity_hash: warehouseIdentityHash, http_status: response.status, accepted_http: response.ok, already_registered: providerAlreadyRegistered });
+  delhiveryWarehouseLog(requestIdValue, "registration_response", { account_id: providerAccountId ?? null, identity_hash: warehouseIdentityHash, contract: registrationContract, http_status: response.status, accepted_http: response.ok, already_registered: providerAlreadyRegistered });
   try {
     const parsedCreateBody = JSON.parse(responseText) as unknown;
     createdProviderReference = findProviderReference(parsedCreateBody, new Set(["facility_id", "warehouse_id", "client_warehouse_uuid", "warehouse_uuid", "facility_uuid"]));
@@ -940,12 +987,22 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   if (!response.ok) {
     if (!providerAlreadyRegistered) {
       delhiveryWarehouseLog(requestIdValue, "registration_failed", { account_id: providerAccountId ?? null, identity_hash: warehouseIdentityHash, error: responseText.slice(0, 240) });
-      return { ok: false as const, error: `Delhivery warehouse creation failed (${response.status}): ${responseText.slice(0, 240)}` };
+      return { ok: false as const, error: lastRegistrationError || `Delhivery warehouse creation failed (${response.status}): ${responseText.slice(0, 240)}` };
     }
     // A duplicate/already-configured response is also registration evidence.
     // The facility-list endpoint can lag or use a different projection than
     // the manifestation API, so let manifestation be the final authority.
     registrationAccepted = true;
+  }
+  if (registrationAccepted && registrationContract === "b2b") {
+    if (existing) {
+      await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_reference = COALESCE(?, provider_reference), provider_name = COALESCE(?, provider_name), provider_error = NULL, provider_activated_at = CURRENT_TIMESTAMP, provider_status = 'active', status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+        .bind(providerAccountId ?? null, createdProviderReference, createdProviderName || providerName, existing.id, clientId).run();
+    } else {
+      await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status, provider_reference, provider_name, provider_activated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'active', ?, ?, CURRENT_TIMESTAMP)")
+        .bind(crypto.randomUUID(), clientId, localName, origin.line, origin.city, origin.state, origin.pincode, origin.phone, origin.name, providerAccountId ?? null, createdProviderReference, createdProviderName || providerName).run();
+    }
+    return { ok: true as const, name: createdProviderName || providerName, reused: providerAlreadyRegistered };
   }
   // A successful or duplicate create response is registration evidence only,
   // never activation evidence. Re-fetch the exact provider identity before
