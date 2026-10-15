@@ -870,6 +870,7 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   const responseText = await providerResponseText(response, timeoutMs);
   let createdProviderReference: string | null = null;
   let createdProviderName: string | null = null;
+  let registrationAccepted = false;
   const providerAlreadyRegistered = !response.ok && (() => {
     const lower = responseText.toLowerCase();
     return lower.includes("already exists") || lower.includes("already configured") || lower.includes("duplicate") || lower.includes("warehouse exists");
@@ -887,9 +888,11 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
       const explicitFailure = providerBody.ok === false || providerBody.success === false || providerBody.error === true;
       const embeddedError = typeof providerBody.error === "string" ? providerBody.error : typeof providerBody.message === "string" && /error|fail|invalid|inactive/i.test(providerBody.message) ? providerBody.message : "";
       if (explicitFailure || embeddedError) return { ok: false as const, error: `Delhivery warehouse registration was rejected: ${(embeddedError || "provider returned success=false").slice(0, 240)}` };
+      registrationAccepted = true;
     } catch {
       // Some Delhivery deployments return an empty/text success response.
       // HTTP success remains sufficient when there is no structured failure.
+      registrationAccepted = true;
     }
   }
   if (!response.ok) {
@@ -906,6 +909,23 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   }
   if (!facility.ok) {
     if (!delhiveryFacilityNotFound(facility.error)) return { ok: false as const, error: facility.error };
+    if (registrationAccepted) {
+      // Delhivery's registration API and B2B facility-list API are eventually
+      // consistent and do not always expose the new row through the same
+      // gateway immediately. An accepted registration is sufficient to send
+      // the booking using the provider name; if manifestation still rejects
+      // it as inactive, the booking route queues it for retry. Keep the local
+      // row pending until a later facility lookup proves activation.
+      const pendingError = "Delhivery accepted the pickup-location registration; activation confirmation is still propagating";
+      if (existing) {
+        await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_reference = COALESCE(?, provider_reference), provider_name = COALESCE(?, provider_name), provider_status = 'pending', provider_error = ?, status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+          .bind(providerAccountId ?? null, createdProviderReference, createdProviderName || providerName, pendingError, existing.id, clientId).run();
+      } else {
+        await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status, provider_reference, provider_name, provider_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'pending', ?, ?, ?)")
+          .bind(crypto.randomUUID(), clientId, localName, origin.line, origin.city, origin.state, origin.pincode, origin.phone, origin.name, providerAccountId ?? null, createdProviderReference, createdProviderName || providerName, pendingError).run();
+      }
+      return { ok: true as const, name: createdProviderName || providerName, reused: false as const };
+    }
     if (existing) {
       await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_reference = COALESCE(?, provider_reference), provider_name = COALESCE(?, provider_name), provider_status = 'pending', provider_error = ?, status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
         .bind(providerAccountId ?? null, createdProviderReference, createdProviderName || providerName, "Delhivery warehouse was created or located but is awaiting provider activation", existing.id, clientId).run();
@@ -1766,7 +1786,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (["tracking", "labels", "lr_copy", "document"].includes(operation) && !trackingNumber) return { enabled: false, status: "invalid_request" as const, reason: "A provider tracking reference is required" };
   if (provider === "delhivery" && operation === "shipments" && String(env.DELHIVERY_ENABLE_SHIPMENT_CREATION) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "Delhivery shipment creation is safety-disabled until live billing approval" };
   if (provider === "delhivery" && operation === "pickups" && String(env.DELHIVERY_ENABLE_PICKUP_CREATION) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "Delhivery pickup creation is safety-disabled until live operations approval" };
-  if (provider === "delhivery" && !new Set(["tracking", "shipments", "pickups", "pickup_slots", "serviceability", "labels", "lr_copy", "document"]).has(operation)) return { enabled: false, status: "unsupported" as const, reason: "Delhivery operation is not supported" };
+  if (provider === "delhivery" && !new Set(["tracking", "shipment_status", "shipments", "pickups", "pickup_slots", "serviceability", "labels", "lr_copy", "document"]).has(operation)) return { enabled: false, status: "unsupported" as const, reason: "Delhivery operation is not supported" };
   if (provider === "ekart" && operation === "pickups") return { enabled: false, status: "unsupported" as const, reason: "Ekart pickup contract is not verified" };
   if (provider === "ekart" && String(env.EKART_ENABLE_PROVIDER_CALLS) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "Ekart is configured but disabled until the agreed provider scope is approved" };
   if (provider === "ekart" && operation !== "tracking" && operation !== "shipments") return { enabled: false, status: "unsupported" as const, reason: "Ekart operation is not supported" };
@@ -1964,6 +1984,8 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         ? `${base.replace(/\/$/, "")}/lr_copy/print/${encodeURIComponent(trackingNumber)}${payload.lr_copy_type ? `?lr_copy_type=${encodeURIComponent(String(payload.lr_copy_type))}` : ""}`
       : provider === "delhivery" && operation === "document"
         ? `${base.replace(/\/$/, "")}/document/download?lrn=${encodeURIComponent(trackingNumber)}${payload.doc_type ? `&doc_type=${encodeURIComponent(String(payload.doc_type))}` : ""}&auto_download=true&version=latest`
+      : provider === "delhivery" && operation === "shipment_status"
+        ? `${base.replace(/\/$/, "")}/manifest?job_id=${encodeURIComponent(String(payload.provider_booking_id ?? ""))}`
       : provider === "delhivery" && operation === "tracking"
         ? useDelhiveryB2b
         ? `${base.replace(/\/$/, "")}/v2/track/${encodeURIComponent(delhiveryB2bNumber(trackingNumber) ?? String(payload.shipment_id ?? trackingNumber))}`
@@ -2015,7 +2037,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         : provider === "rivigo" && operation === "shipments" ? JSON.stringify(rivigoCreate)
         : provider === "rivigo" && operation === "updates" ? JSON.stringify(payload)
         : provider === "rivigo" && operation === "cancellations" ? JSON.stringify(payload.cnotes_list ? { cnotesList: payload.cnotes_list } : {})
-         : provider === "delhivery" && ["tracking", "serviceability", "pickup_slots", "labels", "lr_copy", "document"].includes(operation) ? ""
+         : provider === "delhivery" && ["tracking", "shipment_status", "serviceability", "pickup_slots", "labels", "lr_copy", "document"].includes(operation) ? ""
         : operation === "tracking" ? JSON.stringify({ Appkey: trackon!.appKey, userId: trackon!.userId, password: trackon!.password, AWBNo: trackingNumber })
           : operation === "shipments" ? JSON.stringify(trackonPayload(payload, trackon!))
             : JSON.stringify({ Appkey: trackon!.appKey, userId: trackon!.userId, password: trackon!.password, AWBNo: trackingNumber });
@@ -2035,7 +2057,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       // XpressBees documents tracking as POST even though it is a read-only
       // lookup. Keep the generic GET behavior for Delhivery/Trackon tracking,
       // but send the XpressBees AWB body with POST to avoid provider HTTP 405.
-       const isGet = (["tracking", "serviceability", "pickup_slots", "labels", "lr_copy", "document"].includes(operation) && provider !== "xpressbees" && provider !== "rivigo") || (provider === "trackon" && operation === "labels");
+       const isGet = (["tracking", "shipment_status", "serviceability", "pickup_slots", "labels", "lr_copy", "document"].includes(operation) && provider !== "xpressbees" && provider !== "rivigo") || (provider === "trackon" && operation === "labels");
       const method = provider === "rivigo" && operation === "cancellations" ? "DELETE" : provider === "rivigo" && operation === "updates" ? "PUT" : isGet ? "GET" : "POST";
       response = await providerFetch(url, { method, headers, body: isGet ? undefined : requestBody }, attemptTimeoutMs);
       if (provider === "delhivery" && useDelhiveryB2b && response.status === 401 && attempt === 0 && credential) {
@@ -2132,6 +2154,16 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   }
   let parsedProviderBody: unknown = null;
   try { parsedProviderBody = JSON.parse(responseBody); } catch { parsedProviderBody = null; }
+  if (response.ok && provider === "delhivery" && useDelhiveryB2b && operation === "shipment_status" && clientId && typeof payload.shipment_id === "string") {
+    const statusLr = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["lrnum", "lr_num", "lr_number", "lr_no", "lrn", "lrn_number", "lr"]))) ?? responseBody.match(/(?:lr(?:n|[_ ]?(?:number|num|no))?)[^A-Za-z0-9]{0,12}(\d{6,20})/i)?.[1] ?? null;
+    const statusAwb = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["master_awb", "master_awb_number", "masterawb", "master_waybill", "awb", "awb_number", "waybill", "waybill_number", "waybill_no"]))) ?? responseBody.match(/(?:master[_ ]?awb|awb|waybill)[^A-Za-z0-9]{0,12}(\d{6,20})/i)?.[1] ?? null;
+    const statusJobId = findProviderReference(parsedProviderBody, new Set(["job_id", "jobid", "manifest_job_id", "request_id", "requestid"])) ?? (String(payload.provider_booking_id ?? "").trim() || null);
+    if (statusLr || statusAwb) {
+      await env.DB.prepare("UPDATE shipments SET lr_number = COALESCE(?, lr_number), master_awb = COALESCE(?, master_awb), box_awbs_json = COALESCE(?, box_awbs_json), provider_sync_status = 'confirmed', tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(provider_reference, ?), provider_last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(statusLr, statusAwb, statusAwb ? JSON.stringify([statusAwb]) : null, statusLr ?? statusAwb, statusAwb ?? statusLr, payload.shipment_id, clientId).run();
+      return { enabled: true, status: "accepted" as const, providerStatus: response.status, providerPending: false, providerBookingId: statusJobId, providerReference: statusAwb ?? statusLr, lr_number: statusLr, master_awb: statusAwb };
+    }
+    return { enabled: true, status: "accepted" as const, providerStatus: response.status, providerPending: true, providerBookingId: statusJobId, message: "Delhivery has not published the LR/AWB yet." };
+  }
   if (response.ok && provider === "delhivery" && operation === "pickup_slots") {
     return { enabled: true, status: "accepted" as const, providerStatus: response.status, dates: normalizeDelhiveryPickupSlots(parsedProviderBody) };
   }
@@ -2388,6 +2420,18 @@ async function retryPendingDelhiveryBookings(env: Env, cron: string) {
       await env.DB.prepare("UPDATE shipments SET provider_retry_count = ?, provider_retry_at = datetime('now', '+15 minutes'), provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(retryCount, reason, shipment.id, shipment.client_id).run();
     }
   }
+}
+
+async function reconcilePendingDelhiveryReferences(env: Env, cron: string) {
+  const pending = await env.DB.prepare("SELECT id, client_id, provider_account_id, provider_booking_id FROM shipments WHERE provider = 'delhivery' AND status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery') AND provider_sync_status = 'pending' AND provider_booking_id IS NOT NULL ORDER BY updated_at ASC LIMIT 50").all<{ id: string; client_id: string; provider_account_id: string | null; provider_booking_id: string }>();
+  for (const shipment of pending.results) {
+    try {
+      await safeProviderRequest(env, "delhivery", "shipment_status", { shipment_id: shipment.id, provider_booking_id: shipment.provider_booking_id, provider_account_id: shipment.provider_account_id }, `cron:${cron}:delhivery-reference:${shipment.id}`, shipment.client_id, undefined, 10000);
+    } catch (caught) {
+      console.error(JSON.stringify({ job: "delhivery_reference_reconciliation", shipment_id: shipment.id, error: caught instanceof Error ? caught.message : "unknown_error" }));
+    }
+  }
+  if (pending.results.length) console.log(JSON.stringify({ job: "delhivery_reference_reconciliation", candidates: pending.results.length }));
 }
 async function verifyWebhook(request: Request, env: Env, provider: "delhivery" | "ekart" | "trackon", rawBody: string) {
   const secret = provider === "delhivery" ? env.DELHIVERY_WEBHOOK_SECRET : provider === "ekart" ? env.EKART_WEBHOOK_SECRET : (env as unknown as Record<string, unknown>).TRACKON_WEBHOOK_SECRET as string | undefined;
@@ -4759,6 +4803,7 @@ const worker = {
   },
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
     ctx.waitUntil(retryPendingDelhiveryBookings(env, controller.cron));
+    ctx.waitUntil(reconcilePendingDelhiveryReferences(env, controller.cron));
     ctx.waitUntil(refreshFujiyamaDelhivery(env, controller.cron));
   },
 };
