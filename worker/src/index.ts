@@ -2616,6 +2616,8 @@ async function refreshFujiyamaDelhivery(env: Env, cron: string) {
   const refreshRows: Array<{ id: string; client_id: string; tracking_number: string; lr_number: string | null; provider_reference: string | null; provider_account_id: string }> = [];
   let trackingSucceeded = 0;
   let trackingFailed = 0;
+  let immediatePodSucceeded = 0;
+  let immediatePodFailed = 0;
   const refreshStartedAt = Date.now();
   // Leave a small safety margin for the POD pass and response logging. If the
   // Worker reaches this budget, the next cron invocation continues from the
@@ -2628,15 +2630,25 @@ async function refreshFujiyamaDelhivery(env: Env, cron: string) {
     refreshRows.push(...batch);
     const results = await Promise.all(batch.map(async (shipment) => {
       const result = await safeProviderRequest(env, "delhivery", "tracking", { shipment_id: shipment.id, tracking_number: shipment.tracking_number, lr_number: shipment.lr_number, provider_reference: shipment.provider_reference, provider_account_id: shipment.provider_account_id }, `cron:${cron}:fujiyama:tracking:${shipment.id}`, shipment.client_id, undefined, 10000);
-      return result.status === "accepted";
+      let podStatus: "accepted" | "failed" | null = null;
+      // A delivered transition must immediately start POD retrieval. If
+      // Delhivery has not published the artifact yet, the delivered shipment
+      // remains in the POD backfill queue for the next scheduler run.
+      if (result.status === "accepted" && result.normalized_status === "delivered") {
+        const pod = await safeProviderRequest(env, "delhivery", "document", { shipment_id: shipment.id, tracking_number: shipment.tracking_number, lr_number: shipment.lr_number, provider_reference: shipment.provider_reference, provider_account_id: shipment.provider_account_id, doc_type: "LM_POD" }, `cron:${cron}:fujiyama:pod:${shipment.id}`, shipment.client_id, undefined, 15000);
+        podStatus = pod.status === "accepted" ? "accepted" : "failed";
+      }
+      return { tracking: result.status === "accepted", pod: podStatus };
     }));
-    trackingSucceeded += results.filter(Boolean).length;
-    trackingFailed += results.filter((value) => !value).length;
+    trackingSucceeded += results.filter((result) => result.tracking).length;
+    trackingFailed += results.filter((result) => !result.tracking).length;
+    immediatePodSucceeded += results.filter((result) => result.pod === "accepted").length;
+    immediatePodFailed += results.filter((result) => result.pod === "failed").length;
   }
 
   const podCandidates = await env.DB.prepare("SELECT s.id, s.client_id, s.tracking_number, s.lr_number, s.provider_reference, s.provider_account_id FROM shipments s WHERE s.client_id = ? AND s.provider = 'delhivery' AND s.provider_account_id = ? AND s.status = 'delivered' AND COALESCE(s.lr_number, s.tracking_number, s.provider_reference) IS NOT NULL AND NOT EXISTS (SELECT 1 FROM shipment_documents d WHERE d.shipment_id = s.id AND lower(d.original_filename) LIKE 'delhivery-pod-%') ORDER BY s.updated_at ASC LIMIT 20").bind(FUJIYAMA_CLIENT_ID, FUJIYAMA_DELHIVERY_ACCOUNT_ID).all<{ id: string; client_id: string; tracking_number: string; lr_number: string | null; provider_reference: string | null; provider_account_id: string }>();
-  let podSucceeded = 0;
-  let podFailed = 0;
+  let podSucceeded = immediatePodSucceeded;
+  let podFailed = immediatePodFailed;
   for (let index = 0; index < podCandidates.results.length; index += 3) {
     const batch = podCandidates.results.slice(index, index + 3);
     const results = await Promise.all(batch.map(async (shipment) => {
