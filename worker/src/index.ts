@@ -3408,7 +3408,7 @@ const worker = {
       const shipmentArtifact = route.match(/^\/shipments\/([^/]+)\/(label|sticker|lr-copy|document)$/);
       if (shipmentArtifact && request.method === "GET") {
         if (!hasScope(auth, "tracking.read") && !hasScope(auth, "documents.read")) return error("FORBIDDEN", "Tracking or document read scope required", 403, id, headers);
-         const shipment = await env.DB.prepare("SELECT s.id, s.client_id, s.provider, s.pss_reference, s.lr_number, s.master_awb, s.tracking_number, s.provider_reference, s.provider_account_id, s.pieces, (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = s.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference FROM shipments s WHERE s.id = ? LIMIT 1").bind(shipmentArtifact[1]).first<{ id: string; client_id: string; provider: string | null; pss_reference: string | null; lr_number: string | null; master_awb: string | null; tracking_number: string | null; provider_reference: string | null; provider_account_id: string | null; pieces: number | null; pickup_reference: string | null }>();
+         let shipment = await env.DB.prepare("SELECT s.id, s.client_id, s.provider, s.pss_reference, s.lr_number, s.master_awb, s.tracking_number, s.provider_reference, s.provider_booking_id, s.provider_account_id, s.pieces, (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = s.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference FROM shipments s WHERE s.id = ? LIMIT 1").bind(shipmentArtifact[1]).first<{ id: string; client_id: string; provider: string | null; pss_reference: string | null; lr_number: string | null; master_awb: string | null; tracking_number: string | null; provider_reference: string | null; provider_booking_id: string | null; provider_account_id: string | null; pieces: number | null; pickup_reference: string | null }>();
         if (!shipment || !canAccessClient(auth, shipment.client_id)) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
         if (shipment.provider !== "delhivery") return error("UNSUPPORTED_PROVIDER_OPERATION", "Provider documents are currently available only for Delhivery", 409, id, headers);
         const url = new URL(request.url);
@@ -3416,6 +3416,18 @@ const worker = {
         const operation = kind === "lr-copy" ? "lr_copy" : kind === "document" ? "document" : "labels";
         const requestedSize = url.searchParams.get("size") ?? (kind === "sticker" ? "std" : "a4");
         if (operation === "labels" && !["sm", "md", "a4", "std"].includes(requestedSize)) return error("INVALID_REQUEST", "Delhivery label size must be sm, md, a4, or std", 400, id, headers);
+        if ((operation === "lr_copy" || operation === "document") && !shipment.lr_number) {
+          await safeProviderRequest(env, "delhivery", "shipment_status", {
+            shipment_id: shipment.id,
+            provider_booking_id: shipment.provider_booking_id,
+            tracking_number: shipment.tracking_number,
+            lr_number: shipment.lr_number,
+            provider_reference: shipment.provider_reference,
+            provider_account_id: shipment.provider_account_id,
+          }, id, shipment.client_id);
+          shipment = await env.DB.prepare("SELECT s.id, s.client_id, s.provider, s.pss_reference, s.lr_number, s.master_awb, s.tracking_number, s.provider_reference, s.provider_booking_id, s.provider_account_id, s.pieces, (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = s.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference FROM shipments s WHERE s.id = ? LIMIT 1").bind(shipmentArtifact[1]).first<typeof shipment>();
+        }
+        if (!shipment) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
         // Delhivery's B2B label endpoint validates its path parameter as an
         // active LR number (LRN), not the master AWB. LR copy/document also
         // use the LR number. Keep the PUR and master AWB out of these paths.
