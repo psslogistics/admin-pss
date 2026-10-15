@@ -3315,7 +3315,7 @@ const worker = {
           const providerCode = String((providerResult as { code?: string }).code ?? "");
           const warehousePending = provider === "delhivery" && (
             providerCode === "WAREHOUSE_ACTIVATION_PENDING"
-            || /awaiting provider activation|not active|not configured|warehouse.*activation|pickup.*warehouse.*pending/i.test(failureReason)
+            || /awaiting provider activation|not active|not (?:been )?configured|warehouse.*activation|pickup.*warehouse.*pending/i.test(failureReason)
           );
           if (warehousePending) {
             const retryPayload = { ...payload };
