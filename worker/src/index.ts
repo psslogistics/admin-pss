@@ -67,6 +67,7 @@ const AUTH_CACHE_TTL_MS = 5_000;
 // rows read, so an unbounded dashboard collection can exhaust the free daily
 // quota even when the UI only needs the latest operational records.
 const SUMMARY_CACHE_TTL_MS = 60_000;
+const KYC_TEST_ACCOUNT_EMAIL = "itismeoogway@gmail.com";
 
 function allowedOrigins(env: Env) { return new Set((env.ALLOWED_ORIGINS ?? "").split(",").map((value) => value.trim()).filter(Boolean)); }
 function originAllowed(request: Request, env: Env) { const origin = request.headers.get("Origin"); return !origin || allowedOrigins(env).has(origin); }
@@ -123,6 +124,12 @@ async function supabaseRpc<T>(env: Env, functionName: string, token: string): Pr
   });
   if (!response.ok) return null;
   return await response.json() as T;
+}
+
+async function isKycTestAccount(env: Env, auth: Auth): Promise<boolean> {
+  if (auth.audience !== "client" || !auth.userId || !auth.accessToken) return false;
+  const users = await supabaseGet<{ email: string | null }>(env, `profiles?id=eq.${encodeURIComponent(auth.userId)}&select=email&limit=1`, auth.accessToken);
+  return users[0]?.email?.trim().toLowerCase() === KYC_TEST_ACCOUNT_EMAIL;
 }
 
 async function loadUserAuth(env: Env, token: string): Promise<Auth | null> {
@@ -3230,13 +3237,18 @@ const worker = {
           ? await supabaseGet<{ status: string; gst_number: string | null; pan_number: string | null; aadhaar_last4: string | null; phone_verified_at: string | null; kyc_version: number | null }>(env, `client_kyc_profiles?client_id=eq.${encodeURIComponent(clientId)}&select=status,gst_number,pan_number,aadhaar_last4,phone_verified_at,kyc_version&limit=1`, auth.accessToken)
           : [];
         const kyc = kycRows[0];
-        if (!kyc || kyc.status !== "approved" || !kyc.gst_number?.trim() || !kyc.pan_number?.trim() || !kyc.aadhaar_last4 || !kyc.phone_verified_at) return error("KYC_REQUIRED", "Approved Aadhaar, GST, PAN, and OTP-verified mobile number are required before booking shipments", 403, id, headers);
+        const kycTestAccount = await isKycTestAccount(env, auth);
+        if ((!kyc || kyc.status !== "approved" || !kyc.gst_number?.trim() || !kyc.pan_number?.trim() || !kyc.aadhaar_last4 || !kyc.phone_verified_at) && !kycTestAccount) return error("KYC_REQUIRED", "Approved Aadhaar, GST, PAN, and OTP-verified mobile number are required before booking shipments", 403, id, headers);
+        // Deliberately narrow test-only exception. If this account has a
+        // saved KYC record, its saved GST/PAN values remain authoritative.
         // Never trust client-entered identity fields. The approved KYC record
         // is the source of truth for every provider booking payload.
-        payload.client_gst_tin = kyc.gst_number.trim();
-        payload.client_gstin = kyc.gst_number.trim();
-        payload.client_pan = kyc.pan_number.trim();
-        payload.client_pan_number = kyc.pan_number.trim();
+        if (kyc?.gst_number?.trim() && kyc.pan_number?.trim()) {
+          payload.client_gst_tin = kyc.gst_number.trim();
+          payload.client_gstin = kyc.gst_number.trim();
+          payload.client_pan = kyc.pan_number.trim();
+          payload.client_pan_number = kyc.pan_number.trim();
+        }
         const key = request.headers.get("Idempotency-Key");
         if (!key) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
         const existing = await idempotentResponse(env, key, clientId, "POST /v1/shipments", requestHash);
@@ -3403,8 +3415,8 @@ const worker = {
         // Delhivery's B2B label endpoint validates its path parameter as an
         // active LR number (LRN), not the master AWB. LR copy/document also
         // use the LR number. Keep the PUR and master AWB out of these paths.
-        const providerReference = shipment.lr_number ?? shipment.tracking_number ?? shipment.provider_reference;
-        if (!providerReference) return error("PROVIDER_REFERENCE_UNAVAILABLE", "The Delhivery LR/AWB is not available yet; the PUR cannot be used for downloads", 409, id, headers);
+         const providerReference = operation === "lr_copy" || operation === "document" ? shipment.lr_number : shipment.lr_number ?? shipment.master_awb;
+         if (!providerReference) return error("PROVIDER_REFERENCE_UNAVAILABLE", operation === "lr_copy" || operation === "document" ? "The Delhivery LR/LRN is not available yet" : "The Delhivery LR/AWB is not available yet", 409, id, headers);
         const payload = { shipment_id: shipment.id, tracking_number: providerReference, provider_reference: providerReference, provider_account_id: shipment.provider_account_id, label_size: requestedSize, boxes: Math.max(1, Number(shipment.pieces ?? 1)), lr_copy_type: url.searchParams.get("lr_copy_type") ?? undefined, doc_type: url.searchParams.get("doc_type") ?? "LM_POD" };
         const providerResult = await safeProviderRequest(env, "delhivery", operation, payload, id, shipment.client_id);
         return json({ ok: true, data: providerResult }, 200, headers);
