@@ -693,6 +693,23 @@ function delhiveryAccountIsB2b(accountName: string) {
   return /(^|[^a-z])b2b(c)?([^a-z]|$)/i.test(accountName) || /^PSS\s+B2B$/i.test(accountName.trim());
 }
 
+async function delhiveryWarehouseProviderContext(env: Env, clientId: string, requestedAccountId: string | null, requestIdValue: string, timeoutMs: number) {
+  const defaultAccountName = String((env as unknown as Record<string, unknown>).DELHIVERY_DEFAULT_ACCOUNT_NAME ?? "").trim();
+  const account = requestedAccountId
+    ? await env.DB.prepare(`SELECT pa.id, pa.account_name, pa.credential_secret_name FROM provider_accounts pa LEFT JOIN provider_account_client_policies p ON p.provider_account_id = pa.id AND p.client_id = ? WHERE pa.id = ? AND pa.provider = 'delhivery' AND pa.status = 'active' AND (pa.client_id = ? OR (pa.client_id IS NULL AND p.client_id = ? AND p.enabled = 1)) LIMIT 1`).bind(clientId, requestedAccountId, clientId, clientId).first<{ id: string; account_name: string; credential_secret_name: string }>()
+    : await env.DB.prepare(`SELECT pa.id, pa.account_name, pa.credential_secret_name FROM provider_accounts pa LEFT JOIN provider_account_client_policies p ON p.provider_account_id = pa.id AND p.client_id = ? WHERE pa.provider = 'delhivery' AND pa.status = 'active' AND pa.account_name = ? AND (pa.client_id = ? OR (pa.client_id IS NULL AND p.client_id = ? AND p.enabled = 1)) LIMIT 1`).bind(clientId, defaultAccountName, clientId, clientId).first<{ id: string; account_name: string; credential_secret_name: string }>();
+  if (!account) return { ok: false as const, error: requestedAccountId ? "The selected Delhivery account is not enabled for this client" : "A default Delhivery account must be configured before creating a warehouse" };
+  if (!delhiveryAccountIsB2b(account.account_name)) return { ok: false as const, error: "The selected Delhivery account is not configured for B2B warehouse registration" };
+  const secretBag = env as unknown as Record<string, unknown>;
+  const credential = typeof secretBag[account.credential_secret_name] === "string" ? String(secretBag[account.credential_secret_name]) : undefined;
+  if (!credential) return { ok: false as const, error: "The selected Delhivery account credential is not configured" };
+  const token = await delhiveryB2bBearer(env, credential, account.account_name, requestIdValue, timeoutMs);
+  if (!token) return { ok: false as const, error: "Delhivery B2B authentication failed" };
+  const warehouseApiToken = delhiveryWarehouseApiToken(env, account.account_name, delhiveryB2bCredential(credential));
+  if (!warehouseApiToken) return { ok: false as const, error: "Delhivery warehouse registration requires the production API token for this account" };
+  return { ok: true as const, accountId: account.id, token, warehouseApiToken, base: env.DELHIVERY_B2B_API_BASE_URL ?? "https://ltl-clients-api.delhivery.com" };
+}
+
 function delhiveryJwtExpiry(token: string) {
   try {
     const payload = token.split(".")[1];
@@ -3920,6 +3937,8 @@ const worker = {
         const key = request.headers.get("Idempotency-Key"); if (!key) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
         const endpoint = `POST /v1${route}`; const existing = await idempotentResponse(env, key, clientId, endpoint, requestHash); if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
         const recordId = crypto.randomUUID();
+        let providerStatus: string | null = null;
+        let providerError: string | null = null;
         if (route === "/warehouses") {
           if (typeof payload.name !== "string" || typeof payload.address !== "string") return error("VALIDATION_ERROR", "Warehouse name and address are required", 400, id, headers);
           const providerAccountId = typeof payload.provider_account_id === "string" && payload.provider_account_id.trim() ? payload.provider_account_id.trim() : null;
@@ -3927,14 +3946,38 @@ const worker = {
             const account = await env.DB.prepare("SELECT pa.id FROM provider_accounts pa LEFT JOIN provider_account_client_policies p ON p.provider_account_id = pa.id AND p.client_id = ? WHERE pa.id = ? AND pa.provider = 'delhivery' AND pa.status = 'active' AND (pa.client_id = ? OR (pa.client_id IS NULL AND p.client_id = ? AND p.enabled = 1)) LIMIT 1").bind(clientId, providerAccountId, clientId, clientId).first<{ id: string }>();
             if (!account) return error("PROVIDER_ACCOUNT_NOT_ALLOWED", "The selected Delhivery account is not enabled for this client", 403, id, headers);
           }
-          await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, NULL)").bind(recordId, clientId, payload.name, payload.address, String(payload.city ?? ""), String(payload.state ?? ""), String(payload.pincode ?? ""), String(payload.contact ?? ""), String(payload.contact_name ?? ""), providerAccountId).run();
+          await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'pending')").bind(recordId, clientId, payload.name, payload.address, String(payload.city ?? ""), String(payload.state ?? ""), String(payload.pincode ?? ""), String(payload.contact ?? ""), String(payload.contact_name ?? ""), providerAccountId).run();
+          const context = await delhiveryWarehouseProviderContext(env, clientId, providerAccountId, id, 30000);
+          if (!context.ok) {
+            providerStatus = "failed";
+            providerError = context.error;
+            await env.DB.prepare("UPDATE warehouses SET provider_status = 'failed', provider_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(providerError, recordId, clientId).run();
+          } else {
+            const sync = await ensureDelhiveryWarehouse(env, clientId, context.token, {
+              name: String(payload.contact_name ?? payload.name),
+              line: payload.address,
+              city: String(payload.city ?? ""),
+              state: String(payload.state ?? ""),
+              pincode: String(payload.pincode ?? ""),
+              phone: String(payload.contact ?? ""),
+            }, id, 30000, context.base, context.accountId, recordId, context.warehouseApiToken);
+            if (!sync.ok) {
+              providerStatus = "failed";
+              providerError = sync.error;
+              await env.DB.prepare("UPDATE warehouses SET provider_status = 'failed', provider_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(providerError, recordId, clientId).run();
+            } else {
+              const saved = await env.DB.prepare("SELECT provider_status, provider_error FROM warehouses WHERE id = ? AND client_id = ? LIMIT 1").bind(recordId, clientId).first<{ provider_status: string | null; provider_error: string | null }>();
+              providerStatus = saved?.provider_status ?? "pending";
+              providerError = saved?.provider_error ?? null;
+            }
+          }
         } else {
           if (typeof payload.label !== "string" || typeof payload.address !== "string") return error("VALIDATION_ERROR", "Address label and address are required", 400, id, headers);
           const addressKind = payload.address_kind === "consignee" ? "consignee" : "consignor";
           await env.DB.prepare("INSERT INTO client_addresses (id, client_id, label, address_kind, contact_name, phone, address, city, state, pincode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(recordId, clientId, payload.label, addressKind, String(payload.contact_name ?? ""), String(payload.phone ?? ""), payload.address, String(payload.city ?? ""), String(payload.state ?? ""), String(payload.pincode ?? "")).run();
         }
         await audit(env, ctx, auth, id, `${route.slice(1)}.created`, route.slice(1, -1), recordId, { client_id: clientId });
-        const serialized = JSON.stringify({ ok: true, data: { id: recordId, client_id: clientId }, request_id: id }); await saveIdempotent(env, key, clientId, endpoint, 201, serialized, requestHash);
+        const serialized = JSON.stringify({ ok: true, data: { id: recordId, client_id: clientId, ...(route === "/warehouses" ? { provider: "delhivery", provider_status: providerStatus, provider_error: providerError } : {}) }, request_id: id }); await saveIdempotent(env, key, clientId, endpoint, 201, serialized, requestHash);
         return new Response(serialized, { status: 201, headers: { ...headers, "content-type": "application/json" } });
       }
       if (route === "/returns" && request.method === "POST") {
