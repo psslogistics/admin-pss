@@ -1887,7 +1887,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId, selectedWarehouseId, warehouseApiToken);
       }
     }
-    if (!warehouse.ok) return { enabled: true, status: "failed" as const, error: warehouse.error };
+    if (!warehouse.ok) return { enabled: true, status: "failed" as const, code: warehouse.code, error: warehouse.error };
     delhiveryPickupLocation = warehouse.name;
   }
   const xpressToken = provider === "xpressbees" ? await xpressbeesToken(env, credential!, requestIdValue, providerTimeoutMs) : null;
@@ -1931,7 +1931,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId, selectedWarehouseId, warehouseApiToken);
       }
       }
-      if (!warehouse.ok) return { enabled: true, status: "failed" as const, error: warehouse.error };
+      if (!warehouse.ok) return { enabled: true, status: "failed" as const, code: warehouse.code, error: warehouse.error };
       providerPayload = { ...providerPayload, delhivery_pickup_location: warehouse.name };
     }
   }
@@ -2372,7 +2372,7 @@ async function safeProviderRequest(env: Env, provider: CourierProvider, operatio
       console.error(JSON.stringify({ request_id: requestIdValue, route: "/v1/provider-request", provider, operation, error: "failed_to_record_provider_exception", detail: recordingError instanceof Error ? recordingError.message.slice(0, 200) : "unknown" }));
     }
     console.error(JSON.stringify({ request_id: requestIdValue, route: "/v1/provider-request", provider, operation, error: message }));
-    return { enabled: true, status: "failed" as const, providerStatus: 0, error: "provider_request_failed" };
+    return { enabled: true, status: "failed" as const, providerStatus: 0, error: message };
   }
 }
 
@@ -3312,7 +3312,11 @@ const worker = {
         if (provider === "delhivery") await env.DB.prepare("INSERT OR REPLACE INTO pricing_provider_costs (id, shipment_id, client_id, provider, provider_account_id, provider_amount, provider_status) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(crypto.randomUUID(), shipmentId, clientId, provider, selectedProviderAccountId ?? null, providerAmount(providerResult), providerResult.status).run();
         if (provider && providerResult.status !== "accepted") {
           const failureReason = String((providerResult as { error?: string; reason?: string }).error ?? (providerResult as { reason?: string }).reason ?? `The ${provider} shipment was not accepted`).slice(0, 500);
-          const warehousePending = provider === "delhivery" && /awaiting provider activation|not active|not configured/i.test(failureReason);
+          const providerCode = String((providerResult as { code?: string }).code ?? "");
+          const warehousePending = provider === "delhivery" && (
+            providerCode === "WAREHOUSE_ACTIVATION_PENDING"
+            || /awaiting provider activation|not active|not configured|warehouse.*activation|pickup.*warehouse.*pending/i.test(failureReason)
+          );
           if (warehousePending) {
             const retryPayload = { ...payload };
             delete retryPayload.invoice_documents;
