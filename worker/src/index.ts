@@ -3954,7 +3954,7 @@ const worker = {
             await env.DB.prepare("UPDATE warehouses SET provider_status = 'failed', provider_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(providerError, recordId, clientId).run();
           } else {
             const sync = await ensureDelhiveryWarehouse(env, clientId, context.token, {
-              name: String(payload.contact_name ?? payload.name),
+              name: String(payload.name),
               line: payload.address,
               city: String(payload.city ?? ""),
               state: String(payload.state ?? ""),
