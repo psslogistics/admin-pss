@@ -3182,6 +3182,17 @@ const worker = {
         if (!Number.isFinite(declaredValue) || declaredValue < 0) return error("VALIDATION_ERROR", "Declared value must be a non-negative number", 400, id, headers);
         const clientId = requireClient(auth, payload.client_id);
         if (!clientId || !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
+        const kycRows = auth.accessToken
+          ? await supabaseGet<{ status: string; gst_number: string | null; pan_number: string | null; aadhaar_last4: string | null; phone_verified_at: string | null; kyc_version: number | null }>(env, `client_kyc_profiles?client_id=eq.${encodeURIComponent(clientId)}&select=status,gst_number,pan_number,aadhaar_last4,phone_verified_at,kyc_version&limit=1`, auth.accessToken)
+          : [];
+        const kyc = kycRows[0];
+        if (!kyc || kyc.status !== "approved" || !kyc.gst_number?.trim() || !kyc.pan_number?.trim() || !kyc.aadhaar_last4 || !kyc.phone_verified_at) return error("KYC_REQUIRED", "Approved Aadhaar, GST, PAN, and OTP-verified mobile number are required before booking shipments", 403, id, headers);
+        // Never trust client-entered identity fields. The approved KYC record
+        // is the source of truth for every provider booking payload.
+        payload.client_gst_tin = kyc.gst_number.trim();
+        payload.client_gstin = kyc.gst_number.trim();
+        payload.client_pan = kyc.pan_number.trim();
+        payload.client_pan_number = kyc.pan_number.trim();
         const key = request.headers.get("Idempotency-Key");
         if (!key) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
         const existing = await idempotentResponse(env, key, clientId, "POST /v1/shipments", requestHash);
@@ -3221,7 +3232,7 @@ const worker = {
         const requestedProviderAccountId = typeof payload.provider_account_id === "string" && payload.provider_account_id.trim() ? payload.provider_account_id.trim() : null;
         let pssReference = String(Date.now());
         while (await env.DB.prepare("SELECT 1 FROM shipments WHERE pss_reference = ? LIMIT 1").bind(pssReference).first()) pssReference = String(Number(pssReference) + 1);
-        await env.DB.prepare("INSERT INTO shipments (id, pss_reference, client_id, created_by_user_id, provider, provider_account_id, status, description, origin, destination, origin_address_json, destination_address_json, consignee, total_weight_kg, declared_value, pieces, edd, dimensions_json) VALUES (?, ?, ?, ?, ?, ?, 'booked', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(shipmentId, pssReference, clientId, auth.userId ?? `api:${clientId}`, provider, requestedProviderAccountId, description, origin, destination, JSON.stringify(originAddress), JSON.stringify(destinationAddress), String(destinationAddress.name), weight, declaredValue, pieces, typeof payload.edd === "string" ? payload.edd : null, dimensionsJson).run();
+        await env.DB.prepare("INSERT INTO shipments (id, pss_reference, client_id, created_by_user_id, provider, provider_account_id, client_gst_number, client_pan_number, kyc_version, status, description, origin, destination, origin_address_json, destination_address_json, consignee, total_weight_kg, declared_value, pieces, edd, dimensions_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'booked', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(shipmentId, pssReference, clientId, auth.userId ?? `api:${clientId}`, provider, requestedProviderAccountId, kyc.gst_number.trim(), kyc.pan_number.trim(), kyc.kyc_version ?? null, description, origin, destination, JSON.stringify(originAddress), JSON.stringify(destinationAddress), String(destinationAddress.name), weight, declaredValue, pieces, typeof payload.edd === "string" ? payload.edd : null, dimensionsJson).run();
         await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'booked', 'Shipment created', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipmentId, auth.userId ?? `api:${clientId}`).run();
         const storedDocuments = await persistShipmentDocuments(env, clientId, shipmentId, payload.invoice_documents, auth.userId ?? `api:${clientId}`);
         if (!storedDocuments.ok) {
