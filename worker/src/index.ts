@@ -904,6 +904,10 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   }
   if (!response.ok) {
     if (!providerAlreadyRegistered) return { ok: false as const, error: `Delhivery warehouse creation failed (${response.status}): ${responseText.slice(0, 240)}` };
+    // A duplicate/already-configured response is also registration evidence.
+    // The facility-list endpoint can lag or use a different projection than
+    // the manifestation API, so let manifestation be the final authority.
+    registrationAccepted = true;
   }
   // A successful or duplicate create response is registration evidence only,
   // never activation evidence. Re-fetch the exact provider identity before
