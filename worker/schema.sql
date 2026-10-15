@@ -17,6 +17,11 @@ CREATE TABLE IF NOT EXISTS shipments (
   pieces INTEGER NOT NULL DEFAULT 1,
   edd TEXT,
   delivered_at TEXT,
+  provider_sync_status TEXT,
+  provider_booking_payload_json TEXT,
+  provider_retry_at TEXT,
+  provider_retry_count INTEGER NOT NULL DEFAULT 0,
+  provider_last_error TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );

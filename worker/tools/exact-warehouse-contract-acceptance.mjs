@@ -4,7 +4,7 @@ const source = fs.readFileSync(new URL("../src/index.ts", import.meta.url), "utf
 
 const required = [
   ["exact local warehouse lookup", "WHERE client_id = ? AND id = ? LIMIT 1"],
-  ["client booking requires a selected warehouse", "PICKUP_WAREHOUSE_REQUIRED"],
+  ["client booking can resolve an unsaved pickup address", "ensureDelhiveryWarehouse"],
   ["pending activation is explicit", "WAREHOUSE_ACTIVATION_PENDING"],
   ["provider creation is idempotent", '"Idempotency-Key": warehouseCreateIdempotencyKey'],
   ["provider name is persisted", "provider_name"],
@@ -21,7 +21,8 @@ const required = [
   ["canonical provider warehouse identity", "canonicalDelhiveryWarehouseName"],
   ["provider uses the selected saved warehouse name exactly", "const providerName = localName;"],
   ["create response is followed by exact activation lookup", "A successful or duplicate create response is registration evidence only"],
-  ["registered warehouse can be manifested after list propagation miss", "if (response.ok || providerAlreadyRegistered) return { ok: true"],
+  ["registration without activation is queued", "provider_booking_payload_json"],
+  ["activation retry is scheduled", "retryPendingDelhiveryBookings"],
 ];
 
 for (const [label, needle] of required) {
