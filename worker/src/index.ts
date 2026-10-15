@@ -813,6 +813,13 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   // here because that creates a different provider warehouse name and can
   // make an active Delhivery facility appear inactive.
   const providerName = localName;
+  // A Client-selected warehouse already marked active for this Delhivery
+  // account is eligible for manifestation. The facility-list endpoint is an
+  // auxiliary projection and can lag or omit rows that the manifest service
+  // accepts; let manifestation remain the provider-side authority.
+  if (existing?.provider_status === "active" && (!existing.provider_account_id || !providerAccountId || existing.provider_account_id === providerAccountId)) {
+    return { ok: true as const, name: providerName, reused: true as const };
+  }
   const warehouseCreateIdempotencyKey = `pss-warehouse-${await sha256(`${clientId}|${providerAccountId ?? ""}|${existing?.id ?? localName}|${origin.pincode}`)}`;
   // Reuse the provider's canonical warehouse whenever it already exists.
   // Creation is only allowed after a genuine provider-side "not found"; this
