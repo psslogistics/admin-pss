@@ -2461,7 +2461,11 @@ async function recordPickupAttempt(env: Env, details: { pickupId: string; client
     .run();
 }
 
-const ACTIVE_MANIFEST_PICKUP_STATUSES = ["requested", "provider_pending", "scheduled", "driver_assigned", "en_route"];
+// Delhivery's B2B pickup API exposes creation/cancellation, not an append-
+// shipment operation for an already accepted PUR. Only keep a manifest group
+// open while its provider request is still pending; once accepted/scheduled,
+// a later shipment must receive its own provider pickup request.
+const GROUPABLE_MANIFEST_PICKUP_STATUSES = ["requested", "provider_pending"];
 
 function manifestPickupAddress(payload: Record<string, unknown>) {
   const origin = payload.origin_address && typeof payload.origin_address === "object" ? payload.origin_address as Record<string, unknown> : {};
@@ -2498,14 +2502,14 @@ async function ensureManifestPickupGroup(
   const shipment = await env.DB.prepare("SELECT tracking_number, lr_number, master_awb, provider_reference FROM shipments WHERE id = ? AND client_id = ? LIMIT 1")
     .bind(details.shipmentId, details.clientId).first<{ tracking_number: string | null; lr_number: string | null; master_awb: string | null; provider_reference: string | null }>();
   const shipmentAwbs = normalizePickupAwbNumbers(shipment?.master_awb ?? shipment?.tracking_number ?? shipment?.provider_reference);
-  const activeStatuses = ACTIVE_MANIFEST_PICKUP_STATUSES.map(() => "?").join(", ");
+  const groupableStatuses = GROUPABLE_MANIFEST_PICKUP_STATUSES.map(() => "?").join(", ");
   const existing = await env.DB.prepare(`SELECT id, shipment_id, status, provider_reference, provider_status, provider_awb_numbers_json, pieces, total_weight_kg
     FROM pickup_requests
     WHERE client_id = ? AND provider = ? AND COALESCE(provider_account_id, '') = COALESCE(?, '')
       AND pincode = ? AND pickup_address = ?
-      AND requested_date = ? AND requested_time_slot = ? AND status IN (${activeStatuses})
+      AND requested_date = ? AND requested_time_slot = ? AND status IN (${groupableStatuses})
     ORDER BY created_at ASC LIMIT 1`)
-    .bind(details.clientId, details.provider, details.providerAccountId, address.pincode, address.line, requestedDate, requestedWindow, ...ACTIVE_MANIFEST_PICKUP_STATUSES).first<{ id: string; shipment_id: string | null; status: string; provider_reference: string | null; provider_status: string | null; provider_awb_numbers_json: string | null; pieces: number | null; total_weight_kg: number | null }>();
+    .bind(details.clientId, details.provider, details.providerAccountId, address.pincode, address.line, requestedDate, requestedWindow, ...GROUPABLE_MANIFEST_PICKUP_STATUSES).first<{ id: string; shipment_id: string | null; status: string; provider_reference: string | null; provider_status: string | null; provider_awb_numbers_json: string | null; pieces: number | null; total_weight_kg: number | null }>();
 
   if (existing) {
     let groupedAwbs = pickupAwbsFromJson(existing.provider_awb_numbers_json);
