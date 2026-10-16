@@ -2618,6 +2618,30 @@ async function retryPendingDelhiveryBookings(env: Env, cron: string) {
       continue;
     }
     try {
+      // Older queued bookings may not have persisted the selected warehouse id.
+      // Recover it only when the queued origin exactly matches one of this
+      // client's saved warehouses; unsaved origins remain on registration.
+      if (!(typeof payload.warehouse_id === "string" && payload.warehouse_id.trim())) {
+        const origin = payload.origin_address && typeof payload.origin_address === "object" ? payload.origin_address as Record<string, unknown> : null;
+        const originPincode = String(origin?.pincode ?? "").trim();
+        const originLine = String(origin?.line ?? origin?.address ?? "").trim().toLowerCase();
+        const originCity = String(origin?.city ?? "").trim().toLowerCase();
+        const originState = String(origin?.state ?? "").trim().toLowerCase();
+        const originPhone = String(origin?.phone ?? "").replace(/\D/g, "");
+        const originName = String(origin?.name ?? "").trim().toLowerCase();
+        if (originPincode && originLine) {
+          const savedWarehouses = await env.DB.prepare("SELECT id, address, city, state, pincode, contact, contact_name FROM warehouses WHERE client_id = ? AND status = 'active'").bind(shipment.client_id).all<{ id: string; address: string | null; city: string | null; state: string | null; pincode: string | null; contact: string | null; contact_name: string | null }>();
+          const matchedWarehouse = savedWarehouses.results.find((warehouse) =>
+            String(warehouse.pincode ?? "").trim() === originPincode
+            && String(warehouse.address ?? "").trim().toLowerCase() === originLine
+            && String(warehouse.city ?? "").trim().toLowerCase() === originCity
+            && String(warehouse.state ?? "").trim().toLowerCase() === originState
+            && (!originPhone || String(warehouse.contact ?? "").replace(/\D/g, "") === originPhone)
+            && (!originName || String(warehouse.contact_name ?? "").trim().toLowerCase() === originName)
+          );
+          if (matchedWarehouse) payload.warehouse_id = matchedWarehouse.id;
+        }
+      }
       const invoiceDocuments = await loadShipmentInvoiceDocumentsForRetry(env, shipment.client_id, shipment.id, payload);
       const result = await safeProviderRequest(env, "delhivery", "shipments", { shipment_id: shipment.id, ...payload, invoice_documents: invoiceDocuments, provider_account_id: shipment.provider_account_id ?? payload.provider_account_id }, `cron:${cron}:booking:${shipment.id}`, shipment.client_id, `queued-booking-${shipment.id}`, 25000);
       if (result.status === "accepted") {
