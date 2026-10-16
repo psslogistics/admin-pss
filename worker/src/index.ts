@@ -807,9 +807,9 @@ function delhiveryWarehouseName(origin: { name: string; city?: string; state?: s
 
 async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: string, origin: { name: string; line: string; city: string; state: string; pincode: string; phone: string }, requestIdValue: string, timeoutMs: number, b2bBaseUrl = env.DELHIVERY_B2B_API_BASE_URL ?? "https://ltl-clients-api.delhivery.com", providerAccountId?: string | null, selectedWarehouseId?: string | null, warehouseApiToken?: string | null) {
   const existing = selectedWarehouseId
-    ? await env.DB.prepare("SELECT id, name, address, city, state, pincode, contact, contact_name, provider, provider_status, provider_account_id, provider_reference FROM warehouses WHERE client_id = ? AND id = ? LIMIT 1")
+    ? await env.DB.prepare("SELECT id, name, address, city, state, pincode, contact, contact_name, provider, provider_status, provider_account_id, provider_reference, provider_name FROM warehouses WHERE client_id = ? AND id = ? LIMIT 1")
       .bind(clientId, selectedWarehouseId)
-      .first<{ id: string; name: string; address: string | null; city: string | null; state: string | null; pincode: string | null; contact: string | null; contact_name: string | null; provider: string | null; provider_status: string | null; provider_account_id: string | null; provider_reference: string | null }>()
+      .first<{ id: string; name: string; address: string | null; city: string | null; state: string | null; pincode: string | null; contact: string | null; contact_name: string | null; provider: string | null; provider_status: string | null; provider_account_id: string | null; provider_reference: string | null; provider_name: string | null }>()
     : null;
   if (selectedWarehouseId && !existing) {
     return { ok: false as const, code: "WAREHOUSE_NOT_FOUND" as const, error: "The selected pickup warehouse no longer exists for this client. Select it again before booking." };
@@ -840,6 +840,16 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   const providerName = localName;
   const warehouseIdentityHash = await sha256(`${providerName}|${resolvedOrigin.pincode}`);
   delhiveryWarehouseLog(requestIdValue, "start", { account_id: providerAccountId ?? null, identity_hash: warehouseIdentityHash });
+  // An already-active saved warehouse is the provider identity selected by
+  // the client. Re-resolving it through the facility-list endpoint is not
+  // required for manifestation and can return a false not-found when the
+  // booking and console gateways are out of sync. Trust the persisted
+  // provider mapping for this saved-address path and let manifestation remain
+  // the final authority. Unsaved addresses have no existing row and continue
+  // through registration/activation resolution below unchanged.
+  if (existing?.provider_status === "active" && existing.provider_reference?.trim()) {
+    return { ok: true as const, name: existing.provider_name?.trim() || providerName, reused: true as const, origin: resolvedOrigin };
+  }
   // A saved Client warehouse must be reconciled against Delhivery's exact
   // facility record before it is reused. Local `active` is only a cache and
   // is not sufficient proof that the provider mapping still manifests.
