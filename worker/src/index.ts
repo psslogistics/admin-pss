@@ -807,9 +807,9 @@ function delhiveryWarehouseName(origin: { name: string; city?: string; state?: s
 
 async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: string, origin: { name: string; line: string; city: string; state: string; pincode: string; phone: string }, requestIdValue: string, timeoutMs: number, b2bBaseUrl = env.DELHIVERY_B2B_API_BASE_URL ?? "https://ltl-clients-api.delhivery.com", providerAccountId?: string | null, selectedWarehouseId?: string | null, warehouseApiToken?: string | null) {
   const existing = selectedWarehouseId
-    ? await env.DB.prepare("SELECT id, name, provider, provider_status, provider_account_id, provider_reference FROM warehouses WHERE client_id = ? AND id = ? LIMIT 1")
+    ? await env.DB.prepare("SELECT id, name, address, city, state, pincode, contact, contact_name, provider, provider_status, provider_account_id, provider_reference FROM warehouses WHERE client_id = ? AND id = ? LIMIT 1")
       .bind(clientId, selectedWarehouseId)
-      .first<{ id: string; name: string; provider: string | null; provider_status: string | null; provider_account_id: string | null; provider_reference: string | null }>()
+      .first<{ id: string; name: string; address: string | null; city: string | null; state: string | null; pincode: string | null; contact: string | null; contact_name: string | null; provider: string | null; provider_status: string | null; provider_account_id: string | null; provider_reference: string | null }>()
     : null;
   if (selectedWarehouseId && !existing) {
     return { ok: false as const, code: "WAREHOUSE_NOT_FOUND" as const, error: "The selected pickup warehouse no longer exists for this client. Select it again before booking." };
@@ -820,41 +820,45 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   if (existing?.provider_account_id && providerAccountId && existing.provider_account_id !== providerAccountId) {
     return { ok: false as const, code: "WAREHOUSE_ACCOUNT_MISMATCH" as const, error: "The selected pickup warehouse is mapped to a different Delhivery account. Select a warehouse assigned to this account." };
   }
-  if (existing) {
-    // Keep the local identity complete when an older saved row predates the
-    // state/contact columns. The selected Client record remains authoritative;
-    // this only fills its own mapping and never searches another warehouse.
-    await env.DB.prepare("UPDATE warehouses SET address = ?, city = ?, state = ?, pincode = ?, contact = ?, contact_name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
-      .bind(origin.line, origin.city, origin.state, origin.pincode, origin.phone, origin.name, existing.id, clientId).run();
-  }
-  const localName = existing?.name?.trim() || delhiveryWarehouseName(origin);
+  // A selected saved warehouse is the canonical pickup identity. Never let
+  // editable booking fields overwrite it or combine it with another address.
+  // The unsaved-address path has no `existing` row and remains unchanged.
+  const resolvedOrigin = existing ? {
+    name: existing.contact_name?.trim() || origin.name,
+    line: existing.address?.trim() || origin.line,
+    city: existing.city?.trim() || origin.city,
+    state: existing.state?.trim() || origin.state,
+    pincode: existing.pincode?.trim() || origin.pincode,
+    phone: existing.contact?.trim() || origin.phone,
+  } : origin;
+  const localName = existing?.name?.trim() || delhiveryWarehouseName(resolvedOrigin);
   // Delhivery's manifestation contract identifies a pickup location by the
   // exact warehouse name registered for the account. The Client-selected
   // warehouse is the authoritative identity; do not append city/state/PIN
   // here because that creates a different provider warehouse name and can
   // make an active Delhivery facility appear inactive.
   const providerName = localName;
-  const warehouseIdentityHash = await sha256(`${providerName}|${origin.pincode}`);
+  const warehouseIdentityHash = await sha256(`${providerName}|${resolvedOrigin.pincode}`);
   delhiveryWarehouseLog(requestIdValue, "start", { account_id: providerAccountId ?? null, identity_hash: warehouseIdentityHash });
   // A saved Client warehouse must be reconciled against Delhivery's exact
   // facility record before it is reused. Local `active` is only a cache and
   // is not sufficient proof that the provider mapping still manifests.
   // Leave the unsaved-address path unchanged: it has no `existing` row and
   // continues through the registration flow below.
-  const warehouseCreateIdempotencyKey = `pss-warehouse-${await sha256(`${clientId}|${providerAccountId ?? ""}|${existing?.id ?? localName}|${origin.pincode}`)}`;
+  const warehouseCreateIdempotencyKey = `pss-warehouse-${await sha256(`${clientId}|${providerAccountId ?? ""}|${existing?.id ?? localName}|${resolvedOrigin.pincode}`)}`;
   // Reuse the provider's canonical warehouse whenever it already exists.
   // Creation is only allowed after a genuine provider-side "not found"; this
   // keeps every address/account on the same generic path without duplicates.
-  const existingFacility = await resolveDelhiveryFacility(env, token, b2bBaseUrl, clientId, { warehouse_id: existing?.id, delhivery_pickup_location: providerName, pincode: origin.pincode }, requestIdValue, timeoutMs);
+  const existingFacility = await resolveDelhiveryFacility(env, token, b2bBaseUrl, clientId, { warehouse_id: existing?.id, delhivery_pickup_location: providerName, pincode: resolvedOrigin.pincode }, requestIdValue, timeoutMs);
   if (existingFacility.ok) {
     if (existing) {
       await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_reference = ?, provider_name = ?, provider_error = NULL, provider_activated_at = CURRENT_TIMESTAMP, provider_status = 'active', status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
         .bind(providerAccountId ?? null, existingFacility.facility.id, existingFacility.facility.name || providerName, existing.id, clientId).run();
     } else {
       await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status, provider_reference, provider_name, provider_activated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'active', ?, ?, CURRENT_TIMESTAMP)")
-        .bind(crypto.randomUUID(), clientId, localName, origin.line, origin.city, origin.state, origin.pincode, origin.phone, origin.name, providerAccountId ?? null, existingFacility.facility.id, existingFacility.facility.name || providerName).run();
+        .bind(crypto.randomUUID(), clientId, localName, resolvedOrigin.line, resolvedOrigin.city, resolvedOrigin.state, resolvedOrigin.pincode, resolvedOrigin.phone, resolvedOrigin.name, providerAccountId ?? null, existingFacility.facility.id, existingFacility.facility.name || providerName).run();
     }
-    return { ok: true as const, name: existingFacility.facility.name || providerName, reused: true as const };
+    return { ok: true as const, name: existingFacility.facility.name || providerName, reused: true as const, origin: resolvedOrigin };
   }
   if (!delhiveryFacilityNotFound(existingFacility.error)) {
     return { ok: false as const, error: existingFacility.error };
@@ -866,34 +870,34 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   // the manifest service.
   const email = delhiveryJwtClaim(token, "client_email") || delhiveryJwtClaim(token, "email") || "support@psslogistics.in";
   const warehousePayload = {
-    phone: origin.phone,
-    city: origin.city,
+    phone: resolvedOrigin.phone,
+    city: resolvedOrigin.city,
     name: providerName,
-    pin: origin.pincode,
-    address: origin.line,
+    pin: resolvedOrigin.pincode,
+    address: resolvedOrigin.line,
     country: "India",
     email,
-    registered_name: origin.name || providerName,
-    return_address: origin.line,
-    return_pin: origin.pincode,
-    return_city: origin.city,
-    return_state: origin.state,
+    registered_name: resolvedOrigin.name || providerName,
+    return_address: resolvedOrigin.line,
+    return_pin: resolvedOrigin.pincode,
+    return_city: resolvedOrigin.city,
+    return_state: resolvedOrigin.state,
     return_country: "India",
   };
   const registrationToken = warehouseApiToken && !delhiveryLooksLikeJwt(warehouseApiToken) ? warehouseApiToken : null;
   const b2bWarehousePayload = {
     name: providerName,
-    pin_code: origin.pincode,
-    city: origin.city,
-    state: origin.state,
+    pin_code: resolvedOrigin.pincode,
+    city: resolvedOrigin.city,
+    state: resolvedOrigin.state,
     country: "India",
     address_details: {
-      address: origin.line,
-      contact_person: origin.name || providerName,
-      phone_number: origin.phone,
+      address: resolvedOrigin.line,
+      contact_person: resolvedOrigin.name || providerName,
+      phone_number: resolvedOrigin.phone,
     },
     same_as_fwd_add: true,
-    ret_address: { pin: origin.pincode, address: origin.line },
+    ret_address: { pin: resolvedOrigin.pincode, address: resolvedOrigin.line },
   };
   const registrationAttempts = [
     {
@@ -994,17 +998,17 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   }
   if (registrationAccepted && registrationContract === "b2b" && !existing) {
     await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status, provider_reference, provider_name, provider_activated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'active', ?, ?, CURRENT_TIMESTAMP)")
-      .bind(crypto.randomUUID(), clientId, localName, origin.line, origin.city, origin.state, origin.pincode, origin.phone, origin.name, providerAccountId ?? null, createdProviderReference, createdProviderName || providerName).run();
-    return { ok: true as const, name: createdProviderName || providerName, reused: providerAlreadyRegistered };
+      .bind(crypto.randomUUID(), clientId, localName, resolvedOrigin.line, resolvedOrigin.city, resolvedOrigin.state, resolvedOrigin.pincode, resolvedOrigin.phone, resolvedOrigin.name, providerAccountId ?? null, createdProviderReference, createdProviderName || providerName).run();
+    return { ok: true as const, name: createdProviderName || providerName, reused: providerAlreadyRegistered, origin: resolvedOrigin };
   }
   // A successful or duplicate create response is registration evidence only,
   // never activation evidence. Re-fetch the exact provider identity before
   // allowing manifestation; this prevents account-wide or pincode-only
   // substitutions and makes the pending state explicit.
-  let facility = await resolveDelhiveryFacility(env, token, b2bBaseUrl, clientId, { warehouse_id: existing?.id, delhivery_pickup_location: providerName, pincode: origin.pincode }, requestIdValue, timeoutMs);
+  let facility = await resolveDelhiveryFacility(env, token, b2bBaseUrl, clientId, { warehouse_id: existing?.id, delhivery_pickup_location: providerName, pincode: resolvedOrigin.pincode }, requestIdValue, timeoutMs);
   for (let attempt = 1; !facility.ok && attempt < 5; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 1500 * attempt));
-    facility = await resolveDelhiveryFacility(env, token, b2bBaseUrl, clientId, { warehouse_id: existing?.id, delhivery_pickup_location: providerName, pincode: origin.pincode }, requestIdValue, timeoutMs);
+    facility = await resolveDelhiveryFacility(env, token, b2bBaseUrl, clientId, { warehouse_id: existing?.id, delhivery_pickup_location: providerName, pincode: resolvedOrigin.pincode }, requestIdValue, timeoutMs);
   }
   if (!facility.ok) {
     delhiveryWarehouseLog(requestIdValue, "activation_lookup", { account_id: providerAccountId ?? null, identity_hash: warehouseIdentityHash, result: delhiveryFacilityNotFound(facility.error) ? "not_found" : "provider_error", error: facility.error.slice(0, 240) });
@@ -1022,16 +1026,16 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
           .bind(providerAccountId ?? null, createdProviderReference, createdProviderName || providerName, pendingError, existing.id, clientId).run();
       } else {
         await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status, provider_reference, provider_name, provider_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'pending', ?, ?, ?)")
-          .bind(crypto.randomUUID(), clientId, localName, origin.line, origin.city, origin.state, origin.pincode, origin.phone, origin.name, providerAccountId ?? null, createdProviderReference, createdProviderName || providerName, pendingError).run();
+          .bind(crypto.randomUUID(), clientId, localName, resolvedOrigin.line, resolvedOrigin.city, resolvedOrigin.state, resolvedOrigin.pincode, resolvedOrigin.phone, resolvedOrigin.name, providerAccountId ?? null, createdProviderReference, createdProviderName || providerName, pendingError).run();
       }
-      return { ok: true as const, name: createdProviderName || providerName, reused: false as const };
+      return { ok: true as const, name: createdProviderName || providerName, reused: false as const, origin: resolvedOrigin };
     }
     if (existing) {
       await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_reference = COALESCE(?, provider_reference), provider_name = COALESCE(?, provider_name), provider_status = 'pending', provider_error = ?, status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
         .bind(providerAccountId ?? null, createdProviderReference, createdProviderName || providerName, "Delhivery warehouse was created or located but is awaiting provider activation", existing.id, clientId).run();
     } else {
       await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status, provider_reference, provider_name, provider_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'pending', ?, ?, ?)")
-        .bind(crypto.randomUUID(), clientId, localName, origin.line, origin.city, origin.state, origin.pincode, origin.phone, origin.name, providerAccountId ?? null, createdProviderReference, createdProviderName || providerName, "Delhivery warehouse was created or located but is awaiting provider activation").run();
+        .bind(crypto.randomUUID(), clientId, localName, resolvedOrigin.line, resolvedOrigin.city, resolvedOrigin.state, resolvedOrigin.pincode, resolvedOrigin.phone, resolvedOrigin.name, providerAccountId ?? null, createdProviderReference, createdProviderName || providerName, "Delhivery warehouse was created or located but is awaiting provider activation").run();
     }
     return { ok: false as const, code: "WAREHOUSE_ACTIVATION_PENDING" as const, error: "The selected Delhivery warehouse is awaiting provider activation. Retry booking after Delhivery marks it active." };
   }
@@ -1041,10 +1045,10 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
       .run();
   } else {
     await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status, provider_reference, provider_name, provider_activated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'active', ?, ?, CURRENT_TIMESTAMP)")
-      .bind(crypto.randomUUID(), clientId, localName, origin.line, origin.city, origin.state, origin.pincode, origin.phone, origin.name, providerAccountId ?? null, facility.facility.id, facility.facility.name || providerName)
+      .bind(crypto.randomUUID(), clientId, localName, resolvedOrigin.line, resolvedOrigin.city, resolvedOrigin.state, resolvedOrigin.pincode, resolvedOrigin.phone, resolvedOrigin.name, providerAccountId ?? null, facility.facility.id, facility.facility.name || providerName)
       .run();
   }
-  return { ok: true as const, name: facility.facility.name || providerName, reused: false as const };
+  return { ok: true as const, name: facility.facility.name || providerName, reused: false as const, origin: resolvedOrigin };
 }
 
 type DelhiveryFacility = { id: string; code: string; name: string; pincode: string };
@@ -1967,6 +1971,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   let delhiveryB2bToken = useDelhiveryB2b ? await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs) : null;
   if (provider === "delhivery" && useDelhiveryB2b && !delhiveryB2bToken) return { enabled: true, status: "failed" as const, error: "Delhivery B2B authentication failed" };
   let delhiveryPickupLocation = "";
+  let delhiveryCanonicalOrigin: Record<string, unknown> | null = null;
   if (provider === "delhivery" && operation === "shipments" && useDelhiveryB2b && clientId && delhiveryB2bToken) {
     const origin = delhiveryAddress(payload.origin_address, String(payload.origin ?? "PSS Logistics"));
     if (!origin) return { enabled: true, status: "invalid_request" as const, reason: "A complete consignor address is required to create or select the pickup warehouse" };
@@ -1982,6 +1987,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     }
     if (!warehouse.ok) return { enabled: true, status: "failed" as const, code: warehouse.code, error: warehouse.error };
     delhiveryPickupLocation = warehouse.name;
+    delhiveryCanonicalOrigin = warehouse.origin;
   }
   const xpressToken = provider === "xpressbees" ? await xpressbeesToken(env, credential!, requestIdValue, providerTimeoutMs) : null;
   if (provider === "xpressbees" && !xpressToken) return { enabled: true, status: "failed" as const, error: "XpressBees authentication failed" };
@@ -2000,7 +2006,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   const ekartCreate = provider === "ekart" && operation === "shipments" ? ekartCreatePayload(payload) : null;
   if (provider === "ekart" && operation === "shipments" && !ekartCreate) return { enabled: false, status: "invalid_request" as const, reason: "Origin and destination addresses require valid six-digit pincodes and ten-digit phone numbers" };
   let providerPayload: Record<string, unknown> = account?.provider === "delhivery" ? { ...payload, delhivery_client_name: account.account_name } : payload;
-  if (delhiveryPickupLocation) providerPayload.delhivery_pickup_location = delhiveryPickupLocation;
+  if (delhiveryPickupLocation) providerPayload = { ...providerPayload, delhivery_pickup_location: delhiveryPickupLocation, ...(delhiveryCanonicalOrigin ? { origin_address: delhiveryCanonicalOrigin } : {}) };
   if (provider === "delhivery" && operation === "pickups" && useDelhiveryB2b && clientId && delhiveryB2bToken) {
     const shipmentOrigin = typeof payload.shipment_id === "string"
       ? await env.DB.prepare("SELECT origin_address_json FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(payload.shipment_id, clientId).first<{ origin_address_json: string | null }>()
@@ -2025,7 +2031,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       }
       }
       if (!warehouse.ok) return { enabled: true, status: "failed" as const, code: warehouse.code, error: warehouse.error };
-      providerPayload = { ...providerPayload, delhivery_pickup_location: warehouse.name };
+      providerPayload = { ...providerPayload, origin_address: warehouse.origin, delhivery_pickup_location: warehouse.name };
     }
   }
   if (provider === "delhivery" && operation === "shipments" && clientId) {
