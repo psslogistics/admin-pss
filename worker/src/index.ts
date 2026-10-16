@@ -836,13 +836,11 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   const providerName = localName;
   const warehouseIdentityHash = await sha256(`${providerName}|${origin.pincode}`);
   delhiveryWarehouseLog(requestIdValue, "start", { account_id: providerAccountId ?? null, identity_hash: warehouseIdentityHash });
-  // A Client-selected warehouse already marked active for this Delhivery
-  // account is eligible for manifestation. The facility-list endpoint is an
-  // auxiliary projection and can lag or omit rows that the manifest service
-  // accepts; let manifestation remain the provider-side authority.
-  if (existing?.provider_status === "active" && (!existing.provider_account_id || !providerAccountId || existing.provider_account_id === providerAccountId)) {
-    return { ok: true as const, name: providerName, reused: true as const };
-  }
+  // A saved Client warehouse must be reconciled against Delhivery's exact
+  // facility record before it is reused. Local `active` is only a cache and
+  // is not sufficient proof that the provider mapping still manifests.
+  // Leave the unsaved-address path unchanged: it has no `existing` row and
+  // continues through the registration flow below.
   const warehouseCreateIdempotencyKey = `pss-warehouse-${await sha256(`${clientId}|${providerAccountId ?? ""}|${existing?.id ?? localName}|${origin.pincode}`)}`;
   // Reuse the provider's canonical warehouse whenever it already exists.
   // Creation is only allowed after a genuine provider-side "not found"; this
@@ -994,14 +992,9 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
     // the manifestation API, so let manifestation be the final authority.
     registrationAccepted = true;
   }
-  if (registrationAccepted && registrationContract === "b2b") {
-    if (existing) {
-      await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_reference = COALESCE(?, provider_reference), provider_name = COALESCE(?, provider_name), provider_error = NULL, provider_activated_at = CURRENT_TIMESTAMP, provider_status = 'active', status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
-        .bind(providerAccountId ?? null, createdProviderReference, createdProviderName || providerName, existing.id, clientId).run();
-    } else {
-      await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status, provider_reference, provider_name, provider_activated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'active', ?, ?, CURRENT_TIMESTAMP)")
-        .bind(crypto.randomUUID(), clientId, localName, origin.line, origin.city, origin.state, origin.pincode, origin.phone, origin.name, providerAccountId ?? null, createdProviderReference, createdProviderName || providerName).run();
-    }
+  if (registrationAccepted && registrationContract === "b2b" && !existing) {
+    await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status, provider_reference, provider_name, provider_activated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'active', ?, ?, CURRENT_TIMESTAMP)")
+      .bind(crypto.randomUUID(), clientId, localName, origin.line, origin.city, origin.state, origin.pincode, origin.phone, origin.name, providerAccountId ?? null, createdProviderReference, createdProviderName || providerName).run();
     return { ok: true as const, name: createdProviderName || providerName, reused: providerAlreadyRegistered };
   }
   // A successful or duplicate create response is registration evidence only,
