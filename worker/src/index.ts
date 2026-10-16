@@ -847,7 +847,7 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   // provider mapping for this saved-address path and let manifestation remain
   // the final authority. Unsaved addresses have no existing row and continue
   // through registration/activation resolution below unchanged.
-    if (existing?.provider_status === "active") {
+    if (existing) {
     return { ok: true as const, name: existing.provider_name?.trim() || providerName, reused: true as const, origin: resolvedOrigin };
   }
   // A saved Client warehouse must be reconciled against Delhivery's exact
@@ -855,15 +855,15 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   // is not sufficient proof that the provider mapping still manifests.
   // Leave the unsaved-address path unchanged: it has no `existing` row and
   // continues through the registration flow below.
-  const warehouseCreateIdempotencyKey = `pss-warehouse-${await sha256(`${clientId}|${providerAccountId ?? ""}|${existing?.id ?? localName}|${resolvedOrigin.pincode}`)}`;
+  const warehouseCreateIdempotencyKey = `pss-warehouse-${await sha256(`${clientId}|${providerAccountId ?? ""}|${selectedWarehouseId ?? localName}|${resolvedOrigin.pincode}`)}`;
   // Reuse the provider's canonical warehouse whenever it already exists.
   // Creation is only allowed after a genuine provider-side "not found"; this
   // keeps every address/account on the same generic path without duplicates.
-  const existingFacility = await resolveDelhiveryFacility(env, token, b2bBaseUrl, clientId, { warehouse_id: existing?.id, delhivery_pickup_location: providerName, pincode: resolvedOrigin.pincode }, requestIdValue, timeoutMs);
+  const existingFacility = await resolveDelhiveryFacility(env, token, b2bBaseUrl, clientId, { warehouse_id: selectedWarehouseId, delhivery_pickup_location: providerName, pincode: resolvedOrigin.pincode }, requestIdValue, timeoutMs);
   if (existingFacility.ok) {
     if (existing) {
       await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_reference = ?, provider_name = ?, provider_error = NULL, provider_activated_at = CURRENT_TIMESTAMP, provider_status = 'active', status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
-        .bind(providerAccountId ?? null, existingFacility.facility.id, existingFacility.facility.name || providerName, existing.id, clientId).run();
+        .bind(providerAccountId ?? null, existingFacility.facility.id, existingFacility.facility.name || providerName, selectedWarehouseId, clientId).run();
     } else {
       await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status, provider_reference, provider_name, provider_activated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'active', ?, ?, CURRENT_TIMESTAMP)")
         .bind(crypto.randomUUID(), clientId, localName, resolvedOrigin.line, resolvedOrigin.city, resolvedOrigin.state, resolvedOrigin.pincode, resolvedOrigin.phone, resolvedOrigin.name, providerAccountId ?? null, existingFacility.facility.id, existingFacility.facility.name || providerName).run();
@@ -1015,10 +1015,10 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   // never activation evidence. Re-fetch the exact provider identity before
   // allowing manifestation; this prevents account-wide or pincode-only
   // substitutions and makes the pending state explicit.
-  let facility = await resolveDelhiveryFacility(env, token, b2bBaseUrl, clientId, { warehouse_id: existing?.id, delhivery_pickup_location: providerName, pincode: resolvedOrigin.pincode }, requestIdValue, timeoutMs);
+  let facility = await resolveDelhiveryFacility(env, token, b2bBaseUrl, clientId, { warehouse_id: selectedWarehouseId, delhivery_pickup_location: providerName, pincode: resolvedOrigin.pincode }, requestIdValue, timeoutMs);
   for (let attempt = 1; !facility.ok && attempt < 5; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 1500 * attempt));
-    facility = await resolveDelhiveryFacility(env, token, b2bBaseUrl, clientId, { warehouse_id: existing?.id, delhivery_pickup_location: providerName, pincode: resolvedOrigin.pincode }, requestIdValue, timeoutMs);
+    facility = await resolveDelhiveryFacility(env, token, b2bBaseUrl, clientId, { warehouse_id: selectedWarehouseId, delhivery_pickup_location: providerName, pincode: resolvedOrigin.pincode }, requestIdValue, timeoutMs);
   }
   if (!facility.ok) {
     delhiveryWarehouseLog(requestIdValue, "activation_lookup", { account_id: providerAccountId ?? null, identity_hash: warehouseIdentityHash, result: delhiveryFacilityNotFound(facility.error) ? "not_found" : "provider_error", error: facility.error.slice(0, 240) });
@@ -1033,7 +1033,7 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
       const pendingError = "Delhivery accepted the pickup-location registration; activation confirmation is still propagating";
       if (existing) {
         await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_reference = COALESCE(?, provider_reference), provider_name = COALESCE(?, provider_name), provider_status = 'pending', provider_error = ?, status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
-          .bind(providerAccountId ?? null, createdProviderReference, createdProviderName || providerName, pendingError, existing.id, clientId).run();
+          .bind(providerAccountId ?? null, createdProviderReference, createdProviderName || providerName, pendingError, selectedWarehouseId, clientId).run();
       } else {
         await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status, provider_reference, provider_name, provider_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'pending', ?, ?, ?)")
           .bind(crypto.randomUUID(), clientId, localName, resolvedOrigin.line, resolvedOrigin.city, resolvedOrigin.state, resolvedOrigin.pincode, resolvedOrigin.phone, resolvedOrigin.name, providerAccountId ?? null, createdProviderReference, createdProviderName || providerName, pendingError).run();
@@ -1042,7 +1042,7 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
     }
     if (existing) {
       await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_reference = COALESCE(?, provider_reference), provider_name = COALESCE(?, provider_name), provider_status = 'pending', provider_error = ?, status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
-        .bind(providerAccountId ?? null, createdProviderReference, createdProviderName || providerName, "Delhivery warehouse was created or located but is awaiting provider activation", existing.id, clientId).run();
+        .bind(providerAccountId ?? null, createdProviderReference, createdProviderName || providerName, "Delhivery warehouse was created or located but is awaiting provider activation", selectedWarehouseId, clientId).run();
     } else {
       await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status, provider_reference, provider_name, provider_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'pending', ?, ?, ?)")
         .bind(crypto.randomUUID(), clientId, localName, resolvedOrigin.line, resolvedOrigin.city, resolvedOrigin.state, resolvedOrigin.pincode, resolvedOrigin.phone, resolvedOrigin.name, providerAccountId ?? null, createdProviderReference, createdProviderName || providerName, "Delhivery warehouse was created or located but is awaiting provider activation").run();
@@ -1051,7 +1051,7 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   }
   if (existing) {
     await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_status = 'active', provider_reference = COALESCE(provider_reference, ?), provider_name = ?, provider_error = NULL, provider_activated_at = CURRENT_TIMESTAMP, status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
-      .bind(providerAccountId ?? null, facility.facility.id, facility.facility.name || providerName, existing.id, clientId)
+      .bind(providerAccountId ?? null, facility.facility.id, facility.facility.name || providerName, selectedWarehouseId, clientId)
       .run();
   } else {
     await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status, provider_reference, provider_name, provider_activated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'active', ?, ?, CURRENT_TIMESTAMP)")
