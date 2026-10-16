@@ -847,7 +847,7 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   // provider mapping for this saved-address path and let manifestation remain
   // the final authority. Unsaved addresses have no existing row and continue
   // through registration/activation resolution below unchanged.
-  if (existing?.provider_status === "active" && existing.provider_reference?.trim()) {
+    if (existing?.provider_status === "active") {
     return { ok: true as const, name: existing.provider_name?.trim() || providerName, reused: true as const, origin: resolvedOrigin };
   }
   // A saved Client warehouse must be reconciled against Delhivery's exact
