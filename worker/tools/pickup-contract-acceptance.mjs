@@ -27,6 +27,8 @@ const checks = [
   ["accepted manifest pickups are not silently appended", source.includes("GROUPABLE_MANIFEST_PICKUP_STATUSES = [\"requested\", \"provider_pending\"]") && !source.includes("GROUPABLE_MANIFEST_PICKUP_STATUSES = [\"requested\", \"provider_pending\", \"scheduled\"]")],
   ["standalone pickup path remains distinct", source.includes("provider_managed === true") && source.includes("Provider-managed pickup requests must be linked to a shipment")],
   ["standalone pickups may omit Delhivery AWBs", source.includes("Standalone pickups may be location-only") && !source.includes("At least one Delhivery AWB is required for a standalone pickup")],
+  ["pickup list orders newest requests first", source.includes("ORDER BY created_at DESC, id DESC")],
+  ["pickup reference only accepts PUR fields", source.includes('new Set(["pickup_id", "pickup_request_id", "pur_id", "pur", "pur_number", "pickup_request", "pickup_request_no"])') && !source.includes('"request_id", "request_no"]')],
 ];
 
 const failed = checks.filter(([, passed]) => !passed).map(([name]) => name);

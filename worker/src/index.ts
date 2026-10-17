@@ -2381,7 +2381,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     return { enabled: true, status: "accepted" as const, providerStatus: response.status, artifact };
   }
   if (response.ok && provider === "delhivery" && operation === "pickups" && typeof payload.pickup_id === "string") {
-    const pickupReference = findProviderReference(parsedProviderBody, new Set(["pickup_id", "pickup_request_id", "pur_id", "pur", "pur_number", "pickup_request", "pickup_request_no", "request_id", "request_no"]));
+    const pickupReference = findProviderReference(parsedProviderBody, new Set(["pickup_id", "pickup_request_id", "pur_id", "pur", "pur_number", "pickup_request", "pickup_request_no"]));
     if (pickupReference) await env.DB.prepare("UPDATE pickup_requests SET provider = 'delhivery', provider_reference = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(pickupReference, payload.pickup_id, clientId ?? "").run();
     const providerState = findProviderReference(parsedProviderBody, new Set(["status", "provider_status", "state", "pickup_status"]));
     const providerSlotId = findProviderReference(parsedProviderBody, new Set(["slot_id", "pickup_slot_id", "provider_slot_id", "slot", "time_slot_id"]));
@@ -3750,7 +3750,7 @@ const worker = {
       if (route === "/pickups" && request.method === "GET") {
         if (!hasScope(auth, "pickups.read")) return error("FORBIDDEN", "Pickup read scope required", 403, id, headers);
          const pickupColumns = "id, client_id, shipment_id, requested_date, requested_time_slot, pickup_address, contact_name, contact_phone, contact_email, city, state, pincode, country, pieces, total_weight_kg, status, assigned_to_user_id, notes, provider, provider_account_id, warehouse_id, provider_reference, provider_status, provider_request_id, provider_slot_id, provider_error_code, idempotency_key, failure_reason, created_at, updated_at, (SELECT COUNT(*) FROM pickup_request_shipments prs WHERE prs.pickup_id = pickup_requests.id) AS shipment_count";
-        const rows = auth.system ? await env.DB.prepare(`SELECT ${pickupColumns} FROM pickup_requests ORDER BY requested_date DESC`).all() : auth.clientIds.size ? await env.DB.prepare(`SELECT ${pickupColumns} FROM pickup_requests WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY requested_date DESC`).bind(...auth.clientIds).all() : { results: [] };
+        const rows = auth.system ? await env.DB.prepare(`SELECT ${pickupColumns} FROM pickup_requests ORDER BY created_at DESC, id DESC`).all() : auth.clientIds.size ? await env.DB.prepare(`SELECT ${pickupColumns} FROM pickup_requests WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY created_at DESC, id DESC`).bind(...auth.clientIds).all() : { results: [] };
         return json({ ok: true, data: rows.results }, 200, headers);
       }
 
