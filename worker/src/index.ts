@@ -2381,7 +2381,8 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     return { enabled: true, status: "accepted" as const, providerStatus: response.status, artifact };
   }
   if (response.ok && provider === "delhivery" && operation === "pickups" && typeof payload.pickup_id === "string") {
-    const pickupReference = findProviderReference(parsedProviderBody, new Set(["pickup_id", "pickup_request_id", "pur_id", "pur", "pur_number", "pickup_request", "pickup_request_no"]));
+    const rawPickupReference = findProviderReference(parsedProviderBody, new Set(["pickup_id", "pickup_request_id", "pur_id", "pur", "pur_number", "pickup_request", "pickup_request_no"]));
+    const pickupReference = rawPickupReference && /^\d+$/.test(rawPickupReference) ? rawPickupReference : null;
     if (pickupReference) await env.DB.prepare("UPDATE pickup_requests SET provider = 'delhivery', provider_reference = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(pickupReference, payload.pickup_id, clientId ?? "").run();
     const providerState = findProviderReference(parsedProviderBody, new Set(["status", "provider_status", "state", "pickup_status"]));
     const providerSlotId = findProviderReference(parsedProviderBody, new Set(["slot_id", "pickup_slot_id", "provider_slot_id", "slot", "time_slot_id"]));
