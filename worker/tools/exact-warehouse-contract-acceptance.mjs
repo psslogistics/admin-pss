@@ -17,11 +17,13 @@ const required = [
   ["saved warehouse keeps the consignor name", "contact_name"],
   ["saved warehouse keeps the consignor state", "state"],
   ["pending creation preserves returned provider mapping", "provider_reference = COALESCE(?, provider_reference)"],
-  ["stored provider mapping and local identity constrain lookup", "delhiveryFacilityMatches(row, name, pincode, localWarehouse?.provider_reference, localWarehouse?.name)"],
+  ["confirmed booking evidence gates reuse", "delhiveryWarehouseHasConfirmedBooking"],
+  ["confirmed provider reference is required", "provider_sync_status = 'confirmed' AND provider_reference IS NOT NULL"],
+  ["replacement warehouse names are unique", " - PSS-${replacementId.slice(0, 8)}"],
   ["canonical provider warehouse identity", "canonicalDelhiveryWarehouseName"],
   ["provider uses the selected saved warehouse name exactly", "const providerName = localName;"],
-  ["create response is followed by exact activation lookup", "A successful or duplicate create response is registration evidence only"],
-  ["registration without activation is queued", "provider_booking_payload_json"],
+  ["registration is used without facility lookup", "Facility lookup is intentionally reserved for pickup-slot operations."],
+  ["registration retry remains scheduled", "provider_booking_payload_json"],
   ["activation retry is scheduled", "retryPendingDelhiveryBookings"],
 ];
 
