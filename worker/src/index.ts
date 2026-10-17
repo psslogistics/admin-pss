@@ -1516,19 +1516,21 @@ function findProviderUrl(value: unknown, depth = 0): string | null {
   return null;
 }
 
-function findProviderUrls(value: unknown, result: string[] = [], depth = 0): string[] {
+function findProviderUrls(value: unknown, result: string[] = [], depth = 0, parentKey = "", baseUrl?: string): string[] {
   if (depth > 8 || value === null || value === undefined) return result;
   if (typeof value === "string") {
     const url = value.trim();
-    if (/^https?:\/\//i.test(url) && !result.includes(url)) result.push(url);
+    const relativeAsset = /(?:url|uri|link|path|file|document|label|mps)/i.test(parentKey) && (/^(?:\/\/|\/)/.test(url) || /^[^\s]+\.(?:pdf|png|jpe?g|webp)(?:[?#].*)?$/i.test(url));
+    const resolved = /^https?:\/\//i.test(url) ? url : relativeAsset && baseUrl ? new URL(url, baseUrl).toString() : null;
+    if (resolved && !result.includes(resolved)) result.push(resolved);
     return result;
   }
   if (Array.isArray(value)) {
-    for (const item of value) findProviderUrls(item, result, depth + 1);
+    for (const item of value) findProviderUrls(item, result, depth + 1, parentKey, baseUrl);
     return result;
   }
   if (typeof value !== "object") return result;
-  for (const item of Object.values(value as Record<string, unknown>)) findProviderUrls(item, result, depth + 1);
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) findProviderUrls(item, result, depth + 1, key, baseUrl);
   return result;
 }
 
@@ -2373,7 +2375,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       };
     }
     if (operation === "labels" && artifact && typeof artifact === "object") {
-      const labelUrls = findProviderUrls(artifact);
+      const labelUrls = findProviderUrls(artifact, [], 0, "", response.url);
       if (labelUrls.length) {
         try {
           const labelArtifacts: Array<{ content_base64: string; content_type: string }> = [];
