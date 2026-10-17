@@ -2378,11 +2378,10 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         try {
           const labelArtifacts: Array<{ content_base64: string; content_type: string }> = [];
           const requestedCopies = Math.max(1, Number(payload.boxes ?? payload.pieces ?? 1) + 1);
-          const boxCount = Math.max(1, Number(payload.boxes ?? payload.pieces ?? 1));
-          // get_urls can return the box label followed by a document asset.
-          // The client needs box labels only; the extra required copy is made
-          // from the label image rather than turning the document into page 2.
-          for (const labelUrl of labelUrls.slice(0, boxCount)) {
+          // get_urls returns one asset per box plus a final MPS document asset.
+          // Keep that provider document instead of replacing it with a duplicate
+          // box label; the client uses the returned order for the A4 output.
+          for (const labelUrl of labelUrls.slice(0, requestedCopies)) {
             const labelResponse = await providerFetch(labelUrl, { method: "GET", headers: { accept: "application/json,image/*,application/pdf" } }, attemptTimeoutMs);
             if (!labelResponse.ok) throw new Error(`label_content_http_${labelResponse.status}`);
             const labelContentType = labelResponse.headers.get("content-type") ?? "application/octet-stream";
