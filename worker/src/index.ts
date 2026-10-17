@@ -3615,10 +3615,12 @@ const worker = {
 
       const shipmentUpdate = route.match(/^\/shipments\/([^/]+)$/);
       if (shipmentUpdate && request.method === "PATCH") {
-        if (!hasRole(auth, ["employee", "admin", "super_admin"])) return error("FORBIDDEN", "Employee or administrator role required", 403, id, headers);
+        if (!hasRole(auth, ["employee", "admin", "super_admin"]) && !hasScope(auth, "shipments.create")) return error("FORBIDDEN", "Shipment update permission required", 403, id, headers);
         const current = await env.DB.prepare("SELECT client_id, status, weight_override_kg FROM shipments WHERE id = ? LIMIT 1").bind(shipmentUpdate[1]).first<{ client_id: string; status: string; weight_override_kg: number | null }>();
         if (!current || !canAccessClient(auth, current.client_id)) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
         const payload = await bodyJson(request);
+        const clientActor = hasRole(auth, ["client"]) && !hasRole(auth, ["employee", "admin", "super_admin"]);
+        if (clientActor && Object.keys(payload).some((field) => field !== "status")) return error("FORBIDDEN", "Clients may only cancel their own shipment", 403, id, headers);
         const requestHash = await payloadFingerprint(payload);
         const allowed = ["provider", "provider_reference", "tracking_number", "lr_number", "status", "description", "origin", "destination", "consignee", "total_weight_kg", "declared_value", "pieces", "edd", "delivered_at"] as const;
         const updates = allowed.filter((field) => typeof payload[field] === "string" || typeof payload[field] === "number").map((field) => ({ field, value: payload[field] }));
@@ -3638,6 +3640,40 @@ const worker = {
         if (status) await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipmentUpdate[1], status, "Shipment updated", auth.userId ?? `api:${current.client_id}`).run();
         await audit(env, ctx, auth, id, "shipment.updated", "shipment", shipmentUpdate[1], { client_id: current.client_id, fields: normalized.map((update) => update.field) });
         const serialized = JSON.stringify({ ok: true, data: { id: shipmentUpdate[1], ...Object.fromEntries(normalized.map((update) => [update.field, update.value])), ...(status === "delivered" ? { delivered_at: "CURRENT_TIMESTAMP" } : {}) }, request_id: id }); await saveIdempotent(env, key, current.client_id, endpoint, 200, serialized, requestHash);
+        return new Response(serialized, { status: 200, headers: { ...headers, "content-type": "application/json" } });
+      }
+
+      if (shipmentUpdate && request.method === "DELETE") {
+        if (!hasRole(auth, ["employee", "admin", "super_admin"]) && !hasScope(auth, "shipments.create")) return error("FORBIDDEN", "Shipment deletion permission required", 403, id, headers);
+        const current = await env.DB.prepare("SELECT id, client_id, status, provider_reference, tracking_number, lr_number FROM shipments WHERE id = ? LIMIT 1").bind(shipmentUpdate[1]).first<{ id: string; client_id: string; status: string; provider_reference: string | null; tracking_number: string | null; lr_number: string | null }>();
+        if (!current || !canAccessClient(auth, current.client_id)) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
+        if (!new Set(["cancelled", "exception"]).has(String(current.status).toLowerCase())) return error("CONFLICT", "Only cancelled or failed shipments can be deleted", 409, id, headers);
+        if (current.lr_number || current.tracking_number || current.provider_reference) return error("CONFLICT", "A shipment with a courier reference cannot be deleted", 409, id, headers);
+        const key = request.headers.get("Idempotency-Key"); if (!key) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
+        const requestHash = await payloadFingerprint({ id: shipmentUpdate[1], deleted: true });
+        const endpoint = `DELETE /v1/shipments/${shipmentUpdate[1]}`;
+        const existing = await idempotentResponse(env, key, current.client_id, endpoint, requestHash);
+        if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
+        await env.DB.batch([
+          env.DB.prepare("DELETE FROM pickup_request_shipments WHERE shipment_id = ?").bind(current.id),
+          env.DB.prepare("UPDATE pickup_requests SET shipment_id = NULL WHERE shipment_id = ?").bind(current.id),
+          env.DB.prepare("DELETE FROM tracking_events WHERE shipment_id = ?").bind(current.id),
+          env.DB.prepare("DELETE FROM shipment_documents WHERE shipment_id = ?").bind(current.id),
+          env.DB.prepare("DELETE FROM pricing_provider_costs WHERE shipment_id = ?").bind(current.id),
+          env.DB.prepare("DELETE FROM pricing_shipment_snapshots WHERE shipment_id = ?").bind(current.id),
+          env.DB.prepare("DELETE FROM weight_reconciliation_tickets WHERE shipment_id = ?").bind(current.id),
+          env.DB.prepare("DELETE FROM weight_reconciliations WHERE shipment_id = ?").bind(current.id),
+          env.DB.prepare("DELETE FROM pricing_overrides WHERE shipment_id = ?").bind(current.id),
+          env.DB.prepare("DELETE FROM billing_line_items WHERE shipment_id = ?").bind(current.id),
+          env.DB.prepare("DELETE FROM billing_amendments WHERE shipment_id = ?").bind(current.id),
+          env.DB.prepare("DELETE FROM billing_records WHERE shipment_id = ? AND client_id = ?").bind(current.id, current.client_id),
+          env.DB.prepare("DELETE FROM cod_remittances WHERE shipment_id = ? AND client_id = ?").bind(current.id, current.client_id),
+          env.DB.prepare("DELETE FROM return_shipments WHERE shipment_id = ?").bind(current.id),
+          env.DB.prepare("DELETE FROM shipments WHERE id = ? AND client_id = ?").bind(current.id, current.client_id),
+        ]);
+        await audit(env, ctx, auth, id, "shipment.deleted", "shipment", current.id, { client_id: current.client_id, status: current.status });
+        const serialized = JSON.stringify({ ok: true, data: { id: current.id, deleted: true }, request_id: id });
+        await saveIdempotent(env, key, current.client_id, endpoint, 200, serialized, requestHash);
         return new Response(serialized, { status: 200, headers: { ...headers, "content-type": "application/json" } });
       }
 
