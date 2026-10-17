@@ -1242,7 +1242,7 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
   // The Delhivery account label and the registered pickup warehouse are
   // separate provider values. Never use the account label as the warehouse.
   const pickupLocation = String(payload.delhivery_pickup_location ?? payload.pickup_location ?? env.DELHIVERY_DEFAULT_PICKUP_LOCATION ?? "").trim();
-  const orderId = String(payload.order_id ?? payload.shipment_id ?? crypto.randomUUID()).trim().slice(0, 80);
+  const orderId = String(payload.order_id ?? payload.invoice_reference ?? payload.invoice_number ?? "").trim().slice(0, 80);
   const invoiceNumber = String(payload.invoice_reference ?? payload.invoice_number ?? "").trim();
   const providerInvoiceNumber = invoiceNumber.replace(/[^A-Za-z0-9\/-]/g, "-").replace(/-{2,}/g, "-").replace(/^-|-$/g, "").slice(0, 80);
   const declaredValue = Number(payload.declared_value ?? 0);
@@ -1384,7 +1384,7 @@ function delhiveryCreatePayload(env: Env, payload: Record<string, unknown>) {
   const declaredValue = Math.max(Number(payload.declared_value ?? 0), 0);
   if (!origin || !destination || !client || !pickupLocation || !Number.isFinite(weightKg) || weightKg <= 0 || !Number.isInteger(pieces) || pieces < 1) return null;
   const paymentMode = String(payload.payment_mode ?? "prepaid").trim().toLowerCase() === "cod" ? "COD" : "Pre-paid";
-  const orderId = String(payload.order_id ?? payload.shipment_id ?? crypto.randomUUID()).trim().slice(0, 50);
+  const orderId = String(payload.order_id ?? payload.invoice_reference ?? payload.invoice_number ?? "").trim().slice(0, 50);
   const shipment: Record<string, unknown> = {
     client,
     order: orderId,
@@ -1635,7 +1635,7 @@ function trackonPayload(payload: Record<string, unknown>, credentials: { userId:
     userId: credentials.userId,
     password: credentials.password,
     SerialNo: String(payload.serial_no ?? payload.serialNo ?? "1"),
-    RefNo: String(payload.ref_no ?? payload.order_id ?? payload.shipment_id ?? ""),
+    RefNo: String(payload.ref_no ?? payload.order_id ?? payload.invoice_reference ?? payload.invoice_number ?? ""),
     ActionType: "Book",
     CustomerCode: String(payload.customer_code ?? ""),
     ClientName: String(payload.consignee ?? destination.name ?? "Consignee"),
@@ -1708,7 +1708,7 @@ function xpressbeesBookingPayload(payload: Record<string, unknown>) {
   const dimensions = Array.isArray(payload.dimensions) && payload.dimensions.length ? payload.dimensions[0] as Record<string, unknown> : {};
   const date = new Date().toISOString().slice(0, 10);
   return {
-    id: String(payload.order_id ?? payload.shipment_id ?? crypto.randomUUID()).slice(0, 20),
+    id: String(payload.order_id ?? payload.invoice_reference ?? payload.invoice_number ?? "").slice(0, 20),
     payment_method: paymentMethod,
     consigner_name: String(origin.name ?? payload.consignor ?? "PSS Logistics"),
     consigner_phone: String(origin.phone ?? payload.consignor_phone ?? ""),
@@ -1788,7 +1788,7 @@ function rivigoBookingPayload(payload: Record<string, unknown>, credentials: Riv
       ...(payload.cnote ? { cnote: String(payload.cnote) } : {}),
       toAddressList: [{ ...destination, companyDetails: { companyName: String(payload.destination_company ?? destination.callDetails.name), ...(payload.destination_gstin ? { GSTIN: String(payload.destination_gstin) } : {}) } }],
       loadDetails,
-      ...(payload.order_id || payload.shipment_id ? { clientReferenceNumbers: [String(payload.order_id ?? payload.shipment_id)] } : {}),
+      ...(payload.order_id || payload.invoice_reference || payload.invoice_number ? { clientReferenceNumbers: [String(payload.order_id ?? payload.invoice_reference ?? payload.invoice_number)] } : {}),
     }],
     ...(credentials.clientCode ? { clientCode: credentials.clientCode } : payload.client_code ? { clientCode: String(payload.client_code) } : {}),
   };
@@ -3475,6 +3475,11 @@ const worker = {
         const description = typeof payload.description === "string" ? payload.description.trim() : "";
         const origin = typeof payload.origin === "string" ? payload.origin.trim() : "";
         const destination = typeof payload.destination === "string" ? payload.destination.trim() : "";
+        const requestedOrderId = typeof payload.order_id === "string" ? payload.order_id.trim().slice(0, 80) : "";
+        const invoiceReference = String(payload.invoice_reference ?? payload.invoice_number ?? "").trim().slice(0, 80);
+        const resolvedOrderId = requestedOrderId || invoiceReference;
+        if (!resolvedOrderId) return error("ORDER_ID_REQUIRED", "Order ID or invoice number is required before booking", 400, id, headers);
+        payload.order_id = resolvedOrderId;
         const originAddress = shipmentAddress(payload.origin_address);
         const destinationAddress = shipmentAddress(payload.destination_address);
         const weight = Number(payload.total_weight_kg);
@@ -3544,7 +3549,7 @@ const worker = {
         const requestedProviderAccountId = typeof payload.provider_account_id === "string" && payload.provider_account_id.trim() ? payload.provider_account_id.trim() : null;
         let pssReference = String(Date.now());
         while (await env.DB.prepare("SELECT 1 FROM shipments WHERE pss_reference = ? LIMIT 1").bind(pssReference).first()) pssReference = String(Number(pssReference) + 1);
-        await env.DB.prepare("INSERT INTO shipments (id, pss_reference, client_id, created_by_user_id, provider, provider_account_id, client_gst_number, client_pan_number, kyc_version, status, description, origin, destination, origin_address_json, destination_address_json, consignee, total_weight_kg, declared_value, pieces, edd, dimensions_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'booked', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(shipmentId, pssReference, clientId, auth.userId ?? `api:${clientId}`, provider, requestedProviderAccountId, shipmentGst, shipmentPan, kyc?.kyc_version ?? null, description, origin, destination, JSON.stringify(originAddress), JSON.stringify(destinationAddress), String(destinationAddress.name), weight, declaredValue, pieces, typeof payload.edd === "string" ? payload.edd : null, dimensionsJson).run();
+        await env.DB.prepare("INSERT INTO shipments (id, order_id, pss_reference, client_id, created_by_user_id, provider, provider_account_id, client_gst_number, client_pan_number, kyc_version, status, description, origin, destination, origin_address_json, destination_address_json, consignee, total_weight_kg, declared_value, pieces, edd, dimensions_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'booked', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(shipmentId, resolvedOrderId, pssReference, clientId, auth.userId ?? `api:${clientId}`, provider, requestedProviderAccountId, shipmentGst, shipmentPan, kyc?.kyc_version ?? null, description, origin, destination, JSON.stringify(originAddress), JSON.stringify(destinationAddress), String(destinationAddress.name), weight, declaredValue, pieces, typeof payload.edd === "string" ? payload.edd : null, dimensionsJson).run();
         await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'booked', 'Shipment created', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipmentId, auth.userId ?? `api:${clientId}`).run();
         const storedDocuments = await persistShipmentDocuments(env, clientId, shipmentId, payload.invoice_documents, auth.userId ?? `api:${clientId}`);
         if (!storedDocuments.ok) {
