@@ -836,11 +836,14 @@ async function delhiveryWarehouseHasConfirmedBooking(
 }
 
 async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: string, origin: { name: string; line: string; city: string; state: string; pincode: string; phone: string }, requestIdValue: string, timeoutMs: number, b2bBaseUrl = env.DELHIVERY_B2B_API_BASE_URL ?? "https://ltl-clients-api.delhivery.com", providerAccountId?: string | null, selectedWarehouseId?: string | null, warehouseApiToken?: string | null) {
+  const warehouseRow = "id, name, address, city, state, pincode, contact, contact_name, provider, provider_status, provider_account_id, provider_reference, provider_name";
   const existing = selectedWarehouseId
-    ? await env.DB.prepare("SELECT id, name, address, city, state, pincode, contact, contact_name, provider, provider_status, provider_account_id, provider_reference, provider_name FROM warehouses WHERE client_id = ? AND id = ? LIMIT 1")
+    ? await env.DB.prepare(`SELECT ${warehouseRow} FROM warehouses WHERE client_id = ? AND id = ? LIMIT 1`)
       .bind(clientId, selectedWarehouseId)
       .first<{ id: string; name: string; address: string | null; city: string | null; state: string | null; pincode: string | null; contact: string | null; contact_name: string | null; provider: string | null; provider_status: string | null; provider_account_id: string | null; provider_reference: string | null; provider_name: string | null }>()
-    : null;
+    : await env.DB.prepare(`SELECT ${warehouseRow} FROM warehouses WHERE client_id = ? AND provider = 'delhivery' AND lower(trim(COALESCE(provider_account_id, ''))) = lower(trim(COALESCE(?, ''))) AND lower(trim(COALESCE(address, ''))) = lower(trim(?)) AND lower(trim(COALESCE(city, ''))) = lower(trim(COALESCE(?, ''))) AND lower(trim(COALESCE(state, ''))) = lower(trim(COALESCE(?, ''))) AND lower(trim(COALESCE(pincode, ''))) = lower(trim(COALESCE(?, ''))) AND lower(trim(COALESCE(contact, ''))) = lower(trim(COALESCE(?, ''))) AND lower(trim(COALESCE(contact_name, ''))) = lower(trim(COALESCE(?, ''))) ORDER BY updated_at DESC LIMIT 1`)
+      .bind(clientId, providerAccountId ?? null, origin.line, origin.city, origin.state, origin.pincode, origin.phone, origin.name)
+      .first<{ id: string; name: string; address: string | null; city: string | null; state: string | null; pincode: string | null; contact: string | null; contact_name: string | null; provider: string | null; provider_status: string | null; provider_account_id: string | null; provider_reference: string | null; provider_name: string | null }>();
   if (selectedWarehouseId && !existing) {
     return { ok: false as const, code: "WAREHOUSE_NOT_FOUND" as const, error: "The selected pickup warehouse no longer exists for this client. Select it again before booking." };
   }
@@ -865,7 +868,13 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   const existingHasConfirmedBooking = existing
     ? await delhiveryWarehouseHasConfirmedBooking(env, clientId, providerAccountId, resolvedOrigin)
     : false;
-  const replacementId = existing && !existingHasConfirmedBooking ? crypto.randomUUID() : null;
+  // A saved/previously registered provider location is reusable even when the
+  // first shipment has not published an LR yet. Waiting for a confirmed LR
+  // here caused every retry to create another PSS-suffixed warehouse, which
+  // made repeat bookings intermittent and could make Delhivery reject them.
+  const existingProviderLocation = existing && (existing.provider_status === "active" || existing.provider_status === "pending")
+    && Boolean(existing.provider_name?.trim() || existing.name?.trim());
+  const replacementId = existing && !existingHasConfirmedBooking && !existingProviderLocation ? crypto.randomUUID() : null;
   const localName = replacementId ? `${baseLocalName} - PSS-${replacementId.slice(0, 8)}` : baseLocalName;
   const providerName = localName;
   const warehouseIdentityHash = await sha256(`${providerName}|${resolvedOrigin.pincode}`);

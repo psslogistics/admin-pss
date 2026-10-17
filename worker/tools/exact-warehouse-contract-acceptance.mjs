@@ -18,6 +18,8 @@ const required = [
   ["saved warehouse keeps the consignor state", "state"],
   ["pending creation preserves returned provider mapping", "provider_reference = COALESCE(?, provider_reference)"],
   ["confirmed booking evidence gates reuse", "delhiveryWarehouseHasConfirmedBooking"],
+  ["registered provider locations are reused before an LR exists", "existingProviderLocation"],
+  ["unsaved repeat bookings resolve an exact warehouse", "lower(trim(COALESCE(address, ''))) = lower(trim(?)"],
   ["confirmed provider reference is required", "provider_sync_status = 'confirmed' AND provider_reference IS NOT NULL"],
   ["replacement warehouse names are unique", " - PSS-${replacementId.slice(0, 8)}"],
   ["canonical provider warehouse identity", "canonicalDelhiveryWarehouseName"],
