@@ -3687,7 +3687,7 @@ const worker = {
         const operation = kind === "lr-copy" ? "lr_copy" : kind === "document" ? "document" : "labels";
         const requestedSize = url.searchParams.get("size") ?? (kind === "sticker" ? "std" : "a4");
         if (operation === "labels" && !["sm", "md", "a4", "std"].includes(requestedSize)) return error("INVALID_REQUEST", "Delhivery label size must be sm, md, a4, or std", 400, id, headers);
-        if ((operation === "lr_copy" || operation === "document") && !shipment.lr_number) {
+        if (!shipment.lr_number && !shipment.master_awb && shipment.provider_booking_id) {
           await safeProviderRequest(env, "delhivery", "shipment_status", {
             shipment_id: shipment.id,
             provider_booking_id: shipment.provider_booking_id,
@@ -3726,6 +3726,16 @@ const worker = {
           const providerAccountId = typeof shipment.provider_account_id === "string"
             ? shipment.provider_account_id
             : (await env.DB.prepare("SELECT provider_account_id FROM shipments WHERE id = ? LIMIT 1").bind(String(shipment.id)).first<{ provider_account_id: string | null }>())?.provider_account_id ?? null;
+          if (provider === "delhivery" && !shipment.lr_number && !shipment.master_awb && shipment.provider_booking_id) {
+            await safeProviderRequest(env, provider, "shipment_status", {
+              shipment_id: String(shipment.id),
+              provider_booking_id: shipment.provider_booking_id,
+              tracking_number: shipment.tracking_number,
+              lr_number: shipment.lr_number,
+              provider_reference: shipment.provider_reference,
+              provider_account_id: providerAccountId,
+            }, id, shipment.client_id);
+          }
           const providerResult = provider ? await safeProviderRequest(env, provider, "tracking", { shipment_id: String(shipment.id), tracking_number: shipment.tracking_number, lr_number: shipment.lr_number, provider_reference: shipment.provider_reference, provider_account_id: providerAccountId }, id, shipment.client_id) : { enabled: false, status: "not_requested" as const };
           return json({ ok: true, data: events.results, provider_status: providerResult.status }, 200, headers);
         }
