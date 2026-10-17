@@ -2615,17 +2615,6 @@ async function retryPendingDelhiveryBookings(env: Env, cron: string) {
       const invoiceDocuments = await loadShipmentInvoiceDocumentsForRetry(env, shipment.client_id, shipment.id, payload);
       const result = await safeProviderRequest(env, "delhivery", "shipments", { shipment_id: shipment.id, ...payload, invoice_documents: invoiceDocuments, provider_account_id: shipment.provider_account_id ?? payload.provider_account_id }, `cron:${cron}:booking:${shipment.id}`, shipment.client_id, `queued-booking-${shipment.id}`, 25000);
       if (result.status === "accepted") {
-        const acceptedProviderAccountId = (result as { provider_account_id?: string | null }).provider_account_id ?? shipment.provider_account_id ?? (typeof payload.provider_account_id === "string" ? payload.provider_account_id : null);
-        await ensureManifestPickupGroup(env, {
-          shipmentId: shipment.id,
-          clientId: shipment.client_id,
-          provider: "delhivery",
-          providerAccountId: acceptedProviderAccountId,
-          warehouseId: typeof payload.warehouse_id === "string" ? payload.warehouse_id : null,
-          payload,
-          requestId: `cron:${cron}:manifest-pickup:${shipment.id}`,
-          idempotencyKey: `manifest-pickup-${shipment.id}`,
-        });
         await env.DB.prepare("UPDATE shipments SET provider_booking_payload_json = NULL, provider_retry_at = NULL, provider_last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(shipment.id, shipment.client_id).run();
         continue;
       }
@@ -3567,18 +3556,10 @@ const worker = {
           await audit(env, ctx, auth, id, "shipment.provider_failed", "shipment", shipmentId, { client_id: clientId, provider, reason: failureReason });
           return new Response(failedResponse, { status: 502, headers: { ...headers, "content-type": "application/json" } });
         }
-        // A manifest is a provider shipment, but it is not a pickup appointment.
-        // Create or join the pickup group using the consignor/origin address only
-        // after Delhivery has accepted the shipment. This keeps provider booking
-        // and pickup scheduling explicit while making the normal booking flow
-        // safe for arbitrary saved consignor addresses.
-        const manifestPickup = provider === "delhivery"
-          ? await ensureManifestPickupGroup(env, { shipmentId, clientId, provider: provider as CourierProvider, providerAccountId: selectedProviderAccountId ?? requestedProviderAccountId, warehouseId: selectedWarehouseId || null, payload, requestId: id, idempotencyKey: `manifest-pickup-${shipmentId}` })
-          : null;
         // Return only provider-owned references. Delhivery may assign the LR
         // asynchronously, so read persisted courier values after the provider call.
         const bookedShipment = await env.DB.prepare("SELECT tracking_number, lr_number, provider_reference FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(shipmentId, clientId).first<{ tracking_number: string | null; lr_number: string | null; provider_reference: string | null }>();
-        const serialized = JSON.stringify({ ok: true, data: { id: shipmentId, client_id: clientId, status: "booked", provider, tracking_number: bookedShipment?.tracking_number ?? null, lr_number: bookedShipment?.lr_number ?? null, provider_reference: bookedShipment?.provider_reference ?? null, pricing_amount: pricingAmount || null, provider_status: providerResult.status, pickup_request_id: manifestPickup?.id ?? null, pickup_status: manifestPickup?.status ?? null, pickup_grouped: manifestPickup?.grouped ?? false, pickup_error: manifestPickup && !manifestPickup.ok ? manifestPickup.error : null }, request_id: id });
+        const serialized = JSON.stringify({ ok: true, data: { id: shipmentId, client_id: clientId, status: "booked", provider, tracking_number: bookedShipment?.tracking_number ?? null, lr_number: bookedShipment?.lr_number ?? null, provider_reference: bookedShipment?.provider_reference ?? null, pricing_amount: pricingAmount || null, provider_status: providerResult.status }, request_id: id });
         await saveIdempotent(env, key, clientId, "POST /v1/shipments", 201, serialized, requestHash);
         await audit(env, ctx, auth, id, "shipment.created", "shipment", shipmentId, { client_id: clientId, provider });
         return new Response(serialized, { status: 201, headers: { ...headers, "content-type": "application/json" } });
@@ -3768,9 +3749,24 @@ const worker = {
 
       if (route === "/pickups" && request.method === "GET") {
         if (!hasScope(auth, "pickups.read")) return error("FORBIDDEN", "Pickup read scope required", 403, id, headers);
-         const pickupColumns = "id, client_id, shipment_id, requested_date, requested_time_slot, pickup_address, contact_name, contact_phone, contact_email, city, state, pincode, country, pieces, total_weight_kg, status, assigned_to_user_id, notes, provider, provider_account_id, warehouse_id, provider_reference, provider_status, provider_request_id, provider_slot_id, provider_error_code, idempotency_key, failure_reason, created_at, updated_at";
+         const pickupColumns = "id, client_id, shipment_id, requested_date, requested_time_slot, pickup_address, contact_name, contact_phone, contact_email, city, state, pincode, country, pieces, total_weight_kg, status, assigned_to_user_id, notes, provider, provider_account_id, warehouse_id, provider_reference, provider_status, provider_request_id, provider_slot_id, provider_error_code, idempotency_key, failure_reason, created_at, updated_at, (SELECT COUNT(*) FROM pickup_request_shipments prs WHERE prs.pickup_id = pickup_requests.id) AS shipment_count";
         const rows = auth.system ? await env.DB.prepare(`SELECT ${pickupColumns} FROM pickup_requests ORDER BY requested_date DESC`).all() : auth.clientIds.size ? await env.DB.prepare(`SELECT ${pickupColumns} FROM pickup_requests WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY requested_date DESC`).bind(...auth.clientIds).all() : { results: [] };
         return json({ ok: true, data: rows.results }, 200, headers);
+      }
+
+      if (route === "/pickup-candidates" && request.method === "GET") {
+        if (!hasScope(auth, "pickups.create")) return error("FORBIDDEN", "Pickup creation scope required", 403, id, headers);
+        const clientId = requireClient(auth, url.searchParams.get("client_id"));
+        if (!clientId || !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
+        const provider = String(url.searchParams.get("provider") ?? "").trim().toLowerCase();
+        const providerAccountId = String(url.searchParams.get("provider_account_id") ?? "").trim();
+        const pincode = String(url.searchParams.get("pincode") ?? "").trim();
+        if (!provider || !providerAccountId) return error("VALIDATION_ERROR", "Provider and provider account are required", 400, id, headers);
+        const conditions = ["s.client_id = ?", "s.status = 'booked'", "s.provider = ?", "s.provider_account_id = ?", "NOT EXISTS (SELECT 1 FROM pickup_request_shipments prs JOIN pickup_requests pr ON pr.id = prs.pickup_id WHERE prs.shipment_id = s.id AND pr.status NOT IN ('cancelled', 'completed', 'failed'))"];
+        const binds: unknown[] = [clientId, provider, providerAccountId];
+        if (pincode) { conditions.push("json_extract(s.origin_address_json, '$.pincode') = ?"); binds.push(pincode); }
+        const rows = await env.DB.prepare(`SELECT s.id, s.pss_reference, s.order_id, s.tracking_number, s.lr_number, s.master_awb, s.provider_reference, s.origin_address_json, s.origin, s.total_weight_kg, s.pieces, s.created_at FROM shipments s WHERE ${conditions.join(" AND ")} ORDER BY s.created_at ASC LIMIT 200`).bind(...binds).all<Record<string, unknown>>();
+        return json({ ok: true, data: rows.results.map((row) => { let origin: Record<string, unknown> = {}; try { origin = JSON.parse(String(row.origin_address_json ?? "{}")) as Record<string, unknown>; } catch { origin = {}; } return { ...row, origin_address: origin, awb: row.master_awb ?? row.tracking_number ?? row.provider_reference ?? row.lr_number ?? null }; }) }, 200, headers);
       }
 
       if (route === "/pickups" && request.method === "POST") {
@@ -3799,16 +3795,17 @@ const worker = {
         if (payload.shipment_id !== undefined && !shipment) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
         if (shipment?.provider && shipment.provider !== provider) return error("VALIDATION_ERROR", "The pickup courier must match the shipment courier", 409, id, headers);
         const pickupAwbNumbers = normalizePickupAwbNumbers(payload.awb_number ?? payload.master_awb);
-        if (provider === "delhivery" && !payload.shipment_id && !pickupAwbNumbers.length) return error("VALIDATION_ERROR", "At least one Delhivery AWB is required for a standalone pickup", 400, id, headers);
+        const isManifestSelection = payload.selection_mode === "manifested" || Array.isArray(payload.shipment_ids) === true;
+        if (provider === "delhivery" && !payload.shipment_id && !isManifestSelection && !pickupAwbNumbers.length) return error("VALIDATION_ERROR", "At least one Delhivery AWB is required for a standalone pickup", 400, id, headers);
         const providerAccountId = typeof payload.provider_account_id === "string" && payload.provider_account_id.trim() ? payload.provider_account_id.trim() : shipment?.provider_account_id ?? null;
         if (!providerAccountId) return error("VALIDATION_ERROR", "Select an active courier account before scheduling the pickup", 400, id, headers);
         const providerAccount = await env.DB.prepare(`SELECT pa.id FROM provider_accounts pa LEFT JOIN provider_account_client_policies p ON p.provider_account_id = pa.id AND p.client_id = ? WHERE pa.id = ? AND pa.provider = ? AND pa.status = 'active' AND (pa.client_id = ? OR (p.client_id = ? AND p.enabled = 1)) LIMIT 1`).bind(clientId, providerAccountId, provider, clientId, clientId).first<{ id: string }>();
         if (!providerAccount) return error("PROVIDER_ACCOUNT_UNAVAILABLE", "The selected courier account is not active for this client", 409, id, headers);
         const piecesValue = Number(payload.pieces);
-        if (!Number.isInteger(piecesValue) || piecesValue < 1) return error("VALIDATION_ERROR", "Pickup pieces must be a positive whole number", 400, id, headers);
+        if (!isManifestSelection && (!Number.isInteger(piecesValue) || piecesValue < 1)) return error("VALIDATION_ERROR", "Pickup pieces must be a positive whole number", 400, id, headers);
         const pieces = piecesValue;
         const totalWeight = Number(payload.weight ?? payload.total_weight_kg);
-        if (!Number.isFinite(totalWeight) || totalWeight <= 0) return error("VALIDATION_ERROR", "Total pickup weight must be greater than zero", 400, id, headers);
+        if (!isManifestSelection && (!Number.isFinite(totalWeight) || totalWeight <= 0)) return error("VALIDATION_ERROR", "Total pickup weight must be greater than zero", 400, id, headers);
         const warehouseId = typeof payload.warehouse_id === "string" && payload.warehouse_id.trim() ? payload.warehouse_id.trim() : null;
         if (warehouseId) {
           const savedWarehouse = await env.DB.prepare("SELECT id FROM warehouses WHERE id = ? AND client_id = ? LIMIT 1").bind(warehouseId, clientId).first<{ id: string }>();
@@ -3819,6 +3816,50 @@ const worker = {
          if (payload.provider_managed === true && !shipment) return error("VALIDATION_ERROR", "Provider-managed pickup requests must be linked to a shipment", 400, id, headers);
         const key = request.headers.get("Idempotency-Key"); if (!key) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
         const existing = await idempotentResponse(env, key, clientId, "POST /v1/pickups", requestHash); if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
+        const manifestShipmentIds = payload.selection_mode === "manifested" || Array.isArray(payload.shipment_ids)
+          ? Array.from(new Set((Array.isArray(payload.shipment_ids) ? payload.shipment_ids : []).filter((value): value is string => typeof value === "string" && Boolean(value.trim())).map((value) => value.trim())))
+          : [];
+        if (payload.selection_mode === "manifested" && !manifestShipmentIds.length) return error("VALIDATION_ERROR", "Select at least one manifested shipment for this pickup", 400, id, headers);
+        if (manifestShipmentIds.length > 100) return error("VALIDATION_ERROR", "A pickup request can include at most 100 shipments", 400, id, headers);
+        if (manifestShipmentIds.length) {
+          const placeholders = manifestShipmentIds.map(() => "?").join(",");
+          const selectedRows = await env.DB.prepare(`SELECT id, provider, provider_account_id, status, tracking_number, lr_number, master_awb, provider_reference, origin_address_json, total_weight_kg, pieces FROM shipments WHERE client_id = ? AND id IN (${placeholders})`).bind(clientId, ...manifestShipmentIds).all<Record<string, unknown>>();
+          if (selectedRows.results.length !== manifestShipmentIds.length) return error("NOT_FOUND", "One or more selected shipments do not belong to this client", 404, id, headers);
+          if (selectedRows.results.some((row) => row.status !== "booked")) return error("SHIPMENT_NOT_READY", "Only booked shipments that are not already on an active pickup can be selected", 409, id, headers);
+          if (selectedRows.results.some((row) => String(row.provider ?? "") !== provider || String(row.provider_account_id ?? "") !== providerAccountId)) return error("VALIDATION_ERROR", "All selected shipments must use the selected courier account", 409, id, headers);
+          const normalizedPickupAddress = String(pickupAddressInput).toLowerCase().replace(/[^a-z0-9]/g, "");
+          const mismatchedLocation = selectedRows.results.some((row) => { try { const origin = JSON.parse(String(row.origin_address_json ?? "{}")) as Record<string, unknown>; const originLine = String(origin.line ?? origin.address_line1 ?? origin.address ?? "").toLowerCase().replace(/[^a-z0-9]/g, ""); return !originLine || !normalizedPickupAddress.includes(originLine) || String(origin.pincode ?? "").trim() !== String(payload.pincode).trim() || String(origin.city ?? "").trim().toLowerCase() !== String(payload.city).trim().toLowerCase() || String(origin.state ?? "").trim().toLowerCase() !== String(payload.state).trim().toLowerCase(); } catch { return true; } });
+          if (mismatchedLocation) return error("PICKUP_LOCATION_MISMATCH", "Selected shipments must come from the pickup location and PIN code shown in this request", 409, id, headers);
+          const active = await env.DB.prepare(`SELECT prs.shipment_id FROM pickup_request_shipments prs JOIN pickup_requests pr ON pr.id = prs.pickup_id WHERE prs.client_id = ? AND prs.shipment_id IN (${placeholders}) AND pr.status NOT IN ('cancelled', 'completed', 'failed') LIMIT 1`).bind(clientId, ...manifestShipmentIds).first<{ shipment_id: string }>();
+          if (active) return error("SHIPMENT_ALREADY_ASSIGNED", "One or more selected shipments already belong to an active pickup request", 409, id, headers);
+          const awbs = Array.from(new Set(selectedRows.results.flatMap((row) => normalizePickupAwbNumbers(row.master_awb ?? row.tracking_number ?? row.provider_reference ?? row.lr_number))));
+          if (provider === "delhivery" && !awbs.length) return error("PROVIDER_REFERENCE_UNAVAILABLE", "Selected shipments do not have a Delhivery AWB yet", 409, id, headers);
+          const selectedPieces = selectedRows.results.reduce((sum, row) => sum + Math.max(1, Number(row.pieces ?? 1)), 0);
+          const selectedWeight = selectedRows.results.reduce((sum, row) => sum + Math.max(0, Number(row.total_weight_kg ?? 0)), 0);
+          const pickupId = crypto.randomUUID();
+          await env.DB.prepare("INSERT INTO pickup_requests (id, shipment_id, client_id, created_by_user_id, requested_date, requested_time_slot, pickup_address, contact_name, contact_phone, contact_email, city, state, pincode, country, pieces, total_weight_kg, status, provider, provider_account_id, warehouse_id, provider_status, provider_slot_id, provider_awb_numbers_json, idempotency_key, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?, ?, ?, 'pending', ?, ?, ?, ?)").bind(pickupId, manifestShipmentIds[0], clientId, auth.userId ?? `api:${clientId}`, normalizedScheduledDate, String(requestedWindowInput), String(pickupAddressInput).trim(), String(payload.contact_name).trim(), normalizedContactPhone, typeof payload.contact_email === "string" ? payload.contact_email.trim() : null, String(payload.city).trim(), String(payload.state).trim(), payload.pincode.trim(), String(payload.country).trim(), selectedPieces, selectedWeight, provider, providerAccountId, warehouseId, typeof payload.provider_slot_id === "string" ? payload.provider_slot_id.trim() : null, JSON.stringify(awbs), key, typeof payload.notes === "string" ? payload.notes.trim().slice(0, 2000) : "Manifested shipments pickup").run();
+          for (const shipmentId of manifestShipmentIds) await env.DB.prepare("INSERT INTO pickup_request_shipments (pickup_id, shipment_id, client_id) VALUES (?, ?, ?)").bind(pickupId, shipmentId, clientId).run();
+          const providerResult = await safeProviderRequest(env, provider, "pickups", { ...providerPayload, pickup_id: pickupId, shipment_ids: manifestShipmentIds, awb_number: awbs, pieces: selectedPieces, weight: selectedWeight, provider_managed: true }, id, clientId, key);
+          const providerReference = (providerResult as { providerReference?: string | null }).providerReference ?? null;
+          const providerStatus = (providerResult as { providerStatus?: string | number | null }).providerStatus ?? providerResult.status;
+          const providerErrorMessage = (providerResult as { error?: string; reason?: string }).error ?? (providerResult as { reason?: string }).reason ?? null;
+          await recordPickupAttempt(env, { pickupId, clientId, provider, providerAccountId, requestId: id, idempotencyKey: key, requestedDate: normalizedScheduledDate, requestedWindow: String(requestedWindowInput), status: providerResult.status, providerStatus, providerReference, providerErrorCode: providerResult.status === "accepted" ? null : providerResult.status, errorMessage: providerErrorMessage }).catch(() => undefined);
+          if (providerResult.status !== "accepted") {
+            const failureReason = String(providerErrorMessage ?? `The ${provider} pickup was not accepted`).slice(0, 500);
+            await env.DB.prepare("UPDATE pickup_requests SET status = 'failed', provider_status = ?, provider_request_id = ?, provider_error_code = ?, failure_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(String(providerStatus), id, String(providerResult.status), failureReason, pickupId, clientId).run();
+            const failedResponse = JSON.stringify({ ok: false, error: { code: "PROVIDER_REQUEST_FAILED", category: "provider", message: failureReason, user_safe_message: `The ${provider} pickup was not accepted.`, technical_message: failureReason, request_id: id, retryable: true }, data: { id: pickupId, status: "failed" }, request_id: id });
+            await saveIdempotent(env, key, clientId, "POST /v1/pickups", 502, failedResponse, requestHash);
+            return new Response(failedResponse, { status: 502, headers: { ...headers, "content-type": "application/json" } });
+          }
+          const pickupStatus = (providerResult as { providerPending?: boolean }).providerPending ? "provider_pending" : "scheduled";
+          const acceptedDate = (providerResult as { acceptedDate?: string | null }).acceptedDate ?? normalizedScheduledDate;
+          const acceptedWindow = (providerResult as { acceptedWindow?: string | null }).acceptedWindow ?? String(requestedWindowInput);
+          await env.DB.prepare("UPDATE pickup_requests SET status = ?, provider_status = ?, provider_request_id = ?, provider_reference = COALESCE(?, provider_reference), requested_date = ?, requested_time_slot = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(pickupStatus, String(providerStatus), id, providerReference, acceptedDate, acceptedWindow, pickupId, clientId).run();
+          if (providerReference) await env.DB.prepare(`UPDATE shipments SET provider_pickup_id = ?, updated_at = CURRENT_TIMESTAMP WHERE client_id = ? AND id IN (${placeholders})`).bind(providerReference, clientId, ...manifestShipmentIds).run();
+          const serialized = JSON.stringify({ ok: true, data: { id: pickupId, client_id: clientId, status: pickupStatus, provider, provider_account_id: providerAccountId, provider_reference: providerReference, shipment_ids: manifestShipmentIds, shipment_count: manifestShipmentIds.length, requested_date: acceptedDate, requested_time_slot: acceptedWindow }, request_id: id });
+          await saveIdempotent(env, key, clientId, "POST /v1/pickups", 201, serialized, requestHash); await audit(env, ctx, auth, id, "pickup.created", "pickup", pickupId, { client_id: clientId, provider, shipment_count: manifestShipmentIds.length });
+          return new Response(serialized, { status: 201, headers: { ...headers, "content-type": "application/json" } });
+        }
         if (payload.provider_managed === true && typeof payload.shipment_id === "string" && shipment) {
           const grouped = await ensureManifestPickupGroup(env, { shipmentId: payload.shipment_id, clientId, provider, providerAccountId, warehouseId, payload: providerPayload, requestId: id, idempotencyKey: key });
           const groupedResponse = JSON.stringify({ ok: grouped.ok, data: { id: grouped.id, client_id: clientId, status: grouped.status, provider, provider_account_id: providerAccountId, provider_reference: grouped.providerReference ?? null, grouped: grouped.grouped ?? false }, ...(grouped.ok ? {} : { error: { code: "PROVIDER_REQUEST_FAILED", category: "provider", message: grouped.error, user_safe_message: `The ${provider} pickup was not accepted. Retry it after correcting the provider issue.`, technical_message: grouped.error, provider_code: "PROVIDER_REQUEST_FAILED", request_id: id, retryable: true, stale_data: false } }), request_id: id });
