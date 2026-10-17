@@ -1473,6 +1473,11 @@ function findProviderReference(value: unknown, keys: Set<string>, depth = 0): st
   return null;
 }
 
+function validDelhiveryPickupReference(value: unknown) {
+  const reference = String(value ?? "").trim();
+  return /^\d{6,20}$/.test(reference) ? reference : null;
+}
+
 function findProviderUrl(value: unknown, depth = 0): string | null {
   if (depth > 8 || value === null || value === undefined) return null;
   if (typeof value === "string") return /^https?:\/\//i.test(value.trim()) ? value.trim() : null;
@@ -2381,8 +2386,10 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     return { enabled: true, status: "accepted" as const, providerStatus: response.status, artifact };
   }
   if (response.ok && provider === "delhivery" && operation === "pickups" && typeof payload.pickup_id === "string") {
-    const rawPickupReference = findProviderReference(parsedProviderBody, new Set(["pickup_id", "pickup_request_id", "pur_id", "pur", "pur_number", "pickup_request", "pickup_request_no"]));
-    const pickupReference = rawPickupReference && /^\d+$/.test(rawPickupReference) ? rawPickupReference : null;
+    const rawPickupReference = findProviderReference(parsedProviderBody, new Set(["pickup_id", "pickup_request_id", "pickup_request_number", "pickup_request_no", "pickupRequestId", "pickupRequestNumber", "pur_id", "pur", "pur_number", "pickup_request"]));
+    const pickupReference = validDelhiveryPickupReference(rawPickupReference)
+      ?? responseBody.match(/(?:pickup(?:[_ ]request)?(?:[_ ](?:id|number|no))?|pur(?:[_ ]?(?:id|number|no))?)[^0-9]{0,16}(\d{6,20})/i)?.[1]
+      ?? null;
     if (pickupReference) await env.DB.prepare("UPDATE pickup_requests SET provider = 'delhivery', provider_reference = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(pickupReference, payload.pickup_id, clientId ?? "").run();
     const providerState = findProviderReference(parsedProviderBody, new Set(["status", "provider_status", "state", "pickup_status"]));
     const providerSlotId = findProviderReference(parsedProviderBody, new Set(["slot_id", "pickup_slot_id", "provider_slot_id", "slot", "time_slot_id"]));
