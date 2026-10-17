@@ -18,6 +18,7 @@ const checks = [
   ["Delhivery pickup selection uses request windows when availability is not published", source.includes("delhiveryRequestedPickupSlots") && source.includes("request_windows") && source.includes("does not publish a first-mile slot-availability route")],
   ["structured provider date and slot responses are preserved", source.includes("row.slots") && source.includes("hasEmbeddedSlots")],
   ["Delhivery pickup creation uses the documented B2B pickup endpoint", source.includes("/pickup_requests/") && source.includes("client_warehouse") && source.includes("expected_package_count")],
+  ["Delhivery pickup windows preserve AM/PM start times", source.includes("normalizePickupStartTime") && source.includes("AM|PM") && source.includes("start_time: startTime")],
   ["B2B pickup booking does not depend on internal facility lookup", source.includes("operation === \"pickup_slots\"") && source.includes("client_warehouse")],
   ["provider warehouse reuse is tracked", source.includes("provider_status = 'active'") && source.includes("reused: true") && migration.includes("provider_status")],
   ["migration carries canonical fields", ["provider_account_id", "warehouse_id", "provider_slot_id", "idempotency_key"].every((field) => migration.includes(field))],

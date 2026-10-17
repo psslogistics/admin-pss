@@ -1410,15 +1410,29 @@ function normalizePickupAwbNumbers(value: unknown) {
   return text ? text.split(/[\s,]+/).map((item) => item.trim()).filter(Boolean) : [];
 }
 
+function normalizePickupStartTime(value: string) {
+  const match = value.match(/\b(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?\b/i);
+  if (!match) return null;
+  let hour = Number(match[1]);
+  const minute = Number(match[2]);
+  const second = Number(match[3] ?? 0);
+  const meridiem = match[4]?.toUpperCase();
+  if (hour > 23 || minute > 59 || second > 59) return null;
+  if (meridiem) {
+    if (hour < 1 || hour > 12) return null;
+    if (meridiem === "AM" && hour === 12) hour = 0;
+    if (meridiem === "PM" && hour !== 12) hour += 12;
+  }
+  return [hour, minute, second].map((part) => String(part).padStart(2, "0")).join(":");
+}
+
 function delhiveryPickupPayload(env: Env, payload: Record<string, unknown>, useDelhiveryB2b = false) {
   const pickupLocation = String(payload.delhivery_pickup_location ?? payload.pickup_location ?? env.DELHIVERY_DEFAULT_PICKUP_LOCATION ?? "").trim();
   const pickupDate = String(payload.scheduled_date ?? payload.pickup_date ?? "").trim();
   const rawWindow = String(payload.window ?? payload.pickup_time ?? "").trim();
-  const times = rawWindow.match(/\b\d{1,2}:\d{2}(?::\d{2})?\b/g) ?? [];
-  const normalizeTime = (value: string | undefined) => (value ?? "").split(":").map((part) => part.padStart(2, "0")).slice(0, 3).concat(["00", "00"]).slice(0, 3).join(":");
+  const startTime = normalizePickupStartTime(rawWindow);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(pickupDate)) return null;
   if (useDelhiveryB2b) {
-    const startTime = normalizeTime(times[0]);
     if (!pickupLocation || !startTime) return null;
     return {
       client_warehouse: pickupLocation,
@@ -1428,7 +1442,7 @@ function delhiveryPickupPayload(env: Env, payload: Record<string, unknown>, useD
     };
   }
   if (!pickupLocation) return null;
-  return { pickup_time: normalizeTime(times[0]), pickup_date: pickupDate, pickup_location: pickupLocation, expected_package_count: Math.max(1, Number(payload.expected_package_count ?? payload.package_count ?? 1)) };
+  return { pickup_time: startTime ?? "00:00:00", pickup_date: pickupDate, pickup_location: pickupLocation, expected_package_count: Math.max(1, Number(payload.expected_package_count ?? payload.package_count ?? 1)) };
 }
 
 function providerSafePickupDate(dateValue: string) {
