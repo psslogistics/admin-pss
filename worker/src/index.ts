@@ -343,6 +343,10 @@ function stableSerialize(value: unknown): string {
   return `{${Object.keys(value as Record<string, unknown>).sort().map((key) => `${JSON.stringify(key)}:${stableSerialize((value as Record<string, unknown>)[key])}`).join(",")}}`;
 }
 async function payloadFingerprint(payload: unknown) { return `sha256:${await sha256(stableSerialize(payload))}`; }
+
+function normalizeWarehouseIdentityPart(value: unknown) {
+  return String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+}
 async function idempotentResponse(env: Env, key: string | null, clientId: string, endpoint: string, requestHash?: string) {
   if (!key || key.length > 128) return null;
   const existing = await env.DB.prepare("SELECT response_status, response_body, request_hash FROM idempotency_keys WHERE idempotency_key = ? AND client_id = ? AND endpoint = ? AND expires_at > CURRENT_TIMESTAMP").bind(key, clientId, endpoint).first<{ response_status: number; response_body: string; request_hash: string | null }>();
@@ -4206,6 +4210,22 @@ const worker = {
         "/cod-remittances": { table: "cod_remittances", scope: "cod.read", order: "created_at DESC" },
         "/weight-reconciliation": { table: "weight_reconciliations", scope: "weight.read", order: "updated_at DESC" },
       };
+      if (route === "/warehouses" && request.method === "GET") {
+        if (!hasScope(auth, "addresses.manage")) return error("FORBIDDEN", "Permission required", 403, id, headers);
+        const rows = auth.system
+          ? await env.DB.prepare("SELECT * FROM warehouses ORDER BY updated_at DESC").all<Record<string, unknown>>()
+          : auth.clientIds.size
+            ? await env.DB.prepare(`SELECT * FROM warehouses WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY updated_at DESC`).bind(...auth.clientIds).all<Record<string, unknown>>()
+            : { results: [] as Record<string, unknown>[] };
+        const seen = new Set<string>();
+        const data = rows.results.filter((row) => {
+          const identity = ["client_id", "provider_account_id", "name", "address", "city", "state", "pincode", "contact", "contact_name"].map((field) => normalizeWarehouseIdentityPart(row[field])).join("|");
+          if (seen.has(identity)) return false;
+          seen.add(identity);
+          return true;
+        });
+        return json({ ok: true, data }, 200, headers);
+      }
       if (route === "/billing" && request.method === "GET") {
         if (!hasScope(auth, "billing.read")) return error("FORBIDDEN", "Permission required", 403, id, headers);
         const shipmentColumns = "s.pss_reference AS shipment_pss_reference, s.tracking_number, s.lr_number, s.master_awb, s.origin AS shipment_origin, s.destination AS shipment_destination, s.origin_address_json AS shipment_origin_address_json, s.destination_address_json AS shipment_destination_address_json, s.consignee AS shipment_consignee, s.description AS shipment_description, s.total_weight_kg, s.declared_value, s.pieces, s.edd, s.dimensions_json, s.created_at AS shipment_created_at";
@@ -4277,6 +4297,12 @@ const worker = {
           if (providerAccountId) {
             const account = await env.DB.prepare("SELECT pa.id FROM provider_accounts pa LEFT JOIN provider_account_client_policies p ON p.provider_account_id = pa.id AND p.client_id = ? WHERE pa.id = ? AND pa.provider = 'delhivery' AND pa.status = 'active' AND (pa.client_id = ? OR (pa.client_id IS NULL AND p.client_id = ? AND p.enabled = 1)) LIMIT 1").bind(clientId, providerAccountId, clientId, clientId).first<{ id: string }>();
             if (!account) return error("PROVIDER_ACCOUNT_NOT_ALLOWED", "The selected Delhivery account is not enabled for this client", 403, id, headers);
+          }
+          const duplicate = await env.DB.prepare("SELECT id, client_id, provider, provider_account_id, provider_status, provider_error FROM warehouses WHERE client_id = ? AND lower(trim(COALESCE(provider_account_id, ''))) = lower(trim(COALESCE(?, ''))) AND lower(trim(name)) = lower(trim(?)) AND lower(trim(address)) = lower(trim(?)) AND lower(trim(COALESCE(city, ''))) = lower(trim(COALESCE(?, ''))) AND lower(trim(COALESCE(state, ''))) = lower(trim(COALESCE(?, ''))) AND lower(trim(COALESCE(pincode, ''))) = lower(trim(COALESCE(?, ''))) AND lower(trim(COALESCE(contact, ''))) = lower(trim(COALESCE(?, ''))) AND lower(trim(COALESCE(contact_name, ''))) = lower(trim(COALESCE(?, ''))) ORDER BY updated_at DESC LIMIT 1").bind(clientId, providerAccountId, payload.name, payload.address, String(payload.city ?? ""), String(payload.state ?? ""), String(payload.pincode ?? ""), String(payload.contact ?? ""), String(payload.contact_name ?? "")).first<{ id: string; client_id: string; provider: string | null; provider_account_id: string | null; provider_status: string | null; provider_error: string | null }>();
+          if (duplicate) {
+            const serialized = JSON.stringify({ ok: true, data: duplicate, deduplicated: true, request_id: id });
+            await saveIdempotent(env, key, clientId, endpoint, 200, serialized, requestHash);
+            return new Response(serialized, { status: 200, headers: { ...headers, "content-type": "application/json" } });
           }
           await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'pending')").bind(recordId, clientId, payload.name, payload.address, String(payload.city ?? ""), String(payload.state ?? ""), String(payload.pincode ?? ""), String(payload.contact ?? ""), String(payload.contact_name ?? ""), providerAccountId).run();
           const context = await delhiveryWarehouseProviderContext(env, clientId, providerAccountId, id, 30000);

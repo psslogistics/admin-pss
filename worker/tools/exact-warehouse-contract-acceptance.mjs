@@ -25,6 +25,8 @@ const required = [
   ["registration is used without facility lookup", "Facility lookup is intentionally reserved for pickup-slot operations."],
   ["registration retry remains scheduled", "provider_booking_payload_json"],
   ["activation retry is scheduled", "retryPendingDelhiveryBookings"],
+  ["warehouse reads collapse duplicate identities", "normalizeWarehouseIdentityPart"],
+  ["warehouse creation reuses an exact existing location", "deduplicated: true"],
 ];
 
 for (const [label, needle] of required) {
