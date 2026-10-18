@@ -2761,9 +2761,10 @@ async function handleRivigoWebhook(request: Request, env: Env, requestIdValue: s
 
 function delhiveryWebhookDetails(payload: Record<string, unknown>) {
   const shipment = payload.Shipment && typeof payload.Shipment === "object" ? payload.Shipment as Record<string, unknown> : payload.shipment && typeof payload.shipment === "object" ? payload.shipment as Record<string, unknown> : payload;
+  const pickupDetails = payload.Pickup && typeof payload.Pickup === "object" ? payload.Pickup as Record<string, unknown> : payload.pickup && typeof payload.pickup === "object" ? payload.pickup as Record<string, unknown> : {};
   const statusObject = shipment.Status && typeof shipment.Status === "object" ? shipment.Status as Record<string, unknown> : shipment.status && typeof shipment.status === "object" ? shipment.status as Record<string, unknown> : {};
   const rawStatus = typeof shipment.Status === "string" ? shipment.Status : statusObject.Status ?? statusObject.status ?? shipment.status ?? payload.status ?? payload.event_type;
-  const reference = String(shipment.AWB ?? shipment.awb ?? shipment.waybill ?? shipment.Waybill ?? shipment.ReferenceNo ?? shipment.reference_no ?? payload.awb ?? payload.waybill ?? payload.tracking_number ?? payload.provider_reference ?? payload.shipment_id ?? "").trim();
+  const reference = String(shipment.AWB ?? shipment.awb ?? shipment.waybill ?? shipment.Waybill ?? shipment.ReferenceNo ?? shipment.reference_no ?? pickupDetails.PickupId ?? pickupDetails.pickup_id ?? pickupDetails.PickupID ?? pickupDetails.pickupId ?? pickupDetails.PUR ?? pickupDetails.pur ?? pickupDetails.reference ?? payload.PickupId ?? payload.pickup_id ?? payload.PickupID ?? payload.pickupId ?? payload.PUR ?? payload.pur ?? payload.pickup_reference ?? payload.pickupReference ?? payload.awb ?? payload.waybill ?? payload.tracking_number ?? payload.provider_reference ?? payload.shipment_id ?? "").trim();
   const dateCandidate = findProviderReference(payload, new Set(["pickup_date", "pickupDate", "scheduled_date", "scheduledDate", "pickup_scheduled_date"]));
   const dateMatch = dateCandidate?.match(/(\d{4}-\d{2}-\d{2})/);
   const requestedDate = dateMatch && validPickupDate(dateMatch[1]) ? dateMatch[1] : null;
