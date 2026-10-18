@@ -3734,7 +3734,6 @@ const worker = {
         const shipment = await env.DB.prepare(`SELECT id, pss_reference, client_id, tracking_number, lr_number, master_awb, box_awbs_json, provider_booking_id, provider_pickup_id, provider_sync_status, status, provider, ${sensitiveShipmentView ? "provider_account_id, provider_reference," : "provider_reference,"} (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = shipments.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, (SELECT pr.status FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_status, (SELECT pr.requested_date FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_scheduled_date, (SELECT pr.requested_time_slot FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_time_slot, (SELECT c.provider_status FROM pricing_provider_costs c WHERE c.shipment_id = shipments.id LIMIT 1) AS provider_confirmation_status, description, origin, destination, ${sensitiveShipmentView ? "origin_address_json, destination_address_json, consignee, declared_value," : "NULL AS origin_address_json, NULL AS destination_address_json, NULL AS consignee, NULL AS declared_value,"} total_weight_kg, pieces, edd, delivered_at, created_at, updated_at FROM shipments WHERE (id = ? OR pss_reference = ?) LIMIT 1`).bind(shipmentGet[1], shipmentGet[1]).first<Record<string, unknown> & { client_id: string; provider: string | null; tracking_number: string | null; provider_reference?: string | null }>();
         if (!shipment || !canAccessClient(auth, shipment.client_id)) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
         if (route.endsWith("/tracking")) {
-          const events = await env.DB.prepare("SELECT * FROM tracking_events WHERE shipment_id = ? ORDER BY event_time ASC").bind(String(shipment.id)).all();
           const provider = ["delhivery", "ekart", "trackon", "xpressbees", "rivigo"].includes(String(shipment.provider)) ? shipment.provider as CourierProvider : null;
           // Client-facing shipment reads intentionally omit provider_account_id from
           // the response, but the provider lookup must still use the shipment's
@@ -3754,6 +3753,10 @@ const worker = {
             }, id, shipment.client_id);
           }
           const providerResult = provider ? await safeProviderRequest(env, provider, "tracking", { shipment_id: String(shipment.id), tracking_number: shipment.tracking_number, lr_number: shipment.lr_number, provider_reference: shipment.provider_reference, provider_account_id: providerAccountId }, id, shipment.client_id) : { enabled: false, status: "not_requested" as const };
+          // safeProviderRequest persists a new normalized event before returning.
+          // Read the timeline after that provider call so the Client receives the
+          // picked-up/in-transit event in the same response.
+          const events = await env.DB.prepare("SELECT * FROM tracking_events WHERE shipment_id = ? ORDER BY event_time ASC").bind(String(shipment.id)).all();
           return json({ ok: true, data: events.results, provider_status: providerResult.status }, 200, headers);
         }
         const clientName = auth.accessToken
@@ -4922,6 +4925,22 @@ const worker = {
             );
             continue;
           }
+          // Use the managed Delhivery B2B dataset as the stable coverage
+          // baseline. A provider probe can intermittently return an empty or
+          // incomplete response for a route that is in the approved dataset.
+          if (account.provider === "delhivery") {
+            const [datasetOrigin, datasetDestination] = await Promise.all([pricingPincode(env, origin), pricingPincode(env, destination)]);
+            if (datasetOrigin && datasetDestination) {
+              const datasetOriginRecord = { status: "accepted", pickup: true, serviceable: true, source: "delhivery_b2b_pincode_dataset" };
+              const datasetDestinationRecord = { status: "accepted", serviceable: true, source: "delhivery_b2b_pincode_dataset" };
+              serviceabilityRows.push(
+                { pincode: origin, provider: label, status: "Available", oda: Boolean(datasetOrigin.oda), account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), source: "Delhivery pincode dataset" },
+                { pincode: destination, provider: label, status: "Available", oda: Boolean(datasetDestination.oda), account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), source: "Delhivery pincode dataset" },
+              );
+              routeResults.push({ provider: account.provider, accountId: account.id, accountName: account.account_name, confidenceScore: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), origin: datasetOriginRecord, destination: datasetDestinationRecord, routeServiceable: true });
+              continue;
+            }
+          }
           try {
             const [originResult, destinationResult] = account.provider === "delhivery"
               ? await Promise.all([
@@ -4981,6 +5000,9 @@ const worker = {
         const acceptedResult = routeResults.some((result) => result.origin.status === "accepted" && result.destination.status === "accepted");
         const failedResult = serviceabilityRows.some((row) => row.status === "Provider error" || row.status === "Not configured");
         const providerStatus = routeServiceable || acceptedResult ? "verified" : failedResult ? "provider_error" : configuredProviders.length ? "provider_contract_not_verified" : "provider_unavailable";
+        const availabilityStatus = routeServiceable
+          ? serviceabilityRows.some((row) => row.source === "Delhivery pincode dataset") ? "dataset_verified" : "serviceable"
+          : failedResult ? "provider_error" : acceptedResult ? "not_serviceable" : "provider_unavailable";
         return json({ ok: true, data: {
           client_id: serviceabilityClientId,
           origin_pincode: origin,
@@ -4990,6 +5012,7 @@ const worker = {
           configured_providers: configuredProviders,
           assigned_accounts: accountRows.map((account) => ({ id: account.id, provider: account.provider, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100) })),
           status: providerStatus,
+          availability_status: availabilityStatus,
           serviceability_rows: serviceabilityRows,
           provider_results: routeResults,
         } }, 200, headers);
