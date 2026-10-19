@@ -2196,7 +2196,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
        : provider === "delhivery" && operation === "pickup_slots"
          ? `${base.replace(/\/$/, "")}/web/api/forward_orders/pickup_slots/${encodeURIComponent(String(delhiveryFacility?.code ?? ""))}?facility_id=${encodeURIComponent(String(delhiveryFacility?.id ?? ""))}`
         : provider === "delhivery" && operation === "serviceability"
-          ? `${base.replace(/\/$/, "")}/pincode-service/${encodeURIComponent(String(payload.destination_pincode ?? ""))}?weight=1`
+          ? `${base.replace(/\/$/, "")}/pincode-service/${encodeURIComponent(String(payload.destination_pincode ?? ""))}?weight=${encodeURIComponent(String(Math.max(20000, Number(payload.weight_grams ?? payload.weight ?? 0) || 0)))}`
     : provider === "ekart"
       ? `${base.replace(/\/$/, "")}/v2/shipments/${operation === "shipments" ? "create" : "track"}`
       : provider === "xpressbees" && operation === "tracking"
