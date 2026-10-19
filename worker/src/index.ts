@@ -1,5 +1,6 @@
 import { calculatePssRate, defaultRateRows, type ChargeRule, type PricingAccount } from "./pricing-engine";
 import { canonicalDelhiveryWarehouseName, delhiveryFacilityMatches } from "./warehouse-identity";
+import { evaluateDelhiveryServiceability, serviceabilityCacheKey } from "./serviceability";
 
 type DelhiveryTokenCache = {
   get<T>(key: string, type: "json"): Promise<T | null>;
@@ -2679,8 +2680,8 @@ async function safeProviderRequest(env: Env, provider: CourierProvider, operatio
   }
 }
 
-async function verifyDelhiveryServiceability(env: Env, originPincode: string, destinationPincode: string, providerAccountId: string, requestIdValue: string, clientId: string): Promise<DelhiveryServiceabilityResult> {
-  const cacheKey = `${providerAccountId}|${originPincode}|${destinationPincode}`;
+async function verifyDelhiveryServiceability(env: Env, originPincode: string, destinationPincode: string, providerAccountId: string, requestIdValue: string, clientId: string, paymentMode?: string): Promise<DelhiveryServiceabilityResult> {
+  const cacheKey = serviceabilityCacheKey(providerAccountId, originPincode, destinationPincode, paymentMode);
   const cached = delhiveryServiceabilityCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return { ...cached.result, provenance: "cached_provider" };
   const [originResult, destinationResult] = await Promise.all([
@@ -2689,15 +2690,13 @@ async function verifyDelhiveryServiceability(env: Env, originPincode: string, de
   ]);
   const origin = originResult as Record<string, unknown>;
   const destination = destinationResult as Record<string, unknown>;
-  const originAccepted = origin.status === "accepted" && origin.serviceable === true && origin.pickup === true;
-  const destinationAccepted = destination.status === "accepted" && destination.serviceable === true;
-  const providerUnavailable = [origin, destination].some((result) => result.status === "failed" || result.status === "provider_unavailable" || result.status === "not_configured" || Number(result.providerStatus ?? 0) === 0);
+  const decision = evaluateDelhiveryServiceability(origin, destination, paymentMode);
   const result: DelhiveryServiceabilityResult = {
-    ok: originAccepted && destinationAccepted,
-    provenance: providerUnavailable ? "provider_unavailable" : "live_provider",
+    ok: decision.ok,
+    provenance: decision.providerUnavailable ? "provider_unavailable" : "live_provider",
     origin,
     destination,
-    reason: origin.status !== "accepted" ? String(origin.error ?? origin.reason ?? "Delhivery could not verify the pickup pincode") : !originAccepted ? "The pickup pincode is not pickup-serviceable by Delhivery" : destination.status !== "accepted" ? String(destination.error ?? destination.reason ?? "Delhivery could not verify the delivery pincode") : !destinationAccepted ? "The delivery pincode is not serviceable by Delhivery" : undefined,
+    reason: decision.reason,
   };
   if (result.ok) delhiveryServiceabilityCache.set(cacheKey, { expiresAt: Date.now() + DELHIVERY_SERVICEABILITY_CACHE_TTL_MS, result });
   return result;
@@ -3624,6 +3623,7 @@ const worker = {
         const originAddress = shipmentAddress(payload.origin_address);
         const providerAccountId = typeof payload.provider_account_id === "string" ? payload.provider_account_id.trim() : "";
         const warehouseId = typeof payload.warehouse_id === "string" ? payload.warehouse_id.trim() : "";
+        const paymentMode = String(payload.payment_mode ?? "prepaid").trim().toLowerCase() === "cod" ? "cod" : "prepaid";
         if (!originAddress || !providerAccountId) return error("VALIDATION_ERROR", "A complete pickup address and Delhivery account are required before confirmation", 400, id, headers);
         const endpoint = "POST /v1/shipments/preflight";
         const existing = await idempotentResponse(env, key, clientId, endpoint, requestHash);
@@ -3642,7 +3642,7 @@ const worker = {
           return new Response(failed, { status: 409, headers: { ...headers, "content-type": "application/json" } });
         }
         const destinationPincode = String((payload.destination_address as Record<string, unknown> | null)?.pincode ?? "").trim();
-        const serviceability = await verifyDelhiveryServiceability(env, originAddress.pincode, destinationPincode, providerAccountId, id, clientId);
+        const serviceability = await verifyDelhiveryServiceability(env, originAddress.pincode, destinationPincode, providerAccountId, id, clientId, paymentMode);
         if (!serviceability.ok) {
           const reason = serviceability.reason ?? "Delhivery serviceability could not be verified";
           const failed = JSON.stringify({ ok: false, error: { code: "PROVIDER_SERVICEABILITY_FAILED", category: "provider", message: reason, user_safe_message: "Delhivery cannot verify serviceability for this shipment yet. Check the pincodes before confirming.", technical_message: reason, request_id: id, retryable: true }, request_id: id });
@@ -4864,7 +4864,8 @@ const worker = {
         if (!Number.isFinite(actualWeightKg) || actualWeightKg <= 0 || !Number.isFinite(volumetricWeightKg) || volumetricWeightKg < 0 || !Number.isFinite(invoiceValue) || invoiceValue < 0) return error("VALIDATION_ERROR", "Valid weight and invoice values are required", 400, id, headers);
         const liveProviderAccountId = await resolveDelhiveryProviderAccountId(env, clientId, typeof payload.provider_account_id === "string" ? payload.provider_account_id : null);
         if (!liveProviderAccountId) return error("PROVIDER_ACCOUNT_REQUIRED", "An active Delhivery account is required for live serviceability verification", 409, id, headers);
-        const liveServiceability = await verifyDelhiveryServiceability(env, originPincode, destinationPincode, liveProviderAccountId, id, clientId);
+        const paymentMode = String(payload.payment_mode ?? "prepaid").trim().toLowerCase() === "cod" ? "cod" : "prepaid";
+        const liveServiceability = await verifyDelhiveryServiceability(env, originPincode, destinationPincode, liveProviderAccountId, id, clientId, paymentMode);
         if (!liveServiceability.ok) return error("PROVIDER_SERVICEABILITY_FAILED", liveServiceability.reason ?? "Delhivery could not verify this route", 409, id, headers, JSON.stringify({ provenance: liveServiceability.provenance, origin: liveServiceability.origin, destination: liveServiceability.destination }));
         const version = await env.DB.prepare("SELECT id, minimum_weight_kg, gst_percent FROM pricing_versions WHERE client_id = ? AND provider = 'delhivery' AND service_level = 'b2b' AND status = 'active' AND datetime(effective_at) <= CURRENT_TIMESTAMP ORDER BY datetime(effective_at) DESC LIMIT 1").bind(clientId).first<{ id: string; minimum_weight_kg: number; gst_percent: number }>();
         const activeVersion = version ?? await ensureDefaultClientPricing(env, clientId, auth.userId ?? `api:${clientId}`);
