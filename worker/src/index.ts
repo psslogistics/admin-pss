@@ -2509,11 +2509,18 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     const providerError = body.error && typeof body.error === "object" ? body.error as Record<string, unknown> : null;
     const providerErrorText = String(providerError?.message ?? providerError?.detail ?? providerError?.code ?? "").trim();
     if (body.success === false && providerErrorText && /pincode|pin\s*code|serviceab|not\s*(found|available|serviceable)|unserviceable/i.test(providerErrorText)) return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable: false, prepaid: false, cod: false, pickup: false, oda: null, reason: providerErrorText.slice(0, 300) };
-    const b2bRows = Array.isArray(body.data)
-      ? body.data
-      : Array.isArray(b2bData?.pincode_serviceability_data)
-        ? b2bData.pincode_serviceability_data
-        : b2bData && Object.prototype.hasOwnProperty.call(b2bData, "fm_serviceable") ? [b2bData] : null;
+    const candidateRows = [
+      body.data,
+      b2bData?.pincode_serviceability_data,
+      b2bData?.serviceability_data,
+      b2bData?.data,
+      body.pincode_serviceability_data,
+      body.serviceability_data,
+      body.result,
+      body.results,
+    ];
+    const b2bRows = candidateRows.find((value) => Array.isArray(value)) as unknown[] | undefined
+      ?? (candidateRows.find((value) => value && typeof value === "object" && !Array.isArray(value) && Object.prototype.hasOwnProperty.call(value, "fm_serviceable")) ? [candidateRows.find((value) => value && typeof value === "object" && !Array.isArray(value) && Object.prototype.hasOwnProperty.call(value, "fm_serviceable"))] : null);
     const b2bRow = b2bRows?.[0] && typeof b2bRows[0] === "object" ? b2bRows[0] as Record<string, unknown> : null;
     if (b2bRows && !b2bRow) return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable: false, prepaid: false, cod: false, pickup: false, oda: null, reason: "Delhivery does not currently service this pincode" };
     if (b2bRow) {
