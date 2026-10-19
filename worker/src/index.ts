@@ -5340,8 +5340,8 @@ const worker = {
             const originOda = account.provider === "delhivery" ? (originResult as { oda?: boolean | null }).oda ?? null : (originResult as { origin_oda?: boolean | null }).origin_oda ?? null;
             const destinationOda = account.provider === "delhivery" ? (destinationResult as { oda?: boolean | null } | null)?.oda ?? null : (originResult as { destination_oda?: boolean | null }).destination_oda ?? null;
             serviceabilityRows.push(
-              { pincode: origin, provider: label, status: accountStatus, oda: originOda, prepaid: Boolean((originResult as { prepaid?: boolean }).prepaid), cod: Boolean((originResult as { cod?: boolean }).cod), account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), source: liveVerification?.provenance, reason: accountReason },
-              { pincode: destination, provider: label, status: accountStatus, oda: destinationOda, prepaid: Boolean((destinationRecord as { prepaid?: boolean }).prepaid), cod: Boolean((destinationRecord as { cod?: boolean }).cod), account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), source: liveVerification?.provenance, reason: accountReason },
+              { pincode: origin, provider: label, status: accountStatus, oda: originOda, prepaid: (originResult as { prepaid?: boolean }).prepaid, cod: (originResult as { cod?: boolean }).cod, account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), source: liveVerification?.provenance, reason: accountReason },
+              { pincode: destination, provider: label, status: accountStatus, oda: destinationOda, prepaid: (destinationRecord as { prepaid?: boolean }).prepaid, cod: (destinationRecord as { cod?: boolean }).cod, account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), source: liveVerification?.provenance, reason: accountReason },
             );
             routeResults.push({ provider: account.provider, accountId: account.id, accountName: account.account_name, confidenceScore: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), origin: originRecord, destination: destinationRecord, routeServiceable: routeServiceableForAccount ?? (originServiceable && destinationServiceable) });
           } catch (caught) {
@@ -5355,14 +5355,13 @@ const worker = {
         }
         const routeServiceable = routeResults.some((result) => result.routeServiceable);
         const delhiveryRouteResults = routeResults.filter((result) => result.provider === "delhivery" && result.routeServiceable);
-        const paymentModes = {
-          prepaid: delhiveryRouteResults.length > 0
-            ? delhiveryRouteResults.some((result) => (result.destination as { prepaid?: boolean }).prepaid === true)
-            : routeServiceable,
-          cod: delhiveryRouteResults.length > 0
-            ? delhiveryRouteResults.some((result) => (result.destination as { cod?: boolean }).cod === true)
-            : routeServiceable,
+        const modeAvailability = (mode: "prepaid" | "cod") => {
+          const values = delhiveryRouteResults.map((result) => (result.destination as { prepaid?: boolean; cod?: boolean })[mode]);
+          if (values.some((value) => value === true)) return true;
+          if (values.some((value) => value === false)) return false;
+          return undefined;
         };
+        const paymentModes = { prepaid: modeAvailability("prepaid"), cod: modeAvailability("cod") };
         const acceptedResult = routeResults.some((result) => result.origin.status === "accepted" && result.destination.status === "accepted");
         const failedResult = serviceabilityRows.some((row) => row.status === "Provider error" || row.status === "Not configured");
         const providerStatus = routeServiceable || acceptedResult ? "verified" : failedResult ? "provider_error" : configuredProviders.length ? "provider_contract_not_verified" : "provider_unavailable";
