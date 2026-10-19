@@ -2511,11 +2511,15 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       const paymentTypeValue = b2bRow.payment_type;
       const paymentTypes = Array.isArray(paymentTypeValue) ? paymentTypeValue.map(String) : String(paymentTypeValue ?? "").replace(/[\[\]\"]+/g, "").split(",").map((value) => value.trim()).filter(Boolean);
       const normalizedPaymentTypes = paymentTypes.map((value) => value.toLowerCase().replace(/[-_ ]/g, ""));
-      const serviceable = b2bRow.fm_serviceable === true || String(b2bRow.fm_serviceable ?? "").toLowerCase() === "true";
-      return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable, prepaid: normalizedPaymentTypes.includes("prepaid"), cod: normalizedPaymentTypes.some((value) => value === "cod" || value === "cash"), pickup: serviceable, oda: Boolean(b2bRow.oda) };
+      const hasServiceabilityFlag = Object.prototype.hasOwnProperty.call(b2bRow, "fm_serviceable");
+      if (!hasServiceabilityFlag) return { enabled: true, status: "failed" as const, providerStatus: response.status, error: "Delhivery returned an incomplete pincode serviceability response" };
+      const truthyFlag = (value: unknown) => value === true || ["true", "yes", "y", "1"].includes(String(value ?? "").trim().toLowerCase());
+      const serviceable = truthyFlag(b2bRow.fm_serviceable);
+      return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable, prepaid: normalizedPaymentTypes.includes("prepaid"), cod: normalizedPaymentTypes.some((value) => value === "cod" || value === "cash"), pickup: serviceable, oda: truthyFlag(b2bRow.oda) };
     }
     const code = Array.isArray(body.delivery_codes) ? (body as { delivery_codes: Array<Record<string, unknown>> }).delivery_codes[0] : null;
     const postal = code?.postal_code && typeof code.postal_code === "object" ? code.postal_code as Record<string, unknown> : null;
+    if (!postal) return { enabled: true, status: "failed" as const, providerStatus: response.status, error: "Delhivery returned an incomplete pincode serviceability response" };
     return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable: Boolean(postal && (String(postal.pre_paid ?? "N").toUpperCase() === "Y" || String(postal.cash ?? "N").toUpperCase() === "Y")), prepaid: String(postal?.pre_paid ?? "N").toUpperCase() === "Y", cod: String(postal?.cash ?? "N").toUpperCase() === "Y", pickup: String(postal?.pickup ?? "N").toUpperCase() === "Y", oda: providerOdaFlag(postal) };
   }
   if (response.ok && provider === "rivigo" && operation === "serviceability") {
