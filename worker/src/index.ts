@@ -3232,7 +3232,7 @@ const worker = {
         const pincode = pincodeLookup[1];
         const location = await pricingPincode(env, pincode);
         if (!location) return error("PINCODE_NOT_FOUND", "Pincode is not present in the active PSS dataset", 404, id, headers);
-        return json({ ok: true, data: { pincode, city: location.facility_city, state: location.facility_state, oda: Boolean(location.oda) }, request_id: id }, 200, headers);
+        return json({ ok: true, data: { pincode, city: location.facility_city, state: location.facility_state, oda: Boolean(location.oda), provenance: "local_dataset" }, request_id: id }, 200, headers);
       }
       // Fujiyama receives a stable PSS contract. It never receives Delhivery
       // credentials or calls Delhivery directly. Tracking refreshes the
