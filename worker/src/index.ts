@@ -5265,11 +5265,16 @@ const worker = {
               : [await safeProviderRequest(env, account.provider, "serviceability", { origin_pincode: origin, destination_pincode: destination, provider_account_id: account.id }, id, serviceabilityClientId), null];
             const originRecord = originResult as Record<string, unknown>;
             const destinationRecord = (destinationResult ?? originResult) as Record<string, unknown>;
-            const originServiceable = account.provider === "delhivery"
-              ? originResult.status === "accepted" && Boolean((originResult as { pickup?: boolean; serviceable?: boolean }).pickup ?? (originResult as { serviceable?: boolean }).serviceable)
+            const routeServiceableForAccount = account.provider === "delhivery" && liveVerification ? liveVerification.ok : null;
+            const originServiceable = routeServiceableForAccount !== null
+              ? routeServiceableForAccount
+              : account.provider === "delhivery"
+                ? originResult.status === "accepted" && Boolean((originResult as { pickup?: boolean; serviceable?: boolean }).pickup ?? (originResult as { serviceable?: boolean }).serviceable)
               : originResult.status === "accepted" && Boolean((originResult as { serviceable?: boolean }).serviceable);
-            const destinationServiceable = account.provider === "delhivery"
-              ? destinationResult?.status === "accepted" && Boolean((destinationResult as { serviceable?: boolean }).serviceable)
+            const destinationServiceable = routeServiceableForAccount !== null
+              ? routeServiceableForAccount
+              : account.provider === "delhivery"
+                ? destinationResult?.status === "accepted" && Boolean((destinationResult as { serviceable?: boolean }).serviceable)
               : originServiceable;
             const accountStatus = originResult.status === "accepted" && destinationRecord.status === "accepted"
               ? originServiceable && destinationServiceable ? "Available" : "Unavailable"
@@ -5283,7 +5288,7 @@ const worker = {
               { pincode: origin, provider: label, status: accountStatus, oda: originOda, account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), source: liveVerification?.provenance, reason: accountReason },
               { pincode: destination, provider: label, status: accountStatus, oda: destinationOda, account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), source: liveVerification?.provenance, reason: accountReason },
             );
-            routeResults.push({ provider: account.provider, accountId: account.id, accountName: account.account_name, confidenceScore: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), origin: originRecord, destination: destinationRecord, routeServiceable: originServiceable && destinationServiceable });
+            routeResults.push({ provider: account.provider, accountId: account.id, accountName: account.account_name, confidenceScore: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), origin: originRecord, destination: destinationRecord, routeServiceable: routeServiceableForAccount ?? (originServiceable && destinationServiceable) });
           } catch (caught) {
             const providerError = caught instanceof Error ? caught.message : "provider_request_failed";
             console.error(JSON.stringify({ request_id: id, route: "/v1/serviceability", provider: account.provider, account_id: account.id, error: providerError }));
