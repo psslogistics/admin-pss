@@ -1975,6 +1975,7 @@ function providerOdaFlag(value: Record<string, unknown> | null | undefined): boo
 function providerPaymentFlags(value: Record<string, unknown> | null | undefined) {
   const flags: { prepaid: boolean | null; cod: boolean | null } = { prepaid: null, cod: null };
   const positive: { prepaid: boolean; cod: boolean } = { prepaid: false, cod: false };
+  const authoritativePaymentTypes: unknown[] = [];
   if (!value) return flags;
   const visit = (candidate: unknown, depth = 0) => {
     // B2B responses nest payment_type under data -> serviceability rows.
@@ -2004,11 +2005,17 @@ function providerPaymentFlags(value: Record<string, unknown> | null | undefined)
           if (parsed) positive.cod = true;
         }
       }
+      if (["paymenttype", "paymenttypes", "paymentmode", "paymentmodes", "paymentmethod", "paymentmethods"].includes(normalizedKey)) authoritativePaymentTypes.push(raw);
       if (raw && typeof raw === "object") visit(raw, depth + 1);
       else if (["paymenttype", "paymenttypes", "paymentmode", "paymentmodes", "paymentmethod", "paymentmethods"].includes(normalizedKey)) visit(raw, depth + 1);
     }
   };
   visit(value);
+  if (authoritativePaymentTypes.length) {
+    const tokens = authoritativePaymentTypes.flatMap((entry) => String(entry).toLowerCase().replace(/[\[\]{}\"]+/g, "").split(/[,|;/]+/)).map((item) => item.trim().replace(/[-_ ]/g, "")).filter(Boolean);
+    flags.prepaid = tokens.some((token) => token === "prepaid" || token === "prepaidallowed" || token === "prepaidserviceable");
+    flags.cod = tokens.some((token) => ["cod", "cash", "cashondelivery", "codallowed", "codserviceable"].includes(token));
+  }
   return flags;
 }
 
