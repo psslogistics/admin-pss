@@ -67,7 +67,17 @@ const AUTH_CACHE_TTL_MS = 5_000;
 // rows read, so an unbounded dashboard collection can exhaust the free daily
 // quota even when the UI only needs the latest operational records.
 const SUMMARY_CACHE_TTL_MS = 60_000;
+const DELHIVERY_SERVICEABILITY_CACHE_TTL_MS = 10 * 60_000;
+const delhiveryServiceabilityCache = new Map<string, { expiresAt: number; result: DelhiveryServiceabilityResult }>();
 const KYC_TEST_ACCOUNT_EMAIL = "itismeoogway@gmail.com";
+
+type DelhiveryServiceabilityResult = {
+  ok: boolean;
+  provenance: "live_provider" | "cached_provider" | "provider_unavailable";
+  origin: Record<string, unknown>;
+  destination: Record<string, unknown>;
+  reason?: string;
+};
 
 function allowedOrigins(env: Env) { return new Set((env.ALLOWED_ORIGINS ?? "").split(",").map((value) => value.trim()).filter(Boolean)); }
 function originAllowed(request: Request, env: Env) { const origin = request.headers.get("Origin"); return !origin || allowedOrigins(env).has(origin); }
@@ -2669,6 +2679,30 @@ async function safeProviderRequest(env: Env, provider: CourierProvider, operatio
   }
 }
 
+async function verifyDelhiveryServiceability(env: Env, originPincode: string, destinationPincode: string, providerAccountId: string, requestIdValue: string, clientId: string): Promise<DelhiveryServiceabilityResult> {
+  const cacheKey = `${providerAccountId}|${originPincode}|${destinationPincode}`;
+  const cached = delhiveryServiceabilityCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return { ...cached.result, provenance: "cached_provider" };
+  const [originResult, destinationResult] = await Promise.all([
+    safeProviderRequest(env, "delhivery", "serviceability", { destination_pincode: originPincode, provider_account_id: providerAccountId }, `${requestIdValue}:origin-serviceability`, clientId, undefined, 10000),
+    safeProviderRequest(env, "delhivery", "serviceability", { destination_pincode: destinationPincode, provider_account_id: providerAccountId }, `${requestIdValue}:destination-serviceability`, clientId, undefined, 10000),
+  ]);
+  const origin = originResult as Record<string, unknown>;
+  const destination = destinationResult as Record<string, unknown>;
+  const originAccepted = origin.status === "accepted" && origin.serviceable === true && origin.pickup === true;
+  const destinationAccepted = destination.status === "accepted" && destination.serviceable === true;
+  const providerUnavailable = [origin, destination].some((result) => result.status === "failed" || result.status === "provider_unavailable" || result.status === "not_configured" || Number(result.providerStatus ?? 0) === 0);
+  const result: DelhiveryServiceabilityResult = {
+    ok: originAccepted && destinationAccepted,
+    provenance: providerUnavailable ? "provider_unavailable" : "live_provider",
+    origin,
+    destination,
+    reason: origin.status !== "accepted" ? String(origin.error ?? origin.reason ?? "Delhivery could not verify the pickup pincode") : !originAccepted ? "The pickup pincode is not pickup-serviceable by Delhivery" : destination.status !== "accepted" ? String(destination.error ?? destination.reason ?? "Delhivery could not verify the delivery pincode") : !destinationAccepted ? "The delivery pincode is not serviceable by Delhivery" : undefined,
+  };
+  if (result.ok) delhiveryServiceabilityCache.set(cacheKey, { expiresAt: Date.now() + DELHIVERY_SERVICEABILITY_CACHE_TTL_MS, result });
+  return result;
+}
+
 async function loadShipmentInvoiceDocumentsForRetry(env: Env, clientId: string, shipmentId: string, payload: Record<string, unknown>) {
   const rows = await env.DB.prepare("SELECT object_key, original_filename, content_type FROM shipment_documents WHERE shipment_id = ? AND client_id = ? ORDER BY created_at ASC").bind(shipmentId, clientId).all<{ object_key: string; original_filename: string; content_type: string }>();
   const documents: Array<Record<string, unknown>> = [];
@@ -3599,17 +3633,15 @@ const worker = {
           await saveIdempotent(env, key, clientId, endpoint, 409, failed, requestHash);
           return new Response(failed, { status: 409, headers: { ...headers, "content-type": "application/json" } });
         }
-        const pincodes = [...new Set([originAddress.pincode, String((payload.destination_address as Record<string, unknown> | null)?.pincode ?? "").trim()].filter((value) => /^\d{6}$/.test(value)))];
-        const serviceabilityResults = await Promise.all(pincodes.map(async (pincode) => ({ pincode, result: await safeProviderRequest(env, "delhivery", "serviceability", { destination_pincode: pincode, provider_account_id: providerAccountId }, `${id}:serviceability:${pincode}`, clientId) })));
-        const serviceabilityFailure = serviceabilityResults.find(({ pincode, result }) => result.status !== "accepted" || (result as { serviceable?: boolean }).serviceable !== true || (pincode === originAddress.pincode && (result as { pickup?: boolean }).pickup !== true));
-        if (serviceabilityFailure) {
-          const failedResult = serviceabilityFailure.result;
-          const reason = failedResult.status !== "accepted" ? String((failedResult as { error?: string; reason?: string }).error ?? (failedResult as { reason?: string }).reason ?? "Delhivery serviceability could not be verified") : serviceabilityFailure.pincode === originAddress.pincode ? "The pickup pincode is not pickup-serviceable by Delhivery" : "The delivery pincode is not serviceable by Delhivery";
+        const destinationPincode = String((payload.destination_address as Record<string, unknown> | null)?.pincode ?? "").trim();
+        const serviceability = await verifyDelhiveryServiceability(env, originAddress.pincode, destinationPincode, providerAccountId, id, clientId);
+        if (!serviceability.ok) {
+          const reason = serviceability.reason ?? "Delhivery serviceability could not be verified";
           const failed = JSON.stringify({ ok: false, error: { code: "PROVIDER_SERVICEABILITY_FAILED", category: "provider", message: reason, user_safe_message: "Delhivery cannot verify serviceability for this shipment yet. Check the pincodes before confirming.", technical_message: reason, request_id: id, retryable: true }, request_id: id });
           await saveIdempotent(env, key, clientId, endpoint, 409, failed, requestHash);
           return new Response(failed, { status: 409, headers: { ...headers, "content-type": "application/json" } });
         }
-        const ready = JSON.stringify({ ok: true, data: { ready: true, provider: "delhivery", provider_status: (providerResult as { providerStatus?: number }).providerStatus ?? 200, warehouse_name: (providerResult as { warehouseName?: string }).warehouseName ?? null, serviceable: true }, request_id: id });
+        const ready = JSON.stringify({ ok: true, data: { ready: true, provider: "delhivery", provider_status: (providerResult as { providerStatus?: number }).providerStatus ?? 200, warehouse_name: (providerResult as { warehouseName?: string }).warehouseName ?? null, serviceable: true, serviceability_provenance: serviceability.provenance }, request_id: id });
         await saveIdempotent(env, key, clientId, endpoint, 200, ready, requestHash);
         await audit(env, ctx, auth, id, "shipment.provider_readiness", "shipment", warehouseId || "new-warehouse", { client_id: clientId, provider: "delhivery" });
         return new Response(ready, { status: 200, headers: { ...headers, "content-type": "application/json" } });
@@ -4810,12 +4842,20 @@ const worker = {
         const invoiceValue = payload.invoice_value === undefined ? 0 : Number(payload.invoice_value);
         const previewOnly = payload.preview_only === true;
         if (!Number.isFinite(actualWeightKg) || actualWeightKg <= 0 || !Number.isFinite(volumetricWeightKg) || volumetricWeightKg < 0 || !Number.isFinite(invoiceValue) || invoiceValue < 0) return error("VALIDATION_ERROR", "Valid weight and invoice values are required", 400, id, headers);
+        if (!previewOnly) {
+          const providerAccountId = typeof payload.provider_account_id === "string" ? payload.provider_account_id.trim() : "";
+          if (!providerAccountId) return error("PROVIDER_ACCOUNT_REQUIRED", "A Delhivery account is required for live serviceability verification", 409, id, headers);
+          const liveServiceability = await verifyDelhiveryServiceability(env, originPincode, destinationPincode, providerAccountId, id, clientId);
+          if (!liveServiceability.ok) return error("PROVIDER_SERVICEABILITY_FAILED", liveServiceability.reason ?? "Delhivery could not verify this route", 409, id, headers, JSON.stringify({ provenance: liveServiceability.provenance, origin: liveServiceability.origin, destination: liveServiceability.destination }));
+        }
         const version = await env.DB.prepare("SELECT id, minimum_weight_kg, gst_percent FROM pricing_versions WHERE client_id = ? AND provider = 'delhivery' AND service_level = 'b2b' AND status = 'active' AND datetime(effective_at) <= CURRENT_TIMESTAMP ORDER BY datetime(effective_at) DESC LIMIT 1").bind(clientId).first<{ id: string; minimum_weight_kg: number; gst_percent: number }>();
         const activeVersion = version ?? await ensureDefaultClientPricing(env, clientId, auth.userId ?? `api:${clientId}`);
         if (!activeVersion) return error("PRICING_NOT_CONFIGURED", "A published Delhivery B2B PSS rate card is not configured for this client", 409, id, headers);
         const rules = await env.DB.prepare("SELECT code, label, calculation_type, value, basis, minimum_value, maximum_value, enabled, marker, condition, display_order FROM pricing_charge_rules WHERE version_id = ? ORDER BY display_order ASC, code ASC").bind(activeVersion.id).all<{ code: string; label: string; calculation_type: ChargeRule["kind"]; value: number; basis: ChargeRule["basis"]; minimum_value: number | null; maximum_value: number | null; enabled: number; marker: "*" | null; condition: "oda_or_opa" | null; display_order: number }>();
         const matrixRows = await env.DB.prepare("SELECT origin_zone, destination_zone, rate_per_kg FROM pricing_rate_matrix WHERE version_id = ? AND account_scope = ?").bind(activeVersion.id, account).all<{ origin_zone: string; destination_zone: string; rate_per_kg: number }>();
         const rateMatrix = Object.fromEntries(matrixRows.results.map((row) => [`${row.origin_zone}->${row.destination_zone}`, Number(row.rate_per_kg)]));
+        // The pincode dataset remains pricing metadata only (zones/ODA/rates).
+        // Live Delhivery serviceability above is the booking authority.
         const [originPin, destinationPin] = await Promise.all([pricingPincode(env, originPincode), pricingPincode(env, destinationPincode)]);
         if (!originPin || !destinationPin) return error("PINCODE_NOT_FOUND", "One or both pincodes are not present in the active Delhivery B2B dataset", 404, id, headers);
         let forwardRatePerKg: number | undefined;
@@ -5110,52 +5150,15 @@ const worker = {
             );
             continue;
           }
-          // Use the managed Delhivery B2B dataset as the stable coverage
-          // baseline. A provider probe can intermittently return an empty or
-          // incomplete response for a route that is in the approved dataset.
-          if (account.provider === "delhivery") {
-            const [datasetOrigin, datasetDestination] = await Promise.all([pricingPincode(env, origin), pricingPincode(env, destination)]);
-            if (datasetOrigin && datasetDestination) {
-              const datasetOriginRecord = { status: "accepted", pickup: true, serviceable: true, source: "delhivery_b2b_pincode_dataset" };
-              const datasetDestinationRecord = { status: "accepted", serviceable: true, source: "delhivery_b2b_pincode_dataset" };
-              serviceabilityRows.push(
-                { pincode: origin, provider: label, status: "Available", oda: Boolean(datasetOrigin.oda), account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), source: "Delhivery pincode dataset" },
-                { pincode: destination, provider: label, status: "Available", oda: Boolean(datasetDestination.oda), account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), source: "Delhivery pincode dataset" },
-              );
-              routeResults.push({ provider: account.provider, accountId: account.id, accountName: account.account_name, confidenceScore: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), origin: datasetOriginRecord, destination: datasetDestinationRecord, routeServiceable: true });
-              continue;
-            }
-          }
           try {
-            const [originResult, destinationResult] = account.provider === "delhivery"
-              ? await Promise.all([
-                  safeProviderRequest(env, account.provider, "serviceability", { destination_pincode: origin, provider_account_id: account.id }, id, serviceabilityClientId),
-                  safeProviderRequest(env, account.provider, "serviceability", { destination_pincode: destination, provider_account_id: account.id }, id, serviceabilityClientId),
-                ])
+            const liveVerification = account.provider === "delhivery"
+              ? await verifyDelhiveryServiceability(env, origin, destination, account.id, id, serviceabilityClientId ?? "")
+              : null;
+            const [originResult, destinationResult] = liveVerification
+              ? [liveVerification.origin, liveVerification.destination]
               : [await safeProviderRequest(env, account.provider, "serviceability", { origin_pincode: origin, destination_pincode: destination, provider_account_id: account.id }, id, serviceabilityClientId), null];
             const originRecord = originResult as Record<string, unknown>;
             const destinationRecord = (destinationResult ?? originResult) as Record<string, unknown>;
-            // Delhivery's B2B PIN API can return HTTP 200 with an empty or
-            // incomplete delivery_codes payload. The managed PSS dataset is
-            // the authoritative B2B coverage fallback in that case, not only
-            // when the upstream request throws.
-            const delhiveryResponseVerified = account.provider !== "delhivery"
-              || (originResult.status === "accepted" && Boolean((originResult as { serviceable?: boolean; pickup?: boolean }).serviceable ?? (originResult as { pickup?: boolean }).pickup) && destinationResult?.status === "accepted" && Boolean((destinationResult as { serviceable?: boolean }).serviceable));
-            const datasetFallback = account.provider === "delhivery" && !delhiveryResponseVerified
-              ? await Promise.all([pricingPincode(env, origin), pricingPincode(env, destination)])
-              : [null, null] as const;
-            if (account.provider === "delhivery" && datasetFallback[0] && datasetFallback[1]) {
-              const datasetOrigin = datasetFallback[0];
-              const datasetDestination = datasetFallback[1];
-              const datasetOriginRecord = { status: "accepted", pickup: true, serviceable: true, source: "delhivery_b2b_pincode_dataset" };
-              const datasetDestinationRecord = { status: "accepted", serviceable: true, source: "delhivery_b2b_pincode_dataset" };
-              serviceabilityRows.push(
-                { pincode: origin, provider: label, status: "Available", oda: Boolean(datasetOrigin.oda), account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), source: "Delhivery pincode dataset" },
-                { pincode: destination, provider: label, status: "Available", oda: Boolean(datasetDestination.oda), account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), source: "Delhivery pincode dataset" },
-              );
-              routeResults.push({ provider: account.provider, accountId: account.id, accountName: account.account_name, confidenceScore: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), origin: datasetOriginRecord, destination: datasetDestinationRecord, routeServiceable: true });
-              continue;
-            }
             const originServiceable = account.provider === "delhivery"
               ? originResult.status === "accepted" && Boolean((originResult as { pickup?: boolean; serviceable?: boolean }).pickup ?? (originResult as { serviceable?: boolean }).serviceable)
               : originResult.status === "accepted" && Boolean((originResult as { serviceable?: boolean }).serviceable);
@@ -5168,8 +5171,8 @@ const worker = {
             const originOda = account.provider === "delhivery" ? (originResult as { oda?: boolean | null }).oda ?? null : (originResult as { origin_oda?: boolean | null }).origin_oda ?? null;
             const destinationOda = account.provider === "delhivery" ? (destinationResult as { oda?: boolean | null } | null)?.oda ?? null : (originResult as { destination_oda?: boolean | null }).destination_oda ?? null;
             serviceabilityRows.push(
-              { pincode: origin, provider: label, status: accountStatus, oda: originOda, account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100) },
-              { pincode: destination, provider: label, status: accountStatus, oda: destinationOda, account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100) },
+              { pincode: origin, provider: label, status: accountStatus, oda: originOda, account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), source: liveVerification?.provenance },
+              { pincode: destination, provider: label, status: accountStatus, oda: destinationOda, account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), source: liveVerification?.provenance },
             );
             routeResults.push({ provider: account.provider, accountId: account.id, accountName: account.account_name, confidenceScore: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), origin: originRecord, destination: destinationRecord, routeServiceable: originServiceable && destinationServiceable });
           } catch (caught) {
