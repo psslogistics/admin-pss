@@ -2827,7 +2827,7 @@ async function verifyDelhiveryServiceability(env: Env, originPincode: string, de
     ? { ...origin, serviceable: true, pickup: true }
     : origin;
   const routeDecisionDestination = routeAccepted && destination.status === "accepted"
-    ? { ...destination, serviceable: true }
+    ? { ...destination, serviceable: true, prepaid: route.prepaid === true ? true : destination.prepaid, cod: route.cod === true ? true : destination.cod }
     : destination;
   const decision = routeAccepted
     ? evaluateDelhiveryServiceability(routeDecisionOrigin, routeDecisionDestination, paymentMode)
