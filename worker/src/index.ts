@@ -2606,10 +2606,10 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     ];
     const findB2bRows = (value: unknown, depth = 0): unknown[] | null => {
       if (depth > 4 || value == null) return null;
-      if (Array.isArray(value)) return value;
+      if (Array.isArray(value)) return value.length > 0 ? value : null;
       if (typeof value !== "object") return null;
       const record = value as Record<string, unknown>;
-      if (Object.prototype.hasOwnProperty.call(record, "fm_serviceable")) return [record];
+      if (Object.prototype.hasOwnProperty.call(record, "fm_serviceable") || Object.prototype.hasOwnProperty.call(record, "fmServiceable")) return [record];
       for (const nested of Object.values(record)) {
         const rows = findB2bRows(nested, depth + 1);
         if (rows) return rows;
@@ -2620,10 +2620,10 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     const b2bRow = b2bRows?.[0] && typeof b2bRows[0] === "object" ? b2bRows[0] as Record<string, unknown> : null;
     if (b2bRows && !b2bRow) return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable: false, prepaid: false, cod: false, pickup: false, oda: null, reason: "Delhivery does not currently service this pincode" };
     if (b2bRow) {
-      const hasServiceabilityFlag = Object.prototype.hasOwnProperty.call(b2bRow, "fm_serviceable");
+      const hasServiceabilityFlag = Object.prototype.hasOwnProperty.call(b2bRow, "fm_serviceable") || Object.prototype.hasOwnProperty.call(b2bRow, "fmServiceable");
       if (!hasServiceabilityFlag) return { enabled: true, status: "failed" as const, providerStatus: response.status, error: "Delhivery returned an incomplete pincode serviceability response" };
       const truthyFlag = (value: unknown) => value === true || ["true", "yes", "y", "1"].includes(String(value ?? "").trim().toLowerCase());
-      const serviceable = truthyFlag(b2bRow.fm_serviceable);
+      const serviceable = truthyFlag(b2bRow.fm_serviceable ?? b2bRow.fmServiceable);
       const paymentFlags = providerPaymentFlags(body);
       return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable, prepaid: paymentFlags.prepaid ?? undefined, cod: paymentFlags.cod ?? undefined, pickup: serviceable, oda: truthyFlag(b2bRow.oda), facility_city: String(b2bRow.city ?? "").trim() || undefined, facility_state: String(b2bRow.state ?? "").trim() || undefined };
     }
