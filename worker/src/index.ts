@@ -5172,7 +5172,7 @@ const worker = {
         const configuredProviders = [...new Set(accountRows.map((account) => account.provider))];
         const providerLabel = (provider: CourierProvider) => provider === "delhivery" ? "Delhivery" : provider === "xpressbees" ? "XpressBees" : provider[0].toUpperCase() + provider.slice(1);
         const supportedProviders = new Set<CourierProvider>(["delhivery", "rivigo", "xpressbees"]);
-        const serviceabilityRows: Array<{ pincode: string; provider: string; status: string; oda: boolean | null; account_id: string; account_name: string; confidence_score: number; priority: number; source?: string }> = [];
+        const serviceabilityRows: Array<{ pincode: string; provider: string; status: string; oda: boolean | null; account_id: string; account_name: string; confidence_score: number; priority: number; source?: string; reason?: string }> = [];
         const routeResults: Array<{ provider: CourierProvider; accountId: string; accountName: string; confidenceScore: number; priority: number; origin: Record<string, unknown>; destination: Record<string, unknown>; routeServiceable: boolean }> = [];
         for (const account of accountRows) {
           const label = `${providerLabel(account.provider)} · ${account.account_name}`;
@@ -5201,19 +5201,22 @@ const worker = {
             const accountStatus = originResult.status === "accepted" && destinationRecord.status === "accepted"
               ? originServiceable && destinationServiceable ? "Available" : "Unavailable"
               : originResult.status === "not_configured" || destinationRecord.status === "not_configured" ? "Not configured" : "Provider error";
+            const accountReason = accountStatus === "Available"
+              ? undefined
+              : String((!originServiceable ? originResult.error ?? originResult.reason : !destinationServiceable ? destinationRecord.error ?? destinationRecord.reason : originResult.error ?? destinationRecord.error ?? originResult.reason ?? destinationRecord.reason) ?? (accountStatus === "Unavailable" ? "Delhivery does not currently support this route for the selected account" : "Delhivery could not verify this route")).slice(0, 300);
             const originOda = account.provider === "delhivery" ? (originResult as { oda?: boolean | null }).oda ?? null : (originResult as { origin_oda?: boolean | null }).origin_oda ?? null;
             const destinationOda = account.provider === "delhivery" ? (destinationResult as { oda?: boolean | null } | null)?.oda ?? null : (originResult as { destination_oda?: boolean | null }).destination_oda ?? null;
             serviceabilityRows.push(
-              { pincode: origin, provider: label, status: accountStatus, oda: originOda, account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), source: liveVerification?.provenance },
-              { pincode: destination, provider: label, status: accountStatus, oda: destinationOda, account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), source: liveVerification?.provenance },
+              { pincode: origin, provider: label, status: accountStatus, oda: originOda, account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), source: liveVerification?.provenance, reason: accountReason },
+              { pincode: destination, provider: label, status: accountStatus, oda: destinationOda, account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), source: liveVerification?.provenance, reason: accountReason },
             );
             routeResults.push({ provider: account.provider, accountId: account.id, accountName: account.account_name, confidenceScore: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), origin: originRecord, destination: destinationRecord, routeServiceable: originServiceable && destinationServiceable });
           } catch (caught) {
             const providerError = caught instanceof Error ? caught.message : "provider_request_failed";
             console.error(JSON.stringify({ request_id: id, route: "/v1/serviceability", provider: account.provider, account_id: account.id, error: providerError }));
             serviceabilityRows.push(
-              { pincode: origin, provider: label, status: "Provider error", oda: null, account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100) },
-              { pincode: destination, provider: label, status: "Provider error", oda: null, account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100) },
+              { pincode: origin, provider: label, status: "Provider error", oda: null, account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), reason: providerError },
+              { pincode: destination, provider: label, status: "Provider error", oda: null, account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), reason: providerError },
             );
           }
         }
