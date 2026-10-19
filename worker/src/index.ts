@@ -2624,7 +2624,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       if (!hasServiceabilityFlag) return { enabled: true, status: "failed" as const, providerStatus: response.status, error: "Delhivery returned an incomplete pincode serviceability response" };
       const truthyFlag = (value: unknown) => value === true || ["true", "yes", "y", "1"].includes(String(value ?? "").trim().toLowerCase());
       const serviceable = truthyFlag(b2bRow.fm_serviceable ?? b2bRow.fmServiceable);
-      const paymentFlags = providerPaymentFlags(body);
+      const paymentFlags = providerPaymentFlags(b2bRow);
       return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable, prepaid: paymentFlags.prepaid ?? undefined, cod: paymentFlags.cod ?? undefined, pickup: serviceable, oda: truthyFlag(b2bRow.oda), facility_city: String(b2bRow.city ?? "").trim() || undefined, facility_state: String(b2bRow.state ?? "").trim() || undefined };
     }
     const code = Array.isArray(body.delivery_codes) ? (body as { delivery_codes: Array<Record<string, unknown>> }).delivery_codes[0] : null;
