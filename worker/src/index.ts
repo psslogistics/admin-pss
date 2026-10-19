@@ -2703,6 +2703,14 @@ async function verifyDelhiveryServiceability(env: Env, originPincode: string, de
   return result;
 }
 
+async function resolveDelhiveryProviderAccountId(env: Env, clientId: string, requestedAccountId?: string | null) {
+  const requested = String(requestedAccountId ?? "").trim();
+  const row = requested
+    ? await env.DB.prepare("SELECT pa.id FROM provider_accounts pa LEFT JOIN provider_account_client_policies p ON p.provider_account_id = pa.id AND p.client_id = ? WHERE pa.id = ? AND pa.provider = 'delhivery' AND pa.status = 'active' AND (pa.client_id = ? OR (p.client_id = ? AND p.enabled = 1)) LIMIT 1").bind(clientId, requested, clientId, clientId).first<{ id: string }>()
+    : await env.DB.prepare("SELECT pa.id FROM provider_accounts pa LEFT JOIN provider_account_client_policies p ON p.provider_account_id = pa.id AND p.client_id = ? WHERE pa.provider = 'delhivery' AND pa.status = 'active' AND (pa.client_id = ? OR (p.client_id = ? AND p.enabled = 1)) ORDER BY CASE WHEN pa.client_id = ? THEN 0 ELSE 1 END, COALESCE(p.priority, 100) ASC, COALESCE(p.confidence_score, 0) DESC, pa.account_name ASC LIMIT 1").bind(clientId, clientId, clientId, clientId).first<{ id: string }>();
+  return row?.id ?? null;
+}
+
 async function loadShipmentInvoiceDocumentsForRetry(env: Env, clientId: string, shipmentId: string, payload: Record<string, unknown>) {
   const rows = await env.DB.prepare("SELECT object_key, original_filename, content_type FROM shipment_documents WHERE shipment_id = ? AND client_id = ? ORDER BY created_at ASC").bind(shipmentId, clientId).all<{ object_key: string; original_filename: string; content_type: string }>();
   const documents: Array<Record<string, unknown>> = [];
@@ -3994,6 +4002,8 @@ const worker = {
         if (!requestedClient || !canAccessClient(auth, requestedClient)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
         const account = await env.DB.prepare("SELECT pa.id FROM provider_accounts pa LEFT JOIN provider_account_client_policies p ON p.provider_account_id = pa.id AND p.client_id = ? WHERE pa.id = ? AND pa.provider = ? AND pa.status = 'active' AND (pa.client_id = ? OR (p.client_id = ? AND p.enabled = 1)) LIMIT 1").bind(requestedClient, requestedAccountId, requestedProvider, requestedClient, requestedClient).first<{ id: string }>();
         if (!account) return error("PROVIDER_ACCOUNT_UNAVAILABLE", "The selected courier account is not active for this client", 409, id, headers);
+        const liveServiceability = await verifyDelhiveryServiceability(env, requestedPincode, requestedPincode, account.id, id, requestedClient);
+        if (!liveServiceability.ok) return error("PROVIDER_SERVICEABILITY_FAILED", liveServiceability.reason ?? "Delhivery could not verify this pickup pincode", 409, id, headers, JSON.stringify({ provenance: liveServiceability.provenance, origin: liveServiceability.origin }));
          // Delhivery does not publish a first-mile slot-availability route for
          // B2B. The old implementation called an internal panel endpoint
          // (/web/api/company/configurations/...) which returns 404 in
@@ -4059,6 +4069,10 @@ const worker = {
         if (!providerAccountId) return error("VALIDATION_ERROR", "Select an active courier account before scheduling the pickup", 400, id, headers);
         const providerAccount = await env.DB.prepare(`SELECT pa.id FROM provider_accounts pa LEFT JOIN provider_account_client_policies p ON p.provider_account_id = pa.id AND p.client_id = ? WHERE pa.id = ? AND pa.provider = ? AND pa.status = 'active' AND (pa.client_id = ? OR (p.client_id = ? AND p.enabled = 1)) LIMIT 1`).bind(clientId, providerAccountId, provider, clientId, clientId).first<{ id: string }>();
         if (!providerAccount) return error("PROVIDER_ACCOUNT_UNAVAILABLE", "The selected courier account is not active for this client", 409, id, headers);
+        if (provider === "delhivery") {
+          const liveServiceability = await verifyDelhiveryServiceability(env, payload.pincode.trim(), payload.pincode.trim(), providerAccountId, id, clientId);
+          if (!liveServiceability.ok) return error("PROVIDER_SERVICEABILITY_FAILED", liveServiceability.reason ?? "Delhivery could not verify this pickup pincode", 409, id, headers, JSON.stringify({ provenance: liveServiceability.provenance, origin: liveServiceability.origin }));
+        }
         const piecesValue = Number(payload.pieces);
         if (!isManifestSelection && (!Number.isInteger(piecesValue) || piecesValue < 1)) return error("VALIDATION_ERROR", "Pickup pieces must be a positive whole number", 400, id, headers);
         const pieces = piecesValue;
@@ -4186,6 +4200,11 @@ const worker = {
           if (!pickup.provider || !pickup.provider_account_id) return error("PROVIDER_ACCOUNT_UNAVAILABLE", "This pickup has no active provider account and cannot be retried", 409, id, headers);
           const retryAccount = await env.DB.prepare("SELECT pa.id FROM provider_accounts pa LEFT JOIN provider_account_client_policies p ON p.provider_account_id = pa.id AND p.client_id = ? WHERE pa.id = ? AND pa.provider = ? AND pa.status = 'active' AND (pa.client_id = ? OR (p.client_id = ? AND p.enabled = 1)) LIMIT 1").bind(pickup.client_id, pickup.provider_account_id, pickup.provider, pickup.client_id, pickup.client_id).first<{ id: string }>();
           if (!retryAccount) return error("PROVIDER_ACCOUNT_UNAVAILABLE", "The pickup courier account is no longer active for this client", 409, id, headers);
+          if (pickup.provider === "delhivery") {
+            if (!pickup.pincode || !/^\d{6}$/.test(String(pickup.pincode).trim())) return error("VALIDATION_ERROR", "This pickup does not have a valid six-digit pickup PIN code", 409, id, headers);
+            const liveServiceability = await verifyDelhiveryServiceability(env, String(pickup.pincode).trim(), String(pickup.pincode).trim(), pickup.provider_account_id, id, pickup.client_id);
+            if (!liveServiceability.ok) return error("PROVIDER_SERVICEABILITY_FAILED", liveServiceability.reason ?? "Delhivery could not verify this pickup pincode", 409, id, headers, JSON.stringify({ provenance: liveServiceability.provenance, origin: liveServiceability.origin }));
+          }
           if (payload.requested_date !== undefined && (typeof payload.requested_date !== "string" || !validPickupDate(payload.requested_date.trim()))) return error("VALIDATION_ERROR", "Pickup date must use a valid YYYY-MM-DD date", 400, id, headers);
           const requestedDate = typeof payload.requested_date === "string" && payload.requested_date.trim() ? providerSafePickupDate(payload.requested_date.trim()) : pickup.requested_date;
           const requestedWindow = typeof payload.requested_time_slot === "string" && payload.requested_time_slot.trim() ? payload.requested_time_slot.trim() : pickup.requested_time_slot ?? "";
@@ -4523,11 +4542,12 @@ const worker = {
         let providerError: string | null = null;
         if (route === "/warehouses") {
           if (typeof payload.name !== "string" || typeof payload.address !== "string") return error("VALIDATION_ERROR", "Warehouse name and address are required", 400, id, headers);
-          const providerAccountId = typeof payload.provider_account_id === "string" && payload.provider_account_id.trim() ? payload.provider_account_id.trim() : null;
-          if (providerAccountId) {
-            const account = await env.DB.prepare("SELECT pa.id FROM provider_accounts pa LEFT JOIN provider_account_client_policies p ON p.provider_account_id = pa.id AND p.client_id = ? WHERE pa.id = ? AND pa.provider = 'delhivery' AND pa.status = 'active' AND (pa.client_id = ? OR (pa.client_id IS NULL AND p.client_id = ? AND p.enabled = 1)) LIMIT 1").bind(clientId, providerAccountId, clientId, clientId).first<{ id: string }>();
-            if (!account) return error("PROVIDER_ACCOUNT_NOT_ALLOWED", "The selected Delhivery account is not enabled for this client", 403, id, headers);
-          }
+          if (typeof payload.pincode !== "string" || !/^\d{6}$/.test(payload.pincode.trim())) return error("VALIDATION_ERROR", "A valid six-digit warehouse PIN code is required", 400, id, headers);
+          const requestedProviderAccountId = typeof payload.provider_account_id === "string" && payload.provider_account_id.trim() ? payload.provider_account_id.trim() : null;
+          const providerAccountId = await resolveDelhiveryProviderAccountId(env, clientId, requestedProviderAccountId);
+          if (!providerAccountId) return error("PROVIDER_ACCOUNT_NOT_ALLOWED", "An active Delhivery account is required for warehouse creation", 409, id, headers);
+          const liveServiceability = await verifyDelhiveryServiceability(env, payload.pincode.trim(), payload.pincode.trim(), providerAccountId, id, clientId);
+          if (!liveServiceability.ok) return error("PROVIDER_SERVICEABILITY_FAILED", liveServiceability.reason ?? "Delhivery could not verify this warehouse pickup pincode", 409, id, headers, JSON.stringify({ provenance: liveServiceability.provenance, origin: liveServiceability.origin }));
           const duplicate = await env.DB.prepare("SELECT id, client_id, name, provider, provider_account_id, provider_status, provider_error FROM warehouses WHERE client_id = ? AND lower(trim(COALESCE(provider_account_id, ''))) = lower(trim(COALESCE(?, ''))) AND lower(trim(address)) = lower(trim(?)) AND lower(trim(COALESCE(city, ''))) = lower(trim(COALESCE(?, ''))) AND lower(trim(COALESCE(state, ''))) = lower(trim(COALESCE(?, ''))) AND lower(trim(COALESCE(pincode, ''))) = lower(trim(COALESCE(?, ''))) AND lower(trim(COALESCE(contact, ''))) = lower(trim(COALESCE(?, ''))) AND lower(trim(COALESCE(contact_name, ''))) = lower(trim(COALESCE(?, ''))) ORDER BY updated_at DESC LIMIT 1").bind(clientId, providerAccountId, payload.address, String(payload.city ?? ""), String(payload.state ?? ""), String(payload.pincode ?? ""), String(payload.contact ?? ""), String(payload.contact_name ?? "")).first<{ id: string; client_id: string; name: string; provider: string | null; provider_account_id: string | null; provider_status: string | null; provider_error: string | null }>();
           if (duplicate) {
             const serialized = JSON.stringify({ ok: true, data: duplicate, deduplicated: true, request_id: id });
@@ -4842,12 +4862,10 @@ const worker = {
         const invoiceValue = payload.invoice_value === undefined ? 0 : Number(payload.invoice_value);
         const previewOnly = payload.preview_only === true;
         if (!Number.isFinite(actualWeightKg) || actualWeightKg <= 0 || !Number.isFinite(volumetricWeightKg) || volumetricWeightKg < 0 || !Number.isFinite(invoiceValue) || invoiceValue < 0) return error("VALIDATION_ERROR", "Valid weight and invoice values are required", 400, id, headers);
-        if (!previewOnly) {
-          const providerAccountId = typeof payload.provider_account_id === "string" ? payload.provider_account_id.trim() : "";
-          if (!providerAccountId) return error("PROVIDER_ACCOUNT_REQUIRED", "A Delhivery account is required for live serviceability verification", 409, id, headers);
-          const liveServiceability = await verifyDelhiveryServiceability(env, originPincode, destinationPincode, providerAccountId, id, clientId);
-          if (!liveServiceability.ok) return error("PROVIDER_SERVICEABILITY_FAILED", liveServiceability.reason ?? "Delhivery could not verify this route", 409, id, headers, JSON.stringify({ provenance: liveServiceability.provenance, origin: liveServiceability.origin, destination: liveServiceability.destination }));
-        }
+        const liveProviderAccountId = await resolveDelhiveryProviderAccountId(env, clientId, typeof payload.provider_account_id === "string" ? payload.provider_account_id : null);
+        if (!liveProviderAccountId) return error("PROVIDER_ACCOUNT_REQUIRED", "An active Delhivery account is required for live serviceability verification", 409, id, headers);
+        const liveServiceability = await verifyDelhiveryServiceability(env, originPincode, destinationPincode, liveProviderAccountId, id, clientId);
+        if (!liveServiceability.ok) return error("PROVIDER_SERVICEABILITY_FAILED", liveServiceability.reason ?? "Delhivery could not verify this route", 409, id, headers, JSON.stringify({ provenance: liveServiceability.provenance, origin: liveServiceability.origin, destination: liveServiceability.destination }));
         const version = await env.DB.prepare("SELECT id, minimum_weight_kg, gst_percent FROM pricing_versions WHERE client_id = ? AND provider = 'delhivery' AND service_level = 'b2b' AND status = 'active' AND datetime(effective_at) <= CURRENT_TIMESTAMP ORDER BY datetime(effective_at) DESC LIMIT 1").bind(clientId).first<{ id: string; minimum_weight_kg: number; gst_percent: number }>();
         const activeVersion = version ?? await ensureDefaultClientPricing(env, clientId, auth.userId ?? `api:${clientId}`);
         if (!activeVersion) return error("PRICING_NOT_CONFIGURED", "A published Delhivery B2B PSS rate card is not configured for this client", 409, id, headers);
@@ -4875,10 +4893,10 @@ const worker = {
           : Math.max(50, Math.round(invoiceValue * 0.001 * 100) / 100);
         result.lines.push({ code: carrierRisk ? "carrier_risk" : "owner_risk", label: carrierRisk ? "Carrier risk fee" : "Owner risk fee", amount: riskFee });
         result.total = Number(result.total) + riskFee;
-        if (previewOnly) return json({ ok: true, data: { quote_id: null, provider: "delhivery", service_level: "b2b", client_id: clientId, provider_account_id: typeof payload.provider_account_id === "string" ? payload.provider_account_id : null, provider_account_name: selectedProviderAccountName || null, account_code: account, ...result } }, 200, headers);
+        if (previewOnly) return json({ ok: true, data: { quote_id: null, provider: "delhivery", service_level: "b2b", client_id: clientId, provider_account_id: liveProviderAccountId, provider_account_name: selectedProviderAccountName || null, serviceability_provenance: liveServiceability.provenance, account_code: account, ...result } }, 200, headers);
         const quoteId = crypto.randomUUID();
         await env.DB.prepare("INSERT INTO pricing_quotes (id, client_id, version_id, account_scope, origin_zone, destination_zone, chargeable_weight_kg, client_breakdown_json, expires_at, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+15 minutes'), ?)").bind(quoteId, clientId, activeVersion.id, account, result.originZone, result.destinationZone, result.chargeableWeightKg, JSON.stringify(result), auth.userId ?? `api:${clientId}`).run();
-        return json({ ok: true, data: { quote_id: quoteId, provider: "delhivery", service_level: "b2b", client_id: clientId, ...result } }, 200, headers);
+        return json({ ok: true, data: { quote_id: quoteId, provider: "delhivery", service_level: "b2b", client_id: clientId, provider_account_id: liveProviderAccountId, serviceability_provenance: liveServiceability.provenance, ...result } }, 200, headers);
       }
       if (route === "/pricing/assigned" && request.method === "GET") {
         if (!hasScope(auth, "quotes.create")) return error("FORBIDDEN", "Pricing view permission required", 403, id, headers);
@@ -5188,8 +5206,9 @@ const worker = {
         const acceptedResult = routeResults.some((result) => result.origin.status === "accepted" && result.destination.status === "accepted");
         const failedResult = serviceabilityRows.some((row) => row.status === "Provider error" || row.status === "Not configured");
         const providerStatus = routeServiceable || acceptedResult ? "verified" : failedResult ? "provider_error" : configuredProviders.length ? "provider_contract_not_verified" : "provider_unavailable";
+        const serviceabilityProvenance = serviceabilityRows.find((row) => row.source)?.source;
         const availabilityStatus = routeServiceable
-          ? serviceabilityRows.some((row) => row.source === "Delhivery pincode dataset") ? "dataset_verified" : "serviceable"
+          ? serviceabilityProvenance === "cached_provider" ? "cached_provider" : serviceabilityRows.some((row) => row.source === "Delhivery pincode dataset") ? "dataset_verified" : "serviceable"
           : failedResult ? "provider_error" : acceptedResult ? "not_serviceable" : "provider_unavailable";
         return json({ ok: true, data: {
           client_id: serviceabilityClientId,
@@ -5201,6 +5220,7 @@ const worker = {
           assigned_accounts: accountRows.map((account) => ({ id: account.id, provider: account.provider, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100) })),
           status: providerStatus,
           availability_status: availabilityStatus,
+          serviceability_provenance: serviceabilityProvenance ?? (failedResult ? "provider_unavailable" : undefined),
           serviceability_rows: serviceabilityRows,
           provider_results: routeResults,
         } }, 200, headers);
