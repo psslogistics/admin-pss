@@ -2519,8 +2519,19 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       body.result,
       body.results,
     ];
-    const b2bRows = candidateRows.find((value) => Array.isArray(value)) as unknown[] | undefined
-      ?? (candidateRows.find((value) => value && typeof value === "object" && !Array.isArray(value) && Object.prototype.hasOwnProperty.call(value, "fm_serviceable")) ? [candidateRows.find((value) => value && typeof value === "object" && !Array.isArray(value) && Object.prototype.hasOwnProperty.call(value, "fm_serviceable"))] : null);
+    const findB2bRows = (value: unknown, depth = 0): unknown[] | null => {
+      if (depth > 4 || value == null) return null;
+      if (Array.isArray(value)) return value;
+      if (typeof value !== "object") return null;
+      const record = value as Record<string, unknown>;
+      if (Object.prototype.hasOwnProperty.call(record, "fm_serviceable")) return [record];
+      for (const nested of Object.values(record)) {
+        const rows = findB2bRows(nested, depth + 1);
+        if (rows) return rows;
+      }
+      return null;
+    };
+    const b2bRows = candidateRows.reduce<unknown[] | null>((found, value) => found ?? findB2bRows(value), null);
     const b2bRow = b2bRows?.[0] && typeof b2bRows[0] === "object" ? b2bRows[0] as Record<string, unknown> : null;
     if (b2bRows && !b2bRow) return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable: false, prepaid: false, cod: false, pickup: false, oda: null, reason: "Delhivery does not currently service this pincode" };
     if (b2bRow) {
