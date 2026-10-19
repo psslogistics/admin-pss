@@ -1976,7 +1976,9 @@ function providerPaymentFlags(value: Record<string, unknown> | null | undefined)
   const flags: { prepaid: boolean | null; cod: boolean | null } = { prepaid: null, cod: null };
   if (!value) return flags;
   const visit = (candidate: unknown, depth = 0) => {
-    if (depth > 3 || candidate == null) return;
+    // B2B responses nest payment_type under data -> serviceability rows.
+    // Keep recursion bounded, but reach the documented row-level value.
+    if (depth > 5 || candidate == null) return;
     if (Array.isArray(candidate)) {
       for (const item of candidate) visit(item, depth + 1);
       return;
