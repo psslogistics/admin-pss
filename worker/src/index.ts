@@ -2505,11 +2505,15 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   }
   if (response.ok && provider === "delhivery" && operation === "serviceability") {
     const body = parsedProviderBody && typeof parsedProviderBody === "object" ? parsedProviderBody as Record<string, unknown> : {};
-    const b2bData = body.data && typeof body.data === "object" ? body.data as Record<string, unknown> : null;
+    const b2bData = body.data && typeof body.data === "object" && !Array.isArray(body.data) ? body.data as Record<string, unknown> : null;
     const providerError = body.error && typeof body.error === "object" ? body.error as Record<string, unknown> : null;
     const providerErrorText = String(providerError?.message ?? providerError?.detail ?? providerError?.code ?? "").trim();
     if (body.success === false && providerErrorText && /pincode|pin\s*code|serviceab|not\s*(found|available|serviceable)|unserviceable/i.test(providerErrorText)) return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable: false, prepaid: false, cod: false, pickup: false, oda: null, reason: providerErrorText.slice(0, 300) };
-    const b2bRows = Array.isArray(b2bData?.pincode_serviceability_data) ? b2bData.pincode_serviceability_data : null;
+    const b2bRows = Array.isArray(body.data)
+      ? body.data
+      : Array.isArray(b2bData?.pincode_serviceability_data)
+        ? b2bData.pincode_serviceability_data
+        : b2bData && Object.prototype.hasOwnProperty.call(b2bData, "fm_serviceable") ? [b2bData] : null;
     const b2bRow = b2bRows?.[0] && typeof b2bRows[0] === "object" ? b2bRows[0] as Record<string, unknown> : null;
     if (b2bRows && !b2bRow) return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable: false, prepaid: false, cod: false, pickup: false, oda: null, reason: "Delhivery does not currently service this pincode" };
     if (b2bRow) {
