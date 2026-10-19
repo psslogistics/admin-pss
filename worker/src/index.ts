@@ -2773,11 +2773,19 @@ async function verifyDelhiveryServiceability(env: Env, originPincode: string, de
   const destination = destinationResult as Record<string, unknown>;
   const route = routeResult as Record<string, unknown>;
   const routeAccepted = route.status === "accepted" && route.serviceable === true;
-  // The route/TAT endpoint is an additional provider signal, not a substitute
-  // for either live pincode leg. A route-positive result must never override a
-  // negative or incomplete origin/destination response.
+  // Delhivery's B2B pincode response describes per-pincode capability and
+  // payment flags; the B2B route/TAT response is the authoritative lane
+  // decision. Use the route for origin/destination lane serviceability while
+  // retaining the pincode response's payment restrictions. Explicit provider
+  // failures and a route-negative response still block the operation.
+  const routeDecisionOrigin = routeAccepted && origin.status === "accepted"
+    ? { ...origin, serviceable: true, pickup: true }
+    : origin;
+  const routeDecisionDestination = routeAccepted && destination.status === "accepted"
+    ? { ...destination, serviceable: true }
+    : destination;
   const decision = routeAccepted
-    ? evaluateDelhiveryServiceability(origin, destination, paymentMode)
+    ? evaluateDelhiveryServiceability(routeDecisionOrigin, routeDecisionDestination, paymentMode)
     : { ok: false, providerUnavailable: route.status !== "accepted" && route.status !== "failed", reason: String(route.error ?? route.reason ?? "Delhivery could not verify the origin-to-destination route") };
   const result: DelhiveryServiceabilityResult = {
     ok: decision.ok,
