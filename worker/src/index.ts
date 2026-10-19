@@ -77,6 +77,7 @@ type DelhiveryServiceabilityResult = {
   provenance: "live_provider" | "cached_provider" | "provider_unavailable";
   origin: Record<string, unknown>;
   destination: Record<string, unknown>;
+  route?: Record<string, unknown>;
   reason?: string;
 };
 
@@ -1980,7 +1981,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (["tracking", "labels", "lr_copy", "document"].includes(operation) && !trackingNumber) return { enabled: false, status: "invalid_request" as const, reason: "A provider tracking reference is required" };
   if (provider === "delhivery" && operation === "shipments" && String(env.DELHIVERY_ENABLE_SHIPMENT_CREATION) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "Delhivery shipment creation is safety-disabled until live billing approval" };
   if (provider === "delhivery" && operation === "pickups" && String(env.DELHIVERY_ENABLE_PICKUP_CREATION) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "Delhivery pickup creation is safety-disabled until live operations approval" };
-  if (provider === "delhivery" && !new Set(["tracking", "shipment_status", "shipments", "warehouse_prepare", "pickups", "pickup_slots", "serviceability", "labels", "lr_copy", "document"]).has(operation)) return { enabled: false, status: "unsupported" as const, reason: "Delhivery operation is not supported" };
+  if (provider === "delhivery" && !new Set(["tracking", "shipment_status", "shipments", "warehouse_prepare", "pickups", "pickup_slots", "serviceability", "serviceability_route", "labels", "lr_copy", "document"]).has(operation)) return { enabled: false, status: "unsupported" as const, reason: "Delhivery operation is not supported" };
   if (provider === "ekart" && operation === "pickups") return { enabled: false, status: "unsupported" as const, reason: "Ekart pickup contract is not verified" };
   if (provider === "ekart" && String(env.EKART_ENABLE_PROVIDER_CALLS) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "Ekart is configured but disabled until the agreed provider scope is approved" };
   if (provider === "ekart" && operation !== "tracking" && operation !== "shipments") return { enabled: false, status: "unsupported" as const, reason: "Ekart operation is not supported" };
@@ -2195,6 +2196,8 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
          ? useDelhiveryB2b ? `${base.replace(/\/$/, "")}/pickup_requests/` : "https://track.delhivery.com/fm/request/new/"
        : provider === "delhivery" && operation === "pickup_slots"
          ? `${base.replace(/\/$/, "")}/web/api/forward_orders/pickup_slots/${encodeURIComponent(String(delhiveryFacility?.code ?? ""))}?facility_id=${encodeURIComponent(String(delhiveryFacility?.id ?? ""))}`
+        : provider === "delhivery" && operation === "serviceability_route"
+          ? `${base.replace(/\/$/, "")}/tat/estimate?origin_pin=${encodeURIComponent(String(payload.origin_pincode ?? ""))}&destination_pin=${encodeURIComponent(String(payload.destination_pincode ?? ""))}`
         : provider === "delhivery" && operation === "serviceability"
           ? `${base.replace(/\/$/, "")}/pincode-service/${encodeURIComponent(String(payload.destination_pincode ?? ""))}?weight=${encodeURIComponent(String(Math.max(20000, Number(payload.weight_grams ?? payload.weight ?? 0) || 0)))}`
     : provider === "ekart"
@@ -2236,14 +2239,14 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         : provider === "rivigo" && operation === "shipments" ? JSON.stringify(rivigoCreate)
         : provider === "rivigo" && operation === "updates" ? JSON.stringify(payload)
         : provider === "rivigo" && operation === "cancellations" ? JSON.stringify(payload.cnotes_list ? { cnotesList: payload.cnotes_list } : {})
-         : provider === "delhivery" && ["tracking", "shipment_status", "serviceability", "pickup_slots", "labels", "lr_copy", "document"].includes(operation) ? ""
+         : provider === "delhivery" && ["tracking", "shipment_status", "serviceability", "serviceability_route", "pickup_slots", "labels", "lr_copy", "document"].includes(operation) ? ""
         : operation === "tracking" ? JSON.stringify({ Appkey: trackon!.appKey, userId: trackon!.userId, password: trackon!.password, AWBNo: trackingNumber })
           : operation === "shipments" ? JSON.stringify(trackonPayload(payload, trackon!))
             : JSON.stringify({ Appkey: trackon!.appKey, userId: trackon!.userId, password: trackon!.password, AWBNo: trackingNumber });
   if (provider === "delhivery" && operation === "shipments" && !useDelhiveryB2b) headers["content-type"] = "application/x-www-form-urlencoded";
   if (provider === "delhivery" && operation === "shipments" && useDelhiveryB2b) delete headers["content-type"];
   let response: Response | null = null; let lastError = "provider_request_failed";
-   const readOnlyProviderCall = operation === "tracking" || operation === "serviceability" || operation === "pickup_slots";
+   const readOnlyProviderCall = operation === "tracking" || operation === "serviceability" || operation === "serviceability_route" || operation === "pickup_slots";
   const singleManifestCall = provider === "delhivery" && operation === "shipments";
   const maxAttempts = singleManifestCall ? 1 : readOnlyProviderCall ? (provider === "delhivery" && useDelhiveryB2b ? 2 : 1) : 3;
   // Courier tracking/serviceability are read-only, but provider APIs can take
@@ -2257,7 +2260,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       // XpressBees documents tracking as POST even though it is a read-only
       // lookup. Keep the generic GET behavior for Delhivery/Trackon tracking,
       // but send the XpressBees AWB body with POST to avoid provider HTTP 405.
-       const isGet = (["tracking", "shipment_status", "serviceability", "pickup_slots", "labels", "lr_copy", "document"].includes(operation) && provider !== "xpressbees" && provider !== "rivigo") || (provider === "trackon" && operation === "labels");
+       const isGet = (["tracking", "shipment_status", "serviceability", "serviceability_route", "pickup_slots", "labels", "lr_copy", "document"].includes(operation) && provider !== "xpressbees" && provider !== "rivigo") || (provider === "trackon" && operation === "labels");
       const method = provider === "rivigo" && operation === "cancellations" ? "DELETE" : provider === "rivigo" && operation === "updates" ? "PUT" : isGet ? "GET" : "POST";
       response = await providerFetch(url, { method, headers, body: isGet ? undefined : requestBody }, attemptTimeoutMs);
       if (!singleManifestCall && provider === "delhivery" && useDelhiveryB2b && response.status === 401 && attempt === 0 && credential) {
@@ -2503,6 +2506,41 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     const providerPending = Boolean(providerState && /pending|queued|processing|created|in_progress/i.test(providerState));
     return { enabled: true, status: "accepted" as const, providerStatus: providerState ?? response.status, providerPending, providerReference: pickupReference, providerSlotId, acceptedDate: acceptedDate && validPickupDate(acceptedDate) ? acceptedDate : null, acceptedWindow };
   }
+  if (response.ok && provider === "delhivery" && operation === "serviceability_route") {
+    const body = parsedProviderBody && typeof parsedProviderBody === "object" ? parsedProviderBody as Record<string, unknown> : {};
+    const providerError = body.error && typeof body.error === "object" ? body.error as Record<string, unknown> : null;
+    const providerErrorText = String(providerError?.message ?? providerError?.detail ?? providerError?.code ?? body.message ?? "").trim();
+    if (body.success === false || /not\s*(found|available|serviceable)|unserviceable|invalid\s*(pin|pincode)/i.test(providerErrorText)) {
+      return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable: false, pickup: false, prepaid: false, cod: false, oda: null, reason: providerErrorText.slice(0, 300) || "Delhivery does not currently service this route" };
+    }
+    const parseTat = (value: unknown): number | null => {
+      if (typeof value === "number" && Number.isFinite(value)) return value;
+      if (typeof value === "string") {
+        const match = value.match(/\d+(?:\.\d+)?/);
+        return match ? Number(match[0]) : null;
+      }
+      return null;
+    };
+    const findTat = (value: unknown, depth = 0): number | null => {
+      if (depth > 5 || value == null || typeof value !== "object") return null;
+      if (Array.isArray(value)) {
+        for (const item of value) { const found = findTat(item, depth + 1); if (found !== null) return found; }
+        return null;
+      }
+      const record = value as Record<string, unknown>;
+      for (const key of ["tat", "tat_days", "tatDays", "expected_tat", "estimated_tat", "estimatedTat", "transit_days", "transit_time"]) {
+        if (Object.prototype.hasOwnProperty.call(record, key)) {
+          const found = parseTat(record[key]);
+          if (found !== null) return found;
+        }
+      }
+      for (const nested of Object.values(record)) { if (nested && typeof nested === "object") { const found = findTat(nested, depth + 1); if (found !== null) return found; } }
+      return null;
+    };
+    const tatDays = findTat(body);
+    if (tatDays !== null && tatDays > 0) return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable: true, pickup: true, prepaid: true, cod: false, oda: null, tat_days: tatDays };
+    return { enabled: true, status: "failed" as const, providerStatus: response.status, error: "Delhivery returned an incomplete route serviceability response" };
+  }
   if (response.ok && provider === "delhivery" && operation === "serviceability") {
     const body = parsedProviderBody && typeof parsedProviderBody === "object" ? parsedProviderBody as Record<string, unknown> : {};
     const b2bData = body.data && typeof body.data === "object" && !Array.isArray(body.data) ? body.data as Record<string, unknown> : null;
@@ -2725,18 +2763,26 @@ async function verifyDelhiveryServiceability(env: Env, originPincode: string, de
   const cacheKey = serviceabilityCacheKey(providerAccountId, originPincode, destinationPincode, paymentMode);
   const cached = delhiveryServiceabilityCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return { ...cached.result, provenance: "cached_provider" };
-  const [originResult, destinationResult] = await Promise.all([
+  const [originResult, destinationResult, routeResult] = await Promise.all([
     safeProviderRequest(env, "delhivery", "serviceability", { destination_pincode: originPincode, provider_account_id: providerAccountId }, `${requestIdValue}:origin-serviceability`, clientId, undefined, 10000),
     safeProviderRequest(env, "delhivery", "serviceability", { destination_pincode: destinationPincode, provider_account_id: providerAccountId }, `${requestIdValue}:destination-serviceability`, clientId, undefined, 10000),
+    safeProviderRequest(env, "delhivery", "serviceability_route", { origin_pincode: originPincode, destination_pincode: destinationPincode, provider_account_id: providerAccountId }, `${requestIdValue}:route-serviceability`, clientId, undefined, 10000),
   ]);
   const origin = originResult as Record<string, unknown>;
   const destination = destinationResult as Record<string, unknown>;
-  const decision = evaluateDelhiveryServiceability(origin, destination, paymentMode);
+  const route = routeResult as Record<string, unknown>;
+  const routeAccepted = route.status === "accepted" && route.serviceable === true;
+  const routeDecisionOrigin = routeAccepted ? { ...origin, status: "accepted", serviceable: true, pickup: true } : origin;
+  const routeDecisionDestination = routeAccepted
+    ? { ...destination, status: "accepted", serviceable: true, prepaid: paymentMode === "cod" ? destination.prepaid : true }
+    : destination;
+  const decision = routeAccepted ? evaluateDelhiveryServiceability(routeDecisionOrigin, routeDecisionDestination, paymentMode) : { ok: false, providerUnavailable: route.status !== "accepted" && route.status !== "failed", reason: String(route.error ?? route.reason ?? "Delhivery could not verify the origin-to-destination route") };
   const result: DelhiveryServiceabilityResult = {
     ok: decision.ok,
     provenance: decision.providerUnavailable ? "provider_unavailable" : "live_provider",
     origin,
     destination,
+    route,
     reason: decision.reason,
   };
   if (result.ok) delhiveryServiceabilityCache.set(cacheKey, { expiresAt: Date.now() + DELHIVERY_SERVICEABILITY_CACHE_TTL_MS, result });
@@ -3235,7 +3281,7 @@ const worker = {
       // runtime. Do not leave the Master health panels showing "pending"
       // forever; only terminalize stale read-only checks, never mutations or
       // webhook records.
-      await env.DB.prepare("UPDATE integration_requests SET status = 'failed', error_code = 'PROVIDER_TIMEOUT_STALE', error_message = 'Read-only provider request exceeded the terminalization window', updated_at = CURRENT_TIMESTAMP WHERE status = 'pending' AND operation IN ('tracking', 'serviceability') AND created_at <= datetime('now', '-10 seconds')").run();
+      await env.DB.prepare("UPDATE integration_requests SET status = 'failed', error_code = 'PROVIDER_TIMEOUT_STALE', error_message = 'Read-only provider request exceeded the terminalization window', updated_at = CURRENT_TIMESTAMP WHERE status = 'pending' AND operation IN ('tracking', 'serviceability', 'serviceability_route') AND created_at <= datetime('now', '-10 seconds')").run();
       const unavailableStatuses = new Set(["failed", "not_configured", "disabled", "safety_disabled"]);
       const allProvidersUnavailable = providerOutcomes.length > 0 && providerOutcomes.every(({ status }) => unavailableStatuses.has(status));
       return json({
@@ -3411,7 +3457,7 @@ const worker = {
         // provider probe has exceeded the same bounded terminalization window
         // used by the public tracker. Mutations and webhook records remain
         // untouched by this reconciliation.
-        await env.DB.prepare("UPDATE integration_requests SET status = 'failed', error_code = 'PROVIDER_TIMEOUT_STALE', error_message = 'Read-only provider request remained pending beyond the terminalization window' WHERE status = 'pending' AND operation IN ('tracking', 'serviceability') AND updated_at < datetime('now', '-10 seconds')").run();
+        await env.DB.prepare("UPDATE integration_requests SET status = 'failed', error_code = 'PROVIDER_TIMEOUT_STALE', error_message = 'Read-only provider request remained pending beyond the terminalization window' WHERE status = 'pending' AND operation IN ('tracking', 'serviceability', 'serviceability_route') AND updated_at < datetime('now', '-10 seconds')").run();
         const recentRequests = await env.DB.prepare("SELECT provider, status, error_code, updated_at FROM integration_requests WHERE provider IN ('delhivery', 'ekart', 'trackon', 'xpressbees', 'rivigo') ORDER BY updated_at DESC, CASE WHEN status = 'pending' THEN 1 ELSE 0 END ASC, id DESC").all<{ provider: CourierProvider; status: string; error_code: string | null; updated_at: string | null }>();
         const providerHealth = (provider: CourierProvider) => {
           const latest = recentRequests.results.find((item) => item.provider === provider);
