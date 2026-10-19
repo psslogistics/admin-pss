@@ -31,7 +31,10 @@ export function evaluateDelhiveryServiceability(origin: ServiceabilityObservatio
   if (destination.status !== "accepted") return { ok: false, providerUnavailable, reason: String(destination.error ?? destination.reason ?? "Delhivery could not verify the delivery pincode") };
   if (!destinationAccepted) return { ok: false, providerUnavailable, reason: "The delivery pincode is not serviceable by Delhivery" };
   const mode = String(paymentMode ?? "").trim().toLowerCase();
-  if (mode === "cod" && destination.cod !== true) return { ok: false, providerUnavailable, reason: "The delivery pincode does not support COD with Delhivery" };
-  if (mode === "prepaid" && destination.prepaid !== true) return { ok: false, providerUnavailable, reason: "The delivery pincode does not support prepaid delivery with Delhivery" };
+  // Delhivery's B2B route response can omit payment capabilities even when
+  // the lane is valid. Reject only an explicit provider-negative flag; an
+  // omitted flag must continue to manifest so Delhivery remains authoritative.
+  if (mode === "cod" && destination.cod === false) return { ok: false, providerUnavailable, reason: "The delivery pincode does not support COD with Delhivery" };
+  if (mode === "prepaid" && destination.prepaid === false) return { ok: false, providerUnavailable, reason: "The delivery pincode does not support prepaid delivery with Delhivery" };
   return { ok: true, providerUnavailable };
 }

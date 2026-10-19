@@ -1973,7 +1973,7 @@ function providerOdaFlag(value: Record<string, unknown> | null | undefined): boo
 }
 
 function providerPaymentFlags(value: Record<string, unknown> | null | undefined) {
-  const flags = { prepaid: false, cod: false };
+  const flags: { prepaid: boolean | null; cod: boolean | null } = { prepaid: null, cod: null };
   if (!value) return flags;
   const visit = (candidate: unknown, depth = 0) => {
     if (depth > 3 || candidate == null) return;
@@ -1992,8 +1992,8 @@ function providerPaymentFlags(value: Record<string, unknown> | null | undefined)
       const normalizedKey = key.toLowerCase().replace(/[-_ ]/g, "");
       const parsed = providerBooleanFlag(raw);
       if (parsed !== null) {
-        if (["prepaid", "prepaidallowed", "prepaidserviceable", "prepaidavailable", "prepaidenabled", "prepaidflag"].includes(normalizedKey)) flags.prepaid ||= parsed;
-        if (["cod", "cash", "cashondelivery", "codallowed", "codserviceable", "codavailable", "codenabled", "codflag"].includes(normalizedKey)) flags.cod ||= parsed;
+        if (["prepaid", "prepaidallowed", "prepaidserviceable", "prepaidavailable", "prepaidenabled", "prepaidflag"].includes(normalizedKey)) flags.prepaid = parsed;
+        if (["cod", "cash", "cashondelivery", "codallowed", "codserviceable", "codavailable", "codenabled", "codflag"].includes(normalizedKey)) flags.cod = parsed;
       }
       if (raw && typeof raw === "object") visit(raw, depth + 1);
       else if (["paymenttype", "paymenttypes", "paymentmode", "paymentmodes", "paymentmethod", "paymentmethods"].includes(normalizedKey)) visit(raw, depth + 1);
@@ -2609,7 +2609,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       const truthyFlag = (value: unknown) => value === true || ["true", "yes", "y", "1"].includes(String(value ?? "").trim().toLowerCase());
       const serviceable = truthyFlag(b2bRow.fm_serviceable);
       const paymentFlags = providerPaymentFlags(body);
-      return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable, prepaid: paymentFlags.prepaid, cod: paymentFlags.cod, pickup: serviceable, oda: truthyFlag(b2bRow.oda), facility_city: String(b2bRow.city ?? "").trim() || undefined, facility_state: String(b2bRow.state ?? "").trim() || undefined };
+      return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable, prepaid: paymentFlags.prepaid ?? undefined, cod: paymentFlags.cod ?? undefined, pickup: serviceable, oda: truthyFlag(b2bRow.oda), facility_city: String(b2bRow.city ?? "").trim() || undefined, facility_state: String(b2bRow.state ?? "").trim() || undefined };
     }
     const code = Array.isArray(body.delivery_codes) ? (body as { delivery_codes: Array<Record<string, unknown>> }).delivery_codes[0] : null;
     const postal = code?.postal_code && typeof code.postal_code === "object" ? code.postal_code as Record<string, unknown> : null;
