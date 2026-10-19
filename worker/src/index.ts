@@ -2528,7 +2528,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         return null;
       }
       const record = value as Record<string, unknown>;
-      for (const key of ["tat", "tat_days", "tatDays", "expected_tat", "estimated_tat", "estimatedTat", "transit_days", "transit_time"]) {
+      for (const key of ["tat", "tat_days", "tatDays", "expected_tat", "estimated_tat", "estimatedTat", "estimated_days", "transit_days", "transit_time"]) {
         if (Object.prototype.hasOwnProperty.call(record, key)) {
           const found = parseTat(record[key]);
           if (found !== null) return found;
@@ -2537,7 +2537,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       for (const nested of Object.values(record)) { if (nested && typeof nested === "object") { const found = findTat(nested, depth + 1); if (found !== null) return found; } }
       return null;
     };
-    const tatDays = findTat(body);
+    const tatDays = parseTat(parsedProviderBody) ?? findTat(body);
     if (tatDays !== null && tatDays > 0) return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable: true, pickup: true, prepaid: true, cod: false, oda: null, tat_days: tatDays };
     return { enabled: true, status: "failed" as const, providerStatus: response.status, error: "Delhivery returned an incomplete route serviceability response" };
   }
