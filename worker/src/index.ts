@@ -2681,7 +2681,7 @@ async function retryPendingDelhiveryBookings(env: Env, cron: string) {
 }
 
 async function reconcilePendingDelhiveryReferences(env: Env, cron: string) {
-  const pending = await env.DB.prepare("SELECT id, client_id, provider_account_id, provider_booking_id FROM shipments WHERE provider = 'delhivery' AND status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery') AND provider_sync_status = 'pending' AND provider_booking_id IS NOT NULL ORDER BY updated_at ASC LIMIT 50").all<{ id: string; client_id: string; provider_account_id: string | null; provider_booking_id: string }>();
+  const pending = await env.DB.prepare("SELECT id, client_id, provider_account_id, provider_booking_id FROM shipments WHERE provider = 'delhivery' AND status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery') AND (provider_sync_status = 'pending' OR (provider_sync_status IS NULL AND provider_booking_id IS NOT NULL)) AND provider_booking_id IS NOT NULL ORDER BY updated_at ASC LIMIT 50").all<{ id: string; client_id: string; provider_account_id: string | null; provider_booking_id: string }>();
   for (const shipment of pending.results) {
     try {
       await safeProviderRequest(env, "delhivery", "shipment_status", { shipment_id: shipment.id, provider_booking_id: shipment.provider_booking_id, provider_account_id: shipment.provider_account_id }, `cron:${cron}:delhivery-reference:${shipment.id}`, shipment.client_id, undefined, 10000);
