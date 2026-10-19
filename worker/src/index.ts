@@ -13,7 +13,6 @@ export interface Env extends Omit<Cloudflare.Env, "SUPABASE_PUBLISHABLE_KEY" | "
   API_KEY_PEPPER?: string;
   DELHIVERY_API_TOKEN?: string;
   DELHIVERY_B2B_API_BASE_URL?: string;
-  DELHIVERY_APP_API_BASE_URL?: string;
   DELHIVERY_WEBHOOK_SECRET?: string;
   DELHIVERY_TOKEN_CACHE?: DelhiveryTokenCache;
   EKART_API_KEY?: string;
@@ -2059,7 +2058,6 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (!base || (provider === "trackon" ? !trackon : provider === "rivigo" ? !rivigo : !credential)) return { enabled: false, status: "not_configured" as const };
   const providerTimeoutMs = Math.min(timeoutMsOverride ?? (provider === "delhivery" && operation === "shipments" ? 30000 : 10000), provider === "delhivery" && operation === "shipments" ? 30000 : 10000);
   const delhiveryB2bAccountName = account?.account_name ?? defaultDelhiveryAccountName;
-  const delhiveryB2bServiceability = provider === "delhivery" && useDelhiveryB2b && operation === "serviceability";
   let delhiveryB2bToken = useDelhiveryB2b ? await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs) : null;
   if (provider === "delhivery" && useDelhiveryB2b && !delhiveryB2bToken) return { enabled: true, status: "failed" as const, error: "Delhivery B2B authentication failed" };
   let delhiveryPickupLocation = "";
@@ -2198,9 +2196,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
        : provider === "delhivery" && operation === "pickup_slots"
          ? `${base.replace(/\/$/, "")}/web/api/forward_orders/pickup_slots/${encodeURIComponent(String(delhiveryFacility?.code ?? ""))}?facility_id=${encodeURIComponent(String(delhiveryFacility?.id ?? ""))}`
         : provider === "delhivery" && operation === "serviceability"
-          ? delhiveryB2bServiceability
-            ? `${String(env.DELHIVERY_APP_API_BASE_URL ?? "https://ucp-app-gateway.delhivery.com").replace(/\/$/, "")}/web/api/company/configurations/serviceability_pincode`
-            : `${base.replace(/\/$/, "")}/pincode-service/${encodeURIComponent(String(payload.destination_pincode ?? ""))}?weight=1`
+          ? `${base.replace(/\/$/, "")}/pincode-service/${encodeURIComponent(String(payload.destination_pincode ?? ""))}?weight=1`
     : provider === "ekart"
       ? `${base.replace(/\/$/, "")}/v2/shipments/${operation === "shipments" ? "create" : "track"}`
       : provider === "xpressbees" && operation === "tracking"
@@ -2240,8 +2236,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         : provider === "rivigo" && operation === "shipments" ? JSON.stringify(rivigoCreate)
         : provider === "rivigo" && operation === "updates" ? JSON.stringify(payload)
         : provider === "rivigo" && operation === "cancellations" ? JSON.stringify(payload.cnotes_list ? { cnotesList: payload.cnotes_list } : {})
-         : provider === "delhivery" && ["tracking", "shipment_status", "serviceability", "pickup_slots", "labels", "lr_copy", "document"].includes(operation) && !delhiveryB2bServiceability ? ""
-        : delhiveryB2bServiceability ? JSON.stringify({ pincode: String(payload.destination_pincode ?? ""), product_type: "B2B" })
+         : provider === "delhivery" && ["tracking", "shipment_status", "serviceability", "pickup_slots", "labels", "lr_copy", "document"].includes(operation) ? ""
         : operation === "tracking" ? JSON.stringify({ Appkey: trackon!.appKey, userId: trackon!.userId, password: trackon!.password, AWBNo: trackingNumber })
           : operation === "shipments" ? JSON.stringify(trackonPayload(payload, trackon!))
             : JSON.stringify({ Appkey: trackon!.appKey, userId: trackon!.userId, password: trackon!.password, AWBNo: trackingNumber });
@@ -2262,7 +2257,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       // XpressBees documents tracking as POST even though it is a read-only
       // lookup. Keep the generic GET behavior for Delhivery/Trackon tracking,
       // but send the XpressBees AWB body with POST to avoid provider HTTP 405.
-       const isGet = (["tracking", "shipment_status", "serviceability", "pickup_slots", "labels", "lr_copy", "document"].includes(operation) && provider !== "xpressbees" && provider !== "rivigo" && !delhiveryB2bServiceability) || (provider === "trackon" && operation === "labels");
+       const isGet = (["tracking", "shipment_status", "serviceability", "pickup_slots", "labels", "lr_copy", "document"].includes(operation) && provider !== "xpressbees" && provider !== "rivigo") || (provider === "trackon" && operation === "labels");
       const method = provider === "rivigo" && operation === "cancellations" ? "DELETE" : provider === "rivigo" && operation === "updates" ? "PUT" : isGet ? "GET" : "POST";
       response = await providerFetch(url, { method, headers, body: isGet ? undefined : requestBody }, attemptTimeoutMs);
       if (!singleManifestCall && provider === "delhivery" && useDelhiveryB2b && response.status === 401 && attempt === 0 && credential) {
@@ -2538,14 +2533,6 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     };
     const b2bRows = candidateRows.reduce<unknown[] | null>((found, value) => found ?? findB2bRows(value), null);
     const b2bRow = b2bRows?.[0] && typeof b2bRows[0] === "object" ? b2bRows[0] as Record<string, unknown> : null;
-    const ucpRow = (b2bData && typeof b2bData.center === "string" ? b2bData : b2bRows?.[0] && typeof b2bRows[0] === "object" && typeof (b2bRows[0] as Record<string, unknown>).center === "string" ? b2bRows[0] as Record<string, unknown> : null);
-    if (ucpRow) {
-      const serviceable = String(ucpRow.center).trim().toUpperCase() !== "NSZ";
-      const paymentTypeValue = ucpRow.payment_type;
-      const paymentTypes = Array.isArray(paymentTypeValue) ? paymentTypeValue.map(String) : String(paymentTypeValue ?? "").replace(/[\[\]\"]+/g, "").split(",").map((value) => value.trim()).filter(Boolean);
-      const normalizedPaymentTypes = paymentTypes.map((value) => value.toLowerCase().replace(/[-_ ]/g, ""));
-      return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable, prepaid: normalizedPaymentTypes.length === 0 ? serviceable : normalizedPaymentTypes.includes("prepaid"), cod: normalizedPaymentTypes.some((value) => value === "cod" || value === "cash"), pickup: serviceable, oda: providerOdaFlag(ucpRow) };
-    }
     if (b2bRows && !b2bRow) return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable: false, prepaid: false, cod: false, pickup: false, oda: null, reason: "Delhivery does not currently service this pincode" };
     if (b2bRow) {
       const paymentTypeValue = b2bRow.payment_type;
