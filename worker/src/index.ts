@@ -2580,12 +2580,12 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       if (!hasServiceabilityFlag) return { enabled: true, status: "failed" as const, providerStatus: response.status, error: "Delhivery returned an incomplete pincode serviceability response" };
       const truthyFlag = (value: unknown) => value === true || ["true", "yes", "y", "1"].includes(String(value ?? "").trim().toLowerCase());
       const serviceable = truthyFlag(b2bRow.fm_serviceable);
-      return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable, prepaid: normalizedPaymentTypes.includes("prepaid"), cod: normalizedPaymentTypes.some((value) => value === "cod" || value === "cash"), pickup: serviceable, oda: truthyFlag(b2bRow.oda) };
+      return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable, prepaid: normalizedPaymentTypes.includes("prepaid"), cod: normalizedPaymentTypes.some((value) => value === "cod" || value === "cash"), pickup: serviceable, oda: truthyFlag(b2bRow.oda), facility_city: String(b2bRow.city ?? "").trim() || undefined, facility_state: String(b2bRow.state ?? "").trim() || undefined };
     }
     const code = Array.isArray(body.delivery_codes) ? (body as { delivery_codes: Array<Record<string, unknown>> }).delivery_codes[0] : null;
     const postal = code?.postal_code && typeof code.postal_code === "object" ? code.postal_code as Record<string, unknown> : null;
     if (!postal) return { enabled: true, status: "failed" as const, providerStatus: response.status, error: "Delhivery returned an incomplete pincode serviceability response" };
-    return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable: Boolean(postal && (String(postal.pre_paid ?? "N").toUpperCase() === "Y" || String(postal.cash ?? "N").toUpperCase() === "Y")), prepaid: String(postal?.pre_paid ?? "N").toUpperCase() === "Y", cod: String(postal?.cash ?? "N").toUpperCase() === "Y", pickup: String(postal?.pickup ?? "N").toUpperCase() === "Y", oda: providerOdaFlag(postal) };
+    return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable: Boolean(postal && (String(postal.pre_paid ?? "N").toUpperCase() === "Y" || String(postal.cash ?? "N").toUpperCase() === "Y")), prepaid: String(postal?.pre_paid ?? "N").toUpperCase() === "Y", cod: String(postal?.cash ?? "N").toUpperCase() === "Y", pickup: String(postal?.pickup ?? "N").toUpperCase() === "Y", oda: providerOdaFlag(postal), facility_city: String(postal?.city ?? postal?.district ?? "").trim() || undefined, facility_state: String(postal?.state ?? "").trim() || undefined };
   }
   if (response.ok && provider === "rivigo" && operation === "serviceability") {
     const payloadBody = parsedProviderBody && typeof parsedProviderBody === "object" ? (parsedProviderBody as Record<string, unknown>).payload : null;
@@ -4983,7 +4983,13 @@ const worker = {
         // The pincode dataset remains pricing metadata only (zones/ODA/rates).
         // Live Delhivery serviceability above is the booking authority.
         const [originPin, destinationPin] = await Promise.all([pricingPincode(env, originPincode), pricingPincode(env, destinationPincode)]);
-        if (!originPin || !destinationPin) return error("PINCODE_NOT_FOUND", "One or both pincodes are not present in the active Delhivery B2B dataset", 404, id, headers);
+        const providerOrigin = liveServiceability.origin as Record<string, unknown>;
+        const providerDestination = liveServiceability.destination as Record<string, unknown>;
+        const originCity = originPin?.facility_city ?? String(providerOrigin.facility_city ?? providerOrigin.city ?? payload.origin_city ?? "").trim();
+        const destinationCity = destinationPin?.facility_city ?? String(providerDestination.facility_city ?? providerDestination.city ?? payload.destination_city ?? "").trim();
+        const originState = originPin?.facility_state ?? String(providerOrigin.facility_state ?? providerOrigin.state ?? payload.origin_state ?? "").trim();
+        const destinationState = destinationPin?.facility_state ?? String(providerDestination.facility_state ?? providerDestination.state ?? payload.destination_state ?? "").trim();
+        if (!originCity || !originState || !destinationCity || !destinationState) return error("LOCATION_METADATA_REQUIRED", "Delhivery verified the route, but city/state metadata is unavailable for PSS pricing. Enter the city and state and retry.", 409, id, headers);
         let forwardRatePerKg: number | undefined;
         if (rtoSource) {
           try {
@@ -4993,8 +4999,8 @@ const worker = {
           } catch { return error("RTO_SOURCE_INVALID", "The original shipment pricing snapshot is invalid", 409, id, headers); }
           if (forwardRatePerKg === undefined) return error("RTO_SOURCE_INVALID", "The original shipment pricing snapshot is invalid", 409, id, headers);
         }
-         const oda = Boolean(originPin.oda || destinationPin.oda);
-         const result = calculatePssRate({ account, originCity: originPin.facility_city, destinationCity: destinationPin.facility_city, originState: originPin.facility_state, destinationState: destinationPin.facility_state, actualWeightKg, volumetricWeightKg, invoiceValue, rto, forwardRatePerKg, forwardOriginZoneOverride: rtoSource?.origin_zone, forwardDestinationZoneOverride: rtoSource?.destination_zone, minimumWeightKg: Number(activeVersion.minimum_weight_kg ?? 20), gstPercent: Number(activeVersion.gst_percent ?? 18), versionId: activeVersion.id, oda, opa: false, rateMatrix, riskCharges: [], chargeRules: rules.results.map((rule) => ({ code: rule.code, label: rule.label, kind: rule.calculation_type, value: Number(rule.value), basis: rule.basis, minimum: rule.minimum_value === null ? undefined : Number(rule.minimum_value), maximum: rule.maximum_value === null ? undefined : Number(rule.maximum_value), enabled: Boolean(rule.enabled), marker: rule.marker ?? undefined, condition: rule.condition ?? undefined, displayOrder: Number(rule.display_order ?? 0) })) });
+         const oda = Boolean(originPin?.oda || destinationPin?.oda || providerOrigin.oda === true || providerDestination.oda === true);
+         const result = calculatePssRate({ account, originCity, destinationCity, originState, destinationState, actualWeightKg, volumetricWeightKg, invoiceValue, rto, forwardRatePerKg, forwardOriginZoneOverride: rtoSource?.origin_zone, forwardDestinationZoneOverride: rtoSource?.destination_zone, minimumWeightKg: Number(activeVersion.minimum_weight_kg ?? 20), gstPercent: Number(activeVersion.gst_percent ?? 18), versionId: activeVersion.id, oda, opa: false, rateMatrix, riskCharges: [], chargeRules: rules.results.map((rule) => ({ code: rule.code, label: rule.label, kind: rule.calculation_type, value: Number(rule.value), basis: rule.basis, minimum: rule.minimum_value === null ? undefined : Number(rule.minimum_value), maximum: rule.maximum_value === null ? undefined : Number(rule.maximum_value), enabled: Boolean(rule.enabled), marker: rule.marker ?? undefined, condition: rule.condition ?? undefined, displayOrder: Number(rule.display_order ?? 0) })) });
         const carrierRisk = payload.risk_type === "carrier";
         const riskFee = carrierRisk
           ? Math.max(80, Math.round(invoiceValue * 0.003 * 100) / 100)
