@@ -1995,7 +1995,8 @@ function providerPaymentFlags(value: Record<string, unknown> | null | undefined)
         if (["prepaid", "prepaidallowed", "prepaidserviceable", "prepaidavailable", "prepaidenabled", "prepaidflag"].includes(normalizedKey)) flags.prepaid ||= parsed;
         if (["cod", "cash", "cashondelivery", "codallowed", "codserviceable", "codavailable", "codenabled", "codflag"].includes(normalizedKey)) flags.cod ||= parsed;
       }
-      if (["paymenttype", "paymenttypes", "paymentmode", "paymentmodes", "paymentmethod", "paymentmethods"].includes(normalizedKey)) visit(raw, depth + 1);
+      if (raw && typeof raw === "object") visit(raw, depth + 1);
+      else if (["paymenttype", "paymenttypes", "paymentmode", "paymentmodes", "paymentmethod", "paymentmethods"].includes(normalizedKey)) visit(raw, depth + 1);
     }
   };
   visit(value);
@@ -2607,7 +2608,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       if (!hasServiceabilityFlag) return { enabled: true, status: "failed" as const, providerStatus: response.status, error: "Delhivery returned an incomplete pincode serviceability response" };
       const truthyFlag = (value: unknown) => value === true || ["true", "yes", "y", "1"].includes(String(value ?? "").trim().toLowerCase());
       const serviceable = truthyFlag(b2bRow.fm_serviceable);
-      const paymentFlags = providerPaymentFlags(b2bRow);
+      const paymentFlags = providerPaymentFlags(body);
       return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable, prepaid: paymentFlags.prepaid, cod: paymentFlags.cod, pickup: serviceable, oda: truthyFlag(b2bRow.oda), facility_city: String(b2bRow.city ?? "").trim() || undefined, facility_state: String(b2bRow.state ?? "").trim() || undefined };
     }
     const code = Array.isArray(body.delivery_codes) ? (body as { delivery_codes: Array<Record<string, unknown>> }).delivery_codes[0] : null;
