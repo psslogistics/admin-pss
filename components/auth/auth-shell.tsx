@@ -1,40 +1,10 @@
-import { ArrowUpRight, LockKeyhole, ShieldCheck } from "lucide-react";
+import { ArrowUpRight, Check, LockKeyhole, ShieldCheck } from "lucide-react";
 import type { ReactNode } from "react";
 import { BrandLogo } from "@/components/ui/brand-logo";
 
-type AuthShellProps = {
-  eyebrow: string;
-  title: string;
-  description: string;
-  children: ReactNode;
-};
+type AuthShellProps = { eyebrow: string; title: string; description: string; children: ReactNode };
+const capabilities = ["Clients", "Shipments", "Support"];
 
 export default function AuthShell({ eyebrow, title, description, children }: AuthShellProps) {
-  return (
-    <main className="min-h-dvh bg-[#f5f8fc] p-3 text-[#172033] sm:p-5 lg:p-8">
-      <div className="mx-auto grid min-h-[calc(100dvh-1.5rem)] max-w-[1380px] overflow-hidden rounded-[28px] border border-[#dbe5f2] bg-white shadow-[0_24px_80px_rgba(23,32,51,0.12)] sm:min-h-[calc(100dvh-2.5rem)] lg:grid-cols-[minmax(0,1.08fr)_minmax(430px,0.92fr)]">
-        <section className="relative hidden overflow-hidden bg-[#102642] p-10 text-white lg:flex lg:flex-col lg:justify-between xl:p-14">
-          <div className="absolute -right-28 -top-28 size-[420px] rounded-full bg-[#2563eb]/30 blur-3xl" />
-          <div className="absolute -bottom-36 -left-20 size-[420px] rounded-full bg-[#16a5d8]/20 blur-3xl" />
-          <div className="absolute inset-0 opacity-20 [background-image:linear-gradient(rgba(255,255,255,.14)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,.14)_1px,transparent_1px)] [background-size:42px_42px]" />
-          <div className="relative">
-            <BrandLogo className="h-11 w-[164px]" />
-            <div className="mt-24 max-w-xl">
-              <p className="mb-5 text-xs font-semibold uppercase tracking-[0.22em] text-[#7dd3fc]">Move with confidence</p>
-              <h2 className="text-5xl font-semibold leading-[1.04] tracking-[-0.055em] xl:text-6xl">Every shipment.<br /><span className="text-[#7dd3fc]">One clear view.</span></h2>
-              <p className="mt-7 max-w-md text-[15px] leading-7 text-white/65">Coordinate bookings, track movement, and keep every customer promise visible from pickup to delivery.</p>
-            </div>
-          </div>
-        </section>
-        <section className="flex min-w-0 flex-col justify-center px-5 py-8 sm:px-10 lg:px-12 xl:px-20">
-          <div className="mx-auto w-full max-w-[430px]">
-            <div className="mb-8 flex items-center justify-between lg:hidden"><BrandLogo className="h-9 w-[142px]" /><span className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[#738198]">Secure portal</span></div>
-            <div className="mb-8"><div className="mb-5 hidden size-11 place-items-center rounded-2xl bg-[#eaf2ff] text-[#2563eb] lg:grid"><LockKeyhole className="size-5" /></div><p className="text-[11px] font-bold uppercase tracking-[0.2em] text-[#2563eb]">{eyebrow}</p><h1 className="mt-3 text-3xl font-semibold tracking-[-0.045em] text-[#172033] sm:text-[34px]">{title}</h1><p className="mt-3 max-w-sm text-sm leading-6 text-[#738198]">{description}</p></div>
-            {children}
-            <p className="mt-8 flex items-center justify-center gap-1.5 text-center text-[11px] text-[#9aa6b8]"><ShieldCheck className="size-3.5" /> Your connection is encrypted and monitored <ArrowUpRight className="size-3" /></p>
-          </div>
-        </section>
-      </div>
-    </main>
-  );
+  return <main className="min-h-dvh bg-[#eef4f8] p-0 text-[#172033] sm:p-4 lg:p-6"><div className="mx-auto grid min-h-dvh max-w-[1480px] overflow-hidden border border-[#d7e3ec] bg-white shadow-[0_24px_80px_rgba(23,32,51,0.16)] sm:min-h-[calc(100dvh-2rem)] sm:rounded-[30px] lg:min-h-[calc(100dvh-3rem)] lg:grid-cols-[minmax(0,1.08fr)_minmax(430px,0.92fr)]"><section className="relative hidden overflow-hidden bg-[#102642] text-white lg:flex lg:flex-col lg:justify-between lg:p-10 xl:p-14"><div className="absolute inset-0 bg-[url('/auth-login-hero.png')] bg-cover bg-[center_right]" /><div className="absolute inset-0 bg-[linear-gradient(90deg,rgba(9,27,53,.96)_0%,rgba(9,27,53,.78)_38%,rgba(9,27,53,.16)_100%)]" /><div className="absolute inset-0 bg-[linear-gradient(0deg,rgba(7,25,48,.76)_0%,transparent_48%,rgba(7,25,48,.2)_100%)]" /><div className="relative"><BrandLogo className="h-11 w-[164px] brightness-0 invert" /><div className="mt-20 max-w-xl xl:mt-24"><p className="mb-5 flex items-center gap-3 text-xs font-semibold uppercase tracking-[0.22em] text-[#a8e8ff]"><span className="h-px w-10 bg-[#f4b860]" />Employee operations</p><h2 className="text-5xl font-semibold leading-[1.02] tracking-[-0.055em] xl:text-6xl">Keep work<br /><span className="text-[#8cddff]">moving clearly.</span></h2><p className="mt-7 max-w-md text-[15px] leading-7 text-white/75">Coordinate clients, shipments, pickups, and support from one operational workspace.</p></div></div><div className="relative flex max-w-xl gap-3">{capabilities.map((capability) => <div key={capability} className="flex items-center gap-2 rounded-full border border-white/20 bg-[#0d2c4d]/70 px-4 py-2.5 text-xs font-semibold text-white/90 backdrop-blur-sm"><Check className="size-3.5 text-[#f4b860]" />{capability}</div>)}</div></section><section className="flex min-w-0 flex-col justify-center bg-white px-5 py-8 sm:px-10 lg:px-12 xl:px-20"><div className="mx-auto w-full max-w-[430px]"><div className="mb-8 flex items-center justify-between lg:hidden"><BrandLogo className="h-9 w-[142px]" /><span className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[#738198]">Secure portal</span></div><div className="mb-8 rounded-[26px] border border-[#dce8ef] bg-white p-1 shadow-[0_18px_50px_rgba(23,32,51,0.08)] sm:p-2"><div className="rounded-[21px] bg-[#fbfdff] px-4 py-5 sm:px-7 sm:py-7"><div className="mb-5 grid size-11 place-items-center rounded-2xl bg-[#e8f7fc] text-[#137aa0]"><LockKeyhole className="size-5" /></div><p className="text-[11px] font-bold uppercase tracking-[0.2em] text-[#137aa0]">{eyebrow}</p><h1 className="mt-3 text-3xl font-semibold tracking-[-0.045em] text-[#172033] sm:text-[34px]">{title}</h1><p className="mt-3 max-w-sm text-sm leading-6 text-[#738198]">{description}</p><div className="mt-7">{children}</div></div></div><p className="flex items-center justify-center gap-1.5 text-center text-[11px] text-[#9aa6b8]"><ShieldCheck className="size-3.5" /> Your connection is encrypted and monitored <ArrowUpRight className="size-3" /></p></div></section></div></main>;
 }
