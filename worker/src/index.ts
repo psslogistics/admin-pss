@@ -2773,11 +2773,12 @@ async function verifyDelhiveryServiceability(env: Env, originPincode: string, de
   const destination = destinationResult as Record<string, unknown>;
   const route = routeResult as Record<string, unknown>;
   const routeAccepted = route.status === "accepted" && route.serviceable === true;
-  const routeDecisionOrigin = routeAccepted ? { ...origin, status: "accepted", serviceable: true, pickup: true } : origin;
-  const routeDecisionDestination = routeAccepted
-    ? { ...destination, status: "accepted", serviceable: true, prepaid: paymentMode === "cod" ? destination.prepaid : true }
-    : destination;
-  const decision = routeAccepted ? evaluateDelhiveryServiceability(routeDecisionOrigin, routeDecisionDestination, paymentMode) : { ok: false, providerUnavailable: route.status !== "accepted" && route.status !== "failed", reason: String(route.error ?? route.reason ?? "Delhivery could not verify the origin-to-destination route") };
+  // The route/TAT endpoint is an additional provider signal, not a substitute
+  // for either live pincode leg. A route-positive result must never override a
+  // negative or incomplete origin/destination response.
+  const decision = routeAccepted
+    ? evaluateDelhiveryServiceability(origin, destination, paymentMode)
+    : { ok: false, providerUnavailable: route.status !== "accepted" && route.status !== "failed", reason: String(route.error ?? route.reason ?? "Delhivery could not verify the origin-to-destination route") };
   const result: DelhiveryServiceabilityResult = {
     ok: decision.ok,
     provenance: decision.providerUnavailable ? "provider_unavailable" : "live_provider",
