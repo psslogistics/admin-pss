@@ -1974,6 +1974,7 @@ function providerOdaFlag(value: Record<string, unknown> | null | undefined): boo
 
 function providerPaymentFlags(value: Record<string, unknown> | null | undefined) {
   const flags: { prepaid: boolean | null; cod: boolean | null } = { prepaid: null, cod: null };
+  const positive: { prepaid: boolean; cod: boolean } = { prepaid: false, cod: false };
   if (!value) return flags;
   const visit = (candidate: unknown, depth = 0) => {
     // B2B responses nest payment_type under data -> serviceability rows.
@@ -1985,8 +1986,8 @@ function providerPaymentFlags(value: Record<string, unknown> | null | undefined)
     }
     if (typeof candidate !== "object") {
       const tokens = String(candidate).toLowerCase().replace(/[\[\]{}\"]+/g, "").split(/[,|;/]+/).map((item) => item.trim().replace(/[-_ ]/g, "")).filter(Boolean);
-      if (tokens.some((token) => token === "prepaid" || token === "prepaidallowed" || token === "prepaidserviceable")) flags.prepaid = true;
-      if (tokens.some((token) => ["cod", "cash", "cashondelivery", "codallowed", "codserviceable"].includes(token))) flags.cod = true;
+      if (tokens.some((token) => token === "prepaid" || token === "prepaidallowed" || token === "prepaidserviceable")) { flags.prepaid = true; positive.prepaid = true; }
+      if (tokens.some((token) => ["cod", "cash", "cashondelivery", "codallowed", "codserviceable"].includes(token))) { flags.cod = true; positive.cod = true; }
       return;
     }
     const record = candidate as Record<string, unknown>;
@@ -1994,8 +1995,14 @@ function providerPaymentFlags(value: Record<string, unknown> | null | undefined)
       const normalizedKey = key.toLowerCase().replace(/[-_ ]/g, "");
       const parsed = providerBooleanFlag(raw);
       if (parsed !== null) {
-        if (["prepaid", "prepaidallowed", "prepaidserviceable", "prepaidavailable", "prepaidenabled", "prepaidflag"].includes(normalizedKey)) flags.prepaid = parsed;
-        if (["cod", "cash", "cashondelivery", "codallowed", "codserviceable", "codavailable", "codenabled", "codflag"].includes(normalizedKey)) flags.cod = parsed;
+        if (["prepaid", "prepaidallowed", "prepaidserviceable", "prepaidavailable", "prepaidenabled", "prepaidflag"].includes(normalizedKey)) {
+          if (parsed || !positive.prepaid) flags.prepaid = parsed;
+          if (parsed) positive.prepaid = true;
+        }
+        if (["cod", "cash", "cashondelivery", "codallowed", "codserviceable", "codavailable", "codenabled", "codflag"].includes(normalizedKey)) {
+          if (parsed || !positive.cod) flags.cod = parsed;
+          if (parsed) positive.cod = true;
+        }
       }
       if (raw && typeof raw === "object") visit(raw, depth + 1);
       else if (["paymenttype", "paymenttypes", "paymentmode", "paymentmodes", "paymentmethod", "paymentmethods"].includes(normalizedKey)) visit(raw, depth + 1);
