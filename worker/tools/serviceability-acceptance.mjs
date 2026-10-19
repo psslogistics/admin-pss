@@ -13,4 +13,5 @@ const timeout = evaluateDelhiveryServiceability({ status: "failed", providerStat
 assert.equal(timeout.providerUnavailable, true, "provider timeout must be unavailable, not dataset-positive");
 assert.notEqual(serviceabilityCacheKey("account-a", "110001", "201301", "cod"), serviceabilityCacheKey("account-a", "110001", "201301", "prepaid"), "payment mode must partition the cache");
 assert.notEqual(serviceabilityCacheKey("account-a", "110001", "201301", "prepaid"), serviceabilityCacheKey("account-b", "110001", "201301", "prepaid"), "provider account must partition the cache");
+assert.notEqual(serviceabilityCacheKey("account-a", "110001", "201301", "prepaid", 15), serviceabilityCacheKey("account-a", "110001", "201301", "prepaid", 25), "shipment weight must partition the cache");
 console.log("Delhivery serviceability acceptance scenarios passed.");

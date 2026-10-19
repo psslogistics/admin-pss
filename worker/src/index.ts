@@ -2199,7 +2199,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         : provider === "delhivery" && operation === "serviceability_route"
           ? `${base.replace(/\/$/, "")}/tat/estimate?origin_pin=${encodeURIComponent(String(payload.origin_pincode ?? ""))}&destination_pin=${encodeURIComponent(String(payload.destination_pincode ?? ""))}`
         : provider === "delhivery" && operation === "serviceability"
-          ? `${base.replace(/\/$/, "")}/pincode-service/${encodeURIComponent(String(payload.destination_pincode ?? ""))}?weight=${encodeURIComponent(String(Math.max(20000, Number(payload.weight_grams ?? payload.weight ?? 0) || 0)))}`
+          ? `${base.replace(/\/$/, "")}/pincode-service/${encodeURIComponent(String(payload.destination_pincode ?? ""))}?weight=${encodeURIComponent(String(Math.max(1, Number(payload.weight_grams ?? payload.weight ?? 0) || 0)))}`
     : provider === "ekart"
       ? `${base.replace(/\/$/, "")}/v2/shipments/${operation === "shipments" ? "create" : "track"}`
       : provider === "xpressbees" && operation === "tracking"
@@ -2759,13 +2759,14 @@ async function safeProviderRequest(env: Env, provider: CourierProvider, operatio
   }
 }
 
-async function verifyDelhiveryServiceability(env: Env, originPincode: string, destinationPincode: string, providerAccountId: string, requestIdValue: string, clientId: string, paymentMode?: string): Promise<DelhiveryServiceabilityResult> {
-  const cacheKey = serviceabilityCacheKey(providerAccountId, originPincode, destinationPincode, paymentMode);
+async function verifyDelhiveryServiceability(env: Env, originPincode: string, destinationPincode: string, providerAccountId: string, requestIdValue: string, clientId: string, paymentMode?: string, weightKg?: number): Promise<DelhiveryServiceabilityResult> {
+  const normalizedWeightKg = Number.isFinite(Number(weightKg)) && Number(weightKg) > 0 ? Number(weightKg) : 20;
+  const cacheKey = serviceabilityCacheKey(providerAccountId, originPincode, destinationPincode, paymentMode, normalizedWeightKg);
   const cached = delhiveryServiceabilityCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return { ...cached.result, provenance: "cached_provider" };
   const [originResult, destinationResult, routeResult] = await Promise.all([
-    safeProviderRequest(env, "delhivery", "serviceability", { destination_pincode: originPincode, provider_account_id: providerAccountId }, `${requestIdValue}:origin-serviceability`, clientId, undefined, 10000),
-    safeProviderRequest(env, "delhivery", "serviceability", { destination_pincode: destinationPincode, provider_account_id: providerAccountId }, `${requestIdValue}:destination-serviceability`, clientId, undefined, 10000),
+    safeProviderRequest(env, "delhivery", "serviceability", { destination_pincode: originPincode, weight_grams: Math.max(1, Math.round(normalizedWeightKg * 1000)), provider_account_id: providerAccountId }, `${requestIdValue}:origin-serviceability`, clientId, undefined, 10000),
+    safeProviderRequest(env, "delhivery", "serviceability", { destination_pincode: destinationPincode, weight_grams: Math.max(1, Math.round(normalizedWeightKg * 1000)), provider_account_id: providerAccountId }, `${requestIdValue}:destination-serviceability`, clientId, undefined, 10000),
     safeProviderRequest(env, "delhivery", "serviceability_route", { origin_pincode: originPincode, destination_pincode: destinationPincode, provider_account_id: providerAccountId }, `${requestIdValue}:route-serviceability`, clientId, undefined, 10000),
   ]);
   const origin = originResult as Record<string, unknown>;
@@ -3797,7 +3798,7 @@ const worker = {
           const liveProviderAccountId = await resolveDelhiveryProviderAccountId(env, clientId, requestedProviderAccountId);
           if (!liveProviderAccountId) return error("PROVIDER_ACCOUNT_REQUIRED", "An active Delhivery account is required for live serviceability verification", 409, id, headers);
           payload.provider_account_id = liveProviderAccountId;
-          const liveServiceability = await verifyDelhiveryServiceability(env, originAddress.pincode, destinationAddress.pincode, liveProviderAccountId, id, clientId, String(payload.payment_mode ?? "prepaid").trim().toLowerCase() === "cod" ? "cod" : "prepaid");
+          const liveServiceability = await verifyDelhiveryServiceability(env, originAddress.pincode, destinationAddress.pincode, liveProviderAccountId, id, clientId, String(payload.payment_mode ?? "prepaid").trim().toLowerCase() === "cod" ? "cod" : "prepaid", weight);
           if (!liveServiceability.ok) return error("PROVIDER_SERVICEABILITY_FAILED", liveServiceability.reason ?? "Delhivery could not verify this route", 409, id, headers, JSON.stringify({ provenance: liveServiceability.provenance, origin: liveServiceability.origin, destination: liveServiceability.destination, route: liveServiceability.route }));
           liveServiceabilityProvenance = liveServiceability.provenance;
         }
@@ -4962,7 +4963,7 @@ const worker = {
         const liveProviderAccountId = await resolveDelhiveryProviderAccountId(env, clientId, typeof payload.provider_account_id === "string" ? payload.provider_account_id : null);
         if (!liveProviderAccountId) return error("PROVIDER_ACCOUNT_REQUIRED", "An active Delhivery account is required for live serviceability verification", 409, id, headers);
         const paymentMode = String(payload.payment_mode ?? "prepaid").trim().toLowerCase() === "cod" ? "cod" : "prepaid";
-        const liveServiceability = await verifyDelhiveryServiceability(env, originPincode, destinationPincode, liveProviderAccountId, id, clientId, paymentMode);
+        const liveServiceability = await verifyDelhiveryServiceability(env, originPincode, destinationPincode, liveProviderAccountId, id, clientId, paymentMode, actualWeightKg);
         if (!liveServiceability.ok) return error("PROVIDER_SERVICEABILITY_FAILED", liveServiceability.reason ?? "Delhivery could not verify this route", 409, id, headers, JSON.stringify({ provenance: liveServiceability.provenance, origin: liveServiceability.origin, destination: liveServiceability.destination }));
         const version = await env.DB.prepare("SELECT id, minimum_weight_kg, gst_percent FROM pricing_versions WHERE client_id = ? AND provider = 'delhivery' AND service_level = 'b2b' AND status = 'active' AND datetime(effective_at) <= CURRENT_TIMESTAMP ORDER BY datetime(effective_at) DESC LIMIT 1").bind(clientId).first<{ id: string; minimum_weight_kg: number; gst_percent: number }>();
         const activeVersion = version ?? await ensureDefaultClientPricing(env, clientId, auth.userId ?? `api:${clientId}`);
