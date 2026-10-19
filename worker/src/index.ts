@@ -3791,6 +3791,16 @@ const worker = {
         if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
         const provider = typeof payload.provider === "string" && ["delhivery", "ekart", "trackon", "xpressbees", "rivigo"].includes(payload.provider) ? payload.provider : (hasRole(auth, ["employee", "admin", "super_admin"]) ? "delhivery" : null);
         if ((auth.kind === "api" || hasRole(auth, ["client"])) && provider !== "delhivery") return error("DELHIVERY_B2B_ONLY", "Client shipment booking is currently limited to Delhivery B2B", 409, id, headers);
+        let liveServiceabilityProvenance: DelhiveryServiceabilityResult["provenance"] | null = null;
+        if (provider === "delhivery") {
+          const requestedProviderAccountId = typeof payload.provider_account_id === "string" && payload.provider_account_id.trim() ? payload.provider_account_id.trim() : null;
+          const liveProviderAccountId = await resolveDelhiveryProviderAccountId(env, clientId, requestedProviderAccountId);
+          if (!liveProviderAccountId) return error("PROVIDER_ACCOUNT_REQUIRED", "An active Delhivery account is required for live serviceability verification", 409, id, headers);
+          payload.provider_account_id = liveProviderAccountId;
+          const liveServiceability = await verifyDelhiveryServiceability(env, originAddress.pincode, destinationAddress.pincode, liveProviderAccountId, id, clientId, String(payload.payment_mode ?? "prepaid").trim().toLowerCase() === "cod" ? "cod" : "prepaid");
+          if (!liveServiceability.ok) return error("PROVIDER_SERVICEABILITY_FAILED", liveServiceability.reason ?? "Delhivery could not verify this route", 409, id, headers, JSON.stringify({ provenance: liveServiceability.provenance, origin: liveServiceability.origin, destination: liveServiceability.destination, route: liveServiceability.route }));
+          liveServiceabilityProvenance = liveServiceability.provenance;
+        }
         const selectedWarehouseId = typeof payload.warehouse_id === "string" ? payload.warehouse_id.trim() : "";
         if (provider === "delhivery" && selectedWarehouseId) {
           const selectedWarehouse = await env.DB.prepare("SELECT id FROM warehouses WHERE id = ? AND client_id = ? LIMIT 1").bind(selectedWarehouseId, clientId).first<{ id: string }>();
@@ -3900,7 +3910,7 @@ const worker = {
         // Return only provider-owned references. Delhivery may assign the LR
         // asynchronously, so read persisted courier values after the provider call.
         const bookedShipment = await env.DB.prepare("SELECT tracking_number, lr_number, provider_reference FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(shipmentId, clientId).first<{ tracking_number: string | null; lr_number: string | null; provider_reference: string | null }>();
-        const serialized = JSON.stringify({ ok: true, data: { id: shipmentId, client_id: clientId, status: "booked", provider, tracking_number: bookedShipment?.tracking_number ?? null, lr_number: bookedShipment?.lr_number ?? null, provider_reference: bookedShipment?.provider_reference ?? null, pricing_amount: pricingAmount || null, provider_status: providerResult.status }, request_id: id });
+        const serialized = JSON.stringify({ ok: true, data: { id: shipmentId, client_id: clientId, status: "booked", provider, tracking_number: bookedShipment?.tracking_number ?? null, lr_number: bookedShipment?.lr_number ?? null, provider_reference: bookedShipment?.provider_reference ?? null, pricing_amount: pricingAmount || null, provider_status: providerResult.status, ...(liveServiceabilityProvenance ? { serviceability_provenance: liveServiceabilityProvenance } : {}) }, request_id: id });
         await saveIdempotent(env, key, clientId, "POST /v1/shipments", 201, serialized, requestHash);
         await audit(env, ctx, auth, id, "shipment.created", "shipment", shipmentId, { client_id: clientId, provider });
         return new Response(serialized, { status: 201, headers: { ...headers, "content-type": "application/json" } });
