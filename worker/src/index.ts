@@ -1982,9 +1982,9 @@ function providerPaymentFlags(value: Record<string, unknown> | null | undefined)
       return;
     }
     if (typeof candidate !== "object") {
-      const token = String(candidate).toLowerCase().replace(/[-_ ]/g, "");
-      if (token === "prepaid" || token === "prepaidallowed" || token === "prepaidserviceable") flags.prepaid = true;
-      if (["cod", "cash", "cashondelivery", "codallowed", "codserviceable"].includes(token)) flags.cod = true;
+      const tokens = String(candidate).toLowerCase().replace(/[\[\]{}\"]+/g, "").split(/[,|;/]+/).map((item) => item.trim().replace(/[-_ ]/g, "")).filter(Boolean);
+      if (tokens.some((token) => token === "prepaid" || token === "prepaidallowed" || token === "prepaidserviceable")) flags.prepaid = true;
+      if (tokens.some((token) => ["cod", "cash", "cashondelivery", "codallowed", "codserviceable"].includes(token))) flags.cod = true;
       return;
     }
     const record = candidate as Record<string, unknown>;
