@@ -2230,7 +2230,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         : provider === "delhivery" && operation === "serviceability_route"
           ? `${base.replace(/\/$/, "")}/tat/estimate?origin_pin=${encodeURIComponent(String(payload.origin_pincode ?? ""))}&destination_pin=${encodeURIComponent(String(payload.destination_pincode ?? ""))}`
         : provider === "delhivery" && operation === "serviceability"
-          ? `${base.replace(/\/$/, "")}/pincode-service/${encodeURIComponent(String(payload.destination_pincode ?? ""))}?weight=${encodeURIComponent(String(Math.max(1, Number(payload.weight_grams ?? payload.weight ?? 0) || 0)))}`
+          ? `${base.replace(/\/$/, "")}/pincode-service/${encodeURIComponent(String(payload.destination_pincode ?? ""))}?weight=${encodeURIComponent(String(Math.max(1, Number(payload.weight_kg ?? payload.weight ?? 0) || 0)))}`
     : provider === "ekart"
       ? `${base.replace(/\/$/, "")}/v2/shipments/${operation === "shipments" ? "create" : "track"}`
       : provider === "xpressbees" && operation === "tracking"
@@ -2794,8 +2794,8 @@ async function verifyDelhiveryServiceability(env: Env, originPincode: string, de
   const cached = delhiveryServiceabilityCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return { ...cached.result, provenance: "cached_provider" };
   const [originResult, destinationResult, routeResult] = await Promise.all([
-    safeProviderRequest(env, "delhivery", "serviceability", { destination_pincode: originPincode, weight_grams: Math.max(1, Math.round(normalizedWeightKg * 1000)), provider_account_id: providerAccountId }, `${requestIdValue}:origin-serviceability`, clientId, undefined, 10000),
-    safeProviderRequest(env, "delhivery", "serviceability", { destination_pincode: destinationPincode, weight_grams: Math.max(1, Math.round(normalizedWeightKg * 1000)), provider_account_id: providerAccountId }, `${requestIdValue}:destination-serviceability`, clientId, undefined, 10000),
+    safeProviderRequest(env, "delhivery", "serviceability", { destination_pincode: originPincode, weight_kg: normalizedWeightKg, provider_account_id: providerAccountId }, `${requestIdValue}:origin-serviceability`, clientId, undefined, 10000),
+    safeProviderRequest(env, "delhivery", "serviceability", { destination_pincode: destinationPincode, weight_kg: normalizedWeightKg, provider_account_id: providerAccountId }, `${requestIdValue}:destination-serviceability`, clientId, undefined, 10000),
     safeProviderRequest(env, "delhivery", "serviceability_route", { origin_pincode: originPincode, destination_pincode: destinationPincode, provider_account_id: providerAccountId }, `${requestIdValue}:route-serviceability`, clientId, undefined, 10000),
   ]);
   const origin = originResult as Record<string, unknown>;
