@@ -485,6 +485,37 @@ function billingLineItemStatements(env: Env, billingId: string, shipmentId: stri
     return [env.DB.prepare("INSERT INTO billing_line_items (id, billing_id, shipment_id, client_id, code, label, amount, marker, display_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(crypto.randomUUID(), billingId, shipmentId, clientId, code, label, amount, line.marker === "*" ? "*" : null, displayOrder)];
   });
 }
+
+async function completeShipmentBilling(env: Env, clientId: string, shipmentId: string) {
+  const existing = await env.DB.prepare("SELECT id FROM billing_records WHERE shipment_id = ? AND client_id = ? LIMIT 1").bind(shipmentId, clientId).first<{ id: string }>();
+  if (existing) return { ok: true as const, alreadyCompleted: true as const };
+  const snapshot = await env.DB.prepare("SELECT client_breakdown_json FROM pricing_shipment_snapshots WHERE shipment_id = ? AND client_id = ? LIMIT 1").bind(shipmentId, clientId).first<{ client_breakdown_json: string }>();
+  if (!snapshot) return { ok: false as const, error: "Pricing snapshot was not found for the completed shipment" };
+  let amount = 0;
+  try { amount = Number((JSON.parse(snapshot.client_breakdown_json) as { total?: number }).total ?? 0); } catch { amount = 0; }
+  if (!Number.isFinite(amount) || amount <= 0) return { ok: false as const, error: "The completed shipment has an invalid PSS amount" };
+  const wallet = await env.DB.prepare("SELECT COALESCE(SUM(CASE WHEN lower(COALESCE(type, '')) IN ('debit', 'charge', 'withdrawal') THEN -ABS(amount) ELSE ABS(amount) END), 0) AS balance FROM wallet_transactions WHERE client_id = ? AND status IN ('posted', 'approved')").bind(clientId).first<{ balance: number }>();
+  if (Number(wallet?.balance ?? 0) < amount) return { ok: false as const, error: "The client wallet does not have enough balance for this completed PSS booking" };
+  // Shipment-scoped identifiers make reconciliation idempotent even if the
+  // provider-status poll and the scheduled reconciler observe the LR together.
+  const billingId = `shipment-${shipmentId}`;
+  try {
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO billing_records (id, client_id, shipment_id, invoice_number, amount, status, paid_at) VALUES (?, ?, ?, ?, ?, 'paid', CURRENT_TIMESTAMP)").bind(billingId, clientId, shipmentId, `INV-${billingId.slice(0, 8).toUpperCase()}`, amount),
+      env.DB.prepare("INSERT INTO wallet_transactions (id, client_id, type, amount, reference, status, balance_after) VALUES (?, ?, 'debit', ?, ?, 'posted', 0)").bind(`wallet-${shipmentId}`, clientId, amount, `SHIPMENT-${shipmentId}`),
+      ...billingLineItemStatements(env, billingId, shipmentId, clientId, snapshot.client_breakdown_json),
+    ]);
+  } catch (caught) {
+    // The synchronous booking response and the scheduled LR reconciler can
+    // observe the same provider reference together. Treat a concurrent
+    // winner as success instead of surfacing a false billing failure.
+    const winner = await env.DB.prepare("SELECT id, status FROM billing_records WHERE shipment_id = ? AND client_id = ? LIMIT 1").bind(shipmentId, clientId).first<{ id: string; status: string }>();
+    if (winner?.status === "paid") return { ok: true as const, alreadyCompleted: true as const };
+    throw caught;
+  }
+  await recalculateWalletBalances(env, clientId);
+  return { ok: true as const, alreadyCompleted: false as const, amount };
+}
 async function pricingPincode(env: Env, pincode: string) {
   if (!/^\d{6}$/.test(pincode)) return null;
   return env.DB.prepare("SELECT pincode, facility_city, facility_state, oda FROM delhivery_b2b_pincode_zones WHERE pincode = ? LIMIT 1").bind(pincode).first<{ pincode: string; facility_city: string; facility_state: string; oda: number }>();
@@ -883,6 +914,14 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   // Delhivery accepted and displayed a booking for that pickup location.
   if (existing && existingHasConfirmedBooking) {
     return { ok: true as const, name: existing.provider_name?.trim() || providerName, reused: true as const, origin: resolvedOrigin };
+  }
+  // A provider-activated saved warehouse is already ready for manifestation.
+  // Re-registering it on every booking adds a slow external round trip and can
+  // trigger Delhivery's eventual-activation path again. Pending/unknown rows
+  // still go through registration so local state cannot be mistaken for
+  // provider acceptance.
+  if (existing && existing.provider_status === "active" && existing.provider_name?.trim()) {
+    return { ok: true as const, name: existing.provider_name.trim(), reused: true as const, origin: resolvedOrigin };
   }
   // Do not search Delhivery before registration. The create API is the source
   // of truth for this path; facility-list propagation is asynchronous and its
@@ -1355,6 +1394,32 @@ async function persistShipmentDocuments(env: Env, clientId: string, shipmentId: 
     }
   }
   return { ok: true as const };
+}
+
+type StagedInvoiceDocument = { object_key: string; name: string; content_type: string; body_base64: string };
+
+async function loadStagedInvoiceDocuments(env: Env, clientId: string, references: unknown) {
+  const refs = Array.isArray(references) ? references.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object") : [];
+  if (!refs.length) return { ok: false as const, error: "At least one staged invoice document is required" };
+  const documents: StagedInvoiceDocument[] = [];
+  const objectKeys: string[] = [];
+  let totalBytes = 0;
+  const allowed = new Set(["application/pdf", "image/jpeg", "image/png"]);
+  for (const ref of refs) {
+    const objectKey = String(ref.object_key ?? "").trim();
+    if (!objectKey.startsWith(`staged/clients/${clientId}/`)) return { ok: false as const, error: "The staged invoice reference is not valid for this client" };
+    const object = await env.FILES.get(objectKey);
+    const metadata = object?.customMetadata ?? {};
+    const name = String(metadata.original_filename ?? ref.name ?? "").trim();
+    const contentType = String(metadata.content_type ?? ref.content_type ?? "").split(";", 1)[0].trim().toLowerCase();
+    if (!object || String(metadata.client_id ?? "") !== clientId || !name || name.length > 200 || !allowed.has(contentType)) return { ok: false as const, error: "The staged invoice document is missing or invalid" };
+    const bytes = new Uint8Array(await object.arrayBuffer());
+    totalBytes += bytes.byteLength;
+    if (bytes.byteLength < 1 || bytes.byteLength > 10 * 1024 * 1024 || totalBytes > 20 * 1024 * 1024 || !documentSignatureMatches(contentType, bytes)) return { ok: false as const, error: "Invoice files must be valid documents up to 10 MB each and 20 MB total" };
+    documents.push({ object_key: objectKey, name, content_type: contentType, body_base64: providerBytesToBase64(bytes) });
+    objectKeys.push(objectKey);
+  }
+  return { ok: true as const, documents, objectKeys };
 }
 
 function delhiveryCreatePayload(env: Env, payload: Record<string, unknown>) {
@@ -1904,7 +1969,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (["tracking", "labels", "lr_copy", "document"].includes(operation) && !trackingNumber) return { enabled: false, status: "invalid_request" as const, reason: "A provider tracking reference is required" };
   if (provider === "delhivery" && operation === "shipments" && String(env.DELHIVERY_ENABLE_SHIPMENT_CREATION) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "Delhivery shipment creation is safety-disabled until live billing approval" };
   if (provider === "delhivery" && operation === "pickups" && String(env.DELHIVERY_ENABLE_PICKUP_CREATION) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "Delhivery pickup creation is safety-disabled until live operations approval" };
-  if (provider === "delhivery" && !new Set(["tracking", "shipment_status", "shipments", "pickups", "pickup_slots", "serviceability", "labels", "lr_copy", "document"]).has(operation)) return { enabled: false, status: "unsupported" as const, reason: "Delhivery operation is not supported" };
+  if (provider === "delhivery" && !new Set(["tracking", "shipment_status", "shipments", "warehouse_prepare", "pickups", "pickup_slots", "serviceability", "labels", "lr_copy", "document"]).has(operation)) return { enabled: false, status: "unsupported" as const, reason: "Delhivery operation is not supported" };
   if (provider === "ekart" && operation === "pickups") return { enabled: false, status: "unsupported" as const, reason: "Ekart pickup contract is not verified" };
   if (provider === "ekart" && String(env.EKART_ENABLE_PROVIDER_CALLS) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "Ekart is configured but disabled until the agreed provider scope is approved" };
   if (provider === "ekart" && operation !== "tracking" && operation !== "shipments") return { enabled: false, status: "unsupported" as const, reason: "Ekart operation is not supported" };
@@ -1986,7 +2051,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (provider === "delhivery" && useDelhiveryB2b && !delhiveryB2bToken) return { enabled: true, status: "failed" as const, error: "Delhivery B2B authentication failed" };
   let delhiveryPickupLocation = "";
   let delhiveryCanonicalOrigin: Record<string, unknown> | null = null;
-  if (provider === "delhivery" && operation === "shipments" && useDelhiveryB2b && clientId && delhiveryB2bToken) {
+  if (provider === "delhivery" && ["shipments", "warehouse_prepare"].includes(operation) && useDelhiveryB2b && clientId && delhiveryB2bToken) {
     const origin = delhiveryAddress(payload.origin_address, String(payload.origin ?? "PSS Logistics"));
     if (!origin) return { enabled: true, status: "invalid_request" as const, reason: "A complete consignor address is required to create or select the pickup warehouse" };
     const selectedWarehouseId = typeof payload.warehouse_id === "string" && payload.warehouse_id.trim() ? payload.warehouse_id.trim() : null;
@@ -2002,6 +2067,9 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     if (!warehouse.ok) return { enabled: true, status: "failed" as const, code: warehouse.code, error: warehouse.error };
     delhiveryPickupLocation = warehouse.name;
     delhiveryCanonicalOrigin = warehouse.origin;
+    if (operation === "warehouse_prepare") {
+      return { enabled: true, status: "accepted" as const, providerStatus: 200, providerPending: false, warehouseName: warehouse.name, warehouseId: selectedWarehouseId ?? null };
+    }
   }
   const xpressToken = provider === "xpressbees" ? await xpressbeesToken(env, credential!, requestIdValue, providerTimeoutMs) : null;
   if (provider === "xpressbees" && !xpressToken) return { enabled: true, status: "failed" as const, error: "XpressBees authentication failed" };
@@ -2165,7 +2233,8 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (provider === "delhivery" && operation === "shipments" && useDelhiveryB2b) delete headers["content-type"];
   let response: Response | null = null; let lastError = "provider_request_failed";
    const readOnlyProviderCall = operation === "tracking" || operation === "serviceability" || operation === "pickup_slots";
-  const maxAttempts = readOnlyProviderCall ? (provider === "delhivery" && useDelhiveryB2b ? 2 : 1) : 3;
+  const singleManifestCall = provider === "delhivery" && operation === "shipments";
+  const maxAttempts = singleManifestCall ? 1 : readOnlyProviderCall ? (provider === "delhivery" && useDelhiveryB2b ? 2 : 1) : 3;
   // Courier tracking/serviceability are read-only, but provider APIs can take
   // longer than a browser request under normal network load. Keep a bounded
   // timeout so public tracking does not hang indefinitely while avoiding false
@@ -2180,7 +2249,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
        const isGet = (["tracking", "shipment_status", "serviceability", "pickup_slots", "labels", "lr_copy", "document"].includes(operation) && provider !== "xpressbees" && provider !== "rivigo") || (provider === "trackon" && operation === "labels");
       const method = provider === "rivigo" && operation === "cancellations" ? "DELETE" : provider === "rivigo" && operation === "updates" ? "PUT" : isGet ? "GET" : "POST";
       response = await providerFetch(url, { method, headers, body: isGet ? undefined : requestBody }, attemptTimeoutMs);
-      if (provider === "delhivery" && useDelhiveryB2b && response.status === 401 && attempt === 0 && credential) {
+      if (!singleManifestCall && provider === "delhivery" && useDelhiveryB2b && response.status === 401 && attempt === 0 && credential) {
         const refreshedToken = await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs, true);
         if (refreshedToken) {
           headers.Authorization = `Bearer ${refreshedToken}`;
@@ -2211,14 +2280,6 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
           const alternateResponse = await providerFetch(alternateUrl, { method: "GET", headers }, attemptTimeoutMs);
           if (alternateResponse.ok || alternateResponse.status !== 404) response = alternateResponse;
         } catch { /* Keep the original provider response if the alternate host is unavailable. */ }
-      }
-      // A newly-created Delhivery warehouse can take a moment to propagate in
-      // FAAS. Retry its 400 response instead of immediately exposing a false
-      // booking failure; other client errors remain non-retryable.
-      if (provider === "delhivery" && useDelhiveryB2b && operation === "shipments" && response.status === 400 && attempt < maxAttempts - 1) {
-        lastError = "provider_http_400";
-        await new Promise((resolve) => setTimeout(resolve, 2000 * (attempt + 1)));
-        continue;
       }
       if (response.ok || (response.status >= 400 && response.status < 500 && response.status !== 429)) {
         if (!response.ok) {
@@ -2280,6 +2341,8 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     const statusJobId = findProviderReference(parsedProviderBody, new Set(["job_id", "jobid", "manifest_job_id", "request_id", "requestid"])) ?? (String(payload.provider_booking_id ?? "").trim() || null);
     if (statusLr || statusAwb) {
       await env.DB.prepare("UPDATE shipments SET lr_number = COALESCE(?, lr_number), master_awb = COALESCE(?, master_awb), box_awbs_json = COALESCE(?, box_awbs_json), provider_sync_status = 'confirmed', tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(provider_reference, ?), provider_last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(statusLr, statusAwb, statusAwb ? JSON.stringify([statusAwb]) : null, statusLr ?? statusAwb, statusAwb ?? statusLr, payload.shipment_id, clientId).run();
+      const completedBilling = await completeShipmentBilling(env, clientId, payload.shipment_id);
+      if (!completedBilling.ok) console.error(JSON.stringify({ event: "shipment_billing_deferred", request_id: requestIdValue, shipment_id: payload.shipment_id, error: completedBilling.error }));
       return { enabled: true, status: "accepted" as const, providerStatus: response.status, providerPending: false, providerBookingId: statusJobId, providerReference: statusAwb ?? statusLr, lr_number: statusLr, master_awb: statusAwb };
     }
     return { enabled: true, status: "accepted" as const, providerStatus: response.status, providerPending: true, providerBookingId: statusJobId, message: "Delhivery has not published the LR/AWB yet." };
@@ -2301,7 +2364,10 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     const jobId = findProviderReference(parsedProviderBody, new Set(["job_id", "jobid", "manifest_job_id", "request_id", "requestid"]));
     if (!initialLr && !initialAwb && jobId) {
       for (let poll = 0; poll < 6; poll += 1) {
-        await new Promise((resolve) => setTimeout(resolve, poll === 0 ? 1500 : 1000));
+        // Ask for the status immediately, then use a bounded provider-friendly
+        // interval. The manifest response already supplied the job id, so no
+        // second manifest call is ever needed for LR retrieval.
+        await new Promise((resolve) => setTimeout(resolve, poll === 0 ? 0 : 1500));
         try {
           const statusUrl = `${base.replace(/\/$/, "")}/manifest?job_id=${encodeURIComponent(jobId)}`;
           const statusResponse = await providerFetch(statusUrl, { method: "GET", headers }, Math.max(providerTimeoutMs, 5000));
@@ -2616,7 +2682,7 @@ async function loadShipmentInvoiceDocumentsForRetry(env: Env, clientId: string, 
 }
 
 async function retryPendingDelhiveryBookings(env: Env, cron: string) {
-  const pending = await env.DB.prepare("SELECT id, client_id, provider_account_id, provider_booking_payload_json, provider_retry_count FROM shipments WHERE provider = 'delhivery' AND status = 'booked' AND provider_sync_status = 'pending' AND provider_booking_payload_json IS NOT NULL AND (provider_retry_at IS NULL OR datetime(provider_retry_at) <= datetime('now')) ORDER BY updated_at ASC LIMIT 20").all<{ id: string; client_id: string; provider_account_id: string | null; provider_booking_payload_json: string; provider_retry_count: number | null }>();
+  const pending = await env.DB.prepare("SELECT id, client_id, provider_account_id, provider_booking_payload_json, provider_retry_count FROM shipments WHERE provider = 'delhivery' AND status = 'booked' AND provider_sync_status = 'pending' AND provider_booking_payload_json IS NOT NULL AND provider_booking_id IS NULL AND (provider_retry_at IS NULL OR datetime(provider_retry_at) <= datetime('now')) ORDER BY updated_at ASC LIMIT 20").all<{ id: string; client_id: string; provider_account_id: string | null; provider_booking_payload_json: string; provider_retry_count: number | null }>();
   for (const shipment of pending.results) {
     let payload: Record<string, unknown>;
     try { payload = JSON.parse(shipment.provider_booking_payload_json) as Record<string, unknown>; } catch {
@@ -3464,9 +3530,95 @@ const worker = {
         return json({ ok: true, data: namedPageResults, pagination }, 200, headers);
       }
 
+      if (route === "/shipments/documents/stage" && request.method === "POST") {
+        if (!hasScope(auth, "shipments.create")) return error("FORBIDDEN", "Shipment creation scope required", 403, id, headers);
+        const payload = await bodyJson(request, 28 * 1024 * 1024);
+        const requestHash = await payloadFingerprint(payload);
+        const key = request.headers.get("Idempotency-Key");
+        if (!key) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
+        const clientId = requireClient(auth, payload.client_id);
+        if (!clientId || !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
+        const endpoint = "POST /v1/shipments/documents/stage";
+        const existing = await idempotentResponse(env, key, clientId, endpoint, requestHash);
+        if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
+        const documents = Array.isArray(payload.documents) ? payload.documents.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object") : [];
+        if (!documents.length || documents.length > 20) return error("VALIDATION_ERROR", "At least one and no more than 20 invoice documents may be staged", 400, id, headers);
+        const allowed = new Set(["application/pdf", "image/jpeg", "image/png"]);
+        const staged: Array<{ object_key: string; name: string; content_type: string; size: number }> = [];
+        let totalBytes = 0;
+        try {
+          for (const document of documents) {
+            const name = String(document.name ?? "").trim();
+            const contentType = String(document.content_type ?? "").split(";", 1)[0].trim().toLowerCase();
+            const encoded = String(document.body_base64 ?? "").replace(/^data:[^,]+,/, "");
+            if (!name || name.length > 200 || name.includes("\0") || !allowed.has(contentType) || !encoded || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded) || encoded.length % 4 === 1) throw new Error("Invoice files must be valid PDF, JPG, or PNG documents");
+            let binary: string;
+            try { binary = atob(encoded); } catch { throw new Error("Invoice file content is not valid base64"); }
+            const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+            totalBytes += bytes.byteLength;
+            if (bytes.byteLength < 1 || bytes.byteLength > 10 * 1024 * 1024 || totalBytes > 20 * 1024 * 1024 || !documentSignatureMatches(contentType, bytes)) throw new Error("Invoice files must be valid documents up to 10 MB each and 20 MB total");
+            const objectKey = `staged/clients/${clientId}/${crypto.randomUUID()}-${name.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
+            await env.FILES.put(objectKey, bytes, { httpMetadata: { contentType }, customMetadata: { client_id: clientId, original_filename: name, content_type: contentType, staged_at: new Date().toISOString() } });
+            staged.push({ object_key: objectKey, name, content_type: contentType, size: bytes.byteLength });
+          }
+        } catch (caught) {
+          await Promise.all(staged.map((document) => env.FILES.delete(document.object_key).catch(() => undefined)));
+          return error("INVOICE_DOCUMENT_INVALID", caught instanceof Error ? caught.message : "Invoice files could not be staged", 400, id, headers);
+        }
+        const serialized = JSON.stringify({ ok: true, data: { documents: staged }, request_id: id });
+        await saveIdempotent(env, key, clientId, endpoint, 201, serialized, requestHash);
+        await audit(env, ctx, auth, id, "shipment.invoice_staged", "shipment_document", staged.map((document) => document.object_key).join(","), { client_id: clientId, count: staged.length });
+        return new Response(serialized, { status: 201, headers: { ...headers, "content-type": "application/json" } });
+      }
+
+      if (route === "/shipments/preflight" && request.method === "POST") {
+        if (!hasScope(auth, "shipments.create")) return error("FORBIDDEN", "Shipment creation scope required", 403, id, headers);
+        const payload = await bodyJson(request, 256 * 1024);
+        const requestHash = await payloadFingerprint(payload);
+        const key = request.headers.get("Idempotency-Key");
+        if (!key) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
+        const clientId = requireClient(auth, payload.client_id);
+        if (!clientId || !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
+        const originAddress = shipmentAddress(payload.origin_address);
+        const providerAccountId = typeof payload.provider_account_id === "string" ? payload.provider_account_id.trim() : "";
+        const warehouseId = typeof payload.warehouse_id === "string" ? payload.warehouse_id.trim() : "";
+        if (!originAddress || !providerAccountId) return error("VALIDATION_ERROR", "A complete pickup address and Delhivery account are required before confirmation", 400, id, headers);
+        const endpoint = "POST /v1/shipments/preflight";
+        const existing = await idempotentResponse(env, key, clientId, endpoint, requestHash);
+        if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
+        const providerResult = await safeProviderRequest(env, "delhivery", "warehouse_prepare", {
+          provider: "delhivery",
+          provider_account_id: providerAccountId,
+          warehouse_id: warehouseId || undefined,
+          origin_address: originAddress,
+          origin: `${originAddress.city}, ${originAddress.state}`,
+        }, id, clientId, key);
+        if (providerResult.status !== "accepted") {
+          const reason = String((providerResult as { error?: string; reason?: string }).error ?? (providerResult as { reason?: string }).reason ?? "Delhivery pickup location is not ready").slice(0, 500);
+          const failed = JSON.stringify({ ok: false, error: { code: "PROVIDER_READINESS_FAILED", category: "provider", message: reason, user_safe_message: "The pickup location is not ready with Delhivery yet. Please retry before confirming the booking.", technical_message: reason, request_id: id, retryable: true }, request_id: id });
+          await saveIdempotent(env, key, clientId, endpoint, 409, failed, requestHash);
+          return new Response(failed, { status: 409, headers: { ...headers, "content-type": "application/json" } });
+        }
+        const pincodes = [...new Set([originAddress.pincode, String((payload.destination_address as Record<string, unknown> | null)?.pincode ?? "").trim()].filter((value) => /^\d{6}$/.test(value)))];
+        const serviceabilityResults = await Promise.all(pincodes.map(async (pincode) => ({ pincode, result: await safeProviderRequest(env, "delhivery", "serviceability", { destination_pincode: pincode, provider_account_id: providerAccountId }, `${id}:serviceability:${pincode}`, clientId) })));
+        const serviceabilityFailure = serviceabilityResults.find(({ pincode, result }) => result.status !== "accepted" || (result as { serviceable?: boolean }).serviceable !== true || (pincode === originAddress.pincode && (result as { pickup?: boolean }).pickup !== true));
+        if (serviceabilityFailure) {
+          const failedResult = serviceabilityFailure.result;
+          const reason = failedResult.status !== "accepted" ? String((failedResult as { error?: string; reason?: string }).error ?? (failedResult as { reason?: string }).reason ?? "Delhivery serviceability could not be verified") : serviceabilityFailure.pincode === originAddress.pincode ? "The pickup pincode is not pickup-serviceable by Delhivery" : "The delivery pincode is not serviceable by Delhivery";
+          const failed = JSON.stringify({ ok: false, error: { code: "PROVIDER_SERVICEABILITY_FAILED", category: "provider", message: reason, user_safe_message: "Delhivery cannot verify serviceability for this shipment yet. Check the pincodes before confirming.", technical_message: reason, request_id: id, retryable: true }, request_id: id });
+          await saveIdempotent(env, key, clientId, endpoint, 409, failed, requestHash);
+          return new Response(failed, { status: 409, headers: { ...headers, "content-type": "application/json" } });
+        }
+        const ready = JSON.stringify({ ok: true, data: { ready: true, provider: "delhivery", provider_status: (providerResult as { providerStatus?: number }).providerStatus ?? 200, warehouse_name: (providerResult as { warehouseName?: string }).warehouseName ?? null, serviceable: true }, request_id: id });
+        await saveIdempotent(env, key, clientId, endpoint, 200, ready, requestHash);
+        await audit(env, ctx, auth, id, "shipment.provider_readiness", "shipment", warehouseId || "new-warehouse", { client_id: clientId, provider: "delhivery" });
+        return new Response(ready, { status: 200, headers: { ...headers, "content-type": "application/json" } });
+      }
+
       if (route === "/shipments" && request.method === "POST") {
         if (!hasScope(auth, "shipments.create")) return error("FORBIDDEN", "Shipment creation scope required", 403, id, headers);
         const payload = await bodyJson(request, 32 * 1024 * 1024);
+        const bookingStartedAt = Date.now();
         const requestHash = await payloadFingerprint(payload);
         const description = typeof payload.description === "string" ? payload.description.trim() : "";
         const origin = typeof payload.origin === "string" ? payload.origin.trim() : "";
@@ -3517,12 +3669,21 @@ const worker = {
           const selectedWarehouse = await env.DB.prepare("SELECT id FROM warehouses WHERE id = ? AND client_id = ? LIMIT 1").bind(selectedWarehouseId, clientId).first<{ id: string }>();
           if (!selectedWarehouse) return error("WAREHOUSE_NOT_FOUND", "The selected pickup warehouse no longer exists for this client. Select it again before booking.", 404, id, headers);
         }
+        let stagedInvoiceObjectKeys: string[] = [];
+        if (provider === "delhivery" && Array.isArray(payload.invoice_document_refs) && payload.invoice_document_refs.length) {
+          const stagedDocuments = await loadStagedInvoiceDocuments(env, clientId, payload.invoice_document_refs);
+          if (!stagedDocuments.ok) return error("INVOICE_DOCUMENT_INVALID", stagedDocuments.error, 400, id, headers);
+          stagedInvoiceObjectKeys = stagedDocuments.objectKeys;
+          payload.invoice_documents = stagedDocuments.documents.map((document) => ({ name: document.name, content_type: document.content_type, body_base64: document.body_base64, invoice_number: invoiceReference }));
+          delete payload.invoice_document_refs;
+        }
         if (provider === "delhivery" && (!Array.isArray(payload.invoice_documents) || payload.invoice_documents.length < 1)) return error("INVOICE_DOCUMENT_REQUIRED", "Upload at least one invoice document before booking this Delhivery B2B shipment", 400, id, headers);
         const pricingQuoteId = typeof payload.pricing_quote_id === "string" ? payload.pricing_quote_id.trim() : "";
         const submittedPricingQuote = pricingQuoteId ? await env.DB.prepare("SELECT id, version_id, account_scope, origin_zone, destination_zone, chargeable_weight_kg, client_breakdown_json, expires_at FROM pricing_quotes WHERE id = ? AND client_id = ? LIMIT 1").bind(pricingQuoteId, clientId).first<PricingQuoteRecord & { expires_at: string }>() : null;
         if (pricingQuoteId && !submittedPricingQuote) return error("PRICING_QUOTE_NOT_FOUND", "The submitted PSS quote was not found for this client. Request a fresh quote before booking.", 409, id, headers);
         if (pricingQuoteId && submittedPricingQuote && Date.parse(`${submittedPricingQuote.expires_at.replace(" ", "T")}Z`) <= Date.now()) return error("PRICING_QUOTE_EXPIRED", "The submitted PSS quote has expired. Request a fresh quote before booking.", 409, id, headers);
         let pricingQuote: PricingQuoteRecord | null = null;
+        const pricingStartedAt = Date.now();
         if (provider === "delhivery") {
           try {
             const recalculatedQuote = await createShipmentPricingQuote(env, clientId, payload, auth.userId ?? `api:${clientId}`);
@@ -3536,6 +3697,7 @@ const worker = {
           } catch (caught) { const reason = caught instanceof Error ? caught.message : "PRICING_FAILED"; const knownCodes = new Set(["PRICING_NOT_CONFIGURED", "PRICING_ADDRESS_REQUIRED", "INVALID_ACCOUNT_CODE", "RTO_SOURCE_REQUIRED", "RTO_SOURCE_NOT_FOUND", "RTO_SOURCE_INVALID"]); const code = knownCodes.has(reason) ? reason : "PRICING_INVALID"; return error(code, code === "PRICING_NOT_CONFIGURED" ? "A published Delhivery B2B PSS rate card is not configured for this client" : code === "RTO_SOURCE_REQUIRED" ? "An original shipment is required to price an RTO" : code === "RTO_SOURCE_NOT_FOUND" ? "The original shipment pricing snapshot could not be found" : "The shipment could not be priced using the client PSS rate card", 409, id, headers); }
         }
         const pricingAmount = pricingQuote ? Number((JSON.parse(pricingQuote.client_breakdown_json) as { total?: number }).total ?? 0) : 0;
+        const pricingDurationMs = Date.now() - pricingStartedAt;
         if (pricingQuote && pricingAmount <= 0) return error("PRICING_INVALID", "The PSS pricing snapshot is invalid", 409, id, headers);
         if (pricingQuote) {
           const wallet = await env.DB.prepare("SELECT COALESCE(SUM(CASE WHEN lower(COALESCE(type, '')) IN ('debit', 'charge', 'withdrawal') THEN -ABS(amount) ELSE ABS(amount) END), 0) AS balance FROM wallet_transactions WHERE client_id = ? AND status IN ('posted', 'approved')").bind(clientId).first<{ balance: number }>();
@@ -3550,48 +3712,63 @@ const worker = {
           await env.DB.prepare("UPDATE shipments SET status = 'exception', provider_sync_status = 'failed', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(shipmentId, clientId).run();
           return error("INVOICE_DOCUMENT_INVALID", storedDocuments.error, 400, id, headers);
         }
-        if (pricingQuote) await env.DB.prepare("INSERT INTO weight_reconciliations (id, client_id, shipment_id, declared_weight_kg, declared_volumetric_weight_kg, initial_billable_weight_kg, measured_weight_kg, billable_weight_kg, client_dispute_deadline_at, status) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, NULL, 'pending')").bind(crypto.randomUUID(), clientId, shipmentId, weight, volumetricWeightFromPayload(payload), pricingQuote.chargeable_weight_kg, pricingQuote.chargeable_weight_kg).run();
-        if (pricingQuote) {
-          const billingId = crypto.randomUUID(); const walletId = crypto.randomUUID();
-          await env.DB.batch([
-            env.DB.prepare("INSERT INTO pricing_shipment_snapshots (id, shipment_id, client_id, quote_id, version_id, account_scope, origin_zone, destination_zone, chargeable_weight_kg, client_breakdown_json, original_client_breakdown_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(crypto.randomUUID(), shipmentId, clientId, pricingQuote.id, pricingQuote.version_id, pricingQuote.account_scope, pricingQuote.origin_zone, pricingQuote.destination_zone, pricingQuote.chargeable_weight_kg, pricingQuote.client_breakdown_json, pricingQuote.client_breakdown_json),
-            env.DB.prepare("INSERT INTO billing_records (id, client_id, shipment_id, invoice_number, amount, status, paid_at) VALUES (?, ?, ?, ?, ?, 'paid', CURRENT_TIMESTAMP)").bind(billingId, clientId, shipmentId, `INV-${billingId.slice(0, 8).toUpperCase()}`, pricingAmount),
-            env.DB.prepare("INSERT INTO wallet_transactions (id, client_id, type, amount, reference, status, balance_after) VALUES (?, ?, 'debit', ?, ?, 'posted', 0)").bind(walletId, clientId, pricingAmount, `SHIPMENT-${shipmentId}`),
-            ...billingLineItemStatements(env, billingId, shipmentId, clientId, pricingQuote.client_breakdown_json),
-          ]);
-          await recalculateWalletBalances(env, clientId);
+        if (provider === "delhivery" && payload.eway_document && typeof payload.eway_document === "object") {
+          const ewayDocument = payload.eway_document as Record<string, unknown>;
+          const storedEway = await persistShipmentDocuments(env, clientId, shipmentId, [{
+            ...ewayDocument,
+            name: String(ewayDocument.name ?? "eway-bill"),
+          }], auth.userId ?? `api:${clientId}`);
+          if (!storedEway.ok) {
+            await env.DB.prepare("UPDATE shipments SET status = 'exception', provider_sync_status = 'failed', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(shipmentId, clientId).run();
+            return error("EWAY_DOCUMENT_INVALID", "The E-Way Bill could not be saved before the Delhivery booking request", 400, id, headers);
+          }
+          delete payload.eway_document;
         }
+        if (stagedInvoiceObjectKeys.length) await Promise.all(stagedInvoiceObjectKeys.map((objectKey) => env.FILES.delete(objectKey).catch(() => undefined)));
+        if (pricingQuote) await env.DB.prepare("INSERT INTO weight_reconciliations (id, client_id, shipment_id, declared_weight_kg, declared_volumetric_weight_kg, initial_billable_weight_kg, measured_weight_kg, billable_weight_kg, client_dispute_deadline_at, status) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, NULL, 'pending')").bind(crypto.randomUUID(), clientId, shipmentId, weight, volumetricWeightFromPayload(payload), pricingQuote.chargeable_weight_kg, pricingQuote.chargeable_weight_kg).run();
+        if (pricingQuote) await env.DB.prepare("INSERT INTO pricing_shipment_snapshots (id, shipment_id, client_id, quote_id, version_id, account_scope, origin_zone, destination_zone, chargeable_weight_kg, client_breakdown_json, original_client_breakdown_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(crypto.randomUUID(), shipmentId, clientId, pricingQuote.id, pricingQuote.version_id, pricingQuote.account_scope, pricingQuote.origin_zone, pricingQuote.destination_zone, pricingQuote.chargeable_weight_kg, pricingQuote.client_breakdown_json, pricingQuote.client_breakdown_json).run();
+        const providerStartedAt = Date.now();
         const providerResult = provider ? await safeProviderRequest(env, provider as CourierProvider, "shipments", { shipment_id: shipmentId, ...payload }, id, clientId, key) : { enabled: false, status: "not_requested" as const };
+        console.log(JSON.stringify({ event: "shipment_booking_timing", request_id: id, shipment_id: shipmentId, provider: provider ?? "none", pricing_ms: pricingDurationMs, provider_ms: Date.now() - providerStartedAt, total_ms: Date.now() - bookingStartedAt, provider_result: providerResult.status }));
         const selectedProviderAccountId = (providerResult as { provider_account_id?: string }).provider_account_id;
         if (selectedProviderAccountId) await env.DB.prepare("UPDATE shipments SET provider_account_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(selectedProviderAccountId, shipmentId, clientId).run();
         if (provider === "delhivery") await env.DB.prepare("INSERT OR REPLACE INTO pricing_provider_costs (id, shipment_id, client_id, provider, provider_account_id, provider_amount, provider_status) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(crypto.randomUUID(), shipmentId, clientId, provider, selectedProviderAccountId ?? null, providerAmount(providerResult), providerResult.status).run();
         if (provider && providerResult.status !== "accepted") {
           const failureReason = String((providerResult as { error?: string; reason?: string }).error ?? (providerResult as { reason?: string }).reason ?? `The ${provider} shipment was not accepted`).slice(0, 500);
-          const providerCode = String((providerResult as { code?: string }).code ?? "");
-          const warehousePending = provider === "delhivery" && (
-            providerCode === "WAREHOUSE_ACTIVATION_PENDING"
-            || /awaiting provider activation|not active|not (?:been )?configured|warehouse.*activation|pickup.*warehouse.*pending/i.test(failureReason)
-          );
-          if (warehousePending) {
-            const retryPayload = { ...payload };
-            delete retryPayload.invoice_documents;
-            await env.DB.prepare("UPDATE shipments SET provider_sync_status = 'pending', provider_booking_payload_json = ?, provider_retry_at = datetime('now', '+5 minutes'), provider_retry_count = COALESCE(provider_retry_count, 0), provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
-              .bind(JSON.stringify(retryPayload), failureReason, shipmentId, clientId).run();
-            await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'booked', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
-              .bind(crypto.randomUUID(), shipmentId, "Booking saved; Delhivery warehouse activation is pending. Automatic retry is scheduled.", auth.userId ?? `api:${clientId}`).run();
-            const pendingResponse = JSON.stringify({ ok: true, queued: true, data: { id: shipmentId, client_id: clientId, status: "booked", provider, pricing_amount: pricingAmount || null, provider_status: "pending", provider_sync_status: "pending", message: "Booking saved. Delhivery will be retried automatically after the pickup warehouse is activated." }, request_id: id });
-            await saveIdempotent(env, key, clientId, "POST /v1/shipments", 201, pendingResponse, requestHash);
-            await audit(env, ctx, auth, id, "shipment.provider_pending", "shipment", shipmentId, { client_id: clientId, provider, reason: failureReason });
-            return new Response(pendingResponse, { status: 201, headers: { ...headers, "content-type": "application/json" } });
-          }
+          const providerCode = String((providerResult as { code?: string }).code ?? "") || (provider === "delhivery" && /awaiting provider activation|not active|not (?:been )?configured|warehouse.*activation|pickup.*warehouse.*pending/i.test(failureReason) ? "WAREHOUSE_ACTIVATION_PENDING" : "");
           await env.DB.prepare("UPDATE shipments SET status = 'exception', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(shipmentId, clientId).run();
           await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'exception', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipmentId, `Provider booking failed: ${failureReason}`, auth.userId ?? `api:${clientId}`).run();
-          if (pricingQuote) { await env.DB.prepare("INSERT INTO wallet_transactions (id, client_id, type, amount, reference, status, balance_after) VALUES (?, ?, 'credit', ?, ?, 'posted', 0)").bind(crypto.randomUUID(), clientId, pricingAmount, `REVERSAL-${shipmentId}`).run(); await env.DB.prepare("UPDATE billing_records SET status = 'void', updated_at = CURRENT_TIMESTAMP WHERE shipment_id = ? AND client_id = ?").bind(shipmentId, clientId).run(); await recalculateWalletBalances(env, clientId); }
           const failureCode = "PROVIDER_REQUEST_FAILED";
-          const failedResponse = JSON.stringify({ ok: false, error: { code: failureCode, category: "provider", message: "The shipment could not be booked with the courier. You can retry after checking the provider status.", user_safe_message: "The courier did not accept this booking; retry after correcting the provider issue.", technical_message: failureReason, provider_code: failureCode, request_id: id, retryable: true, stale_data: false }, data: { id: shipmentId, client_id: clientId, status: "exception", provider, pricing_amount: pricingAmount || null }, request_id: id });
+          const failedResponse = JSON.stringify({ ok: false, error: { code: failureCode, category: "provider", message: "The shipment could not be booked with the courier. You can retry after checking the provider status.", user_safe_message: "The courier did not accept this booking; retry after correcting the provider issue.", technical_message: failureReason, provider_code: providerCode || failureCode, request_id: id, retryable: true, stale_data: false }, data: { id: shipmentId, client_id: clientId, status: "exception", provider, pricing_amount: null }, request_id: id });
           await saveIdempotent(env, key, clientId, "POST /v1/shipments", 502, failedResponse, requestHash);
           await audit(env, ctx, auth, id, "shipment.provider_failed", "shipment", shipmentId, { client_id: clientId, provider, reason: failureReason });
           return new Response(failedResponse, { status: 502, headers: { ...headers, "content-type": "application/json" } });
+        }
+        const providerLr = String((providerResult as { lr_number?: string | null }).lr_number ?? "").trim();
+        const providerAwb = String((providerResult as { master_awb?: string | null }).master_awb ?? "").trim();
+        const providerReference = String((providerResult as { providerReference?: string | null }).providerReference ?? "").trim();
+        if (provider === "delhivery" && (!providerLr && !providerAwb && !providerReference)) {
+          const providerBookingId = String((providerResult as { providerBookingId?: string | null }).providerBookingId ?? "").trim() || null;
+          const timeoutReason = "Delhivery accepted the manifest but did not return an LR/AWB within the synchronous booking window";
+          await env.DB.prepare("UPDATE shipments SET provider_booking_id = COALESCE(?, provider_booking_id), provider_sync_status = 'pending', provider_booking_payload_json = NULL, provider_retry_at = NULL, provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+            .bind(providerBookingId, timeoutReason, shipmentId, clientId).run();
+          await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'exception', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
+            .bind(crypto.randomUUID(), shipmentId, timeoutReason, auth.userId ?? `api:${clientId}`).run();
+          const timeoutResponse = JSON.stringify({ ok: false, error: { code: "PROVIDER_LR_TIMEOUT", category: "provider", message: timeoutReason, user_safe_message: "Delhivery did not return the LR yet. Booking was not confirmed or billed; retry after checking the provider status.", technical_message: timeoutReason, provider_code: "PROVIDER_LR_TIMEOUT", request_id: id, retryable: true, stale_data: false }, data: { id: shipmentId, client_id: clientId, status: "exception", provider, provider_booking_id: providerBookingId, pricing_amount: null }, request_id: id });
+          await saveIdempotent(env, key, clientId, "POST /v1/shipments", 504, timeoutResponse, requestHash);
+          await audit(env, ctx, auth, id, "shipment.provider_lr_timeout", "shipment", shipmentId, { client_id: clientId, provider, provider_booking_id: providerBookingId });
+          return new Response(timeoutResponse, { status: 504, headers: { ...headers, "content-type": "application/json" } });
+        }
+        if (pricingQuote) {
+          const completedBilling = await completeShipmentBilling(env, clientId, shipmentId);
+          if (!completedBilling.ok) {
+            const billingFailure = "The LR was received, but the PSS wallet transaction could not be completed safely. Contact support before retrying.";
+            await env.DB.prepare("UPDATE shipments SET status = 'exception', provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(completedBilling.error, shipmentId, clientId).run();
+            const failedBillingResponse = JSON.stringify({ ok: false, error: { code: "BILLING_FAILED", category: "request", message: billingFailure, user_safe_message: billingFailure, technical_message: completedBilling.error, request_id: id, retryable: false, stale_data: false }, data: { id: shipmentId, client_id: clientId, status: "exception", provider, lr_number: providerLr || null, master_awb: providerAwb || null }, request_id: id });
+            await saveIdempotent(env, key, clientId, "POST /v1/shipments", 409, failedBillingResponse, requestHash);
+            await audit(env, ctx, auth, id, "shipment.billing_failed", "shipment", shipmentId, { client_id: clientId, provider, reason: completedBilling.error });
+            return new Response(failedBillingResponse, { status: 409, headers: { ...headers, "content-type": "application/json" } });
+          }
         }
         // Return only provider-owned references. Delhivery may assign the LR
         // asynchronously, so read persisted courier values after the provider call.
@@ -3732,8 +3909,15 @@ const worker = {
         if (!hasScope(auth, route.endsWith("/tracking") ? "tracking.read" : "shipments.read")) return error("FORBIDDEN", "Shipment read scope required", 403, id, headers);
         const internalShipmentView = hasRole(auth, ["employee", "admin", "super_admin"]) || auth.system;
         const sensitiveShipmentView = auth.system || hasScope(auth, "shipments.sensitive.read");
-        const shipment = await env.DB.prepare(`SELECT id, pss_reference, client_id, tracking_number, lr_number, master_awb, box_awbs_json, provider_booking_id, provider_pickup_id, provider_sync_status, status, provider, ${sensitiveShipmentView ? "provider_account_id, provider_reference," : "provider_reference,"} (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = shipments.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, (SELECT pr.status FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_status, (SELECT pr.requested_date FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_scheduled_date, (SELECT pr.requested_time_slot FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_time_slot, (SELECT c.provider_status FROM pricing_provider_costs c WHERE c.shipment_id = shipments.id LIMIT 1) AS provider_confirmation_status, description, origin, destination, ${sensitiveShipmentView ? "origin_address_json, destination_address_json, consignee, declared_value," : "NULL AS origin_address_json, NULL AS destination_address_json, NULL AS consignee, NULL AS declared_value,"} total_weight_kg, pieces, edd, delivered_at, created_at, updated_at FROM shipments WHERE (id = ? OR pss_reference = ?) LIMIT 1`).bind(shipmentGet[1], shipmentGet[1]).first<Record<string, unknown> & { client_id: string; provider: string | null; tracking_number: string | null; provider_reference?: string | null }>();
+        let shipment = await env.DB.prepare(`SELECT id, pss_reference, client_id, tracking_number, lr_number, master_awb, box_awbs_json, provider_booking_id, provider_pickup_id, provider_sync_status, status, provider, ${sensitiveShipmentView ? "provider_account_id, provider_reference," : "provider_reference,"} (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = shipments.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, (SELECT pr.status FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_status, (SELECT pr.requested_date FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_scheduled_date, (SELECT pr.requested_time_slot FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_time_slot, (SELECT c.provider_status FROM pricing_provider_costs c WHERE c.shipment_id = shipments.id LIMIT 1) AS provider_confirmation_status, description, origin, destination, ${sensitiveShipmentView ? "origin_address_json, destination_address_json, consignee, declared_value," : "NULL AS origin_address_json, NULL AS destination_address_json, NULL AS consignee, NULL AS declared_value,"} total_weight_kg, pieces, edd, delivered_at, created_at, updated_at FROM shipments WHERE (id = ? OR pss_reference = ?) LIMIT 1`).bind(shipmentGet[1], shipmentGet[1]).first<Record<string, unknown> & { client_id: string; provider: string | null; tracking_number: string | null; provider_reference?: string | null; provider_booking_id?: string | null; provider_account_id?: string | null; lr_number?: string | null; master_awb?: string | null }>();
         if (!shipment || !canAccessClient(auth, shipment.client_id)) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
+        if (url.searchParams.get("refresh_provider") === "1" && shipment.provider === "delhivery" && !shipment.lr_number && !shipment.master_awb && shipment.provider_booking_id) {
+          const refreshProviderAccountId = typeof shipment.provider_account_id === "string"
+            ? shipment.provider_account_id
+            : (await env.DB.prepare("SELECT provider_account_id FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(String(shipment.id), shipment.client_id).first<{ provider_account_id: string | null }>())?.provider_account_id ?? null;
+          await safeProviderRequest(env, "delhivery", "shipment_status", { shipment_id: String(shipment.id), provider_booking_id: shipment.provider_booking_id, tracking_number: shipment.tracking_number, lr_number: shipment.lr_number, provider_reference: shipment.provider_reference, provider_account_id: refreshProviderAccountId }, id, shipment.client_id);
+          shipment = await env.DB.prepare(`SELECT id, pss_reference, client_id, tracking_number, lr_number, master_awb, box_awbs_json, provider_booking_id, provider_pickup_id, provider_sync_status, status, provider, ${sensitiveShipmentView ? "provider_account_id, provider_reference," : "provider_reference,"} (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = shipments.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, (SELECT pr.status FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_status, (SELECT pr.requested_date FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_scheduled_date, (SELECT pr.requested_time_slot FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_time_slot, (SELECT c.provider_status FROM pricing_provider_costs c WHERE c.shipment_id = shipments.id LIMIT 1) AS provider_confirmation_status, description, origin, destination, ${sensitiveShipmentView ? "origin_address_json, destination_address_json, consignee, declared_value," : "NULL AS origin_address_json, NULL AS destination_address_json, NULL AS consignee, NULL AS declared_value,"} total_weight_kg, pieces, edd, delivered_at, created_at, updated_at FROM shipments WHERE id = ? LIMIT 1`).bind(shipment.id).first<typeof shipment>() ?? shipment;
+        }
         if (route.endsWith("/tracking")) {
           const provider = ["delhivery", "ekart", "trackon", "xpressbees", "rivigo"].includes(String(shipment.provider)) ? shipment.provider as CourierProvider : null;
           // Client-facing shipment reads intentionally omit provider_account_id from
