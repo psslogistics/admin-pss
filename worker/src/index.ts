@@ -2506,7 +2506,9 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (response.ok && provider === "delhivery" && operation === "serviceability") {
     const body = parsedProviderBody && typeof parsedProviderBody === "object" ? parsedProviderBody as Record<string, unknown> : {};
     const b2bData = body.data && typeof body.data === "object" ? body.data as Record<string, unknown> : null;
-    const b2bRow = Array.isArray(b2bData?.pincode_serviceability_data) && b2bData.pincode_serviceability_data[0] && typeof b2bData.pincode_serviceability_data[0] === "object" ? b2bData.pincode_serviceability_data[0] as Record<string, unknown> : null;
+    const b2bRows = Array.isArray(b2bData?.pincode_serviceability_data) ? b2bData.pincode_serviceability_data : null;
+    const b2bRow = b2bRows?.[0] && typeof b2bRows[0] === "object" ? b2bRows[0] as Record<string, unknown> : null;
+    if (b2bRows && !b2bRow) return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable: false, prepaid: false, cod: false, pickup: false, oda: null, reason: "Delhivery does not currently service this pincode" };
     if (b2bRow) {
       const paymentTypeValue = b2bRow.payment_type;
       const paymentTypes = Array.isArray(paymentTypeValue) ? paymentTypeValue.map(String) : String(paymentTypeValue ?? "").replace(/[\[\]\"]+/g, "").split(",").map((value) => value.trim()).filter(Boolean);
