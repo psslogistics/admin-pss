@@ -4428,13 +4428,84 @@ const worker = {
       }
 
       if (route === "/dashboard/summary" && request.method === "GET") {
+        const view = url.searchParams.get("view")?.trim().toLowerCase() ?? "";
         const requestedCollections = new Set((url.searchParams.get("collections") ?? "").split(",").map((value) => value.trim()).filter(Boolean));
         const includeCollection = (key: string) => requestedCollections.size === 0 || requestedCollections.has(key);
         const permissionFingerprint = [...auth.permissions].sort().join(",");
-        const scopeKey = `${auth.userId ?? auth.clientId ?? "anonymous"}:${auth.audience}:${auth.system ? "system" : [...auth.clientIds].sort().join(",")}:${permissionFingerprint}:${[...requestedCollections].sort().join(",")}`;
+        const scopeKey = `${auth.userId ?? auth.clientId ?? "anonymous"}:${auth.audience}:${auth.system ? "system" : [...auth.clientIds].sort().join(",")}:${permissionFingerprint}:${view}:${[...requestedCollections].sort().join(",")}`;
         const cachedSummary = dashboardSummaryCache.get(scopeKey);
         if (cachedSummary && cachedSummary.expiresAt > Date.now()) return json({ ok: true, data: cachedSummary.data, request_id: id }, 200, headers);
         const internalSummaryView = auth.system || hasScope(auth, "shipments.sensitive.read");
+
+        if (view === "overview") {
+          const clientIds = [...auth.clientIds];
+          const clientPlaceholders = clientIds.map(() => "?").join(",");
+          const scopedWhere = (extra = "") => auth.system
+            ? (extra ? ` WHERE ${extra}` : "")
+            : clientIds.length
+              ? ` WHERE client_id IN (${clientPlaceholders})${extra ? ` AND ${extra}` : ""}`
+              : " WHERE 1 = 0";
+          const scoped = (sql: string, extra = "") => {
+            const statement = env.DB.prepare(`${sql}${scopedWhere(extra)}`);
+            return auth.system || !clientIds.length ? statement : statement.bind(...clientIds);
+          };
+          const overviewEntries: Array<{ key: string; statement: ReturnType<typeof env.DB.prepare> }> = [];
+          const addOverview = (key: string, scope: string, sql: string, extra: string) => {
+            if (hasScope(auth, scope)) overviewEntries.push({ key, statement: scoped(sql, extra) });
+          };
+          addOverview("shipments", "shipments.read", "SELECT id, client_id, provider, provider_reference, status, origin, destination, total_weight_kg, pieces, edd, delivered_at, created_at FROM shipments", "edd IS NOT NULL AND (date(edd) < date('now') OR (delivered_at IS NOT NULL AND date(delivered_at) > date(edd))) AND lower(COALESCE(status, '')) NOT IN ('delivered', 'cancelled') ORDER BY edd ASC LIMIT 20");
+          addOverview("pickups", "pickups.read", "SELECT id, shipment_id, client_id, requested_date, requested_time_slot, pickup_address, status, created_at, updated_at FROM pickup_requests", "lower(COALESCE(status, '')) NOT IN ('completed', 'cancelled') ORDER BY requested_date ASC LIMIT 100");
+          addOverview("billing", "billing.read", "SELECT id, client_id, shipment_id, invoice_number, amount, currency, status, due_date, created_at FROM billing_records", "lower(COALESCE(status, '')) = 'pending' ORDER BY created_at DESC LIMIT 100");
+          addOverview("wallet", "wallet.read", "SELECT id, client_id, type, amount, balance_after, reference, status, created_at FROM wallet_transactions", "1 = 1 ORDER BY created_at DESC LIMIT 1");
+          addOverview("exceptions", "cases.read", "SELECT id, shipment_id, client_id, category, severity, title, details, status, assigned_to_user_id, created_at, updated_at FROM exception_cases", "lower(COALESCE(status, '')) NOT IN ('resolved', 'closed') ORDER BY updated_at DESC LIMIT 8");
+          addOverview("ndr", "cases.read", "SELECT id, shipment_id, client_id, reason, attempt, deadline, status, assigned_to_user_id, created_at, updated_at FROM ndr_cases", "lower(COALESCE(status, '')) NOT IN ('resolved', 'closed', 'delivered', 'cancelled') ORDER BY updated_at DESC LIMIT 8");
+          addOverview("activity", "activity.read", "SELECT id, actor_user_id, client_id, shipment_id, action, entity_type, entity_id, created_at FROM activity_events", "1 = 1 ORDER BY created_at DESC LIMIT 12");
+          const overviewResults = overviewEntries.length ? await env.DB.batch<Record<string, unknown>>(overviewEntries.map(({ statement }) => statement)) : [];
+          const overviewRowsFor = (key: string) => {
+            const index = overviewEntries.findIndex((entry) => entry.key === key);
+            return index < 0 ? [] : (overviewResults[index]?.results ?? []) as Record<string, unknown>[];
+          };
+          const delayedShipments = overviewRowsFor("shipments");
+          const pickups = overviewRowsFor("pickups");
+          const billing = overviewRowsFor("billing");
+          const wallet = overviewRowsFor("wallet");
+          const exceptions = overviewRowsFor("exceptions");
+          const ndr = overviewRowsFor("ndr");
+          const activity = overviewRowsFor("activity");
+          const shipmentScope = auth.system ? "" : clientIds.length ? ` WHERE client_id IN (${clientPlaceholders})` : " WHERE 1 = 0";
+          const shipmentParams = auth.system ? [] : clientIds;
+          const stats = hasScope(auth, "shipments.read") ? await env.DB.batch<Record<string, unknown>>([
+            env.DB.prepare(`SELECT COUNT(*) AS total FROM shipments${shipmentScope}`).bind(...shipmentParams),
+            env.DB.prepare(`SELECT status, COUNT(*) AS count FROM shipments${shipmentScope} GROUP BY status`).bind(...shipmentParams),
+            env.DB.prepare(`SELECT COUNT(*) AS count FROM shipments${shipmentScope}${shipmentScope ? " AND" : " WHERE"} edd IS NOT NULL AND date(edd) < date('now') AND lower(COALESCE(status, '')) NOT IN ('delivered', 'cancelled')`).bind(...shipmentParams),
+            env.DB.prepare(`SELECT COALESCE(provider, 'unknown') AS provider, COUNT(*) AS count FROM shipments${shipmentScope} GROUP BY provider`).bind(...shipmentParams),
+          ]) : [];
+          const shipmentStats = { total: Number(stats[0]?.results?.[0]?.total ?? 0), delayed: Number(stats[2]?.results?.[0]?.count ?? 0), statuses: {} as Record<string, number>, providers: {} as Record<string, number> };
+          for (const row of stats[1]?.results ?? []) shipmentStats.statuses[String(row.status ?? "unknown")] = Number(row.count ?? 0);
+          for (const row of stats[3]?.results ?? []) shipmentStats.providers[String(row.provider ?? "unknown")] = Number(row.count ?? 0);
+          const notificationCount = hasScope(auth, "notifications.read")
+            ? auth.system
+              ? await env.DB.prepare("SELECT COUNT(*) AS count FROM notifications WHERE is_read = 0").first<{ count: number }>()
+              : clientIds.length
+                ? await env.DB.prepare(`SELECT COUNT(*) AS count FROM notifications WHERE is_read = 0 AND (client_id IN (${clientPlaceholders}) OR recipient_user_id = ?)`).bind(...clientIds, auth.userId ?? "").first<{ count: number }>()
+                : { count: 0 }
+            : { count: 0 };
+          const data = {
+            shipments: delayedShipments,
+            pickups,
+            billing,
+            wallet,
+            exceptions,
+            ndr,
+            activity,
+            shipment_stats: shipmentStats,
+            unread_notification_count: Number(notificationCount?.count ?? 0),
+            overview: true,
+          };
+          dashboardSummaryCache.set(scopeKey, { expiresAt: Date.now() + SUMMARY_CACHE_TTL_MS, data });
+          return json({ ok: true, data, request_id: id }, 200, headers);
+        }
+
         const summaryColumns: Record<string, string> = {
           shipments: internalSummaryView ? "id, client_id, provider, provider_reference, status, origin, destination, consignee, total_weight_kg, pieces, edd, delivered_at, created_at" : "id, client_id, provider, status, origin, destination, consignee, total_weight_kg, pieces, edd, delivered_at, created_at",
           pickup_requests: "id, shipment_id, client_id, requested_date, requested_time_slot, pickup_address, status, created_at, updated_at",
