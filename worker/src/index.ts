@@ -3089,12 +3089,38 @@ function delhiveryWebhookDetails(payload: Record<string, unknown>) {
 function pickupStatusFromProviderEvent(rawStatus: unknown) {
   const value = String(rawStatus ?? "").trim().toLowerCase().replaceAll("-", "_").replaceAll(" ", "_");
   if (!value) return null;
+  // Check the negative pickup state before the generic "picked" substring.
+  // Otherwise Delhivery's "Not Picked" is incorrectly stored as picked_up.
+  if (value.includes("not_picked") || value.includes("not_collected") || value.includes("pickup_not_done")) return "not_picked";
+  if (value.includes("reschedul")) return "rescheduled";
   if (value.includes("cancel")) return "cancelled";
   if (value.includes("fail") || value.includes("exception") || value.includes("reject") || value.includes("undeliver")) return "failed";
   if (value.includes("picked") || value.includes("pickup_complete") || value.includes("collected")) return "picked_up";
   if (value.includes("driver") || value.includes("assign") || value.includes("en_route") || value.includes("out_for_pickup")) return value.includes("en_route") || value.includes("out_for_pickup") ? "en_route" : "driver_assigned";
   if (value.includes("schedule") || value.includes("manifest") || value.includes("book") || value.includes("accept") || value.includes("confirm")) return "scheduled";
   return null;
+}
+
+async function reconcileShipmentLinkedPickupStatuses(env: Env, cron: string) {
+  const rows = await env.DB.prepare(`
+    SELECT pr.id, pr.client_id, pr.status
+    FROM pickup_requests pr
+    WHERE pr.provider = 'delhivery'
+      AND pr.status IN ('requested', 'provider_pending', 'scheduled', 'driver_assigned', 'en_route', 'rescheduled')
+      AND EXISTS (
+        SELECT 1 FROM shipments s
+        WHERE (s.id = pr.shipment_id OR EXISTS (
+          SELECT 1 FROM pickup_request_shipments prs WHERE prs.pickup_id = pr.id AND prs.shipment_id = s.id
+        ))
+        AND s.status IN ('picked_up', 'in_transit', 'out_for_delivery', 'delivered')
+      )
+    LIMIT 100
+  `).all<{ id: string; client_id: string; status: string }>();
+  for (const pickup of rows.results) {
+    await env.DB.prepare("UPDATE pickup_requests SET status = 'picked_up', provider_status = COALESCE(NULLIF(provider_status, ''), 'shipment_status:picked_up'), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ? AND status IN ('requested', 'provider_pending', 'scheduled', 'driver_assigned', 'en_route', 'rescheduled')")
+      .bind(pickup.id, pickup.client_id).run();
+  }
+  if (rows.results.length) console.log(JSON.stringify({ job: "pickup_status_reconciliation", cron, candidates: rows.results.length }));
 }
 
 function delhiveryDocumentUrl(payload: Record<string, unknown>) {
@@ -3170,7 +3196,7 @@ async function handleProviderWebhook(request: Request, env: Env, provider: "delh
      const pickupStatus = provider === "delhivery" ? pickupStatusFromProviderEvent(delhiveryDetails?.rawStatus ?? payload.status ?? payload.event_type) : null;
      const pickup = provider === "delhivery" && reference ? await env.DB.prepare("SELECT id, shipment_id FROM pickup_requests WHERE provider = 'delhivery' AND (provider_reference = ? OR provider_request_id = ? OR id = ?) LIMIT 1").bind(reference, reference, reference).first<{ id: string; shipment_id: string | null }>() : null;
      if (pickupStatus && pickup) {
-       await env.DB.prepare("UPDATE pickup_requests SET status = ?, provider_status = ?, provider_reference = COALESCE(?, provider_reference), requested_date = COALESCE(?, requested_date), requested_time_slot = COALESCE(?, requested_time_slot), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status IN ('requested', 'provider_pending', 'scheduled', 'driver_assigned', 'en_route')")
+       await env.DB.prepare("UPDATE pickup_requests SET status = ?, provider_status = ?, provider_reference = COALESCE(?, provider_reference), requested_date = COALESCE(?, requested_date), requested_time_slot = COALESCE(?, requested_time_slot), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status IN ('requested', 'provider_pending', 'scheduled', 'driver_assigned', 'en_route', 'rescheduled')")
          .bind(pickupStatus, String(delhiveryDetails?.rawStatus ?? payload.status ?? payload.event_type ?? ""), reference || null, delhiveryDetails?.requestedDate ?? null, delhiveryDetails?.requestedTimeSlot ?? null, pickup.id)
          .run();
      }
@@ -3188,7 +3214,7 @@ async function handleProviderWebhook(request: Request, env: Env, provider: "delh
       await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, location, description, created_by_user_id, event_time, created_at) VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipment.id, status, location, description, `webhook:${provider}`, delhiveryDetails?.eventTime ?? null).run();
        if (provider === "delhivery") {
          if (pickupStatus && !pickup) {
-          await env.DB.prepare("UPDATE pickup_requests SET status = ?, provider_status = ?, provider_reference = COALESCE(?, provider_reference), requested_date = COALESCE(?, requested_date), requested_time_slot = COALESCE(?, requested_time_slot), updated_at = CURRENT_TIMESTAMP WHERE shipment_id = ? AND provider = 'delhivery' AND status IN ('requested', 'provider_pending', 'scheduled', 'driver_assigned', 'en_route')")
+          await env.DB.prepare("UPDATE pickup_requests SET status = ?, provider_status = ?, provider_reference = COALESCE(?, provider_reference), requested_date = COALESCE(?, requested_date), requested_time_slot = COALESCE(?, requested_time_slot), updated_at = CURRENT_TIMESTAMP WHERE shipment_id = ? AND provider = 'delhivery' AND status IN ('requested', 'provider_pending', 'scheduled', 'driver_assigned', 'en_route', 'rescheduled')")
             .bind(pickupStatus, String(delhiveryDetails?.rawStatus ?? payload.status ?? payload.event_type ?? ""), reference || null, delhiveryDetails?.requestedDate ?? null, delhiveryDetails?.requestedTimeSlot ?? null, shipment.id)
             .run();
         }
@@ -4392,7 +4418,7 @@ const worker = {
         const requestHash = await payloadFingerprint(payload);
         // Accept the canonical pickup lifecycle names while retaining the
         // legacy aliases used by older internal callers.
-        const allowedStatuses = new Set(["draft", "requested", "provider_pending", "scheduled", "driver_assigned", "en_route", "picked_up", "completed", "cancelled", "failed", "assigned", "in_transit"]);
+        const allowedStatuses = new Set(["draft", "requested", "provider_pending", "scheduled", "rescheduled", "not_picked", "driver_assigned", "en_route", "picked_up", "completed", "cancelled", "failed", "assigned", "in_transit"]);
         if (payload.status !== undefined && (typeof payload.status !== "string" || !allowedStatuses.has(payload.status))) return error("VALIDATION_ERROR", "Unsupported pickup status", 400, id, headers);
         const clientCancel = !staffUpdate && payload.status === "cancelled" && Object.keys(payload).every((key) => key === "status") && hasScope(auth, "pickups.read");
         const clientReschedule = !staffUpdate && (payload.retry === true || payload.requested_date !== undefined || payload.requested_time_slot !== undefined) && hasScope(auth, "pickups.manage");
@@ -5793,6 +5819,7 @@ const worker = {
     ctx.waitUntil(retryPendingDelhiveryBookings(env, controller.cron));
     ctx.waitUntil(reconcilePendingDelhiveryReferences(env, controller.cron));
     ctx.waitUntil(refreshDelhiveryShipments(env, controller.cron));
+    ctx.waitUntil(reconcileShipmentLinkedPickupStatuses(env, controller.cron));
   },
 };
 
