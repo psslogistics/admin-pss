@@ -1668,8 +1668,8 @@ function findProviderAmount(value: unknown, keys = new Set(["amount", "total_amo
 }
 
 type NormalizedProviderTracking = { status: string; location: string; description: string; eventTime: string | null };
-function normalizeProviderTracking(value: unknown, depth = 0): NormalizedProviderTracking | null {
-  if (depth > 8 || value === null || value === undefined) return null;
+function normalizeProviderTrackingEvents(value: unknown, depth = 0): NormalizedProviderTracking[] {
+  if (depth > 8 || value === null || value === undefined) return [];
   const candidates: NormalizedProviderTracking[] = [];
   const knownStatuses = new Set(["booked", "picked_up", "in_transit", "out_for_delivery", "delivered", "cancelled", "exception", "rto"]);
   const collect = (node: unknown, level: number) => {
@@ -1682,36 +1682,46 @@ function normalizeProviderTracking(value: unknown, depth = 0): NormalizedProvide
       (typeof object.Status === "string" ? object.Status : undefined) ??
       object.shipment_status ?? object.ShipmentStatus ?? object.scan_status ??
       object.status_text ?? object.status_name ?? object.state ?? object.event ?? object.scan_type ??
+      object.Scan ?? object.scan ?? object.ScanType ?? object.scanType ??
       nestedStatus?.Status ?? nestedStatus?.status;
     const normalized = normalizeProviderShipmentStatus(rawStatus);
     if (typeof rawStatus === "string" && knownStatuses.has(normalized)) {
       const eventTimeValue = object.event_time ?? object.eventTime ?? object.timestamp ??
         object.status_date_time ?? object.StatusDateTime ?? object.scan_time ?? object.scan_date ??
-        object.eventDateTime ?? nestedStatus?.StatusDateTime ?? nestedStatus?.status_date_time;
+        object.ScanDateTime ?? object.scan_date_time ?? object.eventDateTime ??
+        nestedStatus?.StatusDateTime ?? nestedStatus?.status_date_time;
       candidates.push({
         status: normalized,
-        location: String(object.location ?? object.city ?? object.status_location ?? object.StatusLocation ?? nestedStatus?.StatusLocation ?? nestedStatus?.location ?? "").trim().slice(0, 200),
-        description: String(object.description ?? object.message ?? object.instructions ?? object.Instructions ?? object.status_description ?? nestedStatus?.Instructions ?? nestedStatus?.description ?? `Provider status: ${normalized}`).trim().slice(0, 500),
+        location: String(object.location ?? object.city ?? object.status_location ?? object.StatusLocation ?? object.ScannedLocation ?? object.scanned_location ?? object.ScanLocation ?? object.scan_location ?? nestedStatus?.StatusLocation ?? nestedStatus?.location ?? "").trim().slice(0, 200),
+        description: String(object.description ?? object.message ?? object.instructions ?? object.Instructions ?? object.Scan ?? object.scan ?? object.status_description ?? nestedStatus?.Instructions ?? nestedStatus?.description ?? `Provider status: ${normalized}`).trim().slice(0, 500),
         eventTime: typeof eventTimeValue === "string" ? eventTimeValue : null,
       });
     }
     for (const child of Object.values(object)) collect(child, level + 1);
   };
   collect(value, depth);
-  if (!candidates.length) return null;
+  // Delhivery may repeat the same scan in a wrapper and in its nested scan list.
+  const unique = new Map<string, NormalizedProviderTracking>();
+  for (const candidate of candidates) unique.set(`${candidate.status}|${candidate.location}|${candidate.description}|${candidate.eventTime ?? ""}`, candidate);
+  const deduped = [...unique.values()];
+  if (!deduped.length) return [];
   // Delhivery responses can include an exception-like wrapper alongside the
   // actual scan state. When an authenticated active scan is present, expose
   // that operational state instead of letting the wrapper hide transit.
-  const activeCandidates = candidates.filter((candidate) => ["picked_up", "in_transit", "out_for_delivery", "delivered"].includes(candidate.status));
-  const effectiveCandidates = activeCandidates.length ? activeCandidates : candidates;
+  const activeCandidates = deduped.filter((candidate) => ["picked_up", "in_transit", "out_for_delivery", "delivered"].includes(candidate.status));
+  const effectiveCandidates = activeCandidates.length ? activeCandidates : deduped;
   const order: Record<string, number> = { booked: 0, picked_up: 1, in_transit: 2, out_for_delivery: 3, delivered: 4, rto: 4, cancelled: 4, exception: -1 };
   return effectiveCandidates.sort((left, right) => {
     const leftTime = left.eventTime ? Date.parse(left.eventTime) : Number.NaN;
     const rightTime = right.eventTime ? Date.parse(right.eventTime) : Number.NaN;
-    if (Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime !== rightTime) return rightTime - leftTime;
-    if (Number.isFinite(rightTime) !== Number.isFinite(leftTime)) return Number.isFinite(rightTime) ? 1 : -1;
-    return (order[right.status] ?? -1) - (order[left.status] ?? -1);
-  })[0];
+    if (Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime !== rightTime) return leftTime - rightTime;
+    if (Number.isFinite(leftTime) !== Number.isFinite(rightTime)) return Number.isFinite(leftTime) ? -1 : 1;
+    return (order[left.status] ?? -1) - (order[right.status] ?? -1);
+  });
+}
+function normalizeProviderTracking(value: unknown): NormalizedProviderTracking | null {
+  const events = normalizeProviderTrackingEvents(value);
+  return events.at(-1) ?? null;
 }
 
 function trackonCredentials(env: Env, accountCredential?: string) {
@@ -2412,24 +2422,32 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   const providerFailureDetail = !response.ok ? responseBody.replace(/\s+/g, " ").trim().slice(0, 300) : null;
   if (persistIntegration) await env.DB.prepare("UPDATE integration_requests SET status = ?, error_code = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(response.ok ? "succeeded" : "failed", response.ok ? null : `HTTP_${response.status}`, response.ok ? null : `${lastError}${providerFailureDetail ? `: ${providerFailureDetail}` : ""}`.slice(0, 500), integrationId).run();
   let normalizedTracking: NormalizedProviderTracking | null = null;
+  let normalizedTrackingEvents: NormalizedProviderTracking[] = [];
   if (operation === "tracking" && clientId && typeof payload.shipment_id === "string") {
     const syncError = response.ok ? null : `${lastError}${providerFailureDetail ? `: ${providerFailureDetail}` : ""}`.slice(0, 500);
     await env.DB.prepare("UPDATE shipments SET provider_last_attempt_at = CURRENT_TIMESTAMP, provider_last_error_code = ?, provider_last_error_message = ?, provider_last_success_at = CASE WHEN ? IS NULL THEN CURRENT_TIMESTAMP ELSE provider_last_success_at END WHERE id = ? AND client_id = ?")
       .bind(response.ok ? null : `HTTP_${response.status}`, syncError, syncError, payload.shipment_id, clientId).run();
   }
   if (response.ok && operation === "tracking") {
-    try { normalizedTracking = normalizeProviderTracking(JSON.parse(responseBody)); } catch { normalizedTracking = null; }
+    try {
+      normalizedTrackingEvents = normalizeProviderTrackingEvents(JSON.parse(responseBody));
+      normalizedTracking = normalizedTrackingEvents.at(-1) ?? null;
+    } catch { normalizedTracking = null; normalizedTrackingEvents = []; }
     if (normalizedTracking && clientId && typeof payload.shipment_id === "string") {
       const current = await env.DB.prepare("SELECT status FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(payload.shipment_id, clientId).first<{ status: string }>();
       const currentStatus = String(current?.status ?? "").toLowerCase();
       const genericExceptionWrapper = normalizedTracking.status === "exception" && /^provider status:\s*exception$/i.test(normalizedTracking.description.trim());
       const preserveActiveStatus = genericExceptionWrapper && ["picked_up", "in_transit", "out_for_delivery"].includes(currentStatus);
       if (current && !preserveActiveStatus && validProviderShipmentTransition(currentStatus, normalizedTracking.status)) {
-        const latest = await env.DB.prepare("SELECT status, location, description FROM tracking_events WHERE shipment_id = ? ORDER BY event_time DESC LIMIT 1").bind(payload.shipment_id).first<{ status: string; location: string | null; description: string | null }>();
-        if (!latest || latest.status !== normalizedTracking.status || (latest.location ?? "") !== normalizedTracking.location || (latest.description ?? "") !== normalizedTracking.description) {
-          await env.DB.prepare("UPDATE shipments SET provider = ?, status = ?, delivered_at = CASE WHEN ? = 'delivered' THEN COALESCE(delivered_at, CURRENT_TIMESTAMP) ELSE delivered_at END, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(provider, normalizedTracking.status, normalizedTracking.status, payload.shipment_id, clientId).run();
-          await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, location, description, created_by_user_id, event_time, created_at) VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), payload.shipment_id, normalizedTracking.status, normalizedTracking.location, normalizedTracking.description, `provider:${provider}`, normalizedTracking.eventTime).run();
-        }
+        await env.DB.prepare("UPDATE shipments SET provider = ?, status = ?, delivered_at = CASE WHEN ? = 'delivered' THEN COALESCE(delivered_at, CURRENT_TIMESTAMP) ELSE delivered_at END, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(provider, normalizedTracking.status, normalizedTracking.status, payload.shipment_id, clientId).run();
+      }
+      const existingEvents = await env.DB.prepare("SELECT status, location, description, event_time FROM tracking_events WHERE shipment_id = ?").bind(payload.shipment_id).all<{ status: string; location: string | null; description: string | null; event_time: string | null }>();
+      const existingSignatures = new Set(existingEvents.results.map((event) => `${event.status}|${event.location ?? ""}|${event.description ?? ""}|${event.event_time ?? ""}`));
+      for (const event of normalizedTrackingEvents) {
+        const signature = `${event.status}|${event.location}|${event.description}|${event.eventTime ?? ""}`;
+        if (existingSignatures.has(signature)) continue;
+        await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, location, description, created_by_user_id, event_time, created_at) VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), payload.shipment_id, event.status, event.location, event.description, `provider:${provider}`, event.eventTime).run();
+        existingSignatures.add(signature);
       }
     }
   }
