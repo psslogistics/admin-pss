@@ -1767,6 +1767,27 @@ function normalizeProviderTrackingEvents(value: unknown, depth = 0): NormalizedP
     walk(value, depth);
     return found;
   })();
+  // Some Delhivery responses expose the pickup lifecycle only as the current
+  // status (without a matching Scans[] description). Preserve that provider
+  // state as a synthetic event so pickup reconciliation can consume it.
+  const currentPickupStatus = (() => {
+    let found = "";
+    const walk = (node: unknown, level: number) => {
+      if (level > 8 || node === null || node === undefined || typeof node !== "object" || found) return;
+      if (Array.isArray(node)) { for (const item of node) walk(item, level + 1); return; }
+      const object = node as Record<string, unknown>;
+      for (const key of ["current_status", "currentStatus", "shipment_status", "ShipmentStatus", "status", "Status", "state", "pickup_status"]) {
+        const value = object[key];
+        if (typeof value === "string" && /out[ _-]+for[ _-]+pickup|driver[ _-]+assigned|en[ _-]+route/i.test(value)) { found = value; return; }
+      }
+      for (const child of Object.values(object)) walk(child, level + 1);
+    };
+    walk(value, depth);
+    return found;
+  })();
+  if (currentPickupStatus && !candidates.some((candidate) => /out for pickup|driver assigned|en route/i.test(candidate.description))) {
+    candidates.push({ status: "booked", location: "", description: currentPickupStatus.replaceAll("_", " "), eventTime: null });
+  }
   for (const scan of scanDetails) {
     const description = String(scan.Instructions ?? scan.instructions ?? scan.Scan ?? scan.scan ?? scan.Description ?? scan.description ?? "Provider scan").trim().slice(0, 500);
     const eventTimeValue = scan.ScanDateTime ?? scan.scan_date_time ?? scan.StatusDateTime ?? scan.status_date_time ?? scan.event_time ?? scan.eventTime ?? scan.timestamp;
@@ -3251,7 +3272,13 @@ async function reconcileShipmentLinkedPickupStatuses(env: Env, cron: string) {
       COUNT(DISTINCT CASE WHEN EXISTS (
         SELECT 1 FROM tracking_events te
         WHERE te.shipment_id = s.id
-          AND lower(COALESCE(te.description, '') || ' ' || COALESCE(te.status, '')) LIKE '%out for pickup%'
+          AND (
+            lower(COALESCE(te.description, '') || ' ' || COALESCE(te.status, '')) LIKE '%out for pickup%'
+            OR lower(COALESCE(te.description, '') || ' ' || COALESCE(te.status, '')) LIKE '%out_for_pickup%'
+            OR lower(COALESCE(te.description, '') || ' ' || COALESCE(te.status, '')) LIKE '%out-for-pickup%'
+            OR lower(COALESCE(te.description, '') || ' ' || COALESCE(te.status, '')) LIKE '%driver assigned%'
+            OR lower(COALESCE(te.description, '') || ' ' || COALESCE(te.status, '')) LIKE '%en route%'
+          )
       ) THEN s.id END) AS en_route_count
     FROM pickup_requests pr
     LEFT JOIN shipments s ON s.id = pr.shipment_id OR EXISTS (
