@@ -3427,6 +3427,7 @@ async function refreshDelhiveryShipments(env: Env, cron: string) {
   // its state-specific cadence. Last-mile centre scans are identified from
   // the latest normalized provider event without changing the public status.
   const due = `(provider_last_attempt_at IS NULL OR
+    (status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery', 'exception', 'rto') AND edd IS NULL AND datetime(provider_last_attempt_at) <= datetime('now', '-10 minutes')) OR
     (status = 'out_for_delivery' AND datetime(provider_last_attempt_at) <= datetime('now', '-10 minutes')) OR
     (status = 'in_transit' AND ${latestEvent} GLOB '*last[- ]mile*' AND datetime(provider_last_attempt_at) <= datetime('now', '-1 hour')) OR
     (status IN ('booked', 'picked_up', 'cancelled') AND datetime(provider_last_attempt_at) <= datetime('now', '-10 minutes')) OR
