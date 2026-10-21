@@ -1690,8 +1690,9 @@ function normalizeProviderTrackingEvents(value: unknown, depth = 0): NormalizedP
     if (Array.isArray(node)) { for (const item of node) collectScans(item, level + 1); return; }
     if (typeof node !== "object") return;
     const object = node as Record<string, unknown>;
-    const hasScanTime = Object.keys(object).some((key) => ["scandatetime", "scan_date_time", "statusdatetime", "status_date_time"].includes(key.toLowerCase()));
-    const hasScanText = Object.keys(object).some((key) => ["scan", "instructions", "description", "statusdescription"].includes(key.toLowerCase()));
+    const normalizedKeys = Object.keys(object).map((key) => key.toLowerCase().replace(/[^a-z]/g, ""));
+    const hasScanTime = normalizedKeys.some((key) => /scan.*date|date.*scan|status.*date|event.*time/.test(key));
+    const hasScanText = normalizedKeys.some((key) => /scan|instruction|description|statusmessage/.test(key));
     if (hasScanTime && hasScanText) scanDetails.push(object);
     for (const [key, child] of Object.entries(object)) {
       if (key.toLowerCase() === "scans") {
