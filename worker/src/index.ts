@@ -276,6 +276,10 @@ function validShipmentTransition(current: string, next: string) { return shipmen
 function validProviderShipmentTransition(current: string, next: string) {
   if (current === next) return true;
   if (current === "delivered" || current === "rto") return false;
+  // Delhivery can report a previously failed/local-exception record as
+  // "Not Picked". That is still a booked shipment, so allow the provider's
+  // explicit booked state to reconcile the stale local exception.
+  if (current === "exception" && next === "booked") return true;
   if (next === "cancelled" || next === "exception") return true;
   const order: Record<string, number> = { booked: 0, picked_up: 1, in_transit: 2, out_for_delivery: 3, delivered: 4, rto: 4 };
   return order[next] !== undefined && order[current] !== undefined && order[next] > order[current];
@@ -283,7 +287,7 @@ function validProviderShipmentTransition(current: string, next: string) {
 function normalizeProviderShipmentStatus(value: unknown) {
   const status = String(value ?? "").trim().toLowerCase().replace(/[\s-]+/g, "_");
   if (!status) return "in_transit";
-  if (["booked", "manifested", "pickup_scheduled", "order_created"].includes(status)) return "booked";
+  if (["booked", "manifested", "pickup_scheduled", "order_created", "not_picked", "not_picked_up", "not_picked_yet", "not_pickup"].includes(status)) return "booked";
   if (["picked", "picked_up", "pickup_complete", "pickup_completed"].includes(status)) return "picked_up";
   if (["in_transit", "transit", "shipped", "dispatched", "out_for_pickup"].includes(status)) return "in_transit";
   if (["out_for_delivery", "out_for_del", "ofd"].includes(status)) return "out_for_delivery";
