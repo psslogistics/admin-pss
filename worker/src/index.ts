@@ -1674,14 +1674,20 @@ function normalizeProviderTracking(value: unknown, depth = 0): NormalizedProvide
     if (typeof node !== "object") return;
     const object = node as Record<string, unknown>;
     const nestedStatus = object.Status && typeof object.Status === "object" ? object.Status as Record<string, unknown> : null;
-    const rawStatus = object.status ?? object.current_status ?? object.currentStatus ?? nestedStatus?.Status ?? nestedStatus?.status;
+    const rawStatus = object.status ?? object.current_status ?? object.currentStatus ??
+      (typeof object.Status === "string" ? object.Status : undefined) ??
+      object.shipment_status ?? object.ShipmentStatus ?? object.scan_status ??
+      object.status_text ?? object.status_name ?? object.state ?? object.event ?? object.scan_type ??
+      nestedStatus?.Status ?? nestedStatus?.status;
     const normalized = normalizeProviderShipmentStatus(rawStatus);
     if (typeof rawStatus === "string" && knownStatuses.has(normalized)) {
-      const eventTimeValue = object.event_time ?? object.eventTime ?? object.timestamp ?? nestedStatus?.StatusDateTime;
+      const eventTimeValue = object.event_time ?? object.eventTime ?? object.timestamp ??
+        object.status_date_time ?? object.StatusDateTime ?? object.scan_time ?? object.scan_date ??
+        object.eventDateTime ?? nestedStatus?.StatusDateTime ?? nestedStatus?.status_date_time;
       candidates.push({
         status: normalized,
-        location: String(object.location ?? object.city ?? nestedStatus?.StatusLocation ?? nestedStatus?.location ?? "").trim().slice(0, 200),
-        description: String(object.description ?? object.message ?? nestedStatus?.Instructions ?? nestedStatus?.description ?? `Provider status: ${normalized}`).trim().slice(0, 500),
+        location: String(object.location ?? object.city ?? object.status_location ?? object.StatusLocation ?? nestedStatus?.StatusLocation ?? nestedStatus?.location ?? "").trim().slice(0, 200),
+        description: String(object.description ?? object.message ?? object.instructions ?? object.Instructions ?? object.status_description ?? nestedStatus?.Instructions ?? nestedStatus?.description ?? `Provider status: ${normalized}`).trim().slice(0, 500),
         eventTime: typeof eventTimeValue === "string" ? eventTimeValue : null,
       });
     }
@@ -3225,14 +3231,14 @@ async function refreshDelhiveryShipments(env: Env, cron: string) {
   // leave the rest of the eligible fleet untouched indefinitely.
   const order = "ORDER BY CASE status WHEN 'out_for_delivery' THEN 0 WHEN 'in_transit' THEN 1 ELSE 2 END, CASE WHEN provider_last_attempt_at IS NULL THEN 0 ELSE 1 END, provider_last_attempt_at ASC, updated_at ASC LIMIT 50";
   const latestEvent = "(SELECT lower(COALESCE(te.location, '') || ' ' || COALESCE(te.description, '')) FROM tracking_events te WHERE te.shipment_id = shipments.id ORDER BY te.event_time DESC LIMIT 1)";
-  // The Worker wakes every 10 minutes, but each shipment is selected only at
+  // The Worker wakes every 2 minutes, but each shipment is selected only at
   // its state-specific cadence. Last-mile centre scans are identified from
   // the latest normalized provider event without changing the public status.
   const due = `(provider_last_attempt_at IS NULL OR
     (status = 'out_for_delivery' AND datetime(provider_last_attempt_at) <= datetime('now', '-10 minutes')) OR
     (status = 'in_transit' AND ${latestEvent} GLOB '*last[- ]mile*' AND datetime(provider_last_attempt_at) <= datetime('now', '-1 hour')) OR
-    (status IN ('booked', 'cancelled') AND datetime(provider_last_attempt_at) <= datetime('now', '-10 minutes')) OR
-    (status IN ('picked_up', 'in_transit', 'exception', 'rto') AND NOT (status = 'in_transit' AND ${latestEvent} GLOB '*last[- ]mile*') AND datetime(provider_last_attempt_at) <= datetime('now', '-4 hours'))) `;
+    (status IN ('booked', 'picked_up', 'cancelled') AND datetime(provider_last_attempt_at) <= datetime('now', '-10 minutes')) OR
+    (status IN ('in_transit', 'exception', 'rto') AND NOT (status = 'in_transit' AND ${latestEvent} GLOB '*last[- ]mile*') AND datetime(provider_last_attempt_at) <= datetime('now', '-4 hours'))) `;
   // Delivered shipments are terminal for status polling. Keep their separate
   // POD backfill below, but do not spend tracking calls refreshing them.
   const refreshRows: Array<{ id: string; client_id: string; tracking_number: string | null; lr_number: string | null; provider_reference: string | null; provider_account_id: string | null }> = [];
@@ -3251,13 +3257,13 @@ async function refreshDelhiveryShipments(env: Env, cron: string) {
     const batch = active.results.slice(0, 5);
     refreshRows.push(...batch);
     const results = await Promise.all(batch.map(async (shipment) => {
-      const result = await safeProviderRequest(env, "delhivery", "tracking", { shipment_id: shipment.id, tracking_number: shipment.tracking_number, lr_number: shipment.lr_number, provider_reference: shipment.provider_reference, provider_account_id: shipment.provider_account_id }, `cron:${cron}:fujiyama:tracking:${shipment.id}`, shipment.client_id, undefined, 10000);
+      const result = await safeProviderRequest(env, "delhivery", "tracking", { shipment_id: shipment.id, tracking_number: shipment.tracking_number, lr_number: shipment.lr_number, provider_reference: shipment.provider_reference, provider_account_id: shipment.provider_account_id }, `cron:${cron}:delhivery:tracking:${shipment.id}`, shipment.client_id, undefined, 10000);
       let podStatus: "accepted" | "failed" | null = null;
       // A delivered transition must immediately start POD retrieval. If
       // Delhivery has not published the artifact yet, the delivered shipment
       // remains in the POD backfill queue for the next scheduler run.
       if (result.status === "accepted" && result.normalized_status === "delivered") {
-        const pod = await safeProviderRequest(env, "delhivery", "document", { shipment_id: shipment.id, tracking_number: shipment.tracking_number, lr_number: shipment.lr_number, provider_reference: shipment.provider_reference, provider_account_id: shipment.provider_account_id, doc_type: "LM_POD" }, `cron:${cron}:fujiyama:pod:${shipment.id}`, shipment.client_id, undefined, 15000);
+        const pod = await safeProviderRequest(env, "delhivery", "document", { shipment_id: shipment.id, tracking_number: shipment.tracking_number, lr_number: shipment.lr_number, provider_reference: shipment.provider_reference, provider_account_id: shipment.provider_account_id, doc_type: "LM_POD" }, `cron:${cron}:delhivery:pod:${shipment.id}`, shipment.client_id, undefined, 15000);
         podStatus = pod.status === "accepted" ? "accepted" : "failed";
       }
       return { tracking: result.status === "accepted", pod: podStatus };
