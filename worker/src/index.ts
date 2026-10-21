@@ -1672,6 +1672,73 @@ function normalizeProviderTrackingEvents(value: unknown, depth = 0): NormalizedP
   if (depth > 8 || value === null || value === undefined) return [];
   const candidates: NormalizedProviderTracking[] = [];
   const knownStatuses = new Set(["booked", "picked_up", "in_transit", "out_for_delivery", "delivered", "cancelled", "exception", "rto"]);
+  const statusFromScanText = (description: string, fallback: string) => {
+    const text = description.toLowerCase();
+    if (/cancel/.test(text)) return "cancelled";
+    if (/deliver(?:ed|y complete)/.test(text)) return "delivered";
+    if (/out for delivery|ofd/.test(text)) return "out_for_delivery";
+    if (/return to origin|returned|rto/.test(text)) return "rto";
+    if (/not picked|pickup failed|failed pickup/.test(text)) return "booked";
+    if (/picked up|pickup complete|collected/.test(text)) return "picked_up";
+    if (/manifest|uploaded|created|booked/.test(text)) return "booked";
+    if (/transit|departed|bag added|trip arrived|received at|arrived at|weight captured|dispatched|shipped/.test(text)) return "in_transit";
+    return fallback;
+  };
+  const scanDetails: Array<Record<string, unknown>> = [];
+  const collectScans = (node: unknown, level: number) => {
+    if (level > 8 || node === null || node === undefined) return;
+    if (Array.isArray(node)) { for (const item of node) collectScans(item, level + 1); return; }
+    if (typeof node !== "object") return;
+    const object = node as Record<string, unknown>;
+    for (const [key, child] of Object.entries(object)) {
+      if (key.toLowerCase() === "scans" && Array.isArray(child)) {
+        for (const item of child) {
+          if (!item || typeof item !== "object") continue;
+          const record = item as Record<string, unknown>;
+          const detail = record.ScanDetail ?? record.scan_detail ?? record.scanDetail;
+          if (detail && typeof detail === "object" && !Array.isArray(detail)) scanDetails.push(detail as Record<string, unknown>);
+          else scanDetails.push(record);
+        }
+      } else collectScans(child, level + 1);
+    }
+  };
+  collectScans(value, depth);
+  const currentStatus = (() => {
+    let found = "in_transit";
+    const walk = (node: unknown, level: number) => {
+      if (level > 8 || node === null || node === undefined || typeof node !== "object") return;
+      if (Array.isArray(node)) { for (const item of node) walk(item, level + 1); return; }
+      const object = node as Record<string, unknown>;
+      const statusObject = object.Status && typeof object.Status === "object" ? object.Status as Record<string, unknown> : null;
+      const raw = object.current_status ?? object.currentStatus ?? object.shipment_status ?? object.ShipmentStatus ??
+        statusObject?.Status ?? (typeof object.Status === "string" ? object.Status : undefined);
+      if (typeof raw === "string" && knownStatuses.has(normalizeProviderShipmentStatus(raw))) found = normalizeProviderShipmentStatus(raw);
+      for (const child of Object.values(object)) walk(child, level + 1);
+    };
+    walk(value, depth);
+    return found;
+  })();
+  for (const scan of scanDetails) {
+    const description = String(scan.Instructions ?? scan.instructions ?? scan.Scan ?? scan.scan ?? scan.Description ?? scan.description ?? "Provider scan").trim().slice(0, 500);
+    const eventTimeValue = scan.ScanDateTime ?? scan.scan_date_time ?? scan.StatusDateTime ?? scan.status_date_time ?? scan.event_time ?? scan.eventTime ?? scan.timestamp;
+    const location = String(scan.ScannedLocation ?? scan.scanned_location ?? scan.StatusLocation ?? scan.status_location ?? scan.Location ?? scan.location ?? scan.City ?? scan.city ?? "").trim().slice(0, 200);
+    candidates.push({ status: statusFromScanText(description, currentStatus), location, description, eventTime: typeof eventTimeValue === "string" ? eventTimeValue : null });
+  }
+  // If the provider supplied its canonical scan array, use it as the source
+  // of truth. The recursive fallback below is only for older/provider-specific
+  // response shapes that do not expose Scans[].
+  if (scanDetails.length) {
+    const unique = new Map<string, NormalizedProviderTracking>();
+    for (const candidate of candidates) unique.set(`${candidate.status}|${candidate.location}|${candidate.description}|${candidate.eventTime ?? ""}`, candidate);
+    const order: Record<string, number> = { booked: 0, picked_up: 1, in_transit: 2, out_for_delivery: 3, delivered: 4, rto: 4, cancelled: 4, exception: -1 };
+    return [...unique.values()].sort((left, right) => {
+      const leftTime = left.eventTime ? Date.parse(left.eventTime) : Number.NaN;
+      const rightTime = right.eventTime ? Date.parse(right.eventTime) : Number.NaN;
+      if (Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime !== rightTime) return leftTime - rightTime;
+      if (Number.isFinite(leftTime) !== Number.isFinite(rightTime)) return Number.isFinite(leftTime) ? -1 : 1;
+      return (order[left.status] ?? -1) - (order[right.status] ?? -1);
+    });
+  }
   const collect = (node: unknown, level: number) => {
     if (level > 8 || node === null || node === undefined) return;
     if (Array.isArray(node)) { for (const item of node) collect(item, level + 1); return; }
@@ -2441,7 +2508,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       if (current && !preserveActiveStatus && validProviderShipmentTransition(currentStatus, normalizedTracking.status)) {
         await env.DB.prepare("UPDATE shipments SET provider = ?, status = ?, delivered_at = CASE WHEN ? = 'delivered' THEN COALESCE(delivered_at, CURRENT_TIMESTAMP) ELSE delivered_at END, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(provider, normalizedTracking.status, normalizedTracking.status, payload.shipment_id, clientId).run();
       }
-      const existingEvents = await env.DB.prepare("SELECT status, location, description, event_time FROM tracking_events WHERE shipment_id = ?").bind(payload.shipment_id).all<{ status: string; location: string | null; description: string | null; event_time: string | null }>();
+      const existingEvents = await env.DB.prepare("SELECT status, location, description, created_by_user_id, event_time FROM tracking_events WHERE shipment_id = ?").bind(payload.shipment_id).all<{ status: string; location: string | null; description: string | null; created_by_user_id: string | null; event_time: string | null }>();
       const existingSignatures = new Set(existingEvents.results.map((event) => `${event.status}|${event.location ?? ""}|${event.description ?? ""}|${event.event_time ?? ""}`));
       for (const event of normalizedTrackingEvents) {
         const signature = `${event.status}|${event.location}|${event.description}|${event.eventTime ?? ""}`;
@@ -2725,7 +2792,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     : /client[- ]warehouse.*not active|warehouse.*inactive|wrong\/inactive center/i.test(providerErrorText)
       ? "Delhivery rejected this booking because the selected pickup warehouse is inactive. Activate that exact saved warehouse for this Delhivery account, then retry."
       : `${lastError}: ${providerErrorText || "Delhivery rejected the booking"}`;
-  return { enabled: true, status: response.ok ? "accepted" as const : "failed" as const, providerStatus: response.status, normalized_status: normalizedTracking?.status, tracking: normalizedTracking ? { status: normalizedTracking.status, location: normalizedTracking.location, description: normalizedTracking.description, event_time: normalizedTracking.eventTime } : undefined, amount: provider === "xpressbees" && operation === "quotes" ? findProviderAmount(parsedProviderBody) : undefined, provider_account_id: account?.id, account_name: account?.account_name, confidence_score: account?.confidence_score, priority: account?.priority, rate_card_id: account?.rate_card_id ?? undefined, error: normalizedError };
+  return { enabled: true, status: response.ok ? "accepted" as const : "failed" as const, providerStatus: response.status, normalized_status: normalizedTracking?.status, tracking: normalizedTracking ? { status: normalizedTracking.status, location: normalizedTracking.location, description: normalizedTracking.description, event_time: normalizedTracking.eventTime } : undefined, tracking_events: operation === "tracking" ? normalizedTrackingEvents.map((event) => ({ status: event.status, location: event.location, description: event.description, event_time: event.eventTime, source: `provider:${provider}` })) : undefined, amount: provider === "xpressbees" && operation === "quotes" ? findProviderAmount(parsedProviderBody) : undefined, provider_account_id: account?.id, account_name: account?.account_name, confidence_score: account?.confidence_score, priority: account?.priority, rate_card_id: account?.rate_card_id ?? undefined, error: normalizedError };
 }
 
 async function recordPickupAttempt(env: Env, details: { pickupId: string; clientId: string; provider: string; providerAccountId?: string | null; requestId?: string | null; idempotencyKey?: string | null; requestedDate?: string | null; requestedWindow?: string | null; status: string; providerStatus?: string | number | null; providerReference?: string | null; providerErrorCode?: string | null; errorMessage?: string | null }) {
@@ -3362,12 +3429,12 @@ const worker = {
       // public tracking does not pay for up to three sequential D1 round trips.
       const shipment = await env.DB.prepare("SELECT id, client_id, tracking_number, lr_number, provider_reference, provider, provider_account_id, status, edd, delivered_at, updated_at FROM shipments WHERE id = ? OR tracking_number = ? OR lr_number = ? OR provider_reference = ? LIMIT 1").bind(reference, reference, reference, reference).first<PublicShipment>();
       if (shipment) {
-        const events = await env.DB.prepare("SELECT status, location, description, event_time FROM tracking_events WHERE shipment_id = ? ORDER BY event_time ASC LIMIT 20").bind(shipment.id).all();
+        const events = await env.DB.prepare("SELECT status, location, description, created_by_user_id, event_time FROM tracking_events WHERE shipment_id = ? ORDER BY event_time ASC LIMIT 50").bind(shipment.id).all();
         if (shipment.provider === "delhivery" && shipment.provider_account_id) {
           const providerResult = await safeProviderRequest(env, "delhivery", "tracking", { shipment_id: shipment.id, tracking_number: shipment.tracking_number, lr_number: shipment.lr_number, provider_reference: shipment.provider_reference, provider_account_id: shipment.provider_account_id }, id, shipment.client_id, undefined, 5000);
           const tracking = (providerResult as { tracking?: { status?: string; location?: string; description?: string; event_time?: string | null } }).tracking;
           if (providerResult.status === "accepted" && tracking?.status) {
-            return json({ ok: true, data: { tracking_number: shipment.tracking_number ?? shipment.provider_reference, status: tracking.status, edd: shipment.edd, delivered_at: tracking.status === "delivered" ? tracking.event_time ?? null : shipment.delivered_at, updated_at: tracking.event_time ?? shipment.updated_at, events: [{ status: tracking.status, location: tracking.location ?? "", description: tracking.description ?? "", event_time: tracking.event_time ?? null }] }, provider: "delhivery", provider_status: providerResult.status, request_id: id }, 200, withCors(request, env, { "cache-control": "private, no-store" }));
+            return json({ ok: true, data: { tracking_number: shipment.tracking_number ?? shipment.provider_reference, status: tracking.status, edd: shipment.edd, delivered_at: tracking.status === "delivered" ? tracking.event_time ?? null : shipment.delivered_at, updated_at: tracking.event_time ?? shipment.updated_at, events: (providerResult as { tracking_events?: unknown[] }).tracking_events ?? [{ status: tracking.status, location: tracking.location ?? "", description: tracking.description ?? "", event_time: tracking.event_time ?? null, source: "provider:delhivery" }] }, provider: "delhivery", provider_status: providerResult.status, request_id: id }, 200, withCors(request, env, { "cache-control": "private, no-store" }));
           }
         }
         // This is the intentionally restricted public projection (no client,
@@ -3491,8 +3558,8 @@ const worker = {
           const directResults = await Promise.all(assignedAccounts.results.map(async (account) => {
             try {
               const providerResult = await safeProviderRequest(env, "delhivery", "tracking", { tracking_number: awb, lr_number: awb, provider_account_id: account.id }, id, auth.clientId ?? undefined, undefined, 5000);
-              const tracking = (providerResult as { tracking?: { status?: string; location?: string; description?: string; event_time?: string | null } }).tracking;
-              return { status: String(providerResult.status), tracking };
+              const tracking = (providerResult as { tracking?: { status?: string; location?: string; description?: string; event_time?: string | null }; tracking_events?: unknown[] }).tracking;
+              return { status: String(providerResult.status), tracking, tracking_events: (providerResult as { tracking_events?: unknown[] }).tracking_events };
             } catch { return { status: "failed", tracking: undefined }; }
           }));
           const directMatch = directResults.find(({ status, tracking }) => status === "accepted" && tracking?.status);
@@ -3508,7 +3575,7 @@ const worker = {
               description: tracking.description ?? "",
               event_time: tracking.event_time ?? null,
               provider: "delhivery",
-              events: [{ status: tracking.status, location: tracking.location ?? "", description: tracking.description ?? "", event_time: tracking.event_time ?? null }],
+              events: directMatch.tracking_events ?? [{ status: tracking.status, location: tracking.location ?? "", description: tracking.description ?? "", event_time: tracking.event_time ?? null, source: "provider:delhivery" }],
             }, request_id: id }, 200, headers);
           }
           return json({ ok: true, data: { tracking_type: trackingType, awb, found: false, source: "delhivery", status: "not_found", location: "", description: "No shipment found in PSS or the client’s active Delhivery accounts", event_time: null, provider: "delhivery", events: [] }, request_id: id }, 200, headers);
@@ -3522,7 +3589,7 @@ const worker = {
               provider_account_id: shipment.provider_account_id ?? undefined,
             }, id, auth.clientId, undefined, 5000)
           : { enabled: false, status: "not_requested" as const };
-        const events = await env.DB.prepare("SELECT status, location, description, event_time FROM tracking_events WHERE shipment_id = ? ORDER BY event_time ASC").bind(shipment.id).all<{ status: string; location: string | null; description: string | null; event_time: string | null }>();
+        const events = await env.DB.prepare("SELECT status, location, description, created_by_user_id, event_time FROM tracking_events WHERE shipment_id = ? ORDER BY event_time ASC").bind(shipment.id).all<{ status: string; location: string | null; description: string | null; created_by_user_id: string | null; event_time: string | null }>();
         const latest = events.results.at(-1);
         const liveTracking = (providerResult as { tracking?: { status?: string; location?: string; description?: string; event_time?: string | null } }).tracking;
         return json({ ok: true, data: {
@@ -3535,7 +3602,7 @@ const worker = {
           event_time: liveTracking?.event_time ?? latest?.event_time ?? shipment.delivered_at ?? null,
           provider: shipment.provider ?? "delhivery",
           provider_status: providerResult.status,
-          events: events.results,
+          events: events.results.map((event) => ({ ...event, source: event.created_by_user_id })),
           edd: shipment.edd ?? null,
         }, request_id: id }, 200, headers);
       }
@@ -3782,13 +3849,13 @@ const worker = {
           const shipments = namedPageResults as Array<Record<string, unknown>>;
           const shipmentIds = shipments.map((shipment) => String(shipment.id));
           const events = shipmentIds.length
-            ? await env.DB.prepare(`SELECT shipment_id, status, location, description, event_time FROM tracking_events WHERE shipment_id IN (${shipmentIds.map(() => "?").join(",")}) ORDER BY event_time ASC`).bind(...shipmentIds).all()
+            ? await env.DB.prepare(`SELECT shipment_id, status, location, description, created_by_user_id, event_time FROM tracking_events WHERE shipment_id IN (${shipmentIds.map(() => "?").join(",")}) ORDER BY event_time ASC`).bind(...shipmentIds).all()
             : { results: [] };
           const eventsByShipment = new Map<string, Array<Record<string, unknown>>>();
           for (const event of events.results as Array<Record<string, unknown>>) {
             const shipmentId = String(event.shipment_id);
             const current = eventsByShipment.get(shipmentId) ?? [];
-            if (current.length < 20) current.push(event);
+            if (current.length < 50) current.push({ ...event, source: event.created_by_user_id });
             eventsByShipment.set(shipmentId, current);
           }
           const data = shipments.map((shipment) => ({ ...shipment, tracking_events: eventsByShipment.get(String(shipment.id)) ?? [] }));
