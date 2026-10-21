@@ -275,7 +275,7 @@ const taskPriorities = new Set(["low", "medium", "high", "urgent"]);
 function validShipmentTransition(current: string, next: string) { return shipmentTransitions[current]?.has(next) ?? current === next; }
 function validProviderShipmentTransition(current: string, next: string) {
   if (current === next) return true;
-  if (current === "cancelled" || current === "delivered" || current === "rto") return false;
+  if (current === "delivered" || current === "rto") return false;
   if (next === "cancelled" || next === "exception") return true;
   const order: Record<string, number> = { booked: 0, picked_up: 1, in_transit: 2, out_for_delivery: 3, delivered: 4, rto: 4 };
   return order[next] !== undefined && order[current] !== undefined && order[next] > order[current];
@@ -1665,24 +1665,38 @@ function findProviderAmount(value: unknown, keys = new Set(["amount", "total_amo
 
 type NormalizedProviderTracking = { status: string; location: string; description: string; eventTime: string | null };
 function normalizeProviderTracking(value: unknown, depth = 0): NormalizedProviderTracking | null {
-  if (depth > 6 || value === null || value === undefined) return null;
-  if (Array.isArray(value)) { for (const item of value) { const found = normalizeProviderTracking(item, depth + 1); if (found) return found; } return null; }
-  if (typeof value !== "object") return null;
-  const object = value as Record<string, unknown>;
-  const nestedStatus = object.Status && typeof object.Status === "object" ? object.Status as Record<string, unknown> : null;
-  const rawStatus = object.status ?? object.current_status ?? object.currentStatus ?? nestedStatus?.Status ?? nestedStatus?.status;
-  const normalized = normalizeProviderShipmentStatus(rawStatus);
+  if (depth > 8 || value === null || value === undefined) return null;
+  const candidates: NormalizedProviderTracking[] = [];
   const knownStatuses = new Set(["booked", "picked_up", "in_transit", "out_for_delivery", "delivered", "cancelled", "exception", "rto"]);
-  if (typeof rawStatus === "string" && knownStatuses.has(normalized)) {
-    return {
-      status: normalized,
-      location: String(object.location ?? object.city ?? nestedStatus?.StatusLocation ?? nestedStatus?.location ?? "").trim().slice(0, 200),
-      description: String(object.description ?? object.message ?? nestedStatus?.Instructions ?? nestedStatus?.description ?? `Provider status: ${normalized}`).trim().slice(0, 500),
-      eventTime: typeof (object.event_time ?? object.eventTime ?? object.timestamp ?? nestedStatus?.StatusDateTime) === "string" ? String(object.event_time ?? object.eventTime ?? object.timestamp ?? nestedStatus?.StatusDateTime) : null,
-    };
-  }
-  for (const child of Object.values(object)) { const found = normalizeProviderTracking(child, depth + 1); if (found) return found; }
-  return null;
+  const collect = (node: unknown, level: number) => {
+    if (level > 8 || node === null || node === undefined) return;
+    if (Array.isArray(node)) { for (const item of node) collect(item, level + 1); return; }
+    if (typeof node !== "object") return;
+    const object = node as Record<string, unknown>;
+    const nestedStatus = object.Status && typeof object.Status === "object" ? object.Status as Record<string, unknown> : null;
+    const rawStatus = object.status ?? object.current_status ?? object.currentStatus ?? nestedStatus?.Status ?? nestedStatus?.status;
+    const normalized = normalizeProviderShipmentStatus(rawStatus);
+    if (typeof rawStatus === "string" && knownStatuses.has(normalized)) {
+      const eventTimeValue = object.event_time ?? object.eventTime ?? object.timestamp ?? nestedStatus?.StatusDateTime;
+      candidates.push({
+        status: normalized,
+        location: String(object.location ?? object.city ?? nestedStatus?.StatusLocation ?? nestedStatus?.location ?? "").trim().slice(0, 200),
+        description: String(object.description ?? object.message ?? nestedStatus?.Instructions ?? nestedStatus?.description ?? `Provider status: ${normalized}`).trim().slice(0, 500),
+        eventTime: typeof eventTimeValue === "string" ? eventTimeValue : null,
+      });
+    }
+    for (const child of Object.values(object)) collect(child, level + 1);
+  };
+  collect(value, depth);
+  if (!candidates.length) return null;
+  const order: Record<string, number> = { booked: 0, picked_up: 1, in_transit: 2, out_for_delivery: 3, delivered: 4, rto: 4, cancelled: 4, exception: -1 };
+  return candidates.sort((left, right) => {
+    const leftTime = left.eventTime ? Date.parse(left.eventTime) : Number.NaN;
+    const rightTime = right.eventTime ? Date.parse(right.eventTime) : Number.NaN;
+    if (Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime !== rightTime) return rightTime - leftTime;
+    if (Number.isFinite(rightTime) !== Number.isFinite(leftTime)) return Number.isFinite(rightTime) ? 1 : -1;
+    return (order[right.status] ?? -1) - (order[left.status] ?? -1);
+  })[0];
 }
 
 function trackonCredentials(env: Env, accountCredential?: string) {
@@ -3217,7 +3231,7 @@ async function refreshDelhiveryShipments(env: Env, cron: string) {
   const due = `(provider_last_attempt_at IS NULL OR
     (status = 'out_for_delivery' AND datetime(provider_last_attempt_at) <= datetime('now', '-10 minutes')) OR
     (status = 'in_transit' AND ${latestEvent} GLOB '*last[- ]mile*' AND datetime(provider_last_attempt_at) <= datetime('now', '-1 hour')) OR
-    (status = 'booked' AND datetime(provider_last_attempt_at) <= datetime('now', '-10 minutes')) OR
+    (status IN ('booked', 'cancelled') AND datetime(provider_last_attempt_at) <= datetime('now', '-10 minutes')) OR
     (status IN ('picked_up', 'in_transit', 'exception', 'rto') AND NOT (status = 'in_transit' AND ${latestEvent} GLOB '*last[- ]mile*') AND datetime(provider_last_attempt_at) <= datetime('now', '-4 hours'))) `;
   // Delivered shipments are terminal for status polling. Keep their separate
   // POD backfill below, but do not spend tracking calls refreshing them.
@@ -3232,7 +3246,7 @@ async function refreshDelhiveryShipments(env: Env, cron: string) {
   // remaining due rows because each attempted shipment receives a new attempt
   // timestamp. There is no fleet-wide 50-record ceiling anymore.
   while (Date.now() - refreshStartedAt < 25000) {
-    const active = await env.DB.prepare(`SELECT ${columns} FROM shipments WHERE provider = 'delhivery' AND COALESCE(lr_number, tracking_number, provider_reference) IS NOT NULL AND status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery', 'exception', 'rto') AND ${due} ${order}`).all<{ id: string; client_id: string; tracking_number: string | null; lr_number: string | null; provider_reference: string | null; provider_account_id: string | null }>();
+    const active = await env.DB.prepare(`SELECT ${columns} FROM shipments WHERE provider = 'delhivery' AND COALESCE(lr_number, tracking_number, provider_reference) IS NOT NULL AND status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery', 'exception', 'rto', 'cancelled') AND ${due} ${order}`).all<{ id: string; client_id: string; tracking_number: string | null; lr_number: string | null; provider_reference: string | null; provider_account_id: string | null }>();
     if (!active.results.length) break;
     const batch = active.results.slice(0, 5);
     refreshRows.push(...batch);
