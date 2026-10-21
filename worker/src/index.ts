@@ -2211,7 +2211,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (["tracking", "labels", "lr_copy", "document"].includes(operation) && !trackingNumber) return { enabled: false, status: "invalid_request" as const, reason: "A provider tracking reference is required" };
   if (provider === "delhivery" && operation === "shipments" && String(env.DELHIVERY_ENABLE_SHIPMENT_CREATION) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "Delhivery shipment creation is safety-disabled until live billing approval" };
   if (provider === "delhivery" && operation === "pickups" && String(env.DELHIVERY_ENABLE_PICKUP_CREATION) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "Delhivery pickup creation is safety-disabled until live operations approval" };
-  if (provider === "delhivery" && !new Set(["tracking", "shipment_status", "shipments", "warehouse_prepare", "pickups", "pickup_slots", "serviceability", "serviceability_route", "labels", "lr_copy", "document"]).has(operation)) return { enabled: false, status: "unsupported" as const, reason: "Delhivery operation is not supported" };
+  if (provider === "delhivery" && !new Set(["tracking", "shipment_status", "shipments", "warehouse_prepare", "pickups", "pickup_status", "pickup_slots", "serviceability", "serviceability_route", "labels", "lr_copy", "document"]).has(operation)) return { enabled: false, status: "unsupported" as const, reason: "Delhivery operation is not supported" };
   if (provider === "ekart" && operation === "pickups") return { enabled: false, status: "unsupported" as const, reason: "Ekart pickup contract is not verified" };
   if (provider === "ekart" && String(env.EKART_ENABLE_PROVIDER_CALLS) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "Ekart is configured but disabled until the agreed provider scope is approved" };
   if (provider === "ekart" && operation !== "tracking" && operation !== "shipments") return { enabled: false, status: "unsupported" as const, reason: "Ekart operation is not supported" };
@@ -2404,7 +2404,9 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   const delhiveryOrigin = provider === "delhivery" ? new URL(base).origin : "";
   const trackonUrl = provider === "trackon" ? operation === "tracking" ? env.TRACKON_TRACKING_URL : operation === "shipments" ? env.TRACKON_BOOKING_URL : env.TRACKON_LABEL_URL : undefined;
   if (provider === "trackon" && !trackonUrl) return { enabled: false, status: "not_configured" as const, reason: `Trackon ${operation} endpoint is not configured` };
-  const url = provider === "trackon" && operation === "tracking"
+  const url = provider === "delhivery" && operation === "pickup_status"
+    ? `https://one.delhivery.com/web/api/forward_orders/shipments/${encodeURIComponent(String(payload.pickup_id ?? ""))}/get_pickup_request`
+    : provider === "trackon" && operation === "tracking"
     ? trackonTrackingUrl(trackonUrl!, trackingNumber, trackon!)
     : provider === "trackon" && operation === "labels"
       ? trackonLabelUrl(trackonUrl!, trackingNumber, trackon!)
@@ -2469,14 +2471,14 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         : provider === "rivigo" && operation === "shipments" ? JSON.stringify(rivigoCreate)
         : provider === "rivigo" && operation === "updates" ? JSON.stringify(payload)
         : provider === "rivigo" && operation === "cancellations" ? JSON.stringify(payload.cnotes_list ? { cnotesList: payload.cnotes_list } : {})
-         : provider === "delhivery" && ["tracking", "shipment_status", "serviceability", "serviceability_route", "pickup_slots", "labels", "lr_copy", "document"].includes(operation) ? ""
+        : provider === "delhivery" && ["tracking", "shipment_status", "serviceability", "serviceability_route", "pickup_status", "pickup_slots", "labels", "lr_copy", "document"].includes(operation) ? ""
         : operation === "tracking" ? JSON.stringify({ Appkey: trackon!.appKey, userId: trackon!.userId, password: trackon!.password, AWBNo: trackingNumber })
           : operation === "shipments" ? JSON.stringify(trackonPayload(payload, trackon!))
             : JSON.stringify({ Appkey: trackon!.appKey, userId: trackon!.userId, password: trackon!.password, AWBNo: trackingNumber });
   if (provider === "delhivery" && operation === "shipments" && !useDelhiveryB2b) headers["content-type"] = "application/x-www-form-urlencoded";
   if (provider === "delhivery" && operation === "shipments" && useDelhiveryB2b) delete headers["content-type"];
   let response: Response | null = null; let lastError = "provider_request_failed";
-   const readOnlyProviderCall = operation === "tracking" || operation === "serviceability" || operation === "serviceability_route" || operation === "pickup_slots";
+   const readOnlyProviderCall = operation === "tracking" || operation === "serviceability" || operation === "serviceability_route" || operation === "pickup_status" || operation === "pickup_slots";
   const singleManifestCall = provider === "delhivery" && operation === "shipments";
   const maxAttempts = singleManifestCall ? 1 : readOnlyProviderCall ? (provider === "delhivery" && useDelhiveryB2b ? 2 : 1) : 3;
   // Courier tracking/serviceability are read-only, but provider APIs can take
@@ -2618,6 +2620,25 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   }
   if (response.ok && provider === "delhivery" && operation === "pickup_slots") {
     return { enabled: true, status: "accepted" as const, providerStatus: response.status, dates: normalizeDelhiveryPickupSlots(parsedProviderBody) };
+  }
+  if (response.ok && provider === "delhivery" && operation === "pickup_status") {
+    const pickupStatus = (() => {
+      let found = "";
+      const walk = (node: unknown, depth = 0) => {
+        if (depth > 8 || node === null || node === undefined || found) return;
+        if (Array.isArray(node)) { for (const item of node) walk(item, depth + 1); return; }
+        if (typeof node !== "object") return;
+        const object = node as Record<string, unknown>;
+        for (const key of ["status", "Status", "pickup_status", "pickupStatus", "state", "State"]) {
+          const value = object[key];
+          if (typeof value === "string" && pickupStatusFromProviderEvent(value)) { found = value; return; }
+        }
+        for (const child of Object.values(object)) walk(child, depth + 1);
+      };
+      walk(parsedProviderBody);
+      return found;
+    })();
+    return { enabled: true, status: "accepted" as const, providerStatus: response.status, pickupStatus: pickupStatusFromProviderEvent(pickupStatus), providerStatusDetail: pickupStatus || "Delhivery pickup status response received" };
   }
   // Delhivery B2B manifestation is asynchronous. The initial POST /manifest
   // acknowledges the request with a job id; the LR and AWB are returned by a
@@ -3314,6 +3335,42 @@ async function reconcileShipmentLinkedPickupStatuses(env: Env, cron: string) {
       .bind(nextStatus, pickedCount, expectedCount, detail, pickup.id, pickup.client_id).run();
   }
   if (rows.results.length) console.log(JSON.stringify({ job: "pickup_status_reconciliation", cron, candidates: rows.results.length }));
+}
+
+async function refreshDelhiveryPickupStatuses(env: Env, cron: string) {
+  const rows = await env.DB.prepare(`
+    SELECT id, client_id, provider_reference, status
+    FROM pickup_requests
+    WHERE provider = 'delhivery'
+      AND provider_reference IS NOT NULL
+      AND status NOT IN ('cancelled', 'completed', 'failed')
+    ORDER BY updated_at ASC
+    LIMIT 250
+  `).all<{ id: string; client_id: string; provider_reference: string; status: string }>();
+  let updated = 0;
+  let failed = 0;
+  for (const pickup of rows.results) {
+    const result = await providerRequest(
+      env,
+      "delhivery",
+      "pickup_status",
+      { pickup_id: pickup.provider_reference },
+      `cron:pickup-status:${pickup.id}`,
+      pickup.client_id,
+    ) as Record<string, unknown>;
+    if (result.status !== "accepted") { failed += 1; continue; }
+    const nextStatus = typeof result.pickupStatus === "string" ? result.pickupStatus : null;
+    if (!nextStatus) continue;
+    const detail = String(result.providerStatusDetail ?? `Delhivery pickup status: ${nextStatus}`).slice(0, 500);
+    await env.DB.prepare(`
+      UPDATE pickup_requests
+      SET status = ?, provider_status = ?, provider_status_synced_at = CURRENT_TIMESTAMP,
+          provider_status_detail = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ? AND client_id = ?
+    `).bind(nextStatus, `delhivery:${String(result.providerStatusDetail ?? nextStatus).toLowerCase().replace(/\s+/g, "_").slice(0, 120)}`, detail, pickup.id, pickup.client_id).run();
+    if (nextStatus !== pickup.status) updated += 1;
+  }
+  if (rows.results.length) console.log(JSON.stringify({ job: "delhivery_pickup_status_poll", cron, candidates: rows.results.length, updated, failed }));
 }
 
 function delhiveryDocumentUrl(payload: Record<string, unknown>) {
@@ -6025,6 +6082,7 @@ const worker = {
       await retryPendingDelhiveryBookings(env, controller.cron);
       await reconcilePendingDelhiveryReferences(env, controller.cron);
       await refreshDelhiveryShipments(env, controller.cron);
+      await refreshDelhiveryPickupStatuses(env, controller.cron);
       await reconcileShipmentLinkedPickupStatuses(env, controller.cron);
     })());
   },
