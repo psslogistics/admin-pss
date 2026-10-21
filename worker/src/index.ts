@@ -1667,6 +1667,41 @@ function findProviderAmount(value: unknown, keys = new Set(["amount", "total_amo
   return null;
 }
 
+function normalizeProviderEdd(value: unknown): string | null {
+  if (typeof value !== "string" && typeof value !== "number") return null;
+  const raw = String(value).trim();
+  if (!raw || raw.length > 80) return null;
+  const isoDate = raw.match(/\b(20\d{2})[-\/.](\d{1,2})[-\/.](\d{1,2})\b/);
+  if (isoDate) return `${isoDate[1]}-${isoDate[2].padStart(2, "0")}-${isoDate[3].padStart(2, "0")}`;
+  const dmy = raw.match(/\b(\d{1,2})[-\/.](\d{1,2})[-\/.](20\d{2})\b/);
+  if (dmy) return `${dmy[3]}-${dmy[2].padStart(2, "0")}-${dmy[1].padStart(2, "0")}`;
+  const parsed = Date.parse(raw);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString().slice(0, 10) : null;
+}
+function findProviderEdd(value: unknown, depth = 0): string | null {
+  if (depth > 8 || value === null || value === undefined) return null;
+  const expectedKeys = new Set([
+    "edd", "estimateddeliverydate", "estimateddelivery", "estimateddeliverydatetime",
+    "estimateddeliverydatEtime", "expecteddeliverydate", "expecteddelivery", "expecteddeliverydatetime",
+    "expecteddate", "promiseddeliverydate", "deliveryestimate",
+  ].map((key) => key.toLowerCase().replace(/[^a-z]/g, "")));
+  if (Array.isArray(value)) {
+    for (const item of value) { const found = findProviderEdd(item, depth + 1); if (found) return found; }
+    return null;
+  }
+  if (typeof value !== "object") return null;
+  const object = value as Record<string, unknown>;
+  for (const [key, candidate] of Object.entries(object)) {
+    const normalizedKey = key.toLowerCase().replace(/[^a-z]/g, "");
+    if (expectedKeys.has(normalizedKey)) {
+      const found = normalizeProviderEdd(candidate);
+      if (found) return found;
+    }
+  }
+  for (const candidate of Object.values(object)) { const found = findProviderEdd(candidate, depth + 1); if (found) return found; }
+  return null;
+}
+
 type NormalizedProviderTracking = { status: string; location: string; description: string; eventTime: string | null };
 function normalizeProviderTrackingEvents(value: unknown, depth = 0): NormalizedProviderTracking[] {
   if (depth > 8 || value === null || value === undefined) return [];
@@ -2494,6 +2529,9 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   }
   const providerFailureDetail = !response.ok ? responseBody.replace(/\s+/g, " ").trim().slice(0, 300) : null;
   if (persistIntegration) await env.DB.prepare("UPDATE integration_requests SET status = ?, error_code = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(response.ok ? "succeeded" : "failed", response.ok ? null : `HTTP_${response.status}`, response.ok ? null : `${lastError}${providerFailureDetail ? `: ${providerFailureDetail}` : ""}`.slice(0, 500), integrationId).run();
+  let parsedProviderBody: unknown = null;
+  try { parsedProviderBody = JSON.parse(responseBody); } catch { parsedProviderBody = null; }
+  const providerEdd = response.ok ? findProviderEdd(parsedProviderBody) : null;
   let normalizedTracking: NormalizedProviderTracking | null = null;
   let normalizedTrackingEvents: NormalizedProviderTracking[] = [];
   if (operation === "tracking" && clientId && typeof payload.shipment_id === "string") {
@@ -2524,8 +2562,10 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       }
     }
   }
-  let parsedProviderBody: unknown = null;
-  try { parsedProviderBody = JSON.parse(responseBody); } catch { parsedProviderBody = null; }
+  if (response.ok && operation === "tracking" && providerEdd && clientId && typeof payload.shipment_id === "string") {
+    await env.DB.prepare("UPDATE shipments SET edd = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+      .bind(providerEdd, payload.shipment_id, clientId).run();
+  }
   if (response.ok && provider === "delhivery" && useDelhiveryB2b && operation === "shipment_status" && clientId && typeof payload.shipment_id === "string") {
     const statusLr = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["lrnum", "lr_num", "lr_number", "lr_no", "lrn", "lrn_number", "lr"]))) ?? responseBody.match(/(?:lr(?:n|[_ ]?(?:number|num|no))?)[^A-Za-z0-9]{0,12}(\d{6,20})/i)?.[1] ?? null;
     const statusAwb = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["master_awb", "master_awb_number", "masterawb", "master_waybill", "awb", "awb_number", "waybill", "waybill_number", "waybill_no"]))) ?? responseBody.match(/(?:master[_ ]?awb|awb|waybill)[^A-Za-z0-9]{0,12}(\d{6,20})/i)?.[1] ?? null;
@@ -2798,7 +2838,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     : /client[- ]warehouse.*not active|warehouse.*inactive|wrong\/inactive center/i.test(providerErrorText)
       ? "Delhivery rejected this booking because the selected pickup warehouse is inactive. Activate that exact saved warehouse for this Delhivery account, then retry."
       : `${lastError}: ${providerErrorText || "Delhivery rejected the booking"}`;
-  return { enabled: true, status: response.ok ? "accepted" as const : "failed" as const, providerStatus: response.status, normalized_status: normalizedTracking?.status, tracking: normalizedTracking ? { status: normalizedTracking.status, location: normalizedTracking.location, description: normalizedTracking.description, event_time: normalizedTracking.eventTime } : undefined, tracking_events: operation === "tracking" ? normalizedTrackingEvents.map((event) => ({ status: event.status, location: event.location, description: event.description, event_time: event.eventTime, source: `provider:${provider}` })) : undefined, amount: provider === "xpressbees" && operation === "quotes" ? findProviderAmount(parsedProviderBody) : undefined, provider_account_id: account?.id, account_name: account?.account_name, confidence_score: account?.confidence_score, priority: account?.priority, rate_card_id: account?.rate_card_id ?? undefined, error: normalizedError };
+  return { enabled: true, status: response.ok ? "accepted" as const : "failed" as const, providerStatus: response.status, normalized_status: normalizedTracking?.status, edd: providerEdd, tracking: normalizedTracking ? { status: normalizedTracking.status, location: normalizedTracking.location, description: normalizedTracking.description, event_time: normalizedTracking.eventTime } : undefined, tracking_events: operation === "tracking" ? normalizedTrackingEvents.map((event) => ({ status: event.status, location: event.location, description: event.description, event_time: event.eventTime, source: `provider:${provider}` })) : undefined, amount: provider === "xpressbees" && operation === "quotes" ? findProviderAmount(parsedProviderBody) : undefined, provider_account_id: account?.id, account_name: account?.account_name, confidence_score: account?.confidence_score, priority: account?.priority, rate_card_id: account?.rate_card_id ?? undefined, error: normalizedError };
 }
 
 async function recordPickupAttempt(env: Env, details: { pickupId: string; clientId: string; provider: string; providerAccountId?: string | null; requestId?: string | null; idempotencyKey?: string | null; requestedDate?: string | null; requestedWindow?: string | null; status: string; providerStatus?: string | number | null; providerReference?: string | null; providerErrorCode?: string | null; errorMessage?: string | null }) {
@@ -3456,7 +3496,7 @@ const worker = {
           const providerResult = await safeProviderRequest(env, "delhivery", "tracking", { shipment_id: shipment.id, tracking_number: shipment.tracking_number, lr_number: shipment.lr_number, provider_reference: shipment.provider_reference, provider_account_id: shipment.provider_account_id }, id, shipment.client_id, undefined, 5000);
           const tracking = (providerResult as { tracking?: { status?: string; location?: string; description?: string; event_time?: string | null } }).tracking;
           if (providerResult.status === "accepted" && tracking?.status) {
-            return json({ ok: true, data: { tracking_number: shipment.tracking_number ?? shipment.provider_reference, status: tracking.status, edd: shipment.edd, delivered_at: tracking.status === "delivered" ? tracking.event_time ?? null : shipment.delivered_at, updated_at: tracking.event_time ?? shipment.updated_at, events: (providerResult as { tracking_events?: unknown[] }).tracking_events ?? [{ status: tracking.status, location: tracking.location ?? "", description: tracking.description ?? "", event_time: tracking.event_time ?? null, source: "provider:delhivery" }] }, provider: "delhivery", provider_status: providerResult.status, request_id: id }, 200, withCors(request, env, { "cache-control": "private, no-store" }));
+            return json({ ok: true, data: { tracking_number: shipment.tracking_number ?? shipment.provider_reference, status: tracking.status, edd: (providerResult as { edd?: string | null }).edd ?? shipment.edd, delivered_at: tracking.status === "delivered" ? tracking.event_time ?? null : shipment.delivered_at, updated_at: tracking.event_time ?? shipment.updated_at, events: (providerResult as { tracking_events?: unknown[] }).tracking_events ?? [{ status: tracking.status, location: tracking.location ?? "", description: tracking.description ?? "", event_time: tracking.event_time ?? null, source: "provider:delhivery" }] }, provider: "delhivery", provider_status: providerResult.status, request_id: id }, 200, withCors(request, env, { "cache-control": "private, no-store" }));
           }
         }
         // This is the intentionally restricted public projection (no client,
@@ -3493,7 +3533,7 @@ const worker = {
           // normal provider timeout.
           const providerResult = await safeProviderRequest(env, provider, "tracking", { tracking_number: reference, ...(providerAccountId ? { provider_account_id: providerAccountId } : {}) }, id, undefined, undefined, 5000);
           const tracking = (providerResult as { tracking?: { status?: string; location?: string; description?: string; event_time?: string | null } }).tracking;
-          return { provider, provider_account_id: providerAccountId, status: String(providerResult.status), tracking };
+          return { provider, provider_account_id: providerAccountId, status: String(providerResult.status), tracking, edd: (providerResult as { edd?: string | null }).edd ?? null };
         } catch (caught) {
           console.warn(JSON.stringify({ request_id: id, provider, public_tracking_error: caught instanceof Error ? caught.message : "provider_request_failed" }));
           return { provider, provider_account_id: providerAccountId, status: "failed", tracking: undefined };
@@ -3502,7 +3542,7 @@ const worker = {
       const match = providerResults.find(({ status, tracking }) => status === "accepted" && tracking?.status);
       if (match?.tracking?.status) {
         const tracking = match.tracking;
-        return json({ ok: true, data: { tracking_number: reference, provider: match.provider, status: tracking.status, edd: null, delivered_at: tracking.status === "delivered" ? tracking.event_time ?? null : null, updated_at: tracking.event_time ?? null, events: [{ status: tracking.status, location: tracking.location ?? "", description: tracking.description ?? "", event_time: tracking.event_time ?? null }] }, request_id: id }, 200, withCors(request, env, { "cache-control": "private, no-store" }));
+        return json({ ok: true, data: { tracking_number: reference, provider: match.provider, status: tracking.status, edd: match.edd ?? null, delivered_at: tracking.status === "delivered" ? tracking.event_time ?? null : null, updated_at: tracking.event_time ?? null, events: [{ status: tracking.status, location: tracking.location ?? "", description: tracking.description ?? "", event_time: tracking.event_time ?? null }] }, request_id: id }, 200, withCors(request, env, { "cache-control": "private, no-store" }));
       }
       const providerOutcomes: Array<{ provider: CourierProvider; status: string }> = providerResults.map(({ provider, status }) => ({ provider, status }));
       // A provider connection can outlive the public request in the edge
@@ -3581,7 +3621,7 @@ const worker = {
             try {
               const providerResult = await safeProviderRequest(env, "delhivery", "tracking", { tracking_number: awb, lr_number: awb, provider_account_id: account.id }, id, auth.clientId ?? undefined, undefined, 5000);
               const tracking = (providerResult as { tracking?: { status?: string; location?: string; description?: string; event_time?: string | null }; tracking_events?: unknown[] }).tracking;
-              return { status: String(providerResult.status), tracking, tracking_events: (providerResult as { tracking_events?: unknown[] }).tracking_events };
+              return { status: String(providerResult.status), tracking, tracking_events: (providerResult as { tracking_events?: unknown[] }).tracking_events, edd: (providerResult as { edd?: string | null }).edd ?? null };
             } catch { return { status: "failed", tracking: undefined }; }
           }));
           const directMatch = directResults.find(({ status, tracking }) => status === "accepted" && tracking?.status);
@@ -3596,6 +3636,7 @@ const worker = {
               location: tracking.location ?? "",
               description: tracking.description ?? "",
               event_time: tracking.event_time ?? null,
+              edd: directMatch.edd ?? null,
               provider: "delhivery",
               events: directMatch.tracking_events ?? [{ status: tracking.status, location: tracking.location ?? "", description: tracking.description ?? "", event_time: tracking.event_time ?? null, source: "provider:delhivery" }],
             }, request_id: id }, 200, headers);
@@ -3625,7 +3666,7 @@ const worker = {
           provider: shipment.provider ?? "delhivery",
           provider_status: providerResult.status,
           events: events.results.map((event) => ({ ...event, source: event.created_by_user_id })),
-          edd: shipment.edd ?? null,
+          edd: (providerResult as { edd?: string | null }).edd ?? shipment.edd ?? null,
         }, request_id: id }, 200, headers);
       }
       if (route === "/fujiyama/bookings" && request.method === "POST") {
