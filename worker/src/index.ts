@@ -2417,7 +2417,10 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     try { normalizedTracking = normalizeProviderTracking(JSON.parse(responseBody)); } catch { normalizedTracking = null; }
     if (normalizedTracking && clientId && typeof payload.shipment_id === "string") {
       const current = await env.DB.prepare("SELECT status FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(payload.shipment_id, clientId).first<{ status: string }>();
-      if (current && validProviderShipmentTransition(String(current.status).toLowerCase(), normalizedTracking.status)) {
+      const currentStatus = String(current?.status ?? "").toLowerCase();
+      const genericExceptionWrapper = normalizedTracking.status === "exception" && /^provider status:\s*exception$/i.test(normalizedTracking.description.trim());
+      const preserveActiveStatus = genericExceptionWrapper && ["picked_up", "in_transit", "out_for_delivery"].includes(currentStatus);
+      if (current && !preserveActiveStatus && validProviderShipmentTransition(currentStatus, normalizedTracking.status)) {
         const latest = await env.DB.prepare("SELECT status, location, description FROM tracking_events WHERE shipment_id = ? ORDER BY event_time DESC LIMIT 1").bind(payload.shipment_id).first<{ status: string; location: string | null; description: string | null }>();
         if (!latest || latest.status !== normalizedTracking.status || (latest.location ?? "") !== normalizedTracking.location || (latest.description ?? "") !== normalizedTracking.description) {
           await env.DB.prepare("UPDATE shipments SET provider = ?, status = ?, delivered_at = CASE WHEN ? = 'delivered' THEN COALESCE(delivered_at, CURRENT_TIMESTAMP) ELSE delivered_at END, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(provider, normalizedTracking.status, normalizedTracking.status, payload.shipment_id, clientId).run();
