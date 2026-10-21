@@ -273,6 +273,13 @@ const shipmentTransitions: Record<string, Set<string>> = {
 const taskStatuses = new Set(["pending", "in_progress", "completed", "cancelled"]);
 const taskPriorities = new Set(["low", "medium", "high", "urgent"]);
 function validShipmentTransition(current: string, next: string) { return shipmentTransitions[current]?.has(next) ?? current === next; }
+function validProviderShipmentTransition(current: string, next: string) {
+  if (current === next) return true;
+  if (current === "cancelled" || current === "delivered" || current === "rto") return false;
+  if (next === "cancelled" || next === "exception") return true;
+  const order: Record<string, number> = { booked: 0, picked_up: 1, in_transit: 2, out_for_delivery: 3, delivered: 4, rto: 4 };
+  return order[next] !== undefined && order[current] !== undefined && order[next] > order[current];
+}
 function normalizeProviderShipmentStatus(value: unknown) {
   const status = String(value ?? "").trim().toLowerCase().replace(/[\s-]+/g, "_");
   if (!status) return "in_transit";
@@ -2385,7 +2392,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     try { normalizedTracking = normalizeProviderTracking(JSON.parse(responseBody)); } catch { normalizedTracking = null; }
     if (normalizedTracking && clientId && typeof payload.shipment_id === "string") {
       const current = await env.DB.prepare("SELECT status FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(payload.shipment_id, clientId).first<{ status: string }>();
-      if (current && validShipmentTransition(String(current.status).toLowerCase(), normalizedTracking.status)) {
+      if (current && validProviderShipmentTransition(String(current.status).toLowerCase(), normalizedTracking.status)) {
         const latest = await env.DB.prepare("SELECT status, location, description FROM tracking_events WHERE shipment_id = ? ORDER BY event_time DESC LIMIT 1").bind(payload.shipment_id).first<{ status: string; location: string | null; description: string | null }>();
         if (!latest || latest.status !== normalizedTracking.status || (latest.location ?? "") !== normalizedTracking.location || (latest.description ?? "") !== normalizedTracking.description) {
           await env.DB.prepare("UPDATE shipments SET provider = ?, status = ?, delivered_at = CASE WHEN ? = 'delivered' THEN COALESCE(delivered_at, CURRENT_TIMESTAMP) ELSE delivered_at END, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(provider, normalizedTracking.status, normalizedTracking.status, payload.shipment_id, clientId).run();
@@ -3197,7 +3204,7 @@ async function handleDelhiveryDocumentWebhook(request: Request, env: Env, reques
   return json({ ok: true, accepted: true, document_event: true, document_stored: documentStored, request_id: requestIdValue }, 202, headers);
 }
 
-async function refreshFujiyamaDelhivery(env: Env, cron: string) {
+async function refreshDelhiveryShipments(env: Env, cron: string) {
   const columns = "id, client_id, tracking_number, lr_number, provider_reference, provider_account_id";
   // Select in small pages for bounded concurrency, but keep paging through the
   // complete due queue. The old single-query LIMIT 50 meant the scheduler could
@@ -3210,10 +3217,11 @@ async function refreshFujiyamaDelhivery(env: Env, cron: string) {
   const due = `(provider_last_attempt_at IS NULL OR
     (status = 'out_for_delivery' AND datetime(provider_last_attempt_at) <= datetime('now', '-10 minutes')) OR
     (status = 'in_transit' AND ${latestEvent} GLOB '*last[- ]mile*' AND datetime(provider_last_attempt_at) <= datetime('now', '-1 hour')) OR
-    (status IN ('booked', 'picked_up', 'in_transit', 'exception', 'rto') AND NOT (status = 'in_transit' AND ${latestEvent} GLOB '*last[- ]mile*') AND datetime(provider_last_attempt_at) <= datetime('now', '-4 hours'))) `;
+    (status = 'booked' AND datetime(provider_last_attempt_at) <= datetime('now', '-10 minutes')) OR
+    (status IN ('picked_up', 'in_transit', 'exception', 'rto') AND NOT (status = 'in_transit' AND ${latestEvent} GLOB '*last[- ]mile*') AND datetime(provider_last_attempt_at) <= datetime('now', '-4 hours'))) `;
   // Delivered shipments are terminal for status polling. Keep their separate
   // POD backfill below, but do not spend tracking calls refreshing them.
-  const refreshRows: Array<{ id: string; client_id: string; tracking_number: string; lr_number: string | null; provider_reference: string | null; provider_account_id: string }> = [];
+  const refreshRows: Array<{ id: string; client_id: string; tracking_number: string | null; lr_number: string | null; provider_reference: string | null; provider_account_id: string | null }> = [];
   let trackingSucceeded = 0;
   let trackingFailed = 0;
   let immediatePodSucceeded = 0;
@@ -3224,7 +3232,7 @@ async function refreshFujiyamaDelhivery(env: Env, cron: string) {
   // remaining due rows because each attempted shipment receives a new attempt
   // timestamp. There is no fleet-wide 50-record ceiling anymore.
   while (Date.now() - refreshStartedAt < 25000) {
-    const active = await env.DB.prepare(`SELECT ${columns} FROM shipments WHERE client_id = ? AND provider = 'delhivery' AND provider_account_id = ? AND COALESCE(lr_number, tracking_number, provider_reference) IS NOT NULL AND status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery', 'exception', 'rto') AND ${due} ${order}`).bind(FUJIYAMA_CLIENT_ID, FUJIYAMA_DELHIVERY_ACCOUNT_ID).all<{ id: string; client_id: string; tracking_number: string; lr_number: string | null; provider_reference: string | null; provider_account_id: string }>();
+    const active = await env.DB.prepare(`SELECT ${columns} FROM shipments WHERE provider = 'delhivery' AND COALESCE(lr_number, tracking_number, provider_reference) IS NOT NULL AND status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery', 'exception', 'rto') AND ${due} ${order}`).all<{ id: string; client_id: string; tracking_number: string | null; lr_number: string | null; provider_reference: string | null; provider_account_id: string | null }>();
     if (!active.results.length) break;
     const batch = active.results.slice(0, 5);
     refreshRows.push(...batch);
@@ -3246,19 +3254,19 @@ async function refreshFujiyamaDelhivery(env: Env, cron: string) {
     immediatePodFailed += results.filter((result) => result.pod === "failed").length;
   }
 
-  const podCandidates = await env.DB.prepare("SELECT s.id, s.client_id, s.tracking_number, s.lr_number, s.provider_reference, s.provider_account_id FROM shipments s WHERE s.client_id = ? AND s.provider = 'delhivery' AND s.provider_account_id = ? AND s.status = 'delivered' AND COALESCE(s.lr_number, s.tracking_number, s.provider_reference) IS NOT NULL AND NOT EXISTS (SELECT 1 FROM shipment_documents d WHERE d.shipment_id = s.id AND lower(d.original_filename) LIKE 'delhivery-pod-%') ORDER BY s.updated_at ASC LIMIT 20").bind(FUJIYAMA_CLIENT_ID, FUJIYAMA_DELHIVERY_ACCOUNT_ID).all<{ id: string; client_id: string; tracking_number: string; lr_number: string | null; provider_reference: string | null; provider_account_id: string }>();
+  const podCandidates = await env.DB.prepare("SELECT s.id, s.client_id, s.tracking_number, s.lr_number, s.provider_reference, s.provider_account_id FROM shipments s WHERE s.provider = 'delhivery' AND s.status = 'delivered' AND COALESCE(s.lr_number, s.tracking_number, s.provider_reference) IS NOT NULL AND NOT EXISTS (SELECT 1 FROM shipment_documents d WHERE d.shipment_id = s.id AND lower(d.original_filename) LIKE 'delhivery-pod-%') ORDER BY s.updated_at ASC LIMIT 20").all<{ id: string; client_id: string; tracking_number: string | null; lr_number: string | null; provider_reference: string | null; provider_account_id: string | null }>();
   let podSucceeded = immediatePodSucceeded;
   let podFailed = immediatePodFailed;
   for (let index = 0; index < podCandidates.results.length; index += 3) {
     const batch = podCandidates.results.slice(index, index + 3);
     const results = await Promise.all(batch.map(async (shipment) => {
-      const result = await safeProviderRequest(env, "delhivery", "document", { shipment_id: shipment.id, tracking_number: shipment.tracking_number, lr_number: shipment.lr_number, provider_reference: shipment.provider_reference, provider_account_id: shipment.provider_account_id, doc_type: "LM_POD" }, `cron:${cron}:fujiyama:pod:${shipment.id}`, shipment.client_id, undefined, 15000);
+      const result = await safeProviderRequest(env, "delhivery", "document", { shipment_id: shipment.id, tracking_number: shipment.tracking_number, lr_number: shipment.lr_number, provider_reference: shipment.provider_reference, provider_account_id: shipment.provider_account_id, doc_type: "LM_POD" }, `cron:${cron}:delhivery:pod:${shipment.id}`, shipment.client_id, undefined, 15000);
       return result.status === "accepted";
     }));
     podSucceeded += results.filter(Boolean).length;
     podFailed += results.filter((value) => !value).length;
   }
-  console.log(JSON.stringify({ job: "fujiyama_delhivery_refresh", cron, tracking_candidates: refreshRows.length, tracking_succeeded: trackingSucceeded, tracking_failed: trackingFailed, pod_candidates: podCandidates.results.length, pod_succeeded: podSucceeded, pod_failed: podFailed }));
+  console.log(JSON.stringify({ job: "delhivery_shipments_refresh", cron, tracking_candidates: refreshRows.length, tracking_succeeded: trackingSucceeded, tracking_failed: trackingFailed, pod_candidates: podCandidates.results.length, pod_succeeded: podSucceeded, pod_failed: podFailed }));
 }
 
 const worker = {
@@ -5734,7 +5742,7 @@ const worker = {
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
     ctx.waitUntil(retryPendingDelhiveryBookings(env, controller.cron));
     ctx.waitUntil(reconcilePendingDelhiveryReferences(env, controller.cron));
-    ctx.waitUntil(refreshFujiyamaDelhivery(env, controller.cron));
+    ctx.waitUntil(refreshDelhiveryShipments(env, controller.cron));
   },
 };
 
