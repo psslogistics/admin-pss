@@ -2538,6 +2538,19 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (persistIntegration) await env.DB.prepare("UPDATE integration_requests SET status = ?, error_code = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(response.ok ? "succeeded" : "failed", response.ok ? null : `HTTP_${response.status}`, response.ok ? null : `${lastError}${providerFailureDetail ? `: ${providerFailureDetail}` : ""}`.slice(0, 500), integrationId).run();
   let parsedProviderBody: unknown = null;
   try { parsedProviderBody = JSON.parse(responseBody); } catch { parsedProviderBody = null; }
+  if (response.ok && operation === "tracking" && provider === "delhivery") {
+    const etaKeys = new Set<string>();
+    const collectEtaKeys = (node: unknown, depth = 0) => {
+      if (depth > 12 || node === null || node === undefined || typeof node !== "object") return;
+      if (Array.isArray(node)) { for (const item of node) collectEtaKeys(item, depth + 1); return; }
+      for (const [key, child] of Object.entries(node as Record<string, unknown>)) {
+        if (/edd|deliver|expect|estimate|promis/i.test(key)) etaKeys.add(key);
+        collectEtaKeys(child, depth + 1);
+      }
+    };
+    collectEtaKeys(parsedProviderBody);
+    if (etaKeys.size) console.log(JSON.stringify({ event: "delhivery_tracking_eta_fields", request_id: requestIdValue, keys: [...etaKeys].slice(0, 30) }));
+  }
   const providerEdd = response.ok ? findProviderEdd(parsedProviderBody) : null;
   let normalizedTracking: NormalizedProviderTracking | null = null;
   let normalizedTrackingEvents: NormalizedProviderTracking[] = [];
