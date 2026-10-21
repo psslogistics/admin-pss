@@ -3176,22 +3176,38 @@ function pickupStatusFromProviderEvent(rawStatus: unknown) {
 
 async function reconcileShipmentLinkedPickupStatuses(env: Env, cron: string) {
   const rows = await env.DB.prepare(`
-    SELECT pr.id, pr.client_id, pr.status
+    SELECT pr.id, pr.client_id, pr.status, pr.provider_status,
+      COUNT(DISTINCT s.id) AS expected_count,
+      COUNT(DISTINCT CASE WHEN s.status IN ('picked_up', 'in_transit', 'out_for_delivery', 'delivered') THEN s.id END) AS picked_count,
+      COUNT(DISTINCT CASE WHEN s.status = 'delivered' THEN s.id END) AS delivered_count,
+      COUNT(DISTINCT CASE WHEN s.status IN ('exception', 'rto', 'cancelled') THEN s.id END) AS failed_count
     FROM pickup_requests pr
-    WHERE pr.provider = 'delhivery'
-      AND pr.status IN ('requested', 'provider_pending', 'scheduled', 'driver_assigned', 'en_route', 'rescheduled')
-      AND EXISTS (
-        SELECT 1 FROM shipments s
-        WHERE (s.id = pr.shipment_id OR EXISTS (
-          SELECT 1 FROM pickup_request_shipments prs WHERE prs.pickup_id = pr.id AND prs.shipment_id = s.id
-        ))
-        AND s.status IN ('picked_up', 'in_transit', 'out_for_delivery', 'delivered')
-      )
-    LIMIT 100
-  `).all<{ id: string; client_id: string; status: string }>();
+    LEFT JOIN shipments s ON s.id = pr.shipment_id OR EXISTS (
+      SELECT 1 FROM pickup_request_shipments prs WHERE prs.pickup_id = pr.id AND prs.shipment_id = s.id
+    )
+    WHERE pr.provider = 'delhivery' AND pr.status NOT IN ('cancelled', 'completed', 'failed')
+    GROUP BY pr.id, pr.client_id, pr.status, pr.provider_status
+    ORDER BY pr.updated_at ASC LIMIT 250
+  `).all<{ id: string; client_id: string; status: string; provider_status: string | null; expected_count: number; picked_count: number; delivered_count: number; failed_count: number }>();
   for (const pickup of rows.results) {
-    await env.DB.prepare("UPDATE pickup_requests SET status = 'picked_up', provider_status = COALESCE(NULLIF(provider_status, ''), 'shipment_status:picked_up'), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ? AND status IN ('requested', 'provider_pending', 'scheduled', 'driver_assigned', 'en_route', 'rescheduled')")
-      .bind(pickup.id, pickup.client_id).run();
+    const expectedCount = Math.max(0, Number(pickup.expected_count ?? 0));
+    const pickedCount = Math.max(0, Number(pickup.picked_count ?? 0));
+    const deliveredCount = Math.max(0, Number(pickup.delivered_count ?? 0));
+    const failedCount = Math.max(0, Number(pickup.failed_count ?? 0));
+    const nextStatus = expectedCount > 0 && deliveredCount === expectedCount
+      ? 'completed'
+      : pickedCount > 0
+        ? 'picked_up'
+        : failedCount === expectedCount && expectedCount > 0
+          ? 'failed'
+          : pickup.status;
+    const detail = pickedCount > 0
+      ? `Delhivery linked shipments: ${pickedCount}/${expectedCount} picked`
+      : failedCount > 0
+        ? `Delhivery linked shipments: ${failedCount}/${expectedCount} failed or cancelled`
+        : 'Delhivery has not reported a pickup scan for the linked shipments';
+    await env.DB.prepare("UPDATE pickup_requests SET status = ?, provider_picked_count = ?, provider_expected_count = ?, provider_status_synced_at = CURRENT_TIMESTAMP, provider_status_detail = ?, provider_status = COALESCE(NULLIF(provider_status, ''), 'delhivery:linked_shipments'), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+      .bind(nextStatus, pickedCount, expectedCount, detail, pickup.id, pickup.client_id).run();
   }
   if (rows.results.length) console.log(JSON.stringify({ job: "pickup_status_reconciliation", cron, candidates: rows.results.length }));
 }
@@ -4324,7 +4340,7 @@ const worker = {
 
       if (route === "/pickups" && request.method === "GET") {
         if (!hasScope(auth, "pickups.read")) return error("FORBIDDEN", "Pickup read scope required", 403, id, headers);
-         const pickupColumns = "id, client_id, shipment_id, requested_date, requested_time_slot, pickup_address, contact_name, contact_phone, contact_email, city, state, pincode, country, pieces, total_weight_kg, status, assigned_to_user_id, notes, provider, provider_account_id, warehouse_id, provider_reference, provider_status, provider_request_id, provider_slot_id, provider_error_code, idempotency_key, failure_reason, created_at, updated_at, (SELECT COUNT(*) FROM pickup_request_shipments prs WHERE prs.pickup_id = pickup_requests.id) AS shipment_count";
+         const pickupColumns = "id, client_id, shipment_id, requested_date, requested_time_slot, pickup_address, contact_name, contact_phone, contact_email, city, state, pincode, country, pieces, total_weight_kg, status, assigned_to_user_id, notes, provider, provider_account_id, warehouse_id, provider_reference, provider_status, provider_picked_count, provider_expected_count, provider_status_synced_at, provider_status_detail, provider_request_id, provider_slot_id, provider_error_code, idempotency_key, failure_reason, created_at, updated_at, (SELECT COUNT(*) FROM pickup_request_shipments prs WHERE prs.pickup_id = pickup_requests.id) AS shipment_count";
         const rows = auth.system ? await env.DB.prepare(`SELECT ${pickupColumns} FROM pickup_requests ORDER BY created_at DESC, id DESC`).all() : auth.clientIds.size ? await env.DB.prepare(`SELECT ${pickupColumns} FROM pickup_requests WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY created_at DESC, id DESC`).bind(...auth.clientIds).all() : { results: [] };
         return json({ ok: true, data: rows.results }, 200, headers);
       }
@@ -5889,10 +5905,12 @@ const worker = {
     }
   },
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
-    ctx.waitUntil(retryPendingDelhiveryBookings(env, controller.cron));
-    ctx.waitUntil(reconcilePendingDelhiveryReferences(env, controller.cron));
-    ctx.waitUntil(refreshDelhiveryShipments(env, controller.cron));
-    ctx.waitUntil(reconcileShipmentLinkedPickupStatuses(env, controller.cron));
+    ctx.waitUntil((async () => {
+      await retryPendingDelhiveryBookings(env, controller.cron);
+      await reconcilePendingDelhiveryReferences(env, controller.cron);
+      await refreshDelhiveryShipments(env, controller.cron);
+      await reconcileShipmentLinkedPickupStatuses(env, controller.cron);
+    })());
   },
 };
 
