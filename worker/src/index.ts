@@ -1682,8 +1682,8 @@ function findProviderEdd(value: unknown, depth = 0): string | null {
   if (depth > 8 || value === null || value === undefined) return null;
   const expectedKeys = new Set([
     "edd", "estimateddeliverydate", "estimateddelivery", "estimateddeliverydatetime",
-    "estimateddeliverydatEtime", "expecteddeliverydate", "expecteddelivery", "expecteddeliverydatetime",
-    "expecteddate", "promiseddeliverydate", "deliveryestimate",
+    "estimateddeliverydatetime", "expecteddeliverydate", "expecteddelivery", "expecteddeliverydatetime",
+    "expecteddate", "expecteddateofdelivery", "promiseddeliverydate", "deliveryestimate", "deliverydate", "estimateddate",
   ].map((key) => key.toLowerCase().replace(/[^a-z]/g, "")));
   if (Array.isArray(value)) {
     for (const item of value) { const found = findProviderEdd(item, depth + 1); if (found) return found; }
@@ -1696,6 +1696,13 @@ function findProviderEdd(value: unknown, depth = 0): string | null {
     if (expectedKeys.has(normalizedKey)) {
       const found = normalizeProviderEdd(candidate);
       if (found) return found;
+      if (candidate && typeof candidate === "object") {
+        const nested = candidate as Record<string, unknown>;
+        for (const dateKey of ["date", "value", "datetime", "timestamp", "delivery_date", "deliveryDate"]) {
+          const nestedFound = normalizeProviderEdd(nested[dateKey]);
+          if (nestedFound) return nestedFound;
+        }
+      }
     }
   }
   for (const candidate of Object.values(object)) { const found = findProviderEdd(candidate, depth + 1); if (found) return found; }
