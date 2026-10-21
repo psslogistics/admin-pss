@@ -1695,8 +1695,13 @@ function normalizeProviderTracking(value: unknown, depth = 0): NormalizedProvide
   };
   collect(value, depth);
   if (!candidates.length) return null;
+  // Delhivery responses can include an exception-like wrapper alongside the
+  // actual scan state. When an authenticated active scan is present, expose
+  // that operational state instead of letting the wrapper hide transit.
+  const activeCandidates = candidates.filter((candidate) => ["picked_up", "in_transit", "out_for_delivery", "delivered"].includes(candidate.status));
+  const effectiveCandidates = activeCandidates.length ? activeCandidates : candidates;
   const order: Record<string, number> = { booked: 0, picked_up: 1, in_transit: 2, out_for_delivery: 3, delivered: 4, rto: 4, cancelled: 4, exception: -1 };
-  return candidates.sort((left, right) => {
+  return effectiveCandidates.sort((left, right) => {
     const leftTime = left.eventTime ? Date.parse(left.eventTime) : Number.NaN;
     const rightTime = right.eventTime ? Date.parse(right.eventTime) : Number.NaN;
     if (Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime !== rightTime) return rightTime - leftTime;
