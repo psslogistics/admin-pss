@@ -2389,7 +2389,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       : provider === "delhivery" && operation === "labels"
         ? `${base.replace(/\/$/, "")}/label/get_urls/${encodeURIComponent(String(payload.label_size ?? "std"))}/${encodeURIComponent(trackingNumber)}`
       : provider === "delhivery" && operation === "lr_copy"
-        ? `${base.replace(/\/$/, "")}/lr_copy/print/${encodeURIComponent(trackingNumber)}${payload.lr_copy_type ? `?lr_copy_type=${encodeURIComponent(String(payload.lr_copy_type))}` : ""}`
+        ? `${base.replace(/\/$/, "")}/lr_copy/print/${encodeURIComponent(trackingNumber)}?lr_copy_type=${encodeURIComponent(String(payload.lr_copy_type ?? "SHIPPER COPY"))}`
       : provider === "delhivery" && operation === "document"
         ? `${base.replace(/\/$/, "")}/document/download?lrn=${encodeURIComponent(trackingNumber)}${payload.doc_type ? `&doc_type=${encodeURIComponent(String(payload.doc_type))}` : ""}&auto_download=true&version=latest`
       : provider === "delhivery" && operation === "shipment_status"
@@ -2522,10 +2522,19 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   // normalized tracking event is persisted and returned to the internal caller.
   let responseBody = "";
   let responseBytes: Uint8Array | null = null;
+  let lrCopyResponses: Array<{ copyType: string; bytes: Uint8Array }> = [];
   try {
     if (provider === "delhivery" && ["labels", "lr_copy", "document"].includes(operation)) {
       responseBytes = await providerResponseBytes(response, 12 * 1024 * 1024);
       responseBody = new TextDecoder().decode(responseBytes);
+      if (response.ok && operation === "lr_copy" && !payload.lr_copy_type) {
+        for (const copyType of ["LM POD", "RECIPIENT COPY"]) {
+          const copyUrl = `${base.replace(/\/$/, "")}/lr_copy/print/${encodeURIComponent(trackingNumber)}?lr_copy_type=${encodeURIComponent(copyType)}`;
+          const copyResponse = await providerFetch(copyUrl, { method: "GET", headers }, attemptTimeoutMs);
+          if (!copyResponse.ok) throw new Error(`provider_lr_copy_${copyType.toLowerCase().replaceAll(" ", "_")}_http_${copyResponse.status}`);
+          lrCopyResponses.push({ copyType, bytes: await providerResponseBytes(copyResponse, 12 * 1024 * 1024) });
+        }
+      }
     } else {
       responseBody = await providerResponseText(response, attemptTimeoutMs);
     }
@@ -2714,6 +2723,16 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     if (operation === "document" && clientId && typeof payload.shipment_id === "string") {
       const pod = await persistDelhiveryPod(env, clientId, payload.shipment_id, trackingNumber, artifact, responseBytes, response, requestIdValue);
       return { enabled: true, status: pod.stored || pod.reason === "already_exists" ? "accepted" as const : "failed" as const, providerStatus: response.status, artifact, pod_document_id: pod.document_id, error: pod.stored || pod.reason === "already_exists" ? undefined : pod.reason };
+    }
+    if (operation === "lr_copy" && !payload.lr_copy_type && responseBytes && lrCopyResponses.length) {
+      artifact = {
+        artifacts: [
+          { copy_type: "SHIPPER COPY", content_base64: providerBytesToBase64(responseBytes), content_type: response.headers.get("content-type") ?? "application/pdf" },
+          ...lrCopyResponses.map(({ copyType, bytes }) => ({ copy_type: copyType, content_base64: providerBytesToBase64(bytes), content_type: "application/pdf" })),
+        ],
+        content_type: "application/pdf",
+        copies: lrCopyResponses.length + 1,
+      };
     }
     return { enabled: true, status: "accepted" as const, providerStatus: response.status, artifact };
   }
