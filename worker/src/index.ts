@@ -1721,6 +1721,7 @@ function normalizeProviderTrackingEvents(value: unknown, depth = 0): NormalizedP
     if (/out for delivery|ofd/.test(text)) return "out_for_delivery";
     if (/return to origin|returned|rto/.test(text)) return "rto";
     if (/not picked|pickup failed|failed pickup/.test(text)) return "booked";
+    if (/out for pickup|driver assigned|en route/.test(text)) return "booked";
     if (/picked up|pickup complete|collected/.test(text)) return "picked_up";
     if (/manifest|uploaded|created|booked/.test(text)) return "booked";
     if (/transit|departed|bag added|trip arrived|received at|arrived at|weight captured|dispatched|shipped/.test(text)) return "in_transit";
@@ -3246,7 +3247,12 @@ async function reconcileShipmentLinkedPickupStatuses(env: Env, cron: string) {
       COUNT(DISTINCT s.id) AS expected_count,
       COUNT(DISTINCT CASE WHEN s.status IN ('picked_up', 'in_transit', 'out_for_delivery', 'delivered') THEN s.id END) AS picked_count,
       COUNT(DISTINCT CASE WHEN s.status = 'delivered' THEN s.id END) AS delivered_count,
-      COUNT(DISTINCT CASE WHEN s.status IN ('exception', 'rto', 'cancelled') THEN s.id END) AS failed_count
+      COUNT(DISTINCT CASE WHEN s.status IN ('exception', 'rto', 'cancelled') THEN s.id END) AS failed_count,
+      COUNT(DISTINCT CASE WHEN EXISTS (
+        SELECT 1 FROM tracking_events te
+        WHERE te.shipment_id = s.id
+          AND lower(COALESCE(te.description, '') || ' ' || COALESCE(te.status, '')) LIKE '%out for pickup%'
+      ) THEN s.id END) AS en_route_count
     FROM pickup_requests pr
     LEFT JOIN shipments s ON s.id = pr.shipment_id OR EXISTS (
       SELECT 1 FROM pickup_request_shipments prs WHERE prs.pickup_id = pr.id AND prs.shipment_id = s.id
@@ -3254,21 +3260,26 @@ async function reconcileShipmentLinkedPickupStatuses(env: Env, cron: string) {
     WHERE pr.provider = 'delhivery' AND pr.status NOT IN ('cancelled', 'completed', 'failed')
     GROUP BY pr.id, pr.client_id, pr.status, pr.provider_status
     ORDER BY pr.updated_at ASC LIMIT 250
-  `).all<{ id: string; client_id: string; status: string; provider_status: string | null; expected_count: number; picked_count: number; delivered_count: number; failed_count: number }>();
+  `).all<{ id: string; client_id: string; status: string; provider_status: string | null; expected_count: number; picked_count: number; delivered_count: number; failed_count: number; en_route_count: number }>();
   for (const pickup of rows.results) {
     const expectedCount = Math.max(0, Number(pickup.expected_count ?? 0));
     const pickedCount = Math.max(0, Number(pickup.picked_count ?? 0));
     const deliveredCount = Math.max(0, Number(pickup.delivered_count ?? 0));
     const failedCount = Math.max(0, Number(pickup.failed_count ?? 0));
+    const enRouteCount = Math.max(0, Number(pickup.en_route_count ?? 0));
     const nextStatus = expectedCount > 0 && deliveredCount === expectedCount
       ? 'completed'
       : pickedCount > 0
         ? 'picked_up'
+        : enRouteCount > 0
+          ? 'en_route'
         : failedCount === expectedCount && expectedCount > 0
           ? 'failed'
           : pickup.status;
     const detail = pickedCount > 0
       ? `Delhivery linked shipments: ${pickedCount}/${expectedCount} picked`
+      : enRouteCount > 0
+        ? `Delhivery linked shipments: ${enRouteCount}/${expectedCount} out for pickup`
       : failedCount > 0
         ? `Delhivery linked shipments: ${failedCount}/${expectedCount} failed or cancelled`
         : 'Delhivery has not reported a pickup scan for the linked shipments';
@@ -3349,9 +3360,19 @@ async function handleProviderWebhook(request: Request, env: Env, provider: "delh
     const description = delhiveryDetails?.description ?? String(payload.description ?? payload.message ?? `Webhook event ${eventId}`); const location = delhiveryDetails?.location ?? String(payload.location ?? payload.city ?? "");
     const shipment = reference ? await env.DB.prepare("SELECT id FROM shipments WHERE id = ? OR tracking_number = ? OR provider_reference = ? LIMIT 1").bind(reference, reference, reference).first<{ id: string }>() : null;
      const pickupStatus = provider === "delhivery" ? pickupStatusFromProviderEvent(delhiveryDetails?.rawStatus ?? payload.status ?? payload.event_type) : null;
-     const pickup = provider === "delhivery" && reference ? await env.DB.prepare("SELECT id, shipment_id FROM pickup_requests WHERE provider = 'delhivery' AND (provider_reference = ? OR provider_request_id = ? OR id = ?) LIMIT 1").bind(reference, reference, reference).first<{ id: string; shipment_id: string | null }>() : null;
+     const pickup = provider === "delhivery" && reference ? await env.DB.prepare(`
+       SELECT pr.id, pr.shipment_id
+       FROM pickup_requests pr
+       WHERE pr.provider = 'delhivery'
+         AND (
+           pr.provider_reference = ? OR pr.provider_request_id = ? OR pr.id = ?
+           OR pr.shipment_id = ?
+           OR EXISTS (SELECT 1 FROM pickup_request_shipments prs WHERE prs.pickup_id = pr.id AND prs.shipment_id = ?)
+         )
+       LIMIT 1
+     `).bind(reference, reference, reference, shipment?.id ?? null, shipment?.id ?? null).first<{ id: string; shipment_id: string | null }>() : null;
      if (pickupStatus && pickup) {
-       await env.DB.prepare("UPDATE pickup_requests SET status = ?, provider_status = ?, provider_reference = COALESCE(?, provider_reference), requested_date = COALESCE(?, requested_date), requested_time_slot = COALESCE(?, requested_time_slot), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status IN ('requested', 'provider_pending', 'scheduled', 'driver_assigned', 'en_route', 'rescheduled')")
+       await env.DB.prepare("UPDATE pickup_requests SET status = ?, provider_status = ?, provider_reference = COALESCE(provider_reference, ?), requested_date = COALESCE(?, requested_date), requested_time_slot = COALESCE(?, requested_time_slot), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status IN ('requested', 'provider_pending', 'scheduled', 'driver_assigned', 'en_route', 'rescheduled')")
          .bind(pickupStatus, String(delhiveryDetails?.rawStatus ?? payload.status ?? payload.event_type ?? ""), reference || null, delhiveryDetails?.requestedDate ?? null, delhiveryDetails?.requestedTimeSlot ?? null, pickup.id)
          .run();
      }
@@ -3369,7 +3390,7 @@ async function handleProviderWebhook(request: Request, env: Env, provider: "delh
       await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, location, description, created_by_user_id, event_time, created_at) VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipment.id, status, location, description, `webhook:${provider}`, delhiveryDetails?.eventTime ?? null).run();
        if (provider === "delhivery") {
          if (pickupStatus && !pickup) {
-          await env.DB.prepare("UPDATE pickup_requests SET status = ?, provider_status = ?, provider_reference = COALESCE(?, provider_reference), requested_date = COALESCE(?, requested_date), requested_time_slot = COALESCE(?, requested_time_slot), updated_at = CURRENT_TIMESTAMP WHERE shipment_id = ? AND provider = 'delhivery' AND status IN ('requested', 'provider_pending', 'scheduled', 'driver_assigned', 'en_route', 'rescheduled')")
+          await env.DB.prepare("UPDATE pickup_requests SET status = ?, provider_status = ?, provider_reference = COALESCE(provider_reference, ?), requested_date = COALESCE(?, requested_date), requested_time_slot = COALESCE(?, requested_time_slot), updated_at = CURRENT_TIMESTAMP WHERE shipment_id = ? AND provider = 'delhivery' AND status IN ('requested', 'provider_pending', 'scheduled', 'driver_assigned', 'en_route', 'rescheduled')")
             .bind(pickupStatus, String(delhiveryDetails?.rawStatus ?? payload.status ?? payload.event_type ?? ""), reference || null, delhiveryDetails?.requestedDate ?? null, delhiveryDetails?.requestedTimeSlot ?? null, shipment.id)
             .run();
         }
