@@ -1691,12 +1691,14 @@ function normalizeProviderTrackingEvents(value: unknown, depth = 0): NormalizedP
     if (typeof node !== "object") return;
     const object = node as Record<string, unknown>;
     for (const [key, child] of Object.entries(object)) {
-      if (key.toLowerCase() === "scans" && Array.isArray(child)) {
-        for (const item of child) {
+      if (key.toLowerCase() === "scans") {
+        const scanItems = Array.isArray(child) ? child : child && typeof child === "object" ? [child] : [];
+        for (const item of scanItems) {
           if (!item || typeof item !== "object") continue;
           const record = item as Record<string, unknown>;
           const detail = record.ScanDetail ?? record.scan_detail ?? record.scanDetail;
-          if (detail && typeof detail === "object" && !Array.isArray(detail)) scanDetails.push(detail as Record<string, unknown>);
+          const details = Array.isArray(detail) ? detail : detail && typeof detail === "object" ? [detail] : [];
+          if (details.length) for (const entry of details) if (entry && typeof entry === "object") scanDetails.push(entry as Record<string, unknown>);
           else scanDetails.push(record);
         }
       } else collectScans(child, level + 1);
