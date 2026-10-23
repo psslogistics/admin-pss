@@ -2826,14 +2826,17 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         content_type: responseBytes ? providerContentTypeFromBytes(responseBytes, response.headers.get("content-type") ?? "application/octet-stream") : response.headers.get("content-type") ?? "application/octet-stream",
       };
     }
-    if (operation === "labels" && payload.label_api_variant === "pdf" && !isProviderPdfArtifact(artifact)) {
+    if (operation === "labels" && (payload.label_api_variant === "pdf" || payload.label_api_variant === "pdf_alt") && !isProviderPdfArtifact(artifact)) {
       // Delhivery queues PDF generation and publishes the resulting PDF URLs
       // through the label-links endpoint once the task completes. Poll that
       // provider endpoint briefly so the client receives the actual PDFs in
       // the same request instead of an empty formats menu.
       const labelUrl = `${String(delhiveryLabelBase).replace(/\/$/, "")}/v2/get-label-urls/${encodeURIComponent(delhiveryLabelApiSize(String(payload.label_size ?? "a4")))}/${encodeURIComponent(trackingNumber)}`;
-      for (let poll = 0; poll < 6 && !findProviderUrls(artifact).length; poll += 1) {
-        if (poll > 0) await new Promise((resolve) => setTimeout(resolve, 1200));
+      // The alternate B2B PDF endpoint returns a job id first. Delhivery's
+      // label-link endpoint usually publishes the completed assets several
+      // seconds later, so poll long enough for the provider job to finish.
+      for (let poll = 0; poll < 12 && !findProviderUrls(artifact).length; poll += 1) {
+        if (poll > 0) await new Promise((resolve) => setTimeout(resolve, 1500));
         try {
           const labelResponse = await providerFetch(labelUrl, { method: "GET", headers }, Math.max(providerTimeoutMs, 5000));
           if (!labelResponse.ok) continue;
