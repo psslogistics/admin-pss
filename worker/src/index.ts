@@ -2457,6 +2457,13 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   const integrationId = crypto.randomUUID();
   if (persistIntegration) await env.DB.prepare("INSERT INTO integration_requests (id, provider, client_id, operation, idempotency_key, provider_request_id, status, attempt_count) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0)").bind(integrationId, provider, clientId ?? null, operation, idempotencyKey ?? null, requestIdValue).run();
   const delhiveryOrigin = provider === "delhivery" ? new URL(base).origin : "";
+  const delhiveryAlternateB2bBase = provider === "delhivery" && useDelhiveryB2b
+    ? (String(base).replace(/\/$/, "") === "https://btob.api.delhivery.com" ? "https://ltl-clients-api.delhivery.com" : "https://btob.api.delhivery.com")
+    : "";
+  const labelVariant = String(payload.label_api_variant ?? "");
+  const delhiveryLabelBase = provider === "delhivery" && operation === "labels" && labelVariant.endsWith("_alt")
+    ? delhiveryAlternateB2bBase
+    : base;
   const trackonUrl = provider === "trackon" ? operation === "tracking" ? env.TRACKON_TRACKING_URL : operation === "shipments" ? env.TRACKON_BOOKING_URL : env.TRACKON_LABEL_URL : undefined;
   if (provider === "trackon" && !trackonUrl) return { enabled: false, status: "not_configured" as const, reason: `Trackon ${operation} endpoint is not configured` };
   const url = provider === "delhivery" && operation === "pickup_status"
@@ -2466,11 +2473,11 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     : provider === "trackon" && operation === "labels"
       ? trackonLabelUrl(trackonUrl!, trackingNumber, trackon!)
       : provider === "delhivery" && operation === "labels"
-        ? (payload.label_api_variant === "pdf" || payload.label_api_variant === "pdf_form")
-          ? `${base.replace(/\/$/, "")}/docket/generate_label_pdf`
-          : payload.label_api_variant === "legacy"
-            ? `${base.replace(/\/$/, "")}/label/get_urls/${encodeURIComponent(delhiveryLabelApiSize(String(payload.label_size ?? "std")))}/${encodeURIComponent(trackingNumber)}`
-            : `${base.replace(/\/$/, "")}/v2/get-label-urls/${encodeURIComponent(delhiveryLabelApiSize(String(payload.label_size ?? "std")))}/${encodeURIComponent(trackingNumber)}`
+        ? (labelVariant === "pdf" || labelVariant === "pdf_alt" || labelVariant === "pdf_form" || labelVariant === "pdf_form_alt")
+          ? `${String(delhiveryLabelBase).replace(/\/$/, "")}/docket/generate_label_pdf`
+          : labelVariant === "legacy" || labelVariant === "legacy_alt"
+            ? `${String(delhiveryLabelBase).replace(/\/$/, "")}/label/get_urls/${encodeURIComponent(delhiveryLabelApiSize(String(payload.label_size ?? "std")))}/${encodeURIComponent(trackingNumber)}`
+            : `${String(delhiveryLabelBase).replace(/\/$/, "")}/v2/get-label-urls/${encodeURIComponent(delhiveryLabelApiSize(String(payload.label_size ?? "std")))}/${encodeURIComponent(trackingNumber)}`
       : provider === "delhivery" && operation === "lr_copy"
         ? `${base.replace(/\/$/, "")}/lr_copy/print/${encodeURIComponent(trackingNumber)}?lr_copy_type=${encodeURIComponent(String(payload.lr_copy_type ?? "SHIPPER COPY"))}`
       : provider === "delhivery" && operation === "document"
@@ -2530,7 +2537,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         : provider === "rivigo" && operation === "shipments" ? JSON.stringify(rivigoCreate)
         : provider === "rivigo" && operation === "updates" ? JSON.stringify(payload)
         : provider === "rivigo" && operation === "cancellations" ? JSON.stringify(payload.cnotes_list ? { cnotesList: payload.cnotes_list } : {})
-        : provider === "delhivery" && operation === "labels" && payload.label_api_variant === "pdf"
+        : provider === "delhivery" && operation === "labels" && (payload.label_api_variant === "pdf" || payload.label_api_variant === "pdf_alt")
           ? JSON.stringify({
               lrn: trackingNumber,
               size: (() => {
@@ -2542,7 +2549,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
                 method: "POST",
               },
             })
-        : provider === "delhivery" && operation === "labels" && payload.label_api_variant === "pdf_form"
+        : provider === "delhivery" && operation === "labels" && (payload.label_api_variant === "pdf_form" || payload.label_api_variant === "pdf_form_alt")
           ? `lrnum=${encodeURIComponent(trackingNumber)}&size=${encodeURIComponent(delhiveryLabelApiSize(String(payload.label_size ?? "a4")))}&label_size=${encodeURIComponent(String(payload.label_size ?? "a4"))}`
         : provider === "delhivery" && ["tracking", "shipment_status", "serviceability", "serviceability_route", "pickup_status", "pickup_slots", "labels", "lr_copy", "document"].includes(operation) ? ""
         : operation === "tracking" ? JSON.stringify({ Appkey: trackon!.appKey, userId: trackon!.userId, password: trackon!.password, AWBNo: trackingNumber })
@@ -2565,9 +2572,9 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       // XpressBees documents tracking as POST even though it is a read-only
       // lookup. Keep the generic GET behavior for Delhivery/Trackon tracking,
       // but send the XpressBees AWB body with POST to avoid provider HTTP 405.
-       const isGet = (["tracking", "shipment_status", "serviceability", "serviceability_route", "pickup_slots", "labels", "lr_copy", "document"].includes(operation) && provider !== "xpressbees" && provider !== "rivigo" && !(provider === "delhivery" && operation === "labels" && ["pdf", "pdf_form"].includes(String(payload.label_api_variant ?? "")))) || (provider === "trackon" && operation === "labels");
+       const isGet = (["tracking", "shipment_status", "serviceability", "serviceability_route", "pickup_slots", "labels", "lr_copy", "document"].includes(operation) && provider !== "xpressbees" && provider !== "rivigo" && !(provider === "delhivery" && operation === "labels" && ["pdf", "pdf_alt", "pdf_form", "pdf_form_alt"].includes(labelVariant))) || (provider === "trackon" && operation === "labels");
       const method = provider === "rivigo" && operation === "cancellations" ? "DELETE" : provider === "rivigo" && operation === "updates" ? "PUT" : isGet ? "GET" : "POST";
-      if (provider === "delhivery" && operation === "labels" && payload.label_api_variant === "pdf_form") headers["content-type"] = "application/x-www-form-urlencoded";
+      if (provider === "delhivery" && operation === "labels" && (payload.label_api_variant === "pdf_form" || payload.label_api_variant === "pdf_form_alt")) headers["content-type"] = "application/x-www-form-urlencoded";
       response = await providerFetch(url, { method, headers, body: isGet ? undefined : requestBody }, attemptTimeoutMs);
       if (!singleManifestCall && provider === "delhivery" && useDelhiveryB2b && response.status === 401 && attempt === 0 && credential) {
         const refreshedToken = await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs, true);
@@ -2824,7 +2831,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       // through the label-links endpoint once the task completes. Poll that
       // provider endpoint briefly so the client receives the actual PDFs in
       // the same request instead of an empty formats menu.
-      const labelUrl = `${base.replace(/\/$/, "")}/v2/get-label-urls/${encodeURIComponent(delhiveryLabelApiSize(String(payload.label_size ?? "a4")))}/${encodeURIComponent(trackingNumber)}`;
+      const labelUrl = `${String(delhiveryLabelBase).replace(/\/$/, "")}/v2/get-label-urls/${encodeURIComponent(delhiveryLabelApiSize(String(payload.label_size ?? "a4")))}/${encodeURIComponent(trackingNumber)}`;
       for (let poll = 0; poll < 6 && !findProviderUrls(artifact).length; poll += 1) {
         if (poll > 0) await new Promise((resolve) => setTimeout(resolve, 1200));
         try {
@@ -4578,7 +4585,7 @@ const worker = {
           // Delhivery's B2B UI generates a PDF task separately from the
           // label-link endpoint. Try the provider PDF API for every provider
           // reference before telling the client that no label exists.
-          const labelVariants = ["pdf", "pdf_form", "legacy"];
+          const labelVariants = ["pdf", "pdf_alt", "pdf_form", "pdf_form_alt", "legacy", "legacy_alt", "primary_alt"];
           for (const labelApiVariant of labelVariants) {
             for (const candidate of referenceCandidates) {
               if (labelApiVariant === "legacy" && candidate === providerReference) continue;
