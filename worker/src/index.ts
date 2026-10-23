@@ -1674,6 +1674,18 @@ function providerContentTypeFromBytes(bytes: Uint8Array, declared: string) {
   return declared.split(";", 1)[0].trim().toLowerCase() || "application/octet-stream";
 }
 
+// Delhivery's UI exposes physical sizes, while its label API still accepts
+// the provider's legacy size codes. Keep this translation server-side so the
+// client never has to know or display those codes.
+function delhiveryLabelApiSize(size: string) {
+  return ({
+    a4: "a4",
+    "4x2": "std",
+    "4x2.5": "md",
+    "3x2": "sm",
+  } as Record<string, string>)[size] ?? size;
+}
+
 function findProviderToken(value: unknown, keys: Set<string>, depth = 0): string | null {
   if (depth > 8 || value === null || value === undefined) return null;
   const normalizedKeys = new Set([...keys].map((key) => key.toLowerCase()));
@@ -2448,7 +2460,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     : provider === "trackon" && operation === "labels"
       ? trackonLabelUrl(trackonUrl!, trackingNumber, trackon!)
       : provider === "delhivery" && operation === "labels"
-        ? `${base.replace(/\/$/, "")}/label/get_urls/${encodeURIComponent(String(payload.label_size ?? "std"))}/${encodeURIComponent(trackingNumber)}`
+        ? `${base.replace(/\/$/, "")}/label/get_urls/${encodeURIComponent(delhiveryLabelApiSize(String(payload.label_size ?? "std")))}/${encodeURIComponent(trackingNumber)}`
       : provider === "delhivery" && operation === "lr_copy"
         ? `${base.replace(/\/$/, "")}/lr_copy/print/${encodeURIComponent(trackingNumber)}?lr_copy_type=${encodeURIComponent(String(payload.lr_copy_type ?? "SHIPPER COPY"))}`
       : provider === "delhivery" && operation === "document"
