@@ -2792,8 +2792,9 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
             }
           }
           if (labelArtifacts.length) {
-            while (labelArtifacts.length < requestedCopies) labelArtifacts.push(labelArtifacts[labelArtifacts.length % Math.max(1, labelArtifacts.length)]);
-            artifact = { artifacts: labelArtifacts.slice(0, requestedCopies), content_type: labelArtifacts[0].content_type, copies: requestedCopies };
+            // Keep only assets Delhivery actually returned. Never fabricate a
+            // missing box label or MPS/document by duplicating another asset.
+            artifact = { artifacts: labelArtifacts, content_type: labelArtifacts[0].content_type, copies: labelArtifacts.length };
           }
         } catch (caught) {
           return { enabled: true, status: "failed" as const, providerStatus: response.status, error: caught instanceof Error ? caught.message : "label_content_fetch_failed" };
