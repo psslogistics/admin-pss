@@ -2531,7 +2531,17 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         : provider === "rivigo" && operation === "updates" ? JSON.stringify(payload)
         : provider === "rivigo" && operation === "cancellations" ? JSON.stringify(payload.cnotes_list ? { cnotesList: payload.cnotes_list } : {})
         : provider === "delhivery" && operation === "labels" && payload.label_api_variant === "pdf"
-          ? JSON.stringify({ lrnum: trackingNumber, size: delhiveryLabelApiSize(String(payload.label_size ?? "a4")), label_size: String(payload.label_size ?? "a4") })
+          ? JSON.stringify({
+              lrn: trackingNumber,
+              size: (() => {
+                const requested = String(payload.label_size ?? "a4");
+                return requested === "a4" ? "a4" : requested === "4x2.5" ? "md" : "sm";
+              })(),
+              callback: {
+                uri: "https://pss-api.psslogisticsadmin.workers.dev/v1/webhooks/delhivery",
+                method: "POST",
+              },
+            })
         : provider === "delhivery" && operation === "labels" && payload.label_api_variant === "pdf_form"
           ? `lrnum=${encodeURIComponent(trackingNumber)}&size=${encodeURIComponent(delhiveryLabelApiSize(String(payload.label_size ?? "a4")))}&label_size=${encodeURIComponent(String(payload.label_size ?? "a4"))}`
         : provider === "delhivery" && ["tracking", "shipment_status", "serviceability", "serviceability_route", "pickup_status", "pickup_slots", "labels", "lr_copy", "document"].includes(operation) ? ""
@@ -2793,6 +2803,26 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         content_base64: responseBytes ? providerBytesToBase64(responseBytes) : btoa(responseBody),
         content_type: responseBytes ? providerContentTypeFromBytes(responseBytes, response.headers.get("content-type") ?? "application/octet-stream") : response.headers.get("content-type") ?? "application/octet-stream",
       };
+    }
+    if (operation === "labels" && payload.label_api_variant === "pdf" && !isProviderPdfArtifact(artifact)) {
+      // Delhivery queues PDF generation and publishes the resulting PDF URLs
+      // through the label-links endpoint once the task completes. Poll that
+      // provider endpoint briefly so the client receives the actual PDFs in
+      // the same request instead of an empty formats menu.
+      const labelUrl = `${base.replace(/\/$/, "")}/v2/get-label-urls/${encodeURIComponent(delhiveryLabelApiSize(String(payload.label_size ?? "a4")))}/${encodeURIComponent(trackingNumber)}`;
+      for (let poll = 0; poll < 6 && !findProviderUrls(artifact).length; poll += 1) {
+        if (poll > 0) await new Promise((resolve) => setTimeout(resolve, 1200));
+        try {
+          const labelResponse = await providerFetch(labelUrl, { method: "GET", headers }, Math.max(providerTimeoutMs, 5000));
+          if (!labelResponse.ok) continue;
+          const labelBody = await providerResponseText(labelResponse, Math.max(providerTimeoutMs, 5000));
+          let labelJson: unknown = null;
+          try { labelJson = JSON.parse(labelBody); } catch { labelJson = null; }
+          if (labelJson && findProviderUrls(labelJson).length) artifact = labelJson;
+        } catch {
+          // Keep the queued response and continue the bounded retry window.
+        }
+      }
     }
     if (operation === "labels" && artifact && typeof artifact === "object") {
       const labelUrls = findProviderUrls(artifact, [], 0, "", response.url);
