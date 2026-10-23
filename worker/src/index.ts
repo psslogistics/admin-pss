@@ -2856,7 +2856,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
           // Keep that provider document instead of replacing it with a duplicate
           // box label; the client uses the returned order for the A4 output.
           for (const labelUrl of labelUrls.slice(0, requestedCopies)) {
-            const labelResponse = await providerFetch(labelUrl, { method: "GET", headers: { accept: "application/json,image/*,application/pdf" } }, attemptTimeoutMs);
+            const labelResponse = await providerFetch(labelUrl, { method: "GET", headers: { ...headers, accept: "application/json,image/*,application/pdf" } }, attemptTimeoutMs);
             if (!labelResponse.ok) throw new Error(`label_content_http_${labelResponse.status}`);
             const labelContentType = labelResponse.headers.get("content-type") ?? "application/octet-stream";
             if (labelContentType.toLowerCase().includes("json")) {
