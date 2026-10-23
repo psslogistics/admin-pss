@@ -1666,6 +1666,12 @@ function providerContentTypeFromBase64(value: string, fallback: string) {
   return fallback;
 }
 
+function isProviderPdfArtifact(value: unknown) {
+  const base64 = findProviderContentBase64(value);
+  if (!base64) return false;
+  return providerContentTypeFromBase64(base64, findProviderContentType(value) ?? "application/octet-stream") === "application/pdf";
+}
+
 function providerContentTypeFromBytes(bytes: Uint8Array, declared: string) {
   const header = new TextDecoder().decode(bytes.subarray(0, 5));
   if (header === "%PDF-") return "application/pdf";
@@ -2814,6 +2820,27 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
           }
         } catch (caught) {
           return { enabled: true, status: "failed" as const, providerStatus: response.status, error: caught instanceof Error ? caught.message : "label_content_fetch_failed" };
+        }
+      }
+      // Some older Delhivery B2B shipments return successful label URL
+      // responses whose assets are image-only, while the provider's LR print
+      // endpoint still publishes the authoritative PDF. Do not convert those
+      // images or pretend that they are the requested physical sticker size.
+      // Offer the provider PDF as A4 only; 4x2, 4x2.5, and 3x2 remain hidden
+      // unless their own Delhivery endpoint returns genuine PDFs.
+      if (operation === "labels" && String(payload.label_size ?? "") === "a4" && !isProviderPdfArtifact(artifact)) {
+        try {
+          const fallbackUrl = `${base.replace(/\/$/, "")}/lr_copy/print/${encodeURIComponent(trackingNumber)}?lr_copy_type=SHIPPER%20COPY`;
+          const fallbackResponse = await providerFetch(fallbackUrl, { method: "GET", headers: { accept: "application/pdf" } }, attemptTimeoutMs);
+          if (fallbackResponse.ok) {
+            const fallbackBytes = await providerResponseBytes(fallbackResponse, 12 * 1024 * 1024);
+            if (providerContentTypeFromBytes(fallbackBytes, fallbackResponse.headers.get("content-type") ?? "application/octet-stream") === "application/pdf") {
+              artifact = { content_base64: providerBytesToBase64(fallbackBytes), content_type: "application/pdf", copies: 1, source: "delhivery_lr_copy_fallback" };
+            }
+          }
+        } catch {
+          // Keep the original provider result. A fallback failure must not
+          // make a successful label endpoint look like a booking failure.
         }
       }
     }
