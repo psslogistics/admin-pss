@@ -1626,7 +1626,7 @@ function findProviderContentBase64(value: unknown, depth = 0): string | null {
   if (depth > 8 || value === null || value === undefined || typeof value !== "object") return null;
   if (Array.isArray(value)) { for (const item of value) { const found = findProviderContentBase64(item, depth + 1); if (found) return found; } return null; }
   const object = value as Record<string, unknown>;
-  for (const key of ["content_base64", "base64", "content", "data"]) {
+  for (const key of ["content_base64", "pdf_base64", "base64", "content", "pdf", "label", "file", "document", "data"]) {
     const candidate = object[key];
     if (typeof candidate === "string") {
       const normalized = candidate.trim().replace(/^data:[^;]+;base64,/, "");
@@ -2466,7 +2466,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     : provider === "trackon" && operation === "labels"
       ? trackonLabelUrl(trackonUrl!, trackingNumber, trackon!)
       : provider === "delhivery" && operation === "labels"
-        ? payload.label_api_variant === "pdf"
+        ? (payload.label_api_variant === "pdf" || payload.label_api_variant === "pdf_form")
           ? `${base.replace(/\/$/, "")}/docket/generate_label_pdf`
           : payload.label_api_variant === "legacy"
             ? `${base.replace(/\/$/, "")}/label/get_urls/${encodeURIComponent(delhiveryLabelApiSize(String(payload.label_size ?? "std")))}/${encodeURIComponent(trackingNumber)}`
@@ -2555,7 +2555,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       // XpressBees documents tracking as POST even though it is a read-only
       // lookup. Keep the generic GET behavior for Delhivery/Trackon tracking,
       // but send the XpressBees AWB body with POST to avoid provider HTTP 405.
-       const isGet = (["tracking", "shipment_status", "serviceability", "serviceability_route", "pickup_slots", "labels", "lr_copy", "document"].includes(operation) && provider !== "xpressbees" && provider !== "rivigo" && !(provider === "delhivery" && operation === "labels" && payload.label_api_variant === "pdf")) || (provider === "trackon" && operation === "labels");
+       const isGet = (["tracking", "shipment_status", "serviceability", "serviceability_route", "pickup_slots", "labels", "lr_copy", "document"].includes(operation) && provider !== "xpressbees" && provider !== "rivigo" && !(provider === "delhivery" && operation === "labels" && ["pdf", "pdf_form"].includes(String(payload.label_api_variant ?? "")))) || (provider === "trackon" && operation === "labels");
       const method = provider === "rivigo" && operation === "cancellations" ? "DELETE" : provider === "rivigo" && operation === "updates" ? "PUT" : isGet ? "GET" : "POST";
       if (provider === "delhivery" && operation === "labels" && payload.label_api_variant === "pdf_form") headers["content-type"] = "application/x-www-form-urlencoded";
       response = await providerFetch(url, { method, headers, body: isGet ? undefined : requestBody }, attemptTimeoutMs);
