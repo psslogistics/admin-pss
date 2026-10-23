@@ -2645,6 +2645,21 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (persistIntegration) await env.DB.prepare("UPDATE integration_requests SET status = ?, error_code = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(response.ok ? "succeeded" : "failed", response.ok ? null : `HTTP_${response.status}`, response.ok ? null : `${lastError}${providerFailureDetail ? `: ${providerFailureDetail}` : ""}`.slice(0, 500), integrationId).run();
   let parsedProviderBody: unknown = null;
   try { parsedProviderBody = JSON.parse(responseBody); } catch { parsedProviderBody = null; }
+  if (provider === "delhivery" && operation === "labels") {
+    const bodyObject = parsedProviderBody && typeof parsedProviderBody === "object" ? parsedProviderBody as Record<string, unknown> : null;
+    console.warn(JSON.stringify({
+      event: "delhivery_label_response",
+      request_id: requestIdValue,
+      variant: String(payload.label_api_variant ?? "primary"),
+      http_status: response.status,
+      content_type: response.headers.get("content-type"),
+      body_bytes: responseBytes?.byteLength ?? responseBody.length,
+      top_level_keys: bodyObject ? Object.keys(bodyObject).slice(0, 20) : [],
+      job_id: bodyObject ? findProviderReference(bodyObject, new Set(["job_id", "jobid", "request_id", "requestid"])) : null,
+      url_count: findProviderUrls(parsedProviderBody).length,
+      pdf_payload: isProviderPdfArtifact(parsedProviderBody),
+    }));
+  }
   const providerEdd = response.ok ? findProviderEdd(parsedProviderBody) : null;
   let normalizedTracking: NormalizedProviderTracking | null = null;
   let normalizedTrackingEvents: NormalizedProviderTracking[] = [];
