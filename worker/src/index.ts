@@ -2466,7 +2466,11 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     : provider === "trackon" && operation === "labels"
       ? trackonLabelUrl(trackonUrl!, trackingNumber, trackon!)
       : provider === "delhivery" && operation === "labels"
-        ? `${base.replace(/\/$/, "")}/v2/get-label-urls/${encodeURIComponent(delhiveryLabelApiSize(String(payload.label_size ?? "std")))}/${encodeURIComponent(trackingNumber)}`
+        ? payload.label_api_variant === "pdf"
+          ? `${base.replace(/\/$/, "")}/docket/generate_label_pdf`
+          : payload.label_api_variant === "legacy"
+            ? `${base.replace(/\/$/, "")}/label/get_urls/${encodeURIComponent(delhiveryLabelApiSize(String(payload.label_size ?? "std")))}/${encodeURIComponent(trackingNumber)}`
+            : `${base.replace(/\/$/, "")}/v2/get-label-urls/${encodeURIComponent(delhiveryLabelApiSize(String(payload.label_size ?? "std")))}/${encodeURIComponent(trackingNumber)}`
       : provider === "delhivery" && operation === "lr_copy"
         ? `${base.replace(/\/$/, "")}/lr_copy/print/${encodeURIComponent(trackingNumber)}?lr_copy_type=${encodeURIComponent(String(payload.lr_copy_type ?? "SHIPPER COPY"))}`
       : provider === "delhivery" && operation === "document"
@@ -2526,6 +2530,8 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         : provider === "rivigo" && operation === "shipments" ? JSON.stringify(rivigoCreate)
         : provider === "rivigo" && operation === "updates" ? JSON.stringify(payload)
         : provider === "rivigo" && operation === "cancellations" ? JSON.stringify(payload.cnotes_list ? { cnotesList: payload.cnotes_list } : {})
+        : provider === "delhivery" && operation === "labels" && payload.label_api_variant === "pdf"
+          ? JSON.stringify({ lrnum: trackingNumber })
         : provider === "delhivery" && ["tracking", "shipment_status", "serviceability", "serviceability_route", "pickup_status", "pickup_slots", "labels", "lr_copy", "document"].includes(operation) ? ""
         : operation === "tracking" ? JSON.stringify({ Appkey: trackon!.appKey, userId: trackon!.userId, password: trackon!.password, AWBNo: trackingNumber })
           : operation === "shipments" ? JSON.stringify(trackonPayload(payload, trackon!))
@@ -2547,7 +2553,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       // XpressBees documents tracking as POST even though it is a read-only
       // lookup. Keep the generic GET behavior for Delhivery/Trackon tracking,
       // but send the XpressBees AWB body with POST to avoid provider HTTP 405.
-       const isGet = (["tracking", "shipment_status", "serviceability", "serviceability_route", "pickup_slots", "labels", "lr_copy", "document"].includes(operation) && provider !== "xpressbees" && provider !== "rivigo") || (provider === "trackon" && operation === "labels");
+       const isGet = (["tracking", "shipment_status", "serviceability", "serviceability_route", "pickup_slots", "labels", "lr_copy", "document"].includes(operation) && provider !== "xpressbees" && provider !== "rivigo" && !(provider === "delhivery" && operation === "labels" && payload.label_api_variant === "pdf")) || (provider === "trackon" && operation === "labels");
       const method = provider === "rivigo" && operation === "cancellations" ? "DELETE" : provider === "rivigo" && operation === "updates" ? "PUT" : isGet ? "GET" : "POST";
       response = await providerFetch(url, { method, headers, body: isGet ? undefined : requestBody }, attemptTimeoutMs);
       if (!singleManifestCall && provider === "delhivery" && useDelhiveryB2b && response.status === 401 && attempt === 0 && credential) {
@@ -4521,10 +4527,17 @@ const worker = {
         const referenceCandidates = Array.from(new Set([shipment.lr_number, shipment.master_awb, shipment.tracking_number, shipment.provider_reference].map((value) => String(value ?? "").trim()).filter(Boolean)));
         let providerResult = await safeProviderRequest(env, "delhivery", operation, { shipment_id: shipment.id, tracking_number: providerReference, provider_reference: providerReference, provider_account_id: shipment.provider_account_id, label_size: requestedSize, boxes: Math.max(1, Number(shipment.pieces ?? 1)), lr_copy_type: url.searchParams.get("lr_copy_type") ?? undefined, doc_type: url.searchParams.get("doc_type") ?? "LM_POD" }, id, shipment.client_id);
         if (operation === "labels" && !isProviderPdfArtifact(providerResult.artifact)) {
-          for (const candidate of referenceCandidates) {
-            if (candidate === providerReference) continue;
-            const retryResult = await safeProviderRequest(env, "delhivery", operation, { shipment_id: shipment.id, tracking_number: candidate, provider_reference: candidate, provider_account_id: shipment.provider_account_id, label_size: requestedSize, boxes: Math.max(1, Number(shipment.pieces ?? 1)), lr_copy_type: url.searchParams.get("lr_copy_type") ?? undefined, doc_type: url.searchParams.get("doc_type") ?? "LM_POD" }, id, shipment.client_id);
-            if (isProviderPdfArtifact(retryResult.artifact)) { providerResult = retryResult; break; }
+          // Delhivery's B2B UI generates a PDF task separately from the
+          // label-link endpoint. Try the provider PDF API for every provider
+          // reference before telling the client that no label exists.
+          const labelVariants = ["pdf", "legacy"];
+          for (const labelApiVariant of labelVariants) {
+            for (const candidate of referenceCandidates) {
+              if (labelApiVariant === "legacy" && candidate === providerReference) continue;
+              const retryResult = await safeProviderRequest(env, "delhivery", operation, { shipment_id: shipment.id, tracking_number: candidate, provider_reference: candidate, provider_account_id: shipment.provider_account_id, label_size: requestedSize, label_api_variant: labelApiVariant, boxes: Math.max(1, Number(shipment.pieces ?? 1)), lr_copy_type: url.searchParams.get("lr_copy_type") ?? undefined, doc_type: url.searchParams.get("doc_type") ?? "LM_POD" }, id, shipment.client_id);
+              if (isProviderPdfArtifact(retryResult.artifact)) { providerResult = retryResult; break; }
+            }
+            if (isProviderPdfArtifact(providerResult.artifact)) break;
           }
         }
         return json({ ok: true, data: providerResult }, 200, headers);
