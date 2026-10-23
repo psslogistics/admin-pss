@@ -4518,8 +4518,15 @@ const worker = {
         // use the LR number. Keep the PUR and master AWB out of these paths.
          const providerReference = operation === "lr_copy" || operation === "document" ? shipment.lr_number : shipment.lr_number ?? shipment.master_awb;
          if (!providerReference) return error("PROVIDER_REFERENCE_UNAVAILABLE", operation === "lr_copy" || operation === "document" ? "The Delhivery LR/LRN is not available yet" : "The Delhivery LR/AWB is not available yet", 409, id, headers);
-        const payload = { shipment_id: shipment.id, tracking_number: providerReference, provider_reference: providerReference, provider_account_id: shipment.provider_account_id, label_size: requestedSize, boxes: Math.max(1, Number(shipment.pieces ?? 1)), lr_copy_type: url.searchParams.get("lr_copy_type") ?? undefined, doc_type: url.searchParams.get("doc_type") ?? "LM_POD" };
-        const providerResult = await safeProviderRequest(env, "delhivery", operation, payload, id, shipment.client_id);
+        const referenceCandidates = Array.from(new Set([shipment.lr_number, shipment.master_awb, shipment.tracking_number, shipment.provider_reference].map((value) => String(value ?? "").trim()).filter(Boolean)));
+        let providerResult = await safeProviderRequest(env, "delhivery", operation, { shipment_id: shipment.id, tracking_number: providerReference, provider_reference: providerReference, provider_account_id: shipment.provider_account_id, label_size: requestedSize, boxes: Math.max(1, Number(shipment.pieces ?? 1)), lr_copy_type: url.searchParams.get("lr_copy_type") ?? undefined, doc_type: url.searchParams.get("doc_type") ?? "LM_POD" }, id, shipment.client_id);
+        if (operation === "labels" && !isProviderPdfArtifact(providerResult.artifact)) {
+          for (const candidate of referenceCandidates) {
+            if (candidate === providerReference) continue;
+            const retryResult = await safeProviderRequest(env, "delhivery", operation, { shipment_id: shipment.id, tracking_number: candidate, provider_reference: candidate, provider_account_id: shipment.provider_account_id, label_size: requestedSize, boxes: Math.max(1, Number(shipment.pieces ?? 1)), lr_copy_type: url.searchParams.get("lr_copy_type") ?? undefined, doc_type: url.searchParams.get("doc_type") ?? "LM_POD" }, id, shipment.client_id);
+            if (isProviderPdfArtifact(retryResult.artifact)) { providerResult = retryResult; break; }
+          }
+        }
         return json({ ok: true, data: providerResult }, 200, headers);
       }
 
