@@ -1637,6 +1637,43 @@ function findProviderContentBase64(value: unknown, depth = 0): string | null {
   return null;
 }
 
+function findProviderContentType(value: unknown, depth = 0): string | null {
+  if (depth > 8 || value === null || value === undefined || typeof value !== "object") return null;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findProviderContentType(item, depth + 1);
+      if (found) return found;
+    }
+    return null;
+  }
+  const object = value as Record<string, unknown>;
+  for (const key of ["content_type", "contentType", "mime_type", "mimeType", "type"]) {
+    const candidate = object[key];
+    if (typeof candidate === "string" && candidate.includes("/")) return candidate.split(";", 1)[0].trim().toLowerCase();
+  }
+  for (const item of Object.values(object)) {
+    const found = findProviderContentType(item, depth + 1);
+    if (found) return found;
+  }
+  return null;
+}
+
+function providerContentTypeFromBase64(value: string, fallback: string) {
+  const normalized = value.replace(/^data:[^;]+;base64,/, "").trim();
+  if (normalized.startsWith("JVBERi0")) return "application/pdf";
+  if (normalized.startsWith("iVBORw0KGgo")) return "image/png";
+  if (normalized.startsWith("/9j/")) return "image/jpeg";
+  return fallback;
+}
+
+function providerContentTypeFromBytes(bytes: Uint8Array, declared: string) {
+  const header = new TextDecoder().decode(bytes.subarray(0, 5));
+  if (header === "%PDF-") return "application/pdf";
+  if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return "image/png";
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
+  return declared.split(";", 1)[0].trim().toLowerCase() || "application/octet-stream";
+}
+
 function findProviderToken(value: unknown, keys: Set<string>, depth = 0): string | null {
   if (depth > 8 || value === null || value === undefined) return null;
   const normalizedKeys = new Set([...keys].map((key) => key.toLowerCase()));
@@ -2727,7 +2764,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     } catch {
       artifact = {
         content_base64: responseBytes ? providerBytesToBase64(responseBytes) : btoa(responseBody),
-        content_type: response.headers.get("content-type") ?? "application/octet-stream",
+        content_type: responseBytes ? providerContentTypeFromBytes(responseBytes, response.headers.get("content-type") ?? "application/octet-stream") : response.headers.get("content-type") ?? "application/octet-stream",
       };
     }
     if (operation === "labels" && artifact && typeof artifact === "object") {
@@ -2748,10 +2785,10 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
               let labelJson: unknown = null;
               try { labelJson = JSON.parse(labelBody); } catch { labelJson = null; }
               const labelBase64 = findProviderContentBase64(labelJson);
-              if (labelBase64) labelArtifacts.push({ content_base64: labelBase64, content_type: "image/png" });
+              if (labelBase64) labelArtifacts.push({ content_base64: labelBase64, content_type: providerContentTypeFromBase64(labelBase64, findProviderContentType(labelJson) ?? "image/png") });
             } else {
               const labelBytes = await providerResponseBytes(labelResponse, 12 * 1024 * 1024);
-              labelArtifacts.push({ content_base64: providerBytesToBase64(labelBytes), content_type: labelContentType });
+              labelArtifacts.push({ content_base64: providerBytesToBase64(labelBytes), content_type: providerContentTypeFromBytes(labelBytes, labelContentType) });
             }
           }
           if (labelArtifacts.length) {
