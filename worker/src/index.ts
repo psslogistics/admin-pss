@@ -4456,8 +4456,8 @@ const worker = {
         const url = new URL(request.url);
         const kind = shipmentArtifact[2];
         const operation = kind === "lr-copy" ? "lr_copy" : kind === "document" ? "document" : "labels";
-        const requestedSize = url.searchParams.get("size") ?? (kind === "sticker" ? "std" : "a4");
-        if (operation === "labels" && !["sm", "md", "a4", "std"].includes(requestedSize)) return error("INVALID_REQUEST", "Delhivery label size must be sm, md, a4, or std", 400, id, headers);
+        const requestedSize = url.searchParams.get("size") ?? (kind === "sticker" ? "3x2" : "a4");
+        if (operation === "labels" && !["a4", "4x2", "4x2.5", "3x2"].includes(requestedSize)) return error("INVALID_REQUEST", "Delhivery label size must be a4, 4x2, 4x2.5, or 3x2", 400, id, headers);
         if (!shipment.lr_number && !shipment.master_awb && shipment.provider_booking_id) {
           await safeProviderRequest(env, "delhivery", "shipment_status", {
             shipment_id: shipment.id,
