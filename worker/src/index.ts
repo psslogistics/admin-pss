@@ -2858,10 +2858,12 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
           // get_urls returns one asset per box plus a final MPS document asset.
           // Keep that provider document instead of replacing it with a duplicate
           // box label; the client uses the returned order for the A4 output.
+          const labelFetchResults: string[] = [];
           for (const labelUrl of labelUrls.slice(0, requestedCopies)) {
             const labelResponse = await providerFetch(labelUrl, { method: "GET", headers: { ...headers, accept: "application/json,image/*,application/pdf" } }, attemptTimeoutMs);
-            if (!labelResponse.ok) throw new Error(`label_content_http_${labelResponse.status}`);
             const labelContentType = labelResponse.headers.get("content-type") ?? "application/octet-stream";
+            labelFetchResults.push(`${labelResponse.status}:${labelContentType}`);
+            if (!labelResponse.ok) throw new Error(`label_content_http_${labelResponse.status}`);
             if (labelContentType.toLowerCase().includes("json")) {
               const labelBody = await providerResponseText(labelResponse, attemptTimeoutMs);
               let labelJson: unknown = null;
@@ -2882,6 +2884,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
             // missing box label or MPS/document by duplicating another asset.
             artifact = { artifacts: labelArtifacts, content_type: labelArtifacts[0].content_type, copies: labelArtifacts.length };
           }
+          console.warn(JSON.stringify({ event: "delhivery_label_assets", request_id: requestIdValue, variant: String(payload.label_api_variant ?? "primary"), requested_size: String(payload.label_size ?? "a4"), url_count: labelUrls.length, fetch_results: labelFetchResults, pdf_count: labelArtifacts.length }));
         } catch (caught) {
           return { enabled: true, status: "failed" as const, providerStatus: response.status, error: caught instanceof Error ? caught.message : "label_content_fetch_failed" };
         }
@@ -4588,7 +4591,12 @@ const worker = {
           // Delhivery's B2B UI generates a PDF task separately from the
           // label-link endpoint. Try the provider PDF API for every provider
           // reference before telling the client that no label exists.
-          const labelVariants = ["pdf", "pdf_alt", "pdf_form", "pdf_form_alt", "legacy", "legacy_alt", "primary_alt"];
+          // The production B2B account is served by Delhivery's alternate
+          // host. Try its direct label-link contract first; the PDF job route
+          // is only a fallback. Keeping the working route first also avoids
+          // creating several duplicate provider jobs and triggering Delhivery
+          // rate limits before the UI can receive the formats.
+          const labelVariants = ["primary_alt", "pdf_alt", "pdf_form_alt", "legacy_alt", "primary", "pdf", "pdf_form", "legacy"];
           for (const labelApiVariant of labelVariants) {
             for (const candidate of referenceCandidates) {
               if (labelApiVariant === "legacy" && candidate === providerReference) continue;
