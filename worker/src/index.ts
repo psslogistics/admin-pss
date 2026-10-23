@@ -2466,7 +2466,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     : provider === "trackon" && operation === "labels"
       ? trackonLabelUrl(trackonUrl!, trackingNumber, trackon!)
       : provider === "delhivery" && operation === "labels"
-        ? `${base.replace(/\/$/, "")}/label/get_urls/${encodeURIComponent(delhiveryLabelApiSize(String(payload.label_size ?? "std")))}/${encodeURIComponent(trackingNumber)}`
+        ? `${base.replace(/\/$/, "")}/v2/get-label-urls/${encodeURIComponent(delhiveryLabelApiSize(String(payload.label_size ?? "std")))}/${encodeURIComponent(trackingNumber)}`
       : provider === "delhivery" && operation === "lr_copy"
         ? `${base.replace(/\/$/, "")}/lr_copy/print/${encodeURIComponent(trackingNumber)}?lr_copy_type=${encodeURIComponent(String(payload.lr_copy_type ?? "SHIPPER COPY"))}`
       : provider === "delhivery" && operation === "document"
