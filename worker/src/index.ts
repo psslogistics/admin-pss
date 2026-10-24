@@ -2777,7 +2777,10 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       if (!completedBilling.ok) console.error(JSON.stringify({ event: "shipment_billing_deferred", request_id: requestIdValue, shipment_id: payload.shipment_id, error: completedBilling.error }));
       return { enabled: true, status: "accepted" as const, providerStatus: response.status, providerPending: false, providerBookingId: statusJobId, providerReference: statusAwb ?? statusLr, lr_number: statusLr, master_awb: statusAwb };
     }
-    return { enabled: true, status: "accepted" as const, providerStatus: response.status, providerPending: true, providerBookingId: statusJobId, message: "Delhivery has not published the LR/AWB yet." };
+    const pendingMessage = "Delhivery accepted the booking but has not published the LR/AWB yet.";
+    await env.DB.prepare("UPDATE shipments SET provider_booking_id = COALESCE(?, provider_booking_id), provider_sync_status = 'pending', provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ? AND provider_reference IS NULL AND lr_number IS NULL AND master_awb IS NULL")
+      .bind(statusJobId, pendingMessage, payload.shipment_id, clientId).run();
+    return { enabled: true, status: "accepted" as const, providerStatus: response.status, providerPending: true, providerBookingId: statusJobId, message: pendingMessage };
   }
   if (response.ok && provider === "delhivery" && operation === "pickup_slots") {
     return { enabled: true, status: "accepted" as const, providerStatus: response.status, dates: normalizeDelhiveryPickupSlots(parsedProviderBody) };
