@@ -926,7 +926,15 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
     pincode: existing.pincode?.trim() || origin.pincode,
     phone: existing.contact?.trim() || origin.phone,
   } : origin;
-  const baseLocalName = existing?.name?.trim() || delhiveryWarehouseName(resolvedOrigin);
+  const generatedLocalName = delhiveryWarehouseName(resolvedOrigin);
+  // Older retries could persist one or more ` - PSS-xxxxxxxx` suffixes on
+  // the same saved warehouse. Treat those names as migration artefacts and
+  // always converge back to the deterministic provider identity. Otherwise a
+  // retry can keep manifesting against a facility that Delhivery never
+  // configured, even though the canonical facility is available.
+  const existingLocalName = existing?.name?.trim() || "";
+  const hasRetrySuffix = /\s-\sPSS-[0-9a-f]{8}(?:\s-\sPSS-[0-9a-f]{8})*$/i.test(existingLocalName);
+  const baseLocalName = existingLocalName && !hasRetrySuffix ? existingLocalName : generatedLocalName;
   const existingHasConfirmedBooking = existing
     ? await delhiveryWarehouseHasConfirmedBooking(env, clientId, providerAccountId, resolvedOrigin)
     : false;
