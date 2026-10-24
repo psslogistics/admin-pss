@@ -2745,7 +2745,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       pdf_payload: isProviderPdfArtifact(parsedProviderBody),
     }));
   }
-  const providerEdd = response.ok ? findProviderEdd(parsedProviderBody) : null;
+  let providerEdd = response.ok ? findProviderEdd(parsedProviderBody) : null;
   let normalizedTracking: NormalizedProviderTracking | null = null;
   let normalizedTrackingEvents: NormalizedProviderTracking[] = [];
   if (operation === "tracking" && clientId && typeof payload.shipment_id === "string") {
@@ -2758,6 +2758,9 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       normalizedTrackingEvents = normalizeProviderTrackingEvents(JSON.parse(responseBody));
       normalizedTracking = normalizedTrackingEvents.at(-1) ?? null;
     } catch { normalizedTracking = null; normalizedTrackingEvents = []; }
+    if (!providerEdd) {
+      providerEdd = normalizedTrackingEvents.map((event) => normalizeProviderEddFromText(event.description)).find((value): value is string => Boolean(value)) ?? null;
+    }
     if (normalizedTracking && clientId && typeof payload.shipment_id === "string") {
       const current = await env.DB.prepare("SELECT status FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(payload.shipment_id, clientId).first<{ status: string }>();
       const currentStatus = String(current?.status ?? "").toLowerCase();
@@ -2794,6 +2797,12 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     await env.DB.prepare("UPDATE shipments SET provider_booking_id = COALESCE(?, provider_booking_id), provider_sync_status = 'pending', status = 'exception', provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ? AND provider_reference IS NULL AND lr_number IS NULL AND master_awb IS NULL")
       .bind(statusJobId, pendingMessage, payload.shipment_id, clientId).run();
     return { enabled: true, status: "accepted" as const, providerStatus: response.status, providerPending: true, providerBookingId: statusJobId, message: pendingMessage };
+  }
+  if (response.ok && provider === "delhivery" && operation === "shipment_status" && clientId && typeof payload.shipment_id === "string" && !String(payload.tracking_number ?? payload.lr_number ?? payload.provider_reference ?? "").trim()) {
+    const pendingMessage = "Delhivery accepted the booking but has not published the LR/AWB yet.";
+    await env.DB.prepare("UPDATE shipments SET provider_sync_status = 'pending', status = 'exception', provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ? AND provider_booking_id IS NOT NULL AND provider_reference IS NULL AND lr_number IS NULL AND master_awb IS NULL")
+      .bind(pendingMessage, payload.shipment_id, clientId).run();
+    return { enabled: true, status: "accepted" as const, providerStatus: response.status, providerPending: true, providerBookingId: String(payload.provider_booking_id ?? "").trim() || null, message: pendingMessage };
   }
   if (response.ok && provider === "delhivery" && operation === "pickup_slots") {
     return { enabled: true, status: "accepted" as const, providerStatus: response.status, dates: normalizeDelhiveryPickupSlots(parsedProviderBody) };
