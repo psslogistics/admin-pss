@@ -1008,19 +1008,24 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
     same_as_fwd_add: true,
     ret_address: { pin: resolvedOrigin.pincode, address: resolvedOrigin.line },
   };
+  // The manifest service is backed by Delhivery's legacy client-warehouse
+  // registry. Prefer the account-scoped production API token for that
+  // registry; the B2B JWT endpoint can show an Active facility in the console
+  // while the manifest service still reports it as unconfigured. Keep the B2B
+  // endpoint as a fallback for accounts that do not expose the legacy token.
   const registrationAttempts = [
-    {
-      contract: "b2b",
-      endpoint: `${String(b2bBaseUrl).replace(/\/$/, "")}/client-warehouse/create/`,
-      authorization: `Bearer ${token}`,
-      payload: b2bWarehousePayload,
-    },
     ...(registrationToken ? [{
       contract: "legacy",
       endpoint: "https://track.delhivery.com/api/backend/clientwarehouse/create/",
       authorization: `Token ${registrationToken}`,
       payload: warehousePayload,
     }] : []),
+    {
+      contract: "b2b",
+      endpoint: `${String(b2bBaseUrl).replace(/\/$/, "")}/client-warehouse/create/`,
+      authorization: `Bearer ${token}`,
+      payload: b2bWarehousePayload,
+    },
   ];
   let response: Response | null = null;
   let responseText = "";
