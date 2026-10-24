@@ -1680,16 +1680,20 @@ function providerContentTypeFromBytes(bytes: Uint8Array, declared: string) {
   return declared.split(";", 1)[0].trim().toLowerCase() || "application/octet-stream";
 }
 
-// Delhivery's UI exposes physical sizes, while its label API still accepts
-// the provider's legacy size codes. Keep this translation server-side so the
-// client never has to know or display those codes.
+// Delhivery's UI exposes physical sizes, while the documented B2B API accepts
+// only sm, md, and a4. Keep this translation server-side so the client stays
+// on the physical-size contract shown to users.
 function delhiveryLabelApiSize(size: string) {
   return ({
     a4: "a4",
-    "4x2": "std",
+    "4x2": "sm",
     "4x2.5": "md",
     "3x2": "sm",
   } as Record<string, string>)[size] ?? size;
+}
+
+function delhiveryB2bDocsBase() {
+  return "https://btob.api.delhivery.com";
 }
 
 function delhiveryUcpLabelSize(size: string) {
@@ -2465,8 +2469,11 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     ? (String(base).replace(/\/$/, "") === "https://btob.api.delhivery.com" ? "https://ltl-clients-api.delhivery.com" : "https://btob.api.delhivery.com")
     : "";
   const labelVariant = String(payload.label_api_variant ?? "");
-  const delhiveryLabelBase = provider === "delhivery" && operation === "labels" && labelVariant.endsWith("_alt")
-    ? delhiveryAlternateB2bBase
+  // Delhivery's published B2B OpenAPI contract is served from btob.api. The
+  // ltl-clients host is retained for the existing manifest/tracking flows, but
+  // label generation must use the documented production server.
+  const delhiveryLabelBase = provider === "delhivery" && operation === "labels"
+    ? labelVariant.endsWith("_alt") ? delhiveryAlternateB2bBase : delhiveryB2bDocsBase()
     : base;
   const trackonUrl = provider === "trackon" ? operation === "tracking" ? env.TRACKON_TRACKING_URL : operation === "shipments" ? env.TRACKON_BOOKING_URL : env.TRACKON_LABEL_URL : undefined;
   if (provider === "trackon" && !trackonUrl) return { enabled: false, status: "not_configured" as const, reason: `Trackon ${operation} endpoint is not configured` };
@@ -2547,8 +2554,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
           ? JSON.stringify({
               lrn: trackingNumber,
               size: (() => {
-                const requested = String(payload.label_size ?? "a4");
-                return requested === "a4" ? "a4" : requested === "4x2.5" ? "md" : "sm";
+              return delhiveryLabelApiSize(String(payload.label_size ?? "a4"));
               })(),
               callback: {
                 uri: "https://pss-api.psslogisticsadmin.workers.dev/v1/webhooks/delhivery",
@@ -4596,9 +4602,13 @@ const worker = {
         // Delhivery's B2B label endpoint validates its path parameter as an
         // active LR number (LRN), not the master AWB. LR copy/document also
         // use the LR number. Keep the PUR and master AWB out of these paths.
-         const providerReference = operation === "lr_copy" || operation === "document" ? shipment.lr_number : shipment.lr_number ?? shipment.master_awb;
+         const providerReference = operation === "labels" || operation === "lr_copy" || operation === "document"
+           ? shipment.lr_number
+           : shipment.lr_number ?? shipment.master_awb;
          if (!providerReference) return error("PROVIDER_REFERENCE_UNAVAILABLE", operation === "lr_copy" || operation === "document" ? "The Delhivery LR/LRN is not available yet" : "The Delhivery LR/AWB is not available yet", 409, id, headers);
-        const referenceCandidates = Array.from(new Set([shipment.lr_number, shipment.master_awb, shipment.tracking_number, shipment.provider_reference].map((value) => String(value ?? "").trim()).filter(Boolean)));
+        const referenceCandidates = operation === "labels"
+          ? [String(shipment.lr_number ?? "").trim()].filter(Boolean)
+          : Array.from(new Set([shipment.lr_number, shipment.master_awb, shipment.tracking_number, shipment.provider_reference].map((value) => String(value ?? "").trim()).filter(Boolean)));
         let providerResult = await safeProviderRequest(env, "delhivery", operation, { shipment_id: shipment.id, tracking_number: providerReference, provider_reference: providerReference, provider_account_id: shipment.provider_account_id, label_size: requestedSize, boxes: Math.max(1, Number(shipment.pieces ?? 1)), lr_copy_type: url.searchParams.get("lr_copy_type") ?? undefined, doc_type: url.searchParams.get("doc_type") ?? "LM_POD" }, id, shipment.client_id);
         if (operation === "labels" && !isProviderPdfArtifact(providerResult.artifact)) {
           // Delhivery's B2B UI generates a PDF task separately from the
@@ -4609,7 +4619,9 @@ const worker = {
           // is only a fallback. Keeping the working route first also avoids
           // creating several duplicate provider jobs and triggering Delhivery
           // rate limits before the UI can receive the formats.
-          const labelVariants = ["ucp", "primary_alt", "pdf_alt", "pdf_form_alt", "legacy_alt", "primary", "pdf", "pdf_form", "legacy"];
+          // Follow Delhivery's published B2B contract first. The browser-only
+          // UCP print route is intentionally not used by the server Worker.
+          const labelVariants = ["primary", "pdf", "primary_alt", "pdf_alt", "legacy_alt", "legacy"];
           for (const labelApiVariant of labelVariants) {
             for (const candidate of referenceCandidates) {
               if (labelApiVariant === "legacy" && candidate === providerReference) continue;
