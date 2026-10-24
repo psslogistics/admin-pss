@@ -288,7 +288,10 @@ function validProviderShipmentTransition(current: string, next: string) {
 }
 function normalizeProviderShipmentStatus(value: unknown) {
   const status = String(value ?? "").trim().toLowerCase().replace(/[\s-]+/g, "_");
-  if (!status) return "in_transit";
+  // An absent provider status is unknown, never in transit. Treating a
+  // missing/unsupported response as transit creates false movement and can
+  // overwrite a real booking failure across every panel.
+  if (!status) return "unknown";
   if (["booked", "manifested", "pickup_scheduled", "order_created", "not_picked", "not_picked_up", "not_picked_yet", "not_pickup"].includes(status)) return "booked";
   if (["picked", "picked_up", "pickup_complete", "pickup_completed"].includes(status)) return "picked_up";
   if (["in_transit", "transit", "shipped", "dispatched", "out_for_pickup"].includes(status)) return "in_transit";
@@ -1831,7 +1834,7 @@ function normalizeProviderTrackingEvents(value: unknown, depth = 0): NormalizedP
   };
   collectScans(value, depth);
   const currentStatus = (() => {
-    let found = "in_transit";
+    let found = "unknown";
     const walk = (node: unknown, level: number) => {
       if (level > 8 || node === null || node === undefined || typeof node !== "object") return;
       if (Array.isArray(node)) { for (const item of node) walk(item, level + 1); return; }
@@ -1870,7 +1873,8 @@ function normalizeProviderTrackingEvents(value: unknown, depth = 0): NormalizedP
     const description = String(scan.Instructions ?? scan.instructions ?? scan.Scan ?? scan.scan ?? scan.Description ?? scan.description ?? "Provider scan").trim().slice(0, 500);
     const eventTimeValue = scan.ScanDateTime ?? scan.scan_date_time ?? scan.StatusDateTime ?? scan.status_date_time ?? scan.event_time ?? scan.eventTime ?? scan.timestamp;
     const location = String(scan.ScannedLocation ?? scan.scanned_location ?? scan.StatusLocation ?? scan.status_location ?? scan.Location ?? scan.location ?? scan.City ?? scan.city ?? "").trim().slice(0, 200);
-    candidates.push({ status: statusFromScanText(description, currentStatus), location, description, eventTime: typeof eventTimeValue === "string" ? eventTimeValue : null });
+    const status = statusFromScanText(description, currentStatus);
+    if (knownStatuses.has(status)) candidates.push({ status, location, description, eventTime: typeof eventTimeValue === "string" ? eventTimeValue : null });
   }
   // If the provider supplied its canonical scan array, use it as the source
   // of truth. The recursive fallback below is only for older/provider-specific
