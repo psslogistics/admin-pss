@@ -2856,7 +2856,10 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     if (useDelhiveryB2b && !createdReference && providerBookingId) {
       const pending = "Delhivery accepted the booking and returned a provider job ID. LR/AWB is still being confirmed.";
       await env.DB.prepare("UPDATE shipments SET provider_booking_id = COALESCE(?, provider_booking_id), provider_sync_status = 'pending', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(providerBookingId, payload.shipment_id, clientId).run();
-      await env.DB.prepare("UPDATE integration_requests SET status = 'accepted', error_code = NULL, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(pending, integrationId).run();
+      // `accepted` is a provider result, not a persisted integration-request
+      // status. Keep the request pending until Delhivery publishes the LR/AWB;
+      // the table intentionally permits only pending/succeeded/failed/retrying.
+      await env.DB.prepare("UPDATE integration_requests SET status = 'pending', error_code = NULL, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(pending, integrationId).run();
       return { enabled: true, status: "accepted" as const, providerStatus: response.status, providerPending: true, providerBookingId, message: pending };
     }
     if (useDelhiveryB2b && !createdReference) {
