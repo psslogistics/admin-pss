@@ -941,8 +941,13 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   // provider's idempotent/already-configured response is the authority.
   const existingProviderLocation = existing && (existing.provider_status === "active" || existing.provider_status === "pending")
     && Boolean((existing.provider_name?.trim() || existing.name?.trim()) && (existing.provider_reference?.trim() || existingHasConfirmedBooking));
-  const replacementId = existing && !existingHasConfirmedBooking && !existingProviderLocation ? crypto.randomUUID() : null;
-  const localName = replacementId ? `${baseLocalName} - PSS-${replacementId.slice(0, 8)}` : baseLocalName;
+  // Keep one stable provider facility name for an address. Generating a new
+  // PSS-suffixed name on every activation retry creates duplicate Delhivery
+  // facilities and can leave the manifest service rejecting the newest name
+  // as not configured. Re-registration must be idempotent on the canonical
+  // name; the provider's duplicate/already-configured response is the source
+  // of truth, followed by the manifest attempt.
+  const localName = baseLocalName;
   const providerName = localName;
   const warehouseIdentityHash = await sha256(`${providerName}|${resolvedOrigin.pincode}`);
   delhiveryWarehouseLog(requestIdValue, "start", { account_id: providerAccountId ?? null, identity_hash: warehouseIdentityHash });
