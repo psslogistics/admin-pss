@@ -1692,6 +1692,10 @@ function delhiveryLabelApiSize(size: string) {
   } as Record<string, string>)[size] ?? size;
 }
 
+function delhiveryUcpLabelSize(size: string) {
+  return ({ a4: "a4", "4x2": "sm", "4x2.5": "md", "3x2": "sm" } as Record<string, string>)[size] ?? "a4";
+}
+
 function findProviderToken(value: unknown, keys: Set<string>, depth = 0): string | null {
   if (depth > 8 || value === null || value === undefined) return null;
   const normalizedKeys = new Set([...keys].map((key) => key.toLowerCase()));
@@ -2473,7 +2477,9 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     : provider === "trackon" && operation === "labels"
       ? trackonLabelUrl(trackonUrl!, trackingNumber, trackon!)
       : provider === "delhivery" && operation === "labels"
-        ? (labelVariant === "pdf" || labelVariant === "pdf_alt" || labelVariant === "pdf_form" || labelVariant === "pdf_form_alt")
+        ? labelVariant === "ucp"
+          ? "https://ucp-egw.delhivery.com/101/api/v1/doc/label/print"
+          : (labelVariant === "pdf" || labelVariant === "pdf_alt" || labelVariant === "pdf_form" || labelVariant === "pdf_form_alt")
           ? `${String(delhiveryLabelBase).replace(/\/$/, "")}/docket/generate_label_pdf`
           : labelVariant === "legacy" || labelVariant === "legacy_alt"
             ? `${String(delhiveryLabelBase).replace(/\/$/, "")}/label/get_urls/${encodeURIComponent(delhiveryLabelApiSize(String(payload.label_size ?? "std")))}/${encodeURIComponent(trackingNumber)}`
@@ -2549,6 +2555,8 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
                 method: "POST",
               },
             })
+        : provider === "delhivery" && operation === "labels" && payload.label_api_variant === "ucp"
+          ? JSON.stringify({ doc_type: "shipping_label", size: delhiveryUcpLabelSize(String(payload.label_size ?? "a4")), lr_numbers: [trackingNumber] })
         : provider === "delhivery" && operation === "labels" && (payload.label_api_variant === "pdf_form" || payload.label_api_variant === "pdf_form_alt")
           ? `lrnum=${encodeURIComponent(trackingNumber)}&size=${encodeURIComponent(delhiveryLabelApiSize(String(payload.label_size ?? "a4")))}&label_size=${encodeURIComponent(String(payload.label_size ?? "a4"))}`
         : provider === "delhivery" && ["tracking", "shipment_status", "serviceability", "serviceability_route", "pickup_status", "pickup_slots", "labels", "lr_copy", "document"].includes(operation) ? ""
@@ -2572,9 +2580,14 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       // XpressBees documents tracking as POST even though it is a read-only
       // lookup. Keep the generic GET behavior for Delhivery/Trackon tracking,
       // but send the XpressBees AWB body with POST to avoid provider HTTP 405.
-       const isGet = (["tracking", "shipment_status", "serviceability", "serviceability_route", "pickup_slots", "labels", "lr_copy", "document"].includes(operation) && provider !== "xpressbees" && provider !== "rivigo" && !(provider === "delhivery" && operation === "labels" && ["pdf", "pdf_alt", "pdf_form", "pdf_form_alt"].includes(labelVariant))) || (provider === "trackon" && operation === "labels");
+       const isGet = (["tracking", "shipment_status", "serviceability", "serviceability_route", "pickup_slots", "labels", "lr_copy", "document"].includes(operation) && provider !== "xpressbees" && provider !== "rivigo" && !(provider === "delhivery" && operation === "labels" && ["ucp", "pdf", "pdf_alt", "pdf_form", "pdf_form_alt"].includes(labelVariant))) || (provider === "trackon" && operation === "labels");
       const method = provider === "rivigo" && operation === "cancellations" ? "DELETE" : provider === "rivigo" && operation === "updates" ? "PUT" : isGet ? "GET" : "POST";
       if (provider === "delhivery" && operation === "labels" && (payload.label_api_variant === "pdf_form" || payload.label_api_variant === "pdf_form_alt")) headers["content-type"] = "application/x-www-form-urlencoded";
+      if (provider === "delhivery" && operation === "labels" && payload.label_api_variant === "ucp") {
+        headers["content-type"] = "application/json";
+        headers["accept"] = "application/pdf";
+        headers["X-Hq-Client-Id"] = "cms::client::4eb099bf-cada-11ed-889a-06153c838f22";
+      }
       response = await providerFetch(url, { method, headers, body: isGet ? undefined : requestBody }, attemptTimeoutMs);
       if (!singleManifestCall && provider === "delhivery" && useDelhiveryB2b && response.status === 401 && attempt === 0 && credential) {
         const refreshedToken = await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs, true);
@@ -4596,7 +4609,7 @@ const worker = {
           // is only a fallback. Keeping the working route first also avoids
           // creating several duplicate provider jobs and triggering Delhivery
           // rate limits before the UI can receive the formats.
-          const labelVariants = ["primary_alt", "pdf_alt", "pdf_form_alt", "legacy_alt", "primary", "pdf", "pdf_form", "legacy"];
+          const labelVariants = ["ucp", "primary_alt", "pdf_alt", "pdf_form_alt", "legacy_alt", "primary", "pdf", "pdf_form", "legacy"];
           for (const labelApiVariant of labelVariants) {
             for (const candidate of referenceCandidates) {
               if (labelApiVariant === "legacy" && candidate === providerReference) continue;
