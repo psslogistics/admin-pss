@@ -4744,7 +4744,10 @@ const worker = {
           // browser-only and legacy routes: four size checks multiplied by
           // those fallbacks left the client menu spinning for too long and
           // could create duplicate provider print jobs.
-          const labelVariants = ["pdf"];
+          // Delhivery accounts are split between the documented B2B host and
+          // the legacy LTL client host. The native One UI uses the latter for
+          // some accounts, so retry the same PDF job contract there as well.
+          const labelVariants = ["pdf", "pdf_alt"];
           for (const labelApiVariant of labelVariants) {
             for (const candidate of referenceCandidates) {
               if (labelApiVariant === "legacy" && candidate === providerReference) continue;
