@@ -3414,7 +3414,11 @@ async function retryPendingDelhiveryBookings(env: Env, cron: string) {
 }
 
 async function reconcilePendingDelhiveryReferences(env: Env, cron: string) {
-  const pending = await env.DB.prepare("SELECT id, client_id, provider_account_id, provider_booking_id FROM shipments WHERE provider = 'delhivery' AND status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery') AND (provider_sync_status = 'pending' OR (provider_sync_status IS NULL AND provider_booking_id IS NOT NULL)) AND provider_booking_id IS NOT NULL ORDER BY updated_at ASC LIMIT 20").all<{ id: string; client_id: string; provider_account_id: string | null; provider_booking_id: string }>();
+  // A provider job can be accepted while the original request still ends in
+  // a local exception (for example, after a persistence error). Keep polling
+  // any reference-less accepted job, regardless of the local display status;
+  // otherwise it becomes permanently stranded and can never receive its LR.
+  const pending = await env.DB.prepare("SELECT id, client_id, provider_account_id, provider_booking_id FROM shipments WHERE provider = 'delhivery' AND provider_booking_id IS NOT NULL AND COALESCE(lr_number, master_awb, provider_reference, '') = '' AND (status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery') OR (status = 'exception' AND provider_sync_status IN ('pending', 'failed'))) ORDER BY updated_at ASC LIMIT 20").all<{ id: string; client_id: string; provider_account_id: string | null; provider_booking_id: string }>();
   for (const shipment of pending.results) {
     try {
       await safeProviderRequest(env, "delhivery", "shipment_status", { shipment_id: shipment.id, provider_booking_id: shipment.provider_booking_id, provider_account_id: shipment.provider_account_id }, `cron:${cron}:delhivery-reference:${shipment.id}`, shipment.client_id, undefined, 10000);
@@ -3583,13 +3587,19 @@ async function reconcileShipmentLinkedPickupStatuses(env: Env, cron: string) {
 }
 
 async function refreshDelhiveryPickupStatuses(env: Env, cron: string) {
+  // B2B pickup status is represented by the linked shipment movement events.
+  // The One web-console endpoint below is not a supported B2B API route and
+  // returns 403 for B2B credentials. Exclude B2B requests from this poll so a
+  // bad endpoint cannot overwrite or obscure the linked-shipment truth.
   const rows = await env.DB.prepare(`
     SELECT id, client_id, provider_reference, status
-    FROM pickup_requests
-    WHERE provider = 'delhivery'
-      AND provider_reference IS NOT NULL
-      AND status NOT IN ('cancelled', 'completed', 'failed')
-    ORDER BY updated_at ASC
+    FROM pickup_requests pr
+    LEFT JOIN provider_accounts pa ON pa.id = pr.provider_account_id
+    WHERE pr.provider = 'delhivery'
+      AND (pa.id IS NULL OR lower(COALESCE(pa.account_name, '')) NOT LIKE '%b2b%')
+      AND pr.provider_reference IS NOT NULL
+      AND pr.status NOT IN ('cancelled', 'completed', 'failed')
+    ORDER BY pr.updated_at ASC
     LIMIT 75
   `).all<{ id: string; client_id: string; provider_reference: string; status: string }>();
   let updated = 0;
