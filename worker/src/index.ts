@@ -4747,7 +4747,7 @@ const worker = {
           // Delhivery accounts are split between the documented B2B host and
           // the legacy LTL client host. The native One UI uses the latter for
           // some accounts, so retry the same PDF job contract there as well.
-          const labelVariants = ["pdf", "pdf_alt"];
+          const labelVariants = ["pdf", "pdf_alt", "legacy_alt"];
           for (const labelApiVariant of labelVariants) {
             for (const candidate of referenceCandidates) {
               if (labelApiVariant === "legacy" && candidate === providerReference) continue;
