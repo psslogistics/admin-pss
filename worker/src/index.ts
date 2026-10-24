@@ -63,11 +63,13 @@ const requestId = (request: Request) => request.headers.get("cf-ray") ?? crypto.
 const userAuthInFlight = new Map<string, Promise<Auth | null>>();
 const userAuthCache = new Map<string, { expiresAt: number; value: Auth | null }>();
 const dashboardSummaryCache = new Map<string, { expiresAt: number; data: Record<string, unknown> }>();
+const shipmentStatusCountsCache = new Map<string, { expiresAt: number; counts: Record<string, number> }>();
 const AUTH_CACHE_TTL_MS = 5_000;
 // Keep dashboard reads bounded and coalesce repeated panel loads. D1 bills by
 // rows read, so an unbounded dashboard collection can exhaust the free daily
 // quota even when the UI only needs the latest operational records.
 const SUMMARY_CACHE_TTL_MS = 60_000;
+const SHIPMENT_STATUS_COUNTS_CACHE_TTL_MS = 60_000;
 const DELHIVERY_SERVICEABILITY_CACHE_TTL_MS = 10 * 60_000;
 const delhiveryServiceabilityCache = new Map<string, { expiresAt: number; result: DelhiveryServiceabilityResult }>();
 const KYC_TEST_ACCOUNT_EMAIL = "itismeoogway@gmail.com";
@@ -3303,7 +3305,7 @@ async function loadShipmentInvoiceDocumentsForRetry(env: Env, clientId: string, 
 }
 
 async function retryPendingDelhiveryBookings(env: Env, cron: string) {
-  const pending = await env.DB.prepare("SELECT id, client_id, provider_account_id, provider_booking_payload_json, provider_retry_count FROM shipments WHERE provider = 'delhivery' AND status = 'booked' AND provider_sync_status = 'pending' AND provider_booking_payload_json IS NOT NULL AND provider_booking_id IS NULL AND (provider_retry_at IS NULL OR datetime(provider_retry_at) <= datetime('now')) ORDER BY updated_at ASC LIMIT 20").all<{ id: string; client_id: string; provider_account_id: string | null; provider_booking_payload_json: string; provider_retry_count: number | null }>();
+  const pending = await env.DB.prepare("SELECT id, client_id, provider_account_id, provider_booking_payload_json, provider_retry_count FROM shipments WHERE provider = 'delhivery' AND status = 'booked' AND provider_sync_status = 'pending' AND provider_booking_payload_json IS NOT NULL AND provider_booking_id IS NULL AND (provider_retry_at IS NULL OR datetime(provider_retry_at) <= datetime('now')) ORDER BY updated_at ASC LIMIT 10").all<{ id: string; client_id: string; provider_account_id: string | null; provider_booking_payload_json: string; provider_retry_count: number | null }>();
   for (const shipment of pending.results) {
     let payload: Record<string, unknown>;
     try { payload = JSON.parse(shipment.provider_booking_payload_json) as Record<string, unknown>; } catch {
@@ -3368,7 +3370,7 @@ async function retryPendingDelhiveryBookings(env: Env, cron: string) {
 }
 
 async function reconcilePendingDelhiveryReferences(env: Env, cron: string) {
-  const pending = await env.DB.prepare("SELECT id, client_id, provider_account_id, provider_booking_id FROM shipments WHERE provider = 'delhivery' AND status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery') AND (provider_sync_status = 'pending' OR (provider_sync_status IS NULL AND provider_booking_id IS NOT NULL)) AND provider_booking_id IS NOT NULL ORDER BY updated_at ASC LIMIT 50").all<{ id: string; client_id: string; provider_account_id: string | null; provider_booking_id: string }>();
+  const pending = await env.DB.prepare("SELECT id, client_id, provider_account_id, provider_booking_id FROM shipments WHERE provider = 'delhivery' AND status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery') AND (provider_sync_status = 'pending' OR (provider_sync_status IS NULL AND provider_booking_id IS NOT NULL)) AND provider_booking_id IS NOT NULL ORDER BY updated_at ASC LIMIT 20").all<{ id: string; client_id: string; provider_account_id: string | null; provider_booking_id: string }>();
   for (const shipment of pending.results) {
     try {
       await safeProviderRequest(env, "delhivery", "shipment_status", { shipment_id: shipment.id, provider_booking_id: shipment.provider_booking_id, provider_account_id: shipment.provider_account_id }, `cron:${cron}:delhivery-reference:${shipment.id}`, shipment.client_id, undefined, 10000);
@@ -3506,7 +3508,7 @@ async function reconcileShipmentLinkedPickupStatuses(env: Env, cron: string) {
     )
     WHERE pr.provider = 'delhivery' AND pr.status NOT IN ('cancelled', 'completed', 'failed')
     GROUP BY pr.id, pr.client_id, pr.status, pr.provider_status
-    ORDER BY pr.updated_at ASC LIMIT 250
+    ORDER BY pr.updated_at ASC LIMIT 75
   `).all<{ id: string; client_id: string; status: string; provider_status: string | null; expected_count: number; picked_count: number; delivered_count: number; failed_count: number; en_route_count: number }>();
   for (const pickup of rows.results) {
     const expectedCount = Math.max(0, Number(pickup.expected_count ?? 0));
@@ -3544,7 +3546,7 @@ async function refreshDelhiveryPickupStatuses(env: Env, cron: string) {
       AND provider_reference IS NOT NULL
       AND status NOT IN ('cancelled', 'completed', 'failed')
     ORDER BY updated_at ASC
-    LIMIT 250
+    LIMIT 75
   `).all<{ id: string; client_id: string; provider_reference: string; status: string }>();
   let updated = 0;
   let failed = 0;
@@ -3847,7 +3849,7 @@ async function refreshDelhiveryShipments(env: Env, cron: string) {
   // leave the rest of the eligible fleet untouched indefinitely.
   const order = "ORDER BY CASE status WHEN 'out_for_delivery' THEN 0 WHEN 'in_transit' THEN 1 ELSE 2 END, CASE WHEN provider_last_attempt_at IS NULL THEN 0 ELSE 1 END, provider_last_attempt_at ASC, updated_at ASC LIMIT 50";
   const latestEvent = "(SELECT lower(COALESCE(te.location, '') || ' ' || COALESCE(te.description, '')) FROM tracking_events te WHERE te.shipment_id = shipments.id ORDER BY te.event_time DESC LIMIT 1)";
-  // The Worker wakes every 2 minutes, but each shipment is selected only at
+  // The Worker wakes every 5 minutes, but each shipment is selected only at
   // its state-specific cadence. Last-mile centre scans are identified from
   // the latest normalized provider event without changing the public status.
   const due = `(provider_last_attempt_at IS NULL OR
@@ -3868,10 +3870,10 @@ async function refreshDelhiveryShipments(env: Env, cron: string) {
   // Worker reaches this budget, the next cron invocation continues from the
   // remaining due rows because each attempted shipment receives a new attempt
   // timestamp. There is no fleet-wide 50-record ceiling anymore.
-  while (Date.now() - refreshStartedAt < 25000) {
+  while (Date.now() - refreshStartedAt < 10000) {
     const active = await env.DB.prepare(`SELECT ${columns} FROM shipments WHERE provider = 'delhivery' AND COALESCE(lr_number, tracking_number, provider_reference) IS NOT NULL AND status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery', 'exception', 'rto', 'cancelled') AND ${due} ${order}`).all<{ id: string; client_id: string; tracking_number: string | null; lr_number: string | null; provider_reference: string | null; provider_account_id: string | null }>();
     if (!active.results.length) break;
-    const batch = active.results.slice(0, 5);
+    const batch = active.results.slice(0, 3);
     refreshRows.push(...batch);
     const results = await Promise.all(batch.map(async (shipment) => {
       const result = await safeProviderRequest(env, "delhivery", "tracking", { shipment_id: shipment.id, tracking_number: shipment.tracking_number, lr_number: shipment.lr_number, provider_reference: shipment.provider_reference, provider_account_id: shipment.provider_account_id }, `cron:${cron}:delhivery:tracking:${shipment.id}`, shipment.client_id, undefined, 10000);
@@ -3891,7 +3893,7 @@ async function refreshDelhiveryShipments(env: Env, cron: string) {
     immediatePodFailed += results.filter((result) => result.pod === "failed").length;
   }
 
-  const podCandidates = await env.DB.prepare("SELECT s.id, s.client_id, s.tracking_number, s.lr_number, s.provider_reference, s.provider_account_id FROM shipments s WHERE s.provider = 'delhivery' AND s.status = 'delivered' AND COALESCE(s.lr_number, s.tracking_number, s.provider_reference) IS NOT NULL AND NOT EXISTS (SELECT 1 FROM shipment_documents d WHERE d.shipment_id = s.id AND lower(d.original_filename) LIKE 'delhivery-pod-%') ORDER BY s.updated_at ASC LIMIT 20").all<{ id: string; client_id: string; tracking_number: string | null; lr_number: string | null; provider_reference: string | null; provider_account_id: string | null }>();
+  const podCandidates = await env.DB.prepare("SELECT s.id, s.client_id, s.tracking_number, s.lr_number, s.provider_reference, s.provider_account_id FROM shipments s WHERE s.provider = 'delhivery' AND s.status = 'delivered' AND COALESCE(s.lr_number, s.tracking_number, s.provider_reference) IS NOT NULL AND NOT EXISTS (SELECT 1 FROM shipment_documents d WHERE d.shipment_id = s.id AND lower(d.original_filename) LIKE 'delhivery-pod-%') ORDER BY s.updated_at ASC LIMIT 5").all<{ id: string; client_id: string; tracking_number: string | null; lr_number: string | null; provider_reference: string | null; provider_account_id: string | null }>();
   let podSucceeded = immediatePodSucceeded;
   let podFailed = immediatePodFailed;
   for (let index = 0; index < podCandidates.results.length; index += 3) {
@@ -4330,8 +4332,16 @@ const worker = {
           : auth.clientIds.size
             ? await env.DB.prepare(`SELECT ${selectedShipmentColumns} FROM shipments s WHERE ${clientWhere} ORDER BY s.created_at DESC LIMIT ${queryLimit} OFFSET ${offset}`).bind(...[...auth.clientIds, ...searchBinds]).all()
             : { results: [] };
-        const statusRows = auth.system ? await env.DB.prepare("SELECT status, COUNT(*) AS count FROM shipments GROUP BY status").all<{ status: string | null; count: number }>() : auth.clientIds.size ? await env.DB.prepare(`SELECT status, COUNT(*) AS count FROM shipments WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) GROUP BY status`).bind(...[...auth.clientIds]).all<{ status: string | null; count: number }>() : { results: [] as Array<{ status: string | null; count: number }> };
-        const statusCounts = Object.fromEntries(statusRows.results.map((item) => [String(item.status ?? "unknown"), Number(item.count ?? 0)]));
+        const scopeKey = auth.system ? "system" : [...auth.clientIds].sort().join(",");
+        const cachedStatusCounts = shipmentStatusCountsCache.get(scopeKey);
+        let statusCounts: Record<string, number>;
+        if (cachedStatusCounts && cachedStatusCounts.expiresAt > Date.now()) {
+          statusCounts = cachedStatusCounts.counts;
+        } else {
+          const statusRows = auth.system ? await env.DB.prepare("SELECT status, COUNT(*) AS count FROM shipments GROUP BY status").all<{ status: string | null; count: number }>() : auth.clientIds.size ? await env.DB.prepare(`SELECT status, COUNT(*) AS count FROM shipments WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) GROUP BY status`).bind(...[...auth.clientIds]).all<{ status: string | null; count: number }>() : { results: [] as Array<{ status: string | null; count: number }> };
+          statusCounts = Object.fromEntries(statusRows.results.map((item) => [String(item.status ?? "unknown"), Number(item.count ?? 0)]));
+          shipmentStatusCountsCache.set(scopeKey, { expiresAt: Date.now() + SHIPMENT_STATUS_COUNTS_CACHE_TTL_MS, counts: statusCounts });
+        }
         const totalCount = Object.values(statusCounts).reduce((sum, count) => sum + count, 0);
         const pageResults = rows.results.length > pageSize ? rows.results.slice(0, pageSize) : rows.results;
         const pagination = { limit: pageSize, offset, next_offset: offset + pageResults.length, has_more: rows.results.length > pageSize, total: totalCount, status_counts: statusCounts };
