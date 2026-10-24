@@ -4064,6 +4064,44 @@ async function refreshDelhiveryShipments(env: Env, cron: string) {
   console.log(JSON.stringify({ job: "delhivery_shipments_refresh", cron, tracking_candidates: refreshRows.length, tracking_succeeded: trackingSucceeded, tracking_failed: trackingFailed, pod_candidates: podCandidates.results.length, pod_succeeded: podSucceeded, pod_failed: podFailed }));
 }
 
+async function refreshPendingProviderWeights(env: Env, cron: string) {
+  // Weight reconciliation has its own bounded queue so status and POD polling
+  // cannot starve shipments whose provider measurement has not arrived yet.
+  // The provider response is the only source allowed to mark a weight as
+  // received; this job never invents or manually overrides a measurement.
+  const candidates = await env.DB.prepare(`
+    SELECT s.id, s.client_id, s.tracking_number, s.lr_number, s.provider_reference, s.provider_account_id
+    FROM shipments s
+    LEFT JOIN weight_reconciliations w ON w.shipment_id = s.id AND w.client_id = s.client_id
+    WHERE s.provider = 'delhivery'
+      AND COALESCE(s.lr_number, s.tracking_number, s.provider_reference) IS NOT NULL
+      AND s.status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery', 'delivered', 'exception', 'rto')
+      AND (w.provider_weight_received_at IS NULL OR s.weight_override_kg IS NULL)
+      AND (s.provider_last_attempt_at IS NULL OR datetime(s.provider_last_attempt_at) <= datetime('now', '-5 minutes'))
+    ORDER BY CASE WHEN s.provider_last_attempt_at IS NULL THEN 0 ELSE 1 END, s.provider_last_attempt_at ASC, s.updated_at ASC
+    LIMIT 20
+  `).all<{ id: string; client_id: string; tracking_number: string | null; lr_number: string | null; provider_reference: string | null; provider_account_id: string | null }>();
+
+  let succeeded = 0;
+  let failed = 0;
+  for (let index = 0; index < candidates.results.length; index += 4) {
+    const batch = candidates.results.slice(index, index + 4);
+    const results = await Promise.allSettled(batch.map((shipment) => safeProviderRequest(
+      env,
+      "delhivery",
+      "tracking",
+      { shipment_id: shipment.id, tracking_number: shipment.tracking_number, lr_number: shipment.lr_number, provider_reference: shipment.provider_reference, provider_account_id: shipment.provider_account_id },
+      `cron:${cron}:delhivery:weight:${shipment.id}`,
+      shipment.client_id,
+      undefined,
+      10000,
+    )));
+    succeeded += results.filter((result) => result.status === "fulfilled" && result.value.status === "accepted").length;
+    failed += results.length - results.filter((result) => result.status === "fulfilled" && result.value.status === "accepted").length;
+  }
+  console.log(JSON.stringify({ job: "delhivery_weight_reconciliation", cron, candidates: candidates.results.length, succeeded, failed }));
+}
+
 const worker = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const id = requestId(request);
@@ -6697,6 +6735,7 @@ const worker = {
     ctx.waitUntil((async () => {
       await retryPendingDelhiveryBookings(env, controller.cron);
       await reconcilePendingDelhiveryReferences(env, controller.cron);
+      await refreshPendingProviderWeights(env, controller.cron);
       await refreshDelhiveryShipments(env, controller.cron);
       await refreshDelhiveryPickupStatuses(env, controller.cron);
       await reconcileShipmentLinkedPickupStatuses(env, controller.cron);
