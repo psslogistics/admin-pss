@@ -951,14 +951,10 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   if (existing && existingHasConfirmedBooking) {
     return { ok: true as const, name: existing.provider_name?.trim() || providerName, reused: true as const, origin: resolvedOrigin };
   }
-  // A provider-activated saved warehouse is already ready for manifestation.
-  // Re-registering it on every booking adds a slow external round trip and can
-  // trigger Delhivery's eventual-activation path again. Pending/unknown rows
-  // still go through registration so local state cannot be mistaken for
-  // provider acceptance.
-  if (existing && existing.provider_status === "active" && existing.provider_name?.trim()) {
-    return { ok: true as const, name: existing.provider_name.trim(), reused: true as const, origin: resolvedOrigin };
-  }
+  // Do not trust a locally active provider flag for an unconfirmed booking.
+  // Existing rows may have a provider name while Delhivery's manifestation
+  // service still rejects the facility as unconfigured. Re-run the provider's
+  // idempotent registration and let that response establish readiness.
   // Do not search Delhivery before registration. The create API is the source
   // of truth for this path; facility-list propagation is asynchronous and its
   // lookup adds latency without proving that a booking can be manifested.
