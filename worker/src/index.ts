@@ -1358,6 +1358,10 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
       ident: orderId,
       count: Math.max(1, Math.trunc(pieces)),
       description: String(payload.description ?? "Shipment").trim().slice(0, 200) || "Shipment",
+      // Delhivery requires exactly one waybill slot on the master suborder.
+      // An empty slot preserves Delhivery's server-side waybill allocation;
+      // sending no array at all is rejected before the order can be queued.
+      waybills: [""],
       master: true,
     }],
     ...(dimensions.length ? { dimensions } : {}),
