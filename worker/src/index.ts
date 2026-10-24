@@ -2538,6 +2538,13 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       : provider === "rivigo" && operation === "cancellations"
         ? `${base.replace(/\/$/, "")}/operations/booking/cancel?bookingId=${encodeURIComponent(String(payload.booking_id ?? payload.provider_reference ?? ""))}`
       : trackonUrl!;
+  const labelCallbackToken = provider === "delhivery" && operation === "labels" && (payload.label_api_variant === "pdf" || payload.label_api_variant === "pdf_alt") && typeof payload.shipment_id === "string"
+    ? crypto.randomUUID()
+    : null;
+  if (labelCallbackToken && typeof payload.shipment_id === "string" && clientId) {
+    await env.DB.prepare("INSERT INTO delhivery_label_callback_tokens (token, shipment_id, client_id, label_size, expires_at) VALUES (?, ?, ?, ?, datetime('now', '+30 minutes'))")
+      .bind(labelCallbackToken, payload.shipment_id, clientId, String(payload.label_size ?? "a4")).run();
+  }
   const requestBody = provider === "delhivery" && operation === "shipments"
     ? useDelhiveryB2b ? delhiveryB2bManifestForm(delhiveryCreate as Record<string, unknown>, providerPayload.invoice_documents) : `format=json&data=${encodeURIComponent(JSON.stringify(delhiveryCreate))}`
      : provider === "delhivery" && operation === "pickups"
@@ -2561,7 +2568,9 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
               return delhiveryLabelApiSize(String(payload.label_size ?? "a4"));
               })(),
               callback: {
-                uri: "https://pss-api.psslogisticsadmin.workers.dev/v1/webhooks/delhivery",
+                // Label generation callbacks are separate from shipment-status
+                // webhooks and are not sent with the status-webhook signature.
+                uri: `https://pss-api.psslogisticsadmin.workers.dev/v1/webhooks/delhivery/labels?token=${encodeURIComponent(labelCallbackToken ?? "")}`,
                 method: "POST",
               },
             })
@@ -3598,6 +3607,83 @@ async function persistDelhiveryPod(env: Env, clientId: string, shipmentId: strin
   return { stored: true, document_id: documentId };
 }
 
+function delhiveryLabelCallbackSize(payload: Record<string, unknown>, fallback: string) {
+  const raw = String(findProviderToken(payload, new Set(["label_size", "labelSize", "size", "format", "label_format"])) ?? fallback).trim().toLowerCase().replace(/[×* ]/g, "x");
+  if (raw === "a4") return "a4";
+  if (raw === "sm" || raw === "3x2") return "3x2";
+  if (raw === "md" || raw === "4x2.5") return "4x2.5";
+  if (raw === "4x2") return "4x2";
+  return fallback;
+}
+
+function delhiveryCallbackAssetAllowed(value: string) {
+  try {
+    const host = new URL(value).hostname.toLowerCase();
+    return host === "delhivery.com" || host.endsWith(".delhivery.com") || host.endsWith(".delhivery.co.in") || host.endsWith(".delhivery.net");
+  } catch { return false; }
+}
+
+async function handleDelhiveryLabelWebhook(request: Request, env: Env, requestIdValue: string, headers: HeadersInit) {
+  const rawBody = await request.text();
+  if (rawBody.length > 1024 * 1024) return error("PAYLOAD_TOO_LARGE", "Label callback payload is too large", 413, requestIdValue, headers);
+  let payload: Record<string, unknown>;
+  try { payload = JSON.parse(rawBody) as Record<string, unknown>; } catch { return error("INVALID_JSON", "Label callback payload must be valid JSON", 400, requestIdValue, headers); }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return error("VALIDATION_ERROR", "Label callback payload must be an object", 400, requestIdValue, headers);
+  const token = new URL(request.url).searchParams.get("token")?.trim() ?? "";
+  if (!token) return error("INVALID_CALLBACK", "Label callback token is required", 401, requestIdValue, headers);
+  const callback = await env.DB.prepare("SELECT token, shipment_id, client_id, label_size FROM delhivery_label_callback_tokens WHERE token = ? AND datetime(expires_at) > CURRENT_TIMESTAMP LIMIT 1").bind(token).first<{ token: string; shipment_id: string; client_id: string; label_size: string }>();
+  if (!callback) return error("INVALID_CALLBACK", "Label callback token is invalid or expired", 401, requestIdValue, headers);
+  const reference = findProviderReference(payload, new Set(["lrn", "lrn_number", "lr_number", "lr", "awb", "awb_number", "waybill", "tracking_number", "provider_reference"]));
+  const jobId = findProviderReference(payload, new Set(["job_id", "jobid", "request_id", "requestid"]));
+  const eventId = `delhivery:label:${callback.token}:${jobId ?? "callback"}:${await sha256(rawBody).then((value) => value.slice(0, 16))}`;
+  const stored = await env.DB.prepare("INSERT OR IGNORE INTO webhook_events (id, provider, event_id, event_type, payload, signature_valid, status) VALUES (?, 'delhivery', ?, 'label_generated', ?, 1, 'received')").bind(crypto.randomUUID(), eventId, rawBody).run();
+  if (Number(stored.meta?.changes ?? 0) === 0) return json({ ok: true, accepted: true, duplicate: true, request_id: requestIdValue }, 202, headers);
+  const size = delhiveryLabelCallbackSize(payload, callback.label_size);
+  const urls = findProviderUrls(payload).filter(delhiveryCallbackAssetAllowed);
+  const base64 = findProviderContentBase64(payload);
+  const account = await env.DB.prepare("SELECT pa.account_name, pa.credential_secret_name FROM provider_accounts pa JOIN shipments s ON s.provider_account_id = pa.id WHERE s.id = ? AND pa.provider = 'delhivery' LIMIT 1").bind(callback.shipment_id).first<{ account_name: string; credential_secret_name: string }>();
+  const credential = account ? (env as unknown as Record<string, unknown>)[account.credential_secret_name] as string | undefined : undefined;
+  const tokenValue = account ? await delhiveryB2bBearer(env, credential, account.account_name, requestIdValue, 8000, false, delhiveryB2bDocsBase()) : null;
+  const assets: Array<{ bytes: Uint8Array; contentType: string }> = [];
+  if (base64) { const bytes = bytesFromBase64(base64); if (bytes && documentSignatureMatches("application/pdf", bytes)) assets.push({ bytes, contentType: "application/pdf" }); }
+  for (const url of urls.slice(0, 32)) {
+    try {
+      const response = await providerFetch(url, { method: "GET", headers: { accept: "application/pdf", ...(tokenValue ? { Authorization: `Bearer ${tokenValue}` } : {}) } }, 10000);
+      if (!response.ok) continue;
+      const bytes = await providerResponseBytes(response, 12 * 1024 * 1024);
+      const contentType = providerContentTypeFromBytes(bytes, response.headers.get("content-type") ?? "application/pdf");
+      if (contentType === "application/pdf" && documentSignatureMatches(contentType, bytes)) assets.push({ bytes, contentType });
+    } catch { /* Keep processing other provider assets. */ }
+  }
+  for (let index = 0; index < assets.length; index += 1) {
+    const filename = `delhivery-label-${reference ?? callback.shipment_id}-${size}-${index + 1}.pdf`;
+    const existing = await env.DB.prepare("SELECT id FROM shipment_documents WHERE shipment_id = ? AND original_filename = ? LIMIT 1").bind(callback.shipment_id, filename).first<{ id: string }>();
+    if (existing) continue;
+    const documentId = crypto.randomUUID();
+    const objectKey = `clients/${callback.client_id}/shipments/${callback.shipment_id}/${documentId}-${filename}`;
+    await env.FILES.put(objectKey, assets[index].bytes, { httpMetadata: { contentType: assets[index].contentType } });
+    try {
+      await env.DB.prepare("INSERT INTO shipment_documents (id, shipment_id, client_id, object_key, original_filename, content_type, file_size_bytes, uploaded_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").bind(documentId, callback.shipment_id, callback.client_id, objectKey, filename, assets[index].contentType, assets[index].bytes.byteLength, "webhook:delhivery:label").run();
+    } catch (caught) { await env.FILES.delete(objectKey).catch(() => undefined); throw caught; }
+  }
+  await env.DB.prepare("UPDATE delhivery_label_callback_tokens SET expires_at = CURRENT_TIMESTAMP WHERE token = ?").bind(callback.token).run();
+  await env.DB.prepare("UPDATE webhook_events SET status = 'processed', processed_at = CURRENT_TIMESTAMP WHERE provider = 'delhivery' AND event_id = ?").bind(eventId).run();
+  console.log(JSON.stringify({ event: "delhivery_label_callback", request_id: requestIdValue, shipment_id: callback.shipment_id, reference, size, urls: urls.length, assets: assets.length }));
+  return json({ ok: true, accepted: true, matched: true, saved: assets.length, request_id: requestIdValue }, 202, headers);
+}
+
+async function loadStoredDelhiveryLabels(env: Env, shipmentId: string, reference: string, size: string) {
+  const rows = await env.DB.prepare("SELECT object_key, content_type FROM shipment_documents WHERE shipment_id = ? AND original_filename LIKE ? ORDER BY original_filename ASC LIMIT 32").bind(shipmentId, `delhivery-label-${reference}-${size}-%`).all<{ object_key: string; content_type: string }>();
+  const artifacts: Array<{ content_base64: string; content_type: string }> = [];
+  for (const row of rows.results) {
+    const object = await env.FILES.get(row.object_key);
+    if (!object) continue;
+    const bytes = new Uint8Array(await object.arrayBuffer());
+    if (row.content_type === "application/pdf" && documentSignatureMatches(row.content_type, bytes)) artifacts.push({ content_base64: providerBytesToBase64(bytes), content_type: row.content_type });
+  }
+  return artifacts;
+}
+
 async function handleProviderWebhook(request: Request, env: Env, provider: "delhivery" | "ekart" | "trackon", requestIdValue: string, headers: HeadersInit) {
   const rawBody = await request.text();
   if (rawBody.length > 1024 * 1024) return error("PAYLOAD_TOO_LARGE", "Webhook payload is too large", 413, requestIdValue, headers);
@@ -3864,6 +3950,7 @@ const worker = {
         request_id: id,
       }, 200, withCors(request, env, { "cache-control": "private, no-store" }));
     }
+    if (url.pathname === "/v1/webhooks/delhivery/labels" && request.method === "POST") return handleDelhiveryLabelWebhook(request, env, id, headers);
     if (url.pathname === "/v1/webhooks/delhivery/documents" && request.method === "POST") return handleDelhiveryDocumentWebhook(request, env, id, headers);
     if (url.pathname === "/v1/webhooks/rivigo" && request.method === "POST") return handleRivigoWebhook(request, env, id, headers);
     const publicWebhook = url.pathname.match(/^\/v1\/webhooks\/(delhivery|ekart|trackon)$/);
@@ -4613,6 +4700,10 @@ const worker = {
         const referenceCandidates = operation === "labels"
           ? [String(shipment.lr_number ?? "").trim()].filter(Boolean)
           : Array.from(new Set([shipment.lr_number, shipment.master_awb, shipment.tracking_number, shipment.provider_reference].map((value) => String(value ?? "").trim()).filter(Boolean)));
+        if (operation === "labels") {
+          const storedLabelArtifacts = await loadStoredDelhiveryLabels(env, shipment.id, String(providerReference), requestedSize);
+          if (storedLabelArtifacts.length) return json({ ok: true, data: { enabled: true, status: "accepted", providerStatus: 200, artifact: { artifacts: storedLabelArtifacts, content_type: "application/pdf", copies: storedLabelArtifacts.length, source: "delhivery_label_callback" } } }, 200, headers);
+        }
         let providerResult = await safeProviderRequest(env, "delhivery", operation, { shipment_id: shipment.id, tracking_number: providerReference, provider_reference: providerReference, provider_account_id: shipment.provider_account_id, label_size: requestedSize, boxes: Math.max(1, Number(shipment.pieces ?? 1)), lr_copy_type: url.searchParams.get("lr_copy_type") ?? undefined, doc_type: url.searchParams.get("doc_type") ?? "LM_POD" }, id, shipment.client_id);
         if (operation === "labels" && !isProviderPdfArtifact(providerResult.artifact)) {
           // Delhivery's B2B UI generates a PDF task separately from the
