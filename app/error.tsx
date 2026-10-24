@@ -8,6 +8,6 @@ export default function Error({ error, reset }: { error: Error & { digest?: stri
     console.error("PSS route error", { digest: error.digest });
   }, [error]);
 
-  return <ErrorScreen statusCode={500} retry={reset} homeUrl="https://admin.psslogisitics.in" />;
+  return <ErrorScreen statusCode={500} retry={reset} homeUrl="https://admin.psslogistics.in" />;
 }
 

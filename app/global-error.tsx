@@ -6,7 +6,7 @@ export default function GlobalError({ reset }: { error: Error & { digest?: strin
   return (
     <html lang="en">
       <body style={{ margin: 0 }}>
-        <ErrorScreen statusCode={500} retry={reset} homeUrl="https://admin.psslogisitics.in" />
+        <ErrorScreen statusCode={500} retry={reset} homeUrl="https://admin.psslogistics.in" />
       </body>
     </html>
   );
