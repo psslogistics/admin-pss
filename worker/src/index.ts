@@ -4612,16 +4612,12 @@ const worker = {
         let providerResult = await safeProviderRequest(env, "delhivery", operation, { shipment_id: shipment.id, tracking_number: providerReference, provider_reference: providerReference, provider_account_id: shipment.provider_account_id, label_size: requestedSize, boxes: Math.max(1, Number(shipment.pieces ?? 1)), lr_copy_type: url.searchParams.get("lr_copy_type") ?? undefined, doc_type: url.searchParams.get("doc_type") ?? "LM_POD" }, id, shipment.client_id);
         if (operation === "labels" && !isProviderPdfArtifact(providerResult.artifact)) {
           // Delhivery's B2B UI generates a PDF task separately from the
-          // label-link endpoint. Try the provider PDF API for every provider
-          // reference before telling the client that no label exists.
-          // The production B2B account is served by Delhivery's alternate
-          // host. Try its direct label-link contract first; the PDF job route
-          // is only a fallback. Keeping the working route first also avoids
-          // creating several duplicate provider jobs and triggering Delhivery
-          // rate limits before the UI can receive the formats.
-          // Follow Delhivery's published B2B contract first. The browser-only
-          // UCP print route is intentionally not used by the server Worker.
-          const labelVariants = ["primary", "pdf", "primary_alt", "pdf_alt", "legacy_alt", "legacy"];
+          // label-link endpoint. Try only the documented PDF job contract
+          // after the documented label-link request. Do not fan out through
+          // browser-only and legacy routes: four size checks multiplied by
+          // those fallbacks left the client menu spinning for too long and
+          // could create duplicate provider print jobs.
+          const labelVariants = ["pdf"];
           for (const labelApiVariant of labelVariants) {
             for (const candidate of referenceCandidates) {
               if (labelApiVariant === "legacy" && candidate === providerReference) continue;
