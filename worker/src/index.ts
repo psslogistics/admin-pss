@@ -2558,7 +2558,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       .bind(labelCallbackToken, payload.shipment_id, clientId, String(payload.label_size ?? "a4")).run();
   }
   const requestBody = provider === "delhivery" && operation === "shipments"
-    ? useDelhiveryB2b ? delhiveryB2bManifestForm(delhiveryCreate as Record<string, unknown>, providerPayload.invoice_documents) : `format=json&data=${encodeURIComponent(JSON.stringify(delhiveryCreate))}`
+    ? useDelhiveryB2b ? JSON.stringify(delhiveryCreate) : `format=json&data=${encodeURIComponent(JSON.stringify(delhiveryCreate))}`
      : provider === "delhivery" && operation === "pickups"
        ? JSON.stringify(delhiveryPickup)
       : provider === "ekart" && operation === "shipments"
@@ -2603,7 +2603,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
           : operation === "shipments" ? JSON.stringify(trackonPayload(payload, trackon!))
             : JSON.stringify({ Appkey: trackon!.appKey, userId: trackon!.userId, password: trackon!.password, AWBNo: trackingNumber });
   if (provider === "delhivery" && operation === "shipments" && !useDelhiveryB2b) headers["content-type"] = "application/x-www-form-urlencoded";
-  if (provider === "delhivery" && operation === "shipments" && useDelhiveryB2b) delete headers["content-type"];
+  if (provider === "delhivery" && operation === "shipments" && useDelhiveryB2b) headers["content-type"] = "application/json";
   let response: Response | null = null; let lastError = "provider_request_failed";
    const readOnlyProviderCall = operation === "tracking" || operation === "serviceability" || operation === "serviceability_route" || operation === "pickup_status" || operation === "pickup_slots";
   const singleManifestCall = provider === "delhivery" && operation === "shipments";
