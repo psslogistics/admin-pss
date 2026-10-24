@@ -1761,17 +1761,30 @@ function normalizeProviderEdd(value: unknown): string | null {
   const parsed = Date.parse(raw);
   return Number.isFinite(parsed) ? new Date(parsed).toISOString().slice(0, 10) : null;
 }
+function normalizeProviderEddFromText(value: string): string | null {
+  const text = value.replace(/\s+/g, " ").trim();
+  if (!/(?:edd|estimated|expected|promised|delivery|deliver by|arrival)/i.test(text)) return null;
+  const iso = text.match(/\b(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b/);
+  if (iso) return normalizeProviderEdd(`${iso[1]}-${iso[2]}-${iso[3]}`);
+  const dmy = text.match(/\b(\d{1,2})[-/.](\d{1,2})[-/.](20\d{2})\b/);
+  if (dmy) return normalizeProviderEdd(`${dmy[1]}-${dmy[2]}-${dmy[3]}`);
+  const named = text.match(/\b(\d{1,2})\s+([A-Za-z]{3,9})\s+(20\d{2})\b/);
+  if (named) return normalizeProviderEdd(`${named[1]} ${named[2]} ${named[3]}`);
+  return null;
+}
 function findProviderEdd(value: unknown, depth = 0): string | null {
   if (depth > 12 || value === null || value === undefined) return null;
   const expectedKeys = new Set([
     "edd", "estimateddeliverydate", "estimateddelivery", "estimateddeliverydatetime",
     "estimateddeliverydatetime", "expecteddeliverydate", "expecteddelivery", "expecteddeliverydatetime",
     "expecteddate", "expecteddateofdelivery", "promiseddeliverydate", "deliveryestimate", "deliverydate", "estimateddate",
+    "eta", "estimatedtimeofarrival", "arrivaldate", "deliveryeta",
   ].map((key) => key.toLowerCase().replace(/[^a-z]/g, "")));
   if (Array.isArray(value)) {
     for (const item of value) { const found = findProviderEdd(item, depth + 1); if (found) return found; }
     return null;
   }
+  if (typeof value === "string") return normalizeProviderEddFromText(value);
   if (typeof value !== "object") return null;
   const object = value as Record<string, unknown>;
   for (const [key, candidate] of Object.entries(object)) {
@@ -2772,13 +2785,13 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     const statusAwb = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["master_awb", "master_awb_number", "masterawb", "master_waybill", "awb", "awb_number", "waybill", "waybill_number", "waybill_no"]))) ?? responseBody.match(/(?:master[_ ]?awb|awb|waybill)[^A-Za-z0-9]{0,12}(\d{6,20})/i)?.[1] ?? null;
     const statusJobId = findProviderReference(parsedProviderBody, new Set(["job_id", "jobid", "manifest_job_id", "request_id", "requestid"])) ?? (String(payload.provider_booking_id ?? "").trim() || null);
     if (statusLr || statusAwb) {
-      await env.DB.prepare("UPDATE shipments SET lr_number = COALESCE(?, lr_number), master_awb = COALESCE(?, master_awb), box_awbs_json = COALESCE(?, box_awbs_json), provider_sync_status = 'confirmed', tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(provider_reference, ?), provider_last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(statusLr, statusAwb, statusAwb ? JSON.stringify([statusAwb]) : null, statusLr ?? statusAwb, statusAwb ?? statusLr, payload.shipment_id, clientId).run();
+      await env.DB.prepare("UPDATE shipments SET lr_number = COALESCE(?, lr_number), master_awb = COALESCE(?, master_awb), box_awbs_json = COALESCE(?, box_awbs_json), provider_sync_status = 'confirmed', status = CASE WHEN status = 'exception' THEN 'booked' ELSE status END, tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(provider_reference, ?), provider_last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(statusLr, statusAwb, statusAwb ? JSON.stringify([statusAwb]) : null, statusLr ?? statusAwb, statusAwb ?? statusLr, payload.shipment_id, clientId).run();
       const completedBilling = await completeShipmentBilling(env, clientId, payload.shipment_id);
       if (!completedBilling.ok) console.error(JSON.stringify({ event: "shipment_billing_deferred", request_id: requestIdValue, shipment_id: payload.shipment_id, error: completedBilling.error }));
       return { enabled: true, status: "accepted" as const, providerStatus: response.status, providerPending: false, providerBookingId: statusJobId, providerReference: statusAwb ?? statusLr, lr_number: statusLr, master_awb: statusAwb };
     }
     const pendingMessage = "Delhivery accepted the booking but has not published the LR/AWB yet.";
-    await env.DB.prepare("UPDATE shipments SET provider_booking_id = COALESCE(?, provider_booking_id), provider_sync_status = 'pending', status = CASE WHEN status = 'exception' THEN 'booked' ELSE status END, provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ? AND provider_reference IS NULL AND lr_number IS NULL AND master_awb IS NULL")
+    await env.DB.prepare("UPDATE shipments SET provider_booking_id = COALESCE(?, provider_booking_id), provider_sync_status = 'pending', status = 'exception', provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ? AND provider_reference IS NULL AND lr_number IS NULL AND master_awb IS NULL")
       .bind(statusJobId, pendingMessage, payload.shipment_id, clientId).run();
     return { enabled: true, status: "accepted" as const, providerStatus: response.status, providerPending: true, providerBookingId: statusJobId, message: pendingMessage };
   }
@@ -2865,7 +2878,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     const providerReference = useDelhiveryB2b ? b2bAwbReference ?? createdReference : createdReference;
     if (useDelhiveryB2b && !createdReference && providerBookingId) {
       const pending = "Delhivery accepted the booking and returned a provider job ID. LR/AWB is still being confirmed.";
-      await env.DB.prepare("UPDATE shipments SET provider_booking_id = COALESCE(?, provider_booking_id), provider_sync_status = 'pending', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(providerBookingId, payload.shipment_id, clientId).run();
+      await env.DB.prepare("UPDATE shipments SET provider_booking_id = COALESCE(?, provider_booking_id), provider_sync_status = 'pending', status = 'exception', provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(providerBookingId, pending, payload.shipment_id, clientId).run();
       // `accepted` is a provider result, not a persisted integration-request
       // status. Keep the request pending until Delhivery publishes the LR/AWB;
       // the table intentionally permits only pending/succeeded/failed/retrying.
@@ -3919,7 +3932,7 @@ async function refreshDelhiveryShipments(env: Env, cron: string) {
   const due = `(provider_last_attempt_at IS NULL OR
     (status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery', 'exception', 'rto') AND edd IS NULL AND datetime(provider_last_attempt_at) <= datetime('now', '-10 minutes')) OR
     (status = 'out_for_delivery' AND datetime(provider_last_attempt_at) <= datetime('now', '-10 minutes')) OR
-    (status = 'in_transit' AND ${latestEvent} GLOB '*last[- ]mile*' AND datetime(provider_last_attempt_at) <= datetime('now', '-1 hour')) OR
+    (status = 'in_transit' AND datetime(provider_last_attempt_at) <= datetime('now', '-30 minutes')) OR
     (status IN ('booked', 'picked_up', 'cancelled') AND datetime(provider_last_attempt_at) <= datetime('now', '-10 minutes')) OR
     (status IN ('in_transit', 'exception', 'rto') AND NOT (status = 'in_transit' AND ${latestEvent} GLOB '*last[- ]mile*') AND datetime(provider_last_attempt_at) <= datetime('now', '-4 hours'))) `;
   // Delivered shipments are terminal for status polling. Keep their separate
@@ -4657,7 +4670,7 @@ const worker = {
           const warehouseActivationPending = provider === "delhivery" && (providerCode === "WAREHOUSE_ACTIVATION_PENDING" || /warehouse.*not configured|warehouse.*activation|pickup.*warehouse.*pending/i.test(failureReason));
           if (warehouseActivationPending && retryPayload) {
             const queuedReason = `Delhivery rejected the pickup warehouse while it activates: ${failureReason}`.slice(0, 500);
-            await env.DB.prepare("UPDATE shipments SET status = 'booked', provider_sync_status = 'pending', provider_booking_payload_json = ?, provider_retry_at = datetime('now', '+5 minutes'), provider_retry_count = 0, provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+            await env.DB.prepare("UPDATE shipments SET status = 'exception', provider_sync_status = 'pending', provider_booking_payload_json = ?, provider_retry_at = datetime('now', '+5 minutes'), provider_retry_count = 0, provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
               .bind(JSON.stringify(retryPayload), queuedReason, shipmentId, clientId).run();
             await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'booked', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
               .bind(crypto.randomUUID(), shipmentId, "Booking queued for automatic retry after Delhivery pickup-warehouse activation", auth.userId ?? `api:${clientId}`).run();
@@ -4680,7 +4693,7 @@ const worker = {
         if (provider === "delhivery" && (!providerLr && !providerAwb && !providerReference)) {
           const providerBookingId = String((providerResult as { providerBookingId?: string | null }).providerBookingId ?? "").trim() || null;
           const timeoutReason = "Delhivery accepted the manifest but did not return an LR/AWB within the synchronous booking window";
-          await env.DB.prepare("UPDATE shipments SET provider_booking_id = COALESCE(?, provider_booking_id), provider_sync_status = 'pending', provider_booking_payload_json = NULL, provider_retry_at = NULL, provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+          await env.DB.prepare("UPDATE shipments SET provider_booking_id = COALESCE(?, provider_booking_id), provider_sync_status = 'pending', status = 'exception', provider_booking_payload_json = NULL, provider_retry_at = NULL, provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
             .bind(providerBookingId, timeoutReason, shipmentId, clientId).run();
           await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'exception', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
             .bind(crypto.randomUUID(), shipmentId, timeoutReason, auth.userId ?? `api:${clientId}`).run();
@@ -4760,7 +4773,7 @@ const worker = {
           const reason = caught instanceof Error ? caught.message : "retry_invoice_documents_missing";
           return error("INVOICE_DOCUMENT_REQUIRED", "The original invoice document is unavailable. Upload the invoice again before retrying this booking.", 409, id, headers, JSON.stringify({ technical_message: reason }));
         }
-        await env.DB.prepare("UPDATE shipments SET status = 'booked', provider_sync_status = 'pending', provider_booking_payload_json = ?, provider_retry_at = NULL, provider_last_error = NULL, provider_retry_count = provider_retry_count + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+        await env.DB.prepare("UPDATE shipments SET status = 'exception', provider_sync_status = 'pending', provider_booking_payload_json = ?, provider_retry_at = NULL, provider_last_error = NULL, provider_retry_count = provider_retry_count + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
           .bind(JSON.stringify(providerRetryPayload(payload)), shipment.id, shipmentClientId).run();
         await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'booked', 'Manual booking retry initiated', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
           .bind(crypto.randomUUID(), shipment.id, auth.userId ?? `api:${shipmentClientId}`).run();
@@ -4769,7 +4782,7 @@ const worker = {
           const reason = String((providerResult as { error?: string; reason?: string }).error ?? (providerResult as { reason?: string }).reason ?? "Delhivery did not accept the booking retry").slice(0, 500);
           const activationPending = /awaiting provider activation|not active|not configured|has not been configured|warehouse.*configured/i.test(reason);
           if (activationPending) {
-            await env.DB.prepare("UPDATE shipments SET status = 'booked', provider_sync_status = 'pending', provider_retry_at = datetime('now', '+5 minutes'), provider_retry_count = provider_retry_count + 1, provider_last_error = ?, provider_booking_payload_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+            await env.DB.prepare("UPDATE shipments SET status = 'exception', provider_sync_status = 'pending', provider_retry_at = datetime('now', '+5 minutes'), provider_retry_count = provider_retry_count + 1, provider_last_error = ?, provider_booking_payload_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
               .bind(reason, JSON.stringify(providerRetryPayload(payload)), shipment.id, shipmentClientId).run();
             await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'booked', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
               .bind(crypto.randomUUID(), shipment.id, "Delhivery is still activating the pickup warehouse; automatic retry scheduled", auth.userId ?? `api:${shipmentClientId}`).run();
