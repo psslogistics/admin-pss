@@ -934,8 +934,13 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   // first shipment has not published an LR yet. Waiting for a confirmed LR
   // here caused every retry to create another PSS-suffixed warehouse, which
   // made repeat bookings intermittent and could make Delhivery reject them.
+  // A local active flag alone is not proof that Delhivery's manifestation
+  // service can use the warehouse. Older rows can be marked active without a
+  // provider facility reference, which produces the provider error
+  // "warehouse ... has not been configured". Re-register those rows; the
+  // provider's idempotent/already-configured response is the authority.
   const existingProviderLocation = existing && (existing.provider_status === "active" || existing.provider_status === "pending")
-    && Boolean(existing.provider_name?.trim() || existing.name?.trim());
+    && Boolean((existing.provider_name?.trim() || existing.name?.trim()) && (existing.provider_reference?.trim() || existingHasConfirmedBooking));
   const replacementId = existing && !existingHasConfirmedBooking && !existingProviderLocation ? crypto.randomUUID() : null;
   const localName = replacementId ? `${baseLocalName} - PSS-${replacementId.slice(0, 8)}` : baseLocalName;
   const providerName = localName;
