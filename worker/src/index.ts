@@ -1962,6 +1962,60 @@ function normalizeProviderTracking(value: unknown): NormalizedProviderTracking |
   return events.at(-1) ?? null;
 }
 
+type ProviderWeightSnapshot = { measuredKg: number | null; chargeableKg: number | null };
+const providerWeightKey = (key: string) => key.toLowerCase().replace(/[^a-z0-9]/g, "");
+const providerWeightNumber = (value: unknown, key = "", unit?: unknown): number | null => {
+  let raw: unknown = value;
+  let explicitUnit = typeof unit === "string" ? unit.toLowerCase() : "";
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    const object = raw as Record<string, unknown>;
+    raw = object.value ?? object.amount ?? object.weight ?? object.value_kg ?? object.kg ?? object.grams ?? object.g;
+    explicitUnit = String(object.unit ?? object.uom ?? explicitUnit).toLowerCase();
+  }
+  const number = Number(typeof raw === "string" ? raw.replace(/,/g, "").match(/-?\d+(?:\.\d+)?/)?.[0] : raw);
+  if (!Number.isFinite(number) || number <= 0) return null;
+  const normalizedKey = providerWeightKey(key);
+  const grams = /gram|grams|gramme|gm|gms/.test(explicitUnit) || /gram|grams|gramme|gm|gms/.test(normalizedKey) || (normalizedKey.endsWith("g") && !normalizedKey.endsWith("kg"));
+  const kg = /kg|kilogram/.test(explicitUnit) || /kg|kilogram/.test(normalizedKey);
+  const normalized = grams ? number / 1000 : kg ? number : number > 1000 ? number / 1000 : number;
+  return normalized > 0 && normalized < 100000 ? Number(normalized.toFixed(3)) : null;
+};
+function findProviderWeight(value: unknown, depth = 0): ProviderWeightSnapshot {
+  if (depth > 10 || value === null || value === undefined) return { measuredKg: null, chargeableKg: null };
+  const measuredKeys = new Set(["actualweight", "actualweightkg", "capturedweight", "capturedweightkg", "measuredweight", "measuredweightkg", "shipmentweight", "shipmentweightkg", "weightcaptured", "weightcapturedkg"]);
+  const chargeableKeys = new Set(["chargeableweight", "chargeableweightkg", "billableweight", "billableweightkg", "courierbilledweight", "courierbilledweightkg"]);
+  let measuredKg: number | null = null;
+  let chargeableKg: number | null = null;
+  const walk = (node: unknown, level: number) => {
+    if (level > 10 || node === null || node === undefined || (measuredKg !== null && chargeableKg !== null)) return;
+    if (Array.isArray(node)) { for (const item of node) walk(item, level + 1); return; }
+    if (typeof node !== "object") return;
+    const object = node as Record<string, unknown>;
+    for (const [key, candidate] of Object.entries(object)) {
+      const normalized = providerWeightKey(key);
+      if (chargeableKg === null && (chargeableKeys.has(normalized) || /chargeable.*weight|billable.*weight|courier.*billed.*weight/.test(normalized))) chargeableKg = providerWeightNumber(candidate, key);
+      if (measuredKg === null && (measuredKeys.has(normalized) || /actual.*weight|captured.*weight|measured.*weight|shipment.*weight/.test(normalized))) measuredKg = providerWeightNumber(candidate, key);
+      // Delhivery scan/detail responses sometimes expose only `Weight`; accept
+      // it as measured weight, but never let it overwrite an explicit value.
+      if (measuredKg === null && normalized === "weight") measuredKg = providerWeightNumber(candidate, key);
+      if (candidate && typeof candidate === "object") walk(candidate, level + 1);
+    }
+  };
+  walk(value, depth);
+  return { measuredKg, chargeableKg };
+}
+
+async function persistProviderWeight(env: Env, shipmentId: string, clientId: string, snapshot: ProviderWeightSnapshot) {
+  const effectiveKg = snapshot.chargeableKg ?? snapshot.measuredKg;
+  if (!effectiveKg) return;
+  // Keep the declared booking weight intact. The provider value is stored as a
+  // provenance-aware override and also feeds the existing reconciliation record.
+  await env.DB.batch([
+    env.DB.prepare("UPDATE shipments SET weight_override_kg = ?, weight_source = 'provider', weight_updated_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ? AND COALESCE(weight_source, 'booking') <> 'manual'").bind(effectiveKg, shipmentId, clientId),
+    env.DB.prepare("UPDATE weight_reconciliations SET measured_weight_kg = COALESCE(?, measured_weight_kg), courier_billed_weight_kg = COALESCE(?, courier_billed_weight_kg), provider_weight_received_at = CURRENT_TIMESTAMP, status = CASE WHEN status = 'resolved' THEN status ELSE 'measured' END, updated_at = CURRENT_TIMESTAMP WHERE shipment_id = ? AND client_id = ?").bind(snapshot.measuredKg ?? effectiveKg, snapshot.chargeableKg ?? effectiveKg, shipmentId, clientId),
+  ]);
+}
+
 function trackonCredentials(env: Env, accountCredential?: string) {
   const raw = accountCredential ?? (env as unknown as Record<string, unknown>).TRACKON_CREDENTIALS_JSON;
   if (typeof raw !== "string" || !raw.trim()) return null;
@@ -2762,6 +2816,9 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       normalizedTrackingEvents = normalizeProviderTrackingEvents(JSON.parse(responseBody));
       normalizedTracking = normalizedTrackingEvents.at(-1) ?? null;
     } catch { normalizedTracking = null; normalizedTrackingEvents = []; }
+    if (clientId && typeof payload.shipment_id === "string") {
+      try { await persistProviderWeight(env, payload.shipment_id, clientId, findProviderWeight(parsedProviderBody)); } catch (caught) { console.error(JSON.stringify({ event: "provider_weight_persist_failed", shipment_id: payload.shipment_id, error: caught instanceof Error ? caught.message : "unknown_error" })); }
+    }
     if (!providerEdd) {
       providerEdd = normalizedTrackingEvents.map((event) => normalizeProviderEddFromText(event.description)).find((value): value is string => Boolean(value)) ?? null;
     }
@@ -3943,7 +4000,7 @@ async function refreshDelhiveryShipments(env: Env, cron: string) {
   // its state-specific cadence. Last-mile centre scans are identified from
   // the latest normalized provider event without changing the public status.
   const due = `(provider_last_attempt_at IS NULL OR
-    (status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery', 'exception', 'rto') AND edd IS NULL AND datetime(provider_last_attempt_at) <= datetime('now', '-10 minutes')) OR
+    (status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery', 'exception', 'rto') AND (edd IS NULL OR weight_override_kg IS NULL) AND datetime(provider_last_attempt_at) <= datetime('now', '-10 minutes')) OR
     (status = 'out_for_delivery' AND datetime(provider_last_attempt_at) <= datetime('now', '-10 minutes')) OR
     (status = 'in_transit' AND datetime(provider_last_attempt_at) <= datetime('now', '-30 minutes')) OR
     (status IN ('booked', 'picked_up', 'cancelled') AND datetime(provider_last_attempt_at) <= datetime('now', '-10 minutes')) OR
@@ -4408,11 +4465,11 @@ const worker = {
               ? `status = '${requestedStatus === "canceled" ? "cancelled" : requestedStatus}'`
               : "";
         const shipmentColumns = compactShipmentView || shipmentView === "tracking"
-          ? "s.id, s.pss_reference, s.client_id, s.tracking_number, s.lr_number, s.master_awb, s.status, s.provider, s.origin, s.destination, s.total_weight_kg, s.pieces, s.edd, s.delivered_at, s.created_at, s.updated_at, s.dimensions_json"
+          ? "s.id, s.pss_reference, s.client_id, s.tracking_number, s.lr_number, s.master_awb, s.status, s.provider, s.origin, s.destination, s.total_weight_kg, s.weight_override_kg, s.weight_source, s.weight_updated_at, s.pieces, s.edd, s.delivered_at, s.created_at, s.updated_at, s.dimensions_json"
           : internalShipmentView
           ? "s.id, s.pss_reference, s.client_id, s.created_by_user_id, s.tracking_number, s.lr_number, s.master_awb, s.box_awbs_json, s.provider_booking_id, s.provider_pickup_id, s.provider_sync_status, s.status, s.provider, s.provider_account_id, s.provider_reference, (SELECT sd.id FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS pod_document_id, (SELECT sd.original_filename FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS pod_filename, (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = s.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, (SELECT pr.status FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_status, (SELECT pr.requested_date FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_scheduled_date, (SELECT pr.requested_time_slot FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_time_slot, (SELECT c.provider_status FROM pricing_provider_costs c WHERE c.shipment_id = s.id LIMIT 1) AS provider_confirmation_status, (SELECT te.description FROM tracking_events te WHERE te.shipment_id = s.id AND te.status = 'exception' ORDER BY te.event_time DESC LIMIT 1) AS provider_failure_reason, s.description, s.origin, s.destination, s.origin_address_json, s.destination_address_json, s.consignee, s.total_weight_kg, s.declared_value, s.pieces, s.edd, s.delivered_at, s.created_at, s.updated_at"
           : "s.id, s.pss_reference, s.client_id, s.created_by_user_id, s.tracking_number, s.lr_number, s.master_awb, s.box_awbs_json, s.provider_booking_id, s.provider_pickup_id, s.provider_sync_status, s.status, s.provider, s.provider_reference, (SELECT sd.id FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS pod_document_id, (SELECT sd.original_filename FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS pod_filename, (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = s.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, (SELECT pr.status FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_status, (SELECT pr.requested_date FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_scheduled_date, (SELECT pr.requested_time_slot FROM pickup_requests pr WHERE pr.shipment_id = s.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_time_slot, (SELECT c.provider_status FROM pricing_provider_costs c WHERE c.shipment_id = s.id LIMIT 1) AS provider_confirmation_status, (SELECT te.description FROM tracking_events te WHERE te.shipment_id = s.id AND te.status = 'exception' ORDER BY te.event_time DESC LIMIT 1) AS provider_failure_reason, s.description, s.origin, s.destination, s.origin_address_json, s.destination_address_json, s.consignee, s.total_weight_kg, s.declared_value, s.pieces, s.edd, s.delivered_at, s.created_at, s.updated_at";
-        const trackingShipmentColumns = "s.id, s.pss_reference, s.client_id, s.tracking_number, s.lr_number, s.master_awb, s.box_awbs_json, s.provider_reference, s.provider_booking_id, s.provider_pickup_id, s.provider_sync_status, s.status, s.provider, s.origin, s.destination, s.origin_address_json, s.destination_address_json, s.consignee, s.total_weight_kg, s.pieces, s.edd, s.delivered_at, s.created_at, s.updated_at, s.dimensions_json, (SELECT sd.id FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS pod_document_id, (SELECT sd.id FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) NOT LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS invoice_document_id, (SELECT pr.provider_reference FROM pickup_requests pr WHERE (pr.shipment_id = s.id OR EXISTS (SELECT 1 FROM pickup_request_shipments prs WHERE prs.pickup_id = pr.id AND prs.shipment_id = s.id)) AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, (SELECT b.invoice_number FROM billing_records b WHERE b.shipment_id = s.id ORDER BY b.created_at DESC LIMIT 1) AS invoice_number";
+        const trackingShipmentColumns = "s.id, s.pss_reference, s.client_id, s.tracking_number, s.lr_number, s.master_awb, s.box_awbs_json, s.provider_reference, s.provider_booking_id, s.provider_pickup_id, s.provider_sync_status, s.status, s.provider, s.origin, s.destination, s.origin_address_json, s.destination_address_json, s.consignee, s.total_weight_kg, s.weight_override_kg, s.weight_source, s.weight_updated_at, s.pieces, s.edd, s.delivered_at, s.created_at, s.updated_at, s.dimensions_json, (SELECT sd.id FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS pod_document_id, (SELECT sd.id FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) NOT LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS invoice_document_id, (SELECT pr.provider_reference FROM pickup_requests pr WHERE (pr.shipment_id = s.id OR EXISTS (SELECT 1 FROM pickup_request_shipments prs WHERE prs.pickup_id = pr.id AND prs.shipment_id = s.id)) AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, (SELECT b.invoice_number FROM billing_records b WHERE b.shipment_id = s.id ORDER BY b.created_at DESC LIMIT 1) AS invoice_number";
         const selectedShipmentColumns = shipmentView === "tracking" || !internalShipmentView ? trackingShipmentColumns : shipmentColumns;
         const queryLimit = pageSize + 1;
         const systemWhere = [statusFilter ? `s.${statusFilter}` : "", searchFilter].filter(Boolean).join(" AND ");
@@ -4990,6 +5047,10 @@ const worker = {
         const internalShipmentView = hasRole(auth, ["employee", "admin", "super_admin"]) || auth.system;
         const sensitiveShipmentView = auth.system || hasScope(auth, "shipments.sensitive.read");
         let shipment = await env.DB.prepare(`SELECT id, pss_reference, client_id, tracking_number, lr_number, master_awb, box_awbs_json, provider_booking_id, provider_pickup_id, provider_sync_status, status, provider, ${sensitiveShipmentView ? "provider_account_id, provider_reference," : "provider_reference,"} (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = shipments.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, (SELECT pr.status FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_status, (SELECT pr.requested_date FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_scheduled_date, (SELECT pr.requested_time_slot FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_time_slot, (SELECT c.provider_status FROM pricing_provider_costs c WHERE c.shipment_id = shipments.id LIMIT 1) AS provider_confirmation_status, description, origin, destination, ${sensitiveShipmentView ? "origin_address_json, destination_address_json, consignee, declared_value," : "NULL AS origin_address_json, NULL AS destination_address_json, NULL AS consignee, NULL AS declared_value,"} total_weight_kg, pieces, edd, delivered_at, created_at, updated_at FROM shipments WHERE (id = ? OR pss_reference = ?) LIMIT 1`).bind(shipmentGet[1], shipmentGet[1]).first<Record<string, unknown> & { client_id: string; provider: string | null; tracking_number: string | null; provider_reference?: string | null; provider_booking_id?: string | null; provider_account_id?: string | null; lr_number?: string | null; master_awb?: string | null }>();
+        if (shipment) {
+          const weight = await env.DB.prepare("SELECT weight_override_kg, weight_source, weight_updated_at FROM shipments WHERE id = ? LIMIT 1").bind(String(shipment.id)).first<{ weight_override_kg: number | null; weight_source: string | null; weight_updated_at: string | null }>();
+          shipment = { ...shipment, ...weight };
+        }
         if (!shipment || !canAccessClient(auth, shipment.client_id)) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
         if (url.searchParams.get("refresh_provider") === "1" && shipment.provider === "delhivery" && !shipment.lr_number && !shipment.master_awb && shipment.provider_booking_id) {
           const refreshProviderAccountId = typeof shipment.provider_account_id === "string"
@@ -4997,6 +5058,10 @@ const worker = {
             : (await env.DB.prepare("SELECT provider_account_id FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(String(shipment.id), shipment.client_id).first<{ provider_account_id: string | null }>())?.provider_account_id ?? null;
           await safeProviderRequest(env, "delhivery", "shipment_status", { shipment_id: String(shipment.id), provider_booking_id: shipment.provider_booking_id, tracking_number: shipment.tracking_number, lr_number: shipment.lr_number, provider_reference: shipment.provider_reference, provider_account_id: refreshProviderAccountId }, id, shipment.client_id);
           shipment = await env.DB.prepare(`SELECT id, pss_reference, client_id, tracking_number, lr_number, master_awb, box_awbs_json, provider_booking_id, provider_pickup_id, provider_sync_status, status, provider, ${sensitiveShipmentView ? "provider_account_id, provider_reference," : "provider_reference,"} (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = shipments.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, (SELECT pr.status FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_status, (SELECT pr.requested_date FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_scheduled_date, (SELECT pr.requested_time_slot FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_time_slot, (SELECT c.provider_status FROM pricing_provider_costs c WHERE c.shipment_id = shipments.id LIMIT 1) AS provider_confirmation_status, description, origin, destination, ${sensitiveShipmentView ? "origin_address_json, destination_address_json, consignee, declared_value," : "NULL AS origin_address_json, NULL AS destination_address_json, NULL AS consignee, NULL AS declared_value,"} total_weight_kg, pieces, edd, delivered_at, created_at, updated_at FROM shipments WHERE id = ? LIMIT 1`).bind(shipment.id).first<typeof shipment>() ?? shipment;
+        }
+        if (shipment) {
+          const weight = await env.DB.prepare("SELECT weight_override_kg, weight_source, weight_updated_at FROM shipments WHERE id = ? LIMIT 1").bind(String(shipment.id)).first<{ weight_override_kg: number | null; weight_source: string | null; weight_updated_at: string | null }>();
+          shipment = { ...shipment, ...weight };
         }
         if (route.endsWith("/tracking")) {
           const provider = ["delhivery", "ekart", "trackon", "xpressbees", "rivigo"].includes(String(shipment.provider)) ? shipment.provider as CourierProvider : null;
