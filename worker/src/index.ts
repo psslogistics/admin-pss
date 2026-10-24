@@ -1751,6 +1751,10 @@ function findProviderAmount(value: unknown, keys = new Set(["amount", "total_amo
 }
 
 function normalizeProviderEdd(value: unknown): string | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const milliseconds = value > 10_000_000_000 ? value : value > 1_000_000_000 ? value * 1000 : 0;
+    if (milliseconds) return new Date(milliseconds).toISOString().slice(0, 10);
+  }
   if (typeof value !== "string" && typeof value !== "number") return null;
   const raw = String(value).trim();
   if (!raw || raw.length > 80) return null;
@@ -1768,7 +1772,7 @@ function normalizeProviderEddFromText(value: string): string | null {
   if (iso) return normalizeProviderEdd(`${iso[1]}-${iso[2]}-${iso[3]}`);
   const dmy = text.match(/\b(\d{1,2})[-/.](\d{1,2})[-/.](20\d{2})\b/);
   if (dmy) return normalizeProviderEdd(`${dmy[1]}-${dmy[2]}-${dmy[3]}`);
-  const named = text.match(/\b(\d{1,2})\s+([A-Za-z]{3,9})\s+(20\d{2})\b/);
+  const named = text.match(/\b(\d{1,2})\s+([A-Za-z]{3,9})[, ]+\s*(20\d{2})\b/);
   if (named) return normalizeProviderEdd(`${named[1]} ${named[2]} ${named[3]}`);
   return null;
 }
@@ -1789,7 +1793,7 @@ function findProviderEdd(value: unknown, depth = 0): string | null {
   const object = value as Record<string, unknown>;
   for (const [key, candidate] of Object.entries(object)) {
     const normalizedKey = key.toLowerCase().replace(/[^a-z]/g, "");
-    if (expectedKeys.has(normalizedKey)) {
+    if (expectedKeys.has(normalizedKey) || /(?:edd|estimateddelivery|expecteddelivery|deliveryestimate|deliveryeta|arrivaldate)/.test(normalizedKey)) {
       const found = normalizeProviderEdd(candidate);
       if (found) return found;
       if (candidate && typeof candidate === "object") {
