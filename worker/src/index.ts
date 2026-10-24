@@ -2579,6 +2579,13 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
                 uri: `https://pss-api.psslogisticsadmin.workers.dev/v1/webhooks/delhivery/labels?token=${encodeURIComponent(labelCallbackToken ?? "")}`,
                 method: "POST",
                 authorization: `Bearer ${labelCallbackToken ?? ""}`,
+                // Delhivery's async label service expects the callback auth
+                // to be forwarded as request headers as well. Keep the query
+                // token as a compatibility fallback for older workers.
+                headers: {
+                  Authorization: `Bearer ${labelCallbackToken ?? ""}`,
+                  "Content-Type": "application/json",
+                },
               },
             })
         : provider === "delhivery" && operation === "labels" && payload.label_api_variant === "ucp"
