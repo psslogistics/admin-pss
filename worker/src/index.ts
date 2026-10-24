@@ -1113,8 +1113,8 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   if (registrationAccepted && registrationContract === "b2b" && !existing) {
     const warehouseId = crypto.randomUUID();
     await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status, provider_reference, provider_name, provider_activated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'active', ?, ?, CURRENT_TIMESTAMP)")
-      .bind(warehouseId, clientId, localName, resolvedOrigin.line, resolvedOrigin.city, resolvedOrigin.state, resolvedOrigin.pincode, resolvedOrigin.phone, resolvedOrigin.name, providerAccountId ?? null, createdProviderReference, createdProviderName || providerName).run();
-    return { ok: true as const, name: createdProviderName || providerName, reused: false as const, origin: resolvedOrigin };
+      .bind(warehouseId, clientId, localName, resolvedOrigin.line, resolvedOrigin.city, resolvedOrigin.state, resolvedOrigin.pincode, resolvedOrigin.phone, resolvedOrigin.name, providerAccountId ?? null, createdProviderReference, providerName).run();
+    return { ok: true as const, name: providerName, reused: false as const, origin: resolvedOrigin };
   }
   // The registration response is the only provider operation needed here.
   // Facility lookup is intentionally reserved for pickup-slot operations.
@@ -1123,14 +1123,17 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
     facility: {
       id: createdProviderReference || "",
       code: createdProviderReference || "",
-      name: createdProviderName || providerName,
+      // The response may contain a display label from an older facility. The
+      // manifest contract must receive the deterministic name sent in this
+      // registration request, not that echoed display label.
+      name: providerName,
       pincode: resolvedOrigin.pincode,
     },
   };
   await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status, provider_reference, provider_name, provider_activated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'active', ?, ?, CURRENT_TIMESTAMP)")
-      .bind(crypto.randomUUID(), clientId, localName, resolvedOrigin.line, resolvedOrigin.city, resolvedOrigin.state, resolvedOrigin.pincode, resolvedOrigin.phone, resolvedOrigin.name, providerAccountId ?? null, facility.facility.id || null, facility.facility.name || providerName)
+      .bind(crypto.randomUUID(), clientId, localName, resolvedOrigin.line, resolvedOrigin.city, resolvedOrigin.state, resolvedOrigin.pincode, resolvedOrigin.phone, resolvedOrigin.name, providerAccountId ?? null, facility.facility.id || null, providerName)
       .run();
-  return { ok: true as const, name: facility.facility.name || providerName, reused: false as const, origin: resolvedOrigin };
+  return { ok: true as const, name: providerName, reused: false as const, origin: resolvedOrigin };
 }
 
 type DelhiveryFacility = { id: string; code: string; name: string; pincode: string };
