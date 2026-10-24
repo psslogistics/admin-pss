@@ -932,9 +932,11 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   // always converge back to the deterministic provider identity. Otherwise a
   // retry can keep manifesting against a facility that Delhivery never
   // configured, even though the canonical facility is available.
-  const existingLocalName = existing?.name?.trim() || "";
-  const hasRetrySuffix = /\s-\sPSS-[0-9a-f]{8}(?:\s-\sPSS-[0-9a-f]{8})*$/i.test(existingLocalName);
-  const baseLocalName = existingLocalName && !hasRetrySuffix ? existingLocalName : generatedLocalName;
+  // Older rows may contain punctuation variants or retry suffixes that were
+  // never registered with the manifestation service. Rebuild the provider
+  // identity from the canonical saved address on every attempt so stale local
+  // names cannot keep a shipment pointed at an unconfigured facility.
+  const baseLocalName = generatedLocalName;
   const existingHasConfirmedBooking = existing
     ? await delhiveryWarehouseHasConfirmedBooking(env, clientId, providerAccountId, resolvedOrigin)
     : false;
