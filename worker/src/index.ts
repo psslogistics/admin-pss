@@ -2918,12 +2918,12 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
               const labelBase64 = findProviderContentBase64(labelJson);
               if (labelBase64) {
                 const labelType = providerContentTypeFromBase64(labelBase64, findProviderContentType(labelJson) ?? "application/octet-stream");
-                if (labelType === "application/pdf") labelArtifacts.push({ content_base64: labelBase64, content_type: "application/pdf" });
+              if (labelType === "application/pdf" || labelType === "image/png" || labelType === "image/jpeg") labelArtifacts.push({ content_base64: labelBase64, content_type: labelType });
               }
             } else {
               const labelBytes = await providerResponseBytes(labelResponse, 12 * 1024 * 1024);
               const labelType = providerContentTypeFromBytes(labelBytes, labelContentType);
-              if (labelType === "application/pdf") labelArtifacts.push({ content_base64: providerBytesToBase64(labelBytes), content_type: "application/pdf" });
+              if (labelType === "application/pdf" || labelType === "image/png" || labelType === "image/jpeg") labelArtifacts.push({ content_base64: providerBytesToBase64(labelBytes), content_type: labelType });
             }
           }
           if (labelArtifacts.length) {
