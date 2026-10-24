@@ -798,13 +798,14 @@ function delhiveryJwtClaim(token: string | undefined, claim: string) {
   } catch { return ""; }
 }
 
-function delhiveryTokenCacheKey(accountName: string) {
-  return `delhivery:b2b:${accountName.trim().toUpperCase().replace(/[^A-Z0-9]+/g, "_")}`;
+function delhiveryTokenCacheKey(accountName: string, authBase?: string) {
+  const host = authBase ? new URL(authBase).hostname.replace(/[^A-Z0-9]+/gi, "_").toUpperCase() : "DEFAULT";
+  return `delhivery:b2b:${host}:${accountName.trim().toUpperCase().replace(/[^A-Z0-9]+/g, "_")}`;
 }
 
 const delhiveryTokenRefreshes = new Map<string, Promise<string | null>>();
 
-async function delhiveryB2bBearer(env: Env, credentialValue: string | undefined, accountName: string, requestIdValue: string, timeoutMs: number, forceRefresh = false) {
+async function delhiveryB2bBearer(env: Env, credentialValue: string | undefined, accountName: string, requestIdValue: string, timeoutMs: number, forceRefresh = false, preferredAuthBase?: string) {
   const credential = delhiveryB2bCredential(credentialValue);
   if (!credential) return null;
   const configuredToken = credential.jwt ?? credential.token;
@@ -814,7 +815,7 @@ async function delhiveryB2bBearer(env: Env, credentialValue: string | undefined,
     return (delhiveryJwtExpiry(configuredToken) ?? now + 86400) > now + 30 ? configuredToken : null;
   }
   if (!credential.username || !credential.password) return configuredToken ?? null;
-  const cacheKey = delhiveryTokenCacheKey(accountName);
+  const cacheKey = delhiveryTokenCacheKey(accountName, preferredAuthBase);
   const now = Math.floor(Date.now() / 1000);
   const usable = (token: string | null | undefined, expiresAt?: number | null) => Boolean(delhiveryLooksLikeJwt(token ?? undefined) && (expiresAt ?? delhiveryJwtExpiry(token ?? "") ?? 0) > now + 300);
   if (!forceRefresh && env.DELHIVERY_TOKEN_CACHE) {
@@ -827,7 +828,9 @@ async function delhiveryB2bBearer(env: Env, credentialValue: string | undefined,
     try {
       if (env.DELHIVERY_TOKEN_CACHE) await env.DELHIVERY_TOKEN_CACHE.delete(cacheKey);
       const configuredBase = String(env.DELHIVERY_B2B_API_BASE_URL ?? "https://ltl-clients-api.delhivery.com").replace(/\/$/, "");
-      const loginBases = [...new Set([configuredBase, "https://btob.api.delhivery.com"])];
+      const loginBases = preferredAuthBase
+        ? [preferredAuthBase.replace(/\/$/, "")]
+        : [...new Set([configuredBase, "https://btob.api.delhivery.com"])];
       for (const base of loginBases) {
         try {
           const response = await providerFetch(`${base}/ums/login`, {
@@ -2352,7 +2355,8 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (!base || (provider === "trackon" ? !trackon : provider === "rivigo" ? !rivigo : !credential)) return { enabled: false, status: "not_configured" as const };
   const providerTimeoutMs = Math.min(timeoutMsOverride ?? (provider === "delhivery" && operation === "shipments" ? 30000 : 10000), provider === "delhivery" && operation === "shipments" ? 30000 : 10000);
   const delhiveryB2bAccountName = account?.account_name ?? defaultDelhiveryAccountName;
-  let delhiveryB2bToken = useDelhiveryB2b ? await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs) : null;
+  const delhiveryLabelAuthBase = provider === "delhivery" && operation === "labels" ? delhiveryB2bDocsBase() : undefined;
+  let delhiveryB2bToken = useDelhiveryB2b ? await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs, false, delhiveryLabelAuthBase) : null;
   if (provider === "delhivery" && useDelhiveryB2b && !delhiveryB2bToken) return { enabled: true, status: "failed" as const, error: "Delhivery B2B authentication failed" };
   let delhiveryPickupLocation = "";
   let delhiveryCanonicalOrigin: Record<string, unknown> | null = null;
@@ -2411,7 +2415,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       const warehouseApiToken = delhiveryWarehouseApiToken(env, delhiveryB2bAccountName, parsedDelhiveryCredential);
       let warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId, selectedWarehouseId, warehouseApiToken);
       if (!warehouse.ok && /\b401\b|invalid token|unauthorized|token decode|not enough segments/i.test(warehouse.error)) {
-        const refreshedToken = await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs, true);
+        const refreshedToken = await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs, true, delhiveryLabelAuthBase);
       if (refreshedToken) {
         delhiveryB2bToken = refreshedToken;
         warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId, selectedWarehouseId, warehouseApiToken);
@@ -2596,7 +2600,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       }
       response = await providerFetch(url, { method, headers, body: isGet ? undefined : requestBody }, attemptTimeoutMs);
       if (!singleManifestCall && provider === "delhivery" && useDelhiveryB2b && response.status === 401 && attempt === 0 && credential) {
-        const refreshedToken = await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs, true);
+        const refreshedToken = await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs, true, delhiveryLabelAuthBase);
         if (refreshedToken) {
           headers.Authorization = `Bearer ${refreshedToken}`;
           continue;
