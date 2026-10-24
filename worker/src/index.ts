@@ -1705,6 +1705,10 @@ function delhiveryB2bDocsBase() {
   return "https://btob.api.delhivery.com";
 }
 
+function delhiveryLabelApiBase() {
+  return "https://ltl-clients-api.delhivery.com";
+}
+
 function delhiveryUcpLabelSize(size: string) {
   return ({ a4: "a4", "4x2": "sm", "4x2.5": "md", "3x2": "sm" } as Record<string, string>)[size] ?? "a4";
 }
@@ -2361,7 +2365,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (!base || (provider === "trackon" ? !trackon : provider === "rivigo" ? !rivigo : !credential)) return { enabled: false, status: "not_configured" as const };
   const providerTimeoutMs = Math.min(timeoutMsOverride ?? (provider === "delhivery" && operation === "shipments" ? 30000 : 10000), provider === "delhivery" && operation === "shipments" ? 30000 : 10000);
   const delhiveryB2bAccountName = account?.account_name ?? defaultDelhiveryAccountName;
-  const delhiveryLabelAuthBase = provider === "delhivery" && operation === "labels" ? delhiveryB2bDocsBase() : undefined;
+    const delhiveryLabelAuthBase = provider === "delhivery" && operation === "labels" ? delhiveryLabelApiBase() : undefined;
   let delhiveryB2bToken = useDelhiveryB2b ? await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs, false, delhiveryLabelAuthBase) : null;
   if (provider === "delhivery" && useDelhiveryB2b && !delhiveryB2bToken) return { enabled: true, status: "failed" as const, error: "Delhivery B2B authentication failed" };
   let delhiveryPickupLocation = "";
@@ -2500,7 +2504,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
           ? `${String(delhiveryLabelBase).replace(/\/$/, "")}/docket/generate_label_pdf`
           : labelVariant === "legacy" || labelVariant === "legacy_alt"
             ? `${String(delhiveryLabelBase).replace(/\/$/, "")}/label/get_urls/${encodeURIComponent(delhiveryLabelApiSize(String(payload.label_size ?? "std")))}/${encodeURIComponent(trackingNumber)}`
-            : `${String(delhiveryLabelBase).replace(/\/$/, "")}/v2/get-label-urls/${encodeURIComponent(delhiveryLabelApiSize(String(payload.label_size ?? "std")))}/${encodeURIComponent(trackingNumber)}`
+            : `${delhiveryLabelApiBase()}/label/get_urls/${encodeURIComponent(delhiveryLabelApiSize(String(payload.label_size ?? "std")))}/${encodeURIComponent(trackingNumber)}`
       : provider === "delhivery" && operation === "lr_copy"
         ? `${base.replace(/\/$/, "")}/lr_copy/print/${encodeURIComponent(trackingNumber)}?lr_copy_type=${encodeURIComponent(String(payload.lr_copy_type ?? "SHIPPER COPY"))}`
       : provider === "delhivery" && operation === "document"
@@ -2878,7 +2882,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       // through the label-links endpoint once the task completes. Poll that
       // provider endpoint briefly so the client receives the actual PDFs in
       // the same request instead of an empty formats menu.
-      const labelUrl = `${String(delhiveryLabelBase).replace(/\/$/, "")}/v2/get-label-urls/${encodeURIComponent(delhiveryLabelApiSize(String(payload.label_size ?? "a4")))}/${encodeURIComponent(trackingNumber)}`;
+      const labelUrl = `${delhiveryLabelApiBase()}/label/get_urls/${encodeURIComponent(delhiveryLabelApiSize(String(payload.label_size ?? "a4")))}/${encodeURIComponent(trackingNumber)}`;
       // The alternate B2B PDF endpoint returns a job id first. Delhivery's
       // label-link endpoint usually publishes the completed assets several
       // seconds later, so poll long enough for the provider job to finish.
