@@ -4743,6 +4743,16 @@ const worker = {
         const providerResult = await safeProviderRequest(env, "delhivery", "shipments", { shipment_id: shipment.id, ...payload, invoice_documents: invoiceDocuments, provider_account_id: shipment.provider_account_id ?? payload.provider_account_id }, id, shipmentClientId, key, 25000);
         if (providerResult.status !== "accepted") {
           const reason = String((providerResult as { error?: string; reason?: string }).error ?? (providerResult as { reason?: string }).reason ?? "Delhivery did not accept the booking retry").slice(0, 500);
+          const activationPending = /awaiting provider activation|not active|not configured|has not been configured|warehouse.*configured/i.test(reason);
+          if (activationPending) {
+            await env.DB.prepare("UPDATE shipments SET status = 'booked', provider_sync_status = 'pending', provider_retry_at = datetime('now', '+5 minutes'), provider_retry_count = provider_retry_count + 1, provider_last_error = ?, provider_booking_payload_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+              .bind(reason, JSON.stringify(providerRetryPayload(payload)), shipment.id, shipmentClientId).run();
+            await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'booked', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
+              .bind(crypto.randomUUID(), shipment.id, "Delhivery is still activating the pickup warehouse; automatic retry scheduled", auth.userId ?? `api:${shipmentClientId}`).run();
+            const pending = JSON.stringify({ ok: true, data: { id: shipment.id, status: "booked", provider_status: "pending", message: "Delhivery is still activating the pickup warehouse; the booking will retry automatically." }, request_id: id });
+            await saveIdempotent(env, key, shipmentClientId, endpoint, 202, pending, requestHash);
+            return new Response(pending, { status: 202, headers: { ...headers, "content-type": "application/json" } });
+          }
           await env.DB.prepare("UPDATE shipments SET status = 'exception', provider_sync_status = 'failed', provider_last_error = ?, provider_booking_payload_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(reason, JSON.stringify(providerRetryPayload(payload)), shipment.id, shipmentClientId).run();
           await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'exception', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipment.id, `Booking retry failed: ${reason}`, auth.userId ?? `api:${shipmentClientId}`).run();
           const failed = JSON.stringify({ ok: false, error: { code: "PROVIDER_REQUEST_FAILED", category: "provider", message: "Delhivery still did not accept this booking.", user_safe_message: "Delhivery still did not accept this booking. The shipment remains retryable.", technical_message: reason, provider_code: (providerResult as { code?: string }).code ?? "PROVIDER_REQUEST_FAILED", request_id: id, retryable: true }, data: { id: shipment.id, status: "exception" }, request_id: id });
