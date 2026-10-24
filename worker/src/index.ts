@@ -2710,6 +2710,13 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (persistIntegration) await env.DB.prepare("UPDATE integration_requests SET status = ?, error_code = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(response.ok ? "succeeded" : "failed", response.ok ? null : `HTTP_${response.status}`, response.ok ? null : `${lastError}${providerFailureDetail ? `: ${providerFailureDetail}` : ""}`.slice(0, 500), integrationId).run();
   let parsedProviderBody: unknown = null;
   try { parsedProviderBody = JSON.parse(responseBody); } catch { parsedProviderBody = responseBody.trim() || null; }
+  if (!response.ok && provider === "delhivery" && operation === "shipment_status" && clientId && typeof payload.shipment_id === "string" && response.status === 404 && /invalid job id/i.test(responseBody)) {
+    // Only Delhivery's explicit invalid-job response is strong enough to
+    // release an asynchronous booking for a safe retry. Other failures must
+    // never clear the job id or risk creating a duplicate shipment.
+    await env.DB.prepare("UPDATE shipments SET provider_booking_id = NULL, provider_sync_status = 'failed', status = CASE WHEN status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery') THEN 'exception' ELSE status END, provider_retry_at = NULL, provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ? AND provider_reference IS NULL AND lr_number IS NULL AND master_awb IS NULL")
+      .bind("Delhivery invalidated the asynchronous booking job; queued for a safe retry", payload.shipment_id, clientId).run();
+  }
   if (provider === "delhivery" && operation === "labels") {
     const bodyObject = parsedProviderBody && typeof parsedProviderBody === "object" ? parsedProviderBody as Record<string, unknown> : null;
     console.warn(JSON.stringify({
@@ -3341,7 +3348,7 @@ function parseJsonArray(value: string | null | undefined) {
 }
 
 async function retryPendingDelhiveryBookings(env: Env, cron: string) {
-  const pending = await env.DB.prepare("SELECT id, client_id, provider_account_id, provider_booking_payload_json, provider_retry_count FROM shipments WHERE provider = 'delhivery' AND status = 'booked' AND provider_sync_status = 'pending' AND provider_booking_payload_json IS NOT NULL AND provider_booking_id IS NULL AND (provider_retry_at IS NULL OR datetime(provider_retry_at) <= datetime('now')) ORDER BY updated_at ASC LIMIT 10").all<{ id: string; client_id: string; provider_account_id: string | null; provider_booking_payload_json: string; provider_retry_count: number | null }>();
+  const pending = await env.DB.prepare("SELECT id, client_id, provider_account_id, provider_booking_payload_json, provider_retry_count FROM shipments WHERE provider = 'delhivery' AND status IN ('booked', 'exception') AND provider_sync_status IN ('pending', 'failed') AND provider_booking_payload_json IS NOT NULL AND provider_booking_id IS NULL AND (provider_retry_at IS NULL OR datetime(provider_retry_at) <= datetime('now')) ORDER BY updated_at ASC LIMIT 10").all<{ id: string; client_id: string; provider_account_id: string | null; provider_booking_payload_json: string; provider_retry_count: number | null }>();
   for (const shipment of pending.results) {
     let payload: Record<string, unknown>;
     try { payload = JSON.parse(shipment.provider_booking_payload_json) as Record<string, unknown>; } catch {
