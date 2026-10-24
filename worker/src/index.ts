@@ -1610,9 +1610,15 @@ function findProviderUrl(value: unknown, depth = 0): string | null {
 function findProviderUrls(value: unknown, result: string[] = [], depth = 0, parentKey = "", baseUrl?: string): string[] {
   if (depth > 8 || value === null || value === undefined) return result;
   if (typeof value === "string") {
-    const url = value.trim();
-    const relativeAsset = /(?:url|uri|link|path|file|document|label|mps)/i.test(parentKey) && (/^(?:\/\/|\/)/.test(url) || /^[^\s]+\.(?:pdf|png|jpe?g|webp)(?:[?#].*)?$/i.test(url));
-    const resolved = /^https?:\/\//i.test(url) ? url : relativeAsset && baseUrl ? new URL(url, baseUrl).toString() : null;
+    const text = value.trim();
+    const candidates = /^https?:\/\//i.test(text)
+      ? [text]
+      : [...text.matchAll(/https?:\/\/[^\s"'<>]+/gi)].map((match) => match[0].replace(/[),.;]+$/, ""));
+    for (const url of candidates) {
+      if (!result.includes(url)) result.push(url);
+    }
+    const relativeAsset = /(?:url|uri|link|path|file|document|label|mps)/i.test(parentKey) && (/^(?:\/\/|\/)/.test(text) || /^[^\s]+\.(?:pdf|png|jpe?g|webp)(?:[?#].*)?$/i.test(text));
+    const resolved = relativeAsset && baseUrl ? new URL(text, baseUrl).toString() : null;
     if (resolved && !result.includes(resolved)) result.push(resolved);
     return result;
   }
@@ -2684,7 +2690,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   const providerFailureDetail = !response.ok ? responseBody.replace(/\s+/g, " ").trim().slice(0, 300) : null;
   if (persistIntegration) await env.DB.prepare("UPDATE integration_requests SET status = ?, error_code = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(response.ok ? "succeeded" : "failed", response.ok ? null : `HTTP_${response.status}`, response.ok ? null : `${lastError}${providerFailureDetail ? `: ${providerFailureDetail}` : ""}`.slice(0, 500), integrationId).run();
   let parsedProviderBody: unknown = null;
-  try { parsedProviderBody = JSON.parse(responseBody); } catch { parsedProviderBody = null; }
+  try { parsedProviderBody = JSON.parse(responseBody); } catch { parsedProviderBody = responseBody.trim() || null; }
   if (provider === "delhivery" && operation === "labels") {
     const bodyObject = parsedProviderBody && typeof parsedProviderBody === "object" ? parsedProviderBody as Record<string, unknown> : null;
     console.warn(JSON.stringify({
@@ -2855,6 +2861,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       artifact = JSON.parse(responseBody);
     } catch {
       artifact = {
+        urls: findProviderUrls(responseBody, [], 0, "", response.url),
         content_base64: responseBytes ? providerBytesToBase64(responseBytes) : btoa(responseBody),
         content_type: responseBytes ? providerContentTypeFromBytes(responseBytes, response.headers.get("content-type") ?? "application/octet-stream") : response.headers.get("content-type") ?? "application/octet-stream",
       };
@@ -2875,8 +2882,8 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
           if (!labelResponse.ok) continue;
           const labelBody = await providerResponseText(labelResponse, Math.max(providerTimeoutMs, 5000));
           let labelJson: unknown = null;
-          try { labelJson = JSON.parse(labelBody); } catch { labelJson = null; }
-          if (labelJson && findProviderUrls(labelJson).length) artifact = labelJson;
+          try { labelJson = JSON.parse(labelBody); } catch { labelJson = labelBody.trim() || null; }
+          if (labelJson && findProviderUrls(labelJson).length) artifact = typeof labelJson === "object" ? labelJson : { urls: findProviderUrls(labelJson, [], 0, "", labelResponse.url) };
         } catch {
           // Keep the queued response and continue the bounded retry window.
         }
@@ -2900,7 +2907,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
             if (labelContentType.toLowerCase().includes("json")) {
               const labelBody = await providerResponseText(labelResponse, attemptTimeoutMs);
               let labelJson: unknown = null;
-              try { labelJson = JSON.parse(labelBody); } catch { labelJson = null; }
+              try { labelJson = JSON.parse(labelBody); } catch { labelJson = labelBody.trim() || null; }
               const labelBase64 = findProviderContentBase64(labelJson);
               if (labelBase64) {
                 const labelType = providerContentTypeFromBase64(labelBase64, findProviderContentType(labelJson) ?? "application/octet-stream");
@@ -3666,7 +3673,10 @@ async function handleDelhiveryLabelWebhook(request: Request, env: Env, requestId
       const labelResponse = await providerFetch(`${delhiveryB2bDocsBase()}/v2/get-label-urls/${encodeURIComponent(delhiveryLabelApiSize(size))}/${encodeURIComponent(effectiveReference)}`, { method: "GET", headers: { accept: "application/json", Authorization: `Bearer ${tokenValue}` } }, 10000);
       if (labelResponse.ok) {
         let labelPayload: unknown = null;
-        try { labelPayload = JSON.parse(await providerResponseText(labelResponse, 10000)); } catch { labelPayload = null; }
+        try {
+          const labelBody = await providerResponseText(labelResponse, 10000);
+          try { labelPayload = JSON.parse(labelBody); } catch { labelPayload = labelBody.trim() || null; }
+        } catch { labelPayload = null; }
         for (const url of findProviderUrls(labelPayload, [], 0, "", labelResponse.url).filter(delhiveryCallbackAssetAllowed).slice(0, 32)) {
           const response = await providerFetch(url, { method: "GET", headers: { accept: "application/pdf", Authorization: `Bearer ${tokenValue}` } }, 10000);
           if (!response.ok) continue;
