@@ -1121,7 +1121,7 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
     delhivery_pickup_location: providerName,
     pincode: resolvedOrigin.pincode,
   }, requestIdValue, timeoutMs);
-  for (let attempt = 1; !facility.ok && attempt < 5; attempt += 1) {
+  for (let attempt = 1; !facility.ok && attempt < 8; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
     facility = await resolveDelhiveryFacility(env, token, b2bBaseUrl, clientId, {
       warehouse_id: existing?.id,
