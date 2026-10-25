@@ -2626,7 +2626,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       : provider === "delhivery" && operation === "document"
         ? `${base.replace(/\/$/, "")}/document/download?lrn=${encodeURIComponent(trackingNumber)}${payload.doc_type ? `&doc_type=${encodeURIComponent(String(payload.doc_type))}` : ""}&auto_download=true&version=latest`
       : provider === "delhivery" && operation === "freight_charges"
-        ? `${base.replace(/\/$/, "")}/lrn/freight-breakup/lrns=${encodeURIComponent(trackingNumber)}`
+        ? `${base.replace(/\/$/, "")}/lrn/freight-breakup?lrns=${encodeURIComponent(trackingNumber)}`
       : provider === "delhivery" && operation === "shipment_status"
         ? `${(useDelhiveryB2b ? delhiveryB2bDocsBase() : base).replace(/\/$/, "")}/${useDelhiveryB2b ? "v2/manifest" : "manifest"}?job_id=${encodeURIComponent(String(payload.provider_booking_id ?? ""))}`
       : provider === "delhivery" && operation === "tracking"
