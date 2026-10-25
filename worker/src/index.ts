@@ -2597,11 +2597,13 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (provider === "delhivery" && operation === "pickups" && !delhiveryPickup) return { enabled: false, status: "invalid_request" as const, reason: "Delhivery requires a valid pickup date and registered pickup location" };
   const rivigoCreate = provider === "rivigo" && operation === "shipments" ? rivigoBookingPayload(payload, rivigo!) : null;
   if (provider === "rivigo" && operation === "shipments" && !rivigoCreate) return { enabled: false, status: "invalid_request" as const, reason: "Rivigo requires valid origin/destination addresses, positive weight, and at least one box" };
-  // Scheduled Fujiyama tracking is a high-volume read-only job. Keep the
-  // shipment outcome and meaningful tracking events in D1, but avoid creating
-  // an integration audit row for every unchanged cron poll. Interactive and
-  // mutation requests remain fully audited.
-  const persistIntegration = !(provider === "delhivery" && operation === "tracking" && requestIdValue.startsWith("cron:"));
+  // Scheduled provider reconciliation is high-volume and mostly unchanged.
+  // Keep shipment outcomes, meaningful tracking events, and interactive
+  // requests in D1, but do not spend a D1 write for every cron poll. This is
+  // especially important on the Cloudflare free tier, where repeated audit
+  // rows can exhaust the daily write allowance and block real bookings.
+  const cronReadOperations = new Set(["tracking", "document", "shipment_status", "serviceability", "serviceability_route", "pickup_status", "pickup_slots", "freight_charges"]);
+  const persistIntegration = !(requestIdValue.startsWith("cron:") && cronReadOperations.has(operation));
   const integrationId = crypto.randomUUID();
   if (persistIntegration) await env.DB.prepare("INSERT INTO integration_requests (id, provider, client_id, operation, idempotency_key, provider_request_id, status, attempt_count) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0)").bind(integrationId, provider, clientId ?? null, operation, idempotencyKey ?? null, requestIdValue).run();
   const delhiveryOrigin = provider === "delhivery" ? new URL(base).origin : "";
@@ -3390,10 +3392,14 @@ async function safeProviderRequest(env: Env, provider: CourierProvider, operatio
     return await providerRequest(env, provider, operation, payload, requestIdValue, clientId, idempotencyKey, timeoutMsOverride);
   } catch (caught) {
     const message = caught instanceof Error ? caught.message.slice(0, 500) : "provider_request_failed";
-    try {
-      await env.DB.prepare("UPDATE integration_requests SET status = 'failed', error_code = 'PROVIDER_EXCEPTION', error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE provider_request_id = ? AND provider = ? AND operation = ? AND status = 'pending'").bind(message, requestIdValue, provider, operation).run();
-    } catch (recordingError) {
-      console.error(JSON.stringify({ request_id: requestIdValue, route: "/v1/provider-request", provider, operation, error: "failed_to_record_provider_exception", detail: recordingError instanceof Error ? recordingError.message.slice(0, 200) : "unknown" }));
+    const cronReadOperations = new Set(["tracking", "document", "shipment_status", "serviceability", "serviceability_route", "pickup_status", "pickup_slots", "freight_charges"]);
+    const persistIntegration = !(requestIdValue.startsWith("cron:") && cronReadOperations.has(operation));
+    if (persistIntegration) {
+      try {
+        await env.DB.prepare("UPDATE integration_requests SET status = 'failed', error_code = 'PROVIDER_EXCEPTION', error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE provider_request_id = ? AND provider = ? AND operation = ? AND status = 'pending'").bind(message, requestIdValue, provider, operation).run();
+      } catch (recordingError) {
+        console.error(JSON.stringify({ request_id: requestIdValue, route: "/v1/provider-request", provider, operation, error: "failed_to_record_provider_exception", detail: recordingError instanceof Error ? recordingError.message.slice(0, 200) : "unknown" }));
+      }
     }
     console.error(JSON.stringify({ request_id: requestIdValue, route: "/v1/provider-request", provider, operation, error: message }));
     return { enabled: true, status: "failed" as const, providerStatus: 0, error: message };
