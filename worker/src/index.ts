@@ -940,7 +940,6 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   const existingHasConfirmedBooking = existing
     ? await delhiveryWarehouseHasConfirmedBooking(env, clientId, providerAccountId, resolvedOrigin)
     : false;
-  const configuredPickupLocation = String(env.DELHIVERY_DEFAULT_PICKUP_LOCATION ?? "").trim();
   // A saved/previously registered provider location is reusable even when the
   // first shipment has not published an LR yet. Waiting for a confirmed LR
   // here caused every retry to create another PSS-suffixed warehouse, which
@@ -953,22 +952,6 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   const existingProviderLocation = existing && (existing.provider_status === "active" || existing.provider_status === "pending")
     && Boolean((existing.provider_name?.trim() || existing.name?.trim()) && (existing.provider_reference?.trim() || existingHasConfirmedBooking));
   const warehouseIdentityHash = await sha256(`${baseLocalName}|${resolvedOrigin.pincode}`);
-  // A local warehouse row is not, by itself, a Delhivery facility. In
-  // particular, older rows can be marked active while provider_reference is
-  // still empty. Sending the generated local name in that case makes the
-  // manifest API reject the booking with "warehouse ... has not been
-  // configured". Use the account's configured pickup location until the
-  // provider gives us positive evidence that a custom facility is usable.
-  if (configuredPickupLocation && !existingProviderLocation) {
-    delhiveryWarehouseLog(requestIdValue, "using_configured_pickup_location", {
-      account_id: providerAccountId ?? null,
-      identity_hash: warehouseIdentityHash,
-      configured_pickup_location: configuredPickupLocation,
-      local_warehouse_id: existing?.id ?? null,
-      local_provider_reference: existing?.provider_reference ?? null,
-    });
-    return { ok: true as const, name: configuredPickupLocation, reused: true as const, origin: resolvedOrigin };
-  }
   // Keep one stable provider facility name for an address. Generating a new
   // PSS-suffixed name on every activation retry creates duplicate Delhivery
   // facilities and can leave the manifest service rejecting the newest name
@@ -1129,30 +1112,40 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
     // the manifestation API, so let manifestation be the final authority.
     registrationAccepted = true;
   }
-  if (registrationAccepted && registrationContract === "b2b" && !existing) {
-    const warehouseId = crypto.randomUUID();
-    await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status, provider_reference, provider_name, provider_activated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'active', ?, ?, CURRENT_TIMESTAMP)")
-      .bind(warehouseId, clientId, localName, resolvedOrigin.line, resolvedOrigin.city, resolvedOrigin.state, resolvedOrigin.pincode, resolvedOrigin.phone, resolvedOrigin.name, providerAccountId ?? null, createdProviderReference, providerName).run();
-    return { ok: true as const, name: providerName, reused: false as const, origin: resolvedOrigin };
-  }
-  // The registration response is the only provider operation needed here.
-  // Facility lookup is intentionally reserved for pickup-slot operations.
-  const facility = {
-    ok: true,
-    facility: {
-      id: createdProviderReference || "",
-      code: createdProviderReference || "",
-      // The response may contain a display label from an older facility. The
-      // manifest contract must receive the deterministic name sent in this
-      // registration request, not that echoed display label.
-      name: providerName,
+  // HTTP success from the warehouse-create endpoint is not sufficient: the
+  // manifest service can still reject the facility while Delhivery's
+  // activation/indexing job is pending. Confirm the exact facility on the
+  // provider-side inventory before allowing a booking to be submitted.
+  let facility = await resolveDelhiveryFacility(env, token, b2bBaseUrl, clientId, {
+    warehouse_id: existing?.id,
+    delhivery_pickup_location: providerName,
+    pincode: resolvedOrigin.pincode,
+  }, requestIdValue, timeoutMs);
+  for (let attempt = 1; !facility.ok && attempt < 5; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+    facility = await resolveDelhiveryFacility(env, token, b2bBaseUrl, clientId, {
+      warehouse_id: existing?.id,
+      delhivery_pickup_location: providerName,
       pincode: resolvedOrigin.pincode,
-    },
-  };
-  await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status, provider_reference, provider_name, provider_activated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'active', ?, ?, CURRENT_TIMESTAMP)")
-      .bind(crypto.randomUUID(), clientId, localName, resolvedOrigin.line, resolvedOrigin.city, resolvedOrigin.state, resolvedOrigin.pincode, resolvedOrigin.phone, resolvedOrigin.name, providerAccountId ?? null, facility.facility.id || null, providerName)
+    }, requestIdValue, timeoutMs);
+  }
+  if (!facility.ok) {
+    if (!delhiveryFacilityNotFound(facility.error)) return { ok: false as const, error: facility.error };
+    if (existing) {
+      await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_reference = COALESCE(?, provider_reference), provider_name = COALESCE(?, provider_name), provider_status = 'pending', provider_error = ?, status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+        .bind(providerAccountId ?? null, createdProviderReference, createdProviderName || providerName, "Delhivery warehouse was created but is awaiting provider activation", existing.id, clientId).run();
+    }
+    return { ok: false as const, code: "WAREHOUSE_ACTIVATION_PENDING" as const, error: "Delhivery accepted the warehouse request, but the pickup facility is not active yet. Retry after Delhivery activates it." };
+  }
+  if (existing) {
+    await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_status = 'active', provider_reference = COALESCE(provider_reference, ?), provider_name = ?, provider_error = NULL, provider_activated_at = CURRENT_TIMESTAMP, status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+      .bind(providerAccountId ?? null, facility.facility.id, facility.facility.name || providerName, existing.id, clientId).run();
+  } else {
+    await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status, provider_reference, provider_name, provider_activated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'active', ?, ?, CURRENT_TIMESTAMP)")
+      .bind(crypto.randomUUID(), clientId, localName, resolvedOrigin.line, resolvedOrigin.city, resolvedOrigin.state, resolvedOrigin.pincode, resolvedOrigin.phone, resolvedOrigin.name, providerAccountId ?? null, facility.facility.id, facility.facility.name || providerName)
       .run();
-  return { ok: true as const, name: providerName, reused: false as const, origin: resolvedOrigin };
+  }
+  return { ok: true as const, name: facility.facility.name || providerName, reused: false as const, origin: resolvedOrigin };
 }
 
 type DelhiveryFacility = { id: string; code: string; name: string; pincode: string };
