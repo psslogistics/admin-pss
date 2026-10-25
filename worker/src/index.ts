@@ -6357,9 +6357,18 @@ const worker = {
       }
       if (route === "/pricing/internal/margins" && request.method === "GET") {
         if (!hasRole(auth, ["super_admin"]) || !hasScope(auth, "provider_cost.view")) return error("FORBIDDEN", "Internal pricing access required", 403, id, headers);
-        const clientId = requireClient(auth, url.searchParams.get("client_id")); if (!clientId) return error("VALIDATION_ERROR", "A client is required", 400, id, headers);
-        const rows = await env.DB.prepare("SELECT b.id AS billing_id, b.shipment_id, b.invoice_number, b.amount AS pss_amount, b.created_at, c.provider, c.provider_account_id, c.provider_amount, c.provider_status, CASE WHEN c.provider_amount IS NULL THEN NULL ELSE b.amount - c.provider_amount END AS margin FROM billing_records b LEFT JOIN pricing_provider_costs c ON c.shipment_id = b.shipment_id WHERE b.client_id = ? ORDER BY b.created_at DESC LIMIT 200").bind(clientId).all();
-        return json({ ok: true, data: rows.results }, 200, headers);
+        const requestedClientId = url.searchParams.get("client_id")?.trim() || null;
+        const clientId = requestedClientId ? requireClient(auth, requestedClientId) : null;
+        if (requestedClientId && !clientId) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
+        const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 200) || 200, 1), 10000);
+        const offset = Math.max(Number(url.searchParams.get("offset") ?? 0) || 0, 0);
+        const where = clientId ? "WHERE b.client_id = ?" : "";
+        const bindings = clientId ? [clientId, limit, offset] : [limit, offset];
+        const [count, rows] = await Promise.all([
+          env.DB.prepare(`SELECT COUNT(*) AS total FROM billing_records b ${where}`).bind(...(clientId ? [clientId] : [])).first<{ total: number }>(),
+          env.DB.prepare(`SELECT b.id AS billing_id, b.shipment_id, b.client_id, b.invoice_number, b.amount AS pss_amount, b.created_at, c.provider, c.provider_account_id, c.provider_amount, c.provider_status, CASE WHEN c.provider_amount IS NULL THEN NULL ELSE b.amount - c.provider_amount END AS margin FROM billing_records b LEFT JOIN pricing_provider_costs c ON c.shipment_id = b.shipment_id ${where} ORDER BY b.created_at DESC LIMIT ? OFFSET ?`).bind(...bindings).all(),
+        ]);
+        return json({ ok: true, data: rows.results, pagination: { total: Number(count?.total ?? 0), limit, offset, has_more: offset + rows.results.length < Number(count?.total ?? 0) } }, 200, headers);
       }
       if (route === "/serviceability" && request.method === "POST") {
         if (!hasScope(auth, "quotes.create")) return error("FORBIDDEN", "Serviceability scope required", 403, id, headers);
