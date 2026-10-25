@@ -2400,10 +2400,10 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   // same value in tracking_number, but new bookings can also have a provider
   // reference or master AWB. Prefer the explicit LR whenever one is present.
   const trackingNumber = String(payload.lr_number ?? payload.tracking_number ?? payload.provider_reference ?? "").trim();
-  if (["tracking", "labels", "lr_copy", "document"].includes(operation) && !trackingNumber) return { enabled: false, status: "invalid_request" as const, reason: "A provider tracking reference is required" };
+  if (["tracking", "freight_charges", "labels", "lr_copy", "document"].includes(operation) && !trackingNumber) return { enabled: false, status: "invalid_request" as const, reason: "A provider tracking reference is required" };
   if (provider === "delhivery" && operation === "shipments" && String(env.DELHIVERY_ENABLE_SHIPMENT_CREATION) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "Delhivery shipment creation is safety-disabled until live billing approval" };
   if (provider === "delhivery" && operation === "pickups" && String(env.DELHIVERY_ENABLE_PICKUP_CREATION) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "Delhivery pickup creation is safety-disabled until live operations approval" };
-  if (provider === "delhivery" && !new Set(["tracking", "shipment_status", "shipments", "warehouse_prepare", "pickups", "pickup_status", "pickup_slots", "serviceability", "serviceability_route", "labels", "lr_copy", "document"]).has(operation)) return { enabled: false, status: "unsupported" as const, reason: "Delhivery operation is not supported" };
+  if (provider === "delhivery" && !new Set(["tracking", "freight_charges", "shipment_status", "shipments", "warehouse_prepare", "pickups", "pickup_status", "pickup_slots", "serviceability", "serviceability_route", "labels", "lr_copy", "document"]).has(operation)) return { enabled: false, status: "unsupported" as const, reason: "Delhivery operation is not supported" };
   if (provider === "ekart" && operation === "pickups") return { enabled: false, status: "unsupported" as const, reason: "Ekart pickup contract is not verified" };
   if (provider === "ekart" && String(env.EKART_ENABLE_PROVIDER_CALLS) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "Ekart is configured but disabled until the agreed provider scope is approved" };
   if (provider === "ekart" && operation !== "tracking" && operation !== "shipments") return { enabled: false, status: "unsupported" as const, reason: "Ekart operation is not supported" };
@@ -2625,6 +2625,8 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         ? `${base.replace(/\/$/, "")}/lr_copy/print/${encodeURIComponent(trackingNumber)}?lr_copy_type=${encodeURIComponent(String(payload.lr_copy_type ?? "SHIPPER COPY"))}`
       : provider === "delhivery" && operation === "document"
         ? `${base.replace(/\/$/, "")}/document/download?lrn=${encodeURIComponent(trackingNumber)}${payload.doc_type ? `&doc_type=${encodeURIComponent(String(payload.doc_type))}` : ""}&auto_download=true&version=latest`
+      : provider === "delhivery" && operation === "freight_charges"
+        ? `${base.replace(/\/$/, "")}/lrn/freight-breakup/lrns=${encodeURIComponent(trackingNumber)}`
       : provider === "delhivery" && operation === "shipment_status"
         ? `${(useDelhiveryB2b ? delhiveryB2bDocsBase() : base).replace(/\/$/, "")}/${useDelhiveryB2b ? "v2/manifest" : "manifest"}?job_id=${encodeURIComponent(String(payload.provider_booking_id ?? ""))}`
       : provider === "delhivery" && operation === "tracking"
@@ -2712,7 +2714,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
           ? JSON.stringify({ doc_type: "shipping_label", size: delhiveryUcpLabelSize(String(payload.label_size ?? "a4")), lr_numbers: [trackingNumber] })
         : provider === "delhivery" && operation === "labels" && (payload.label_api_variant === "pdf_form" || payload.label_api_variant === "pdf_form_alt")
           ? `lrnum=${encodeURIComponent(trackingNumber)}&size=${encodeURIComponent(delhiveryLabelApiSize(String(payload.label_size ?? "a4")))}&label_size=${encodeURIComponent(String(payload.label_size ?? "a4"))}`
-        : provider === "delhivery" && ["tracking", "shipment_status", "serviceability", "serviceability_route", "pickup_status", "pickup_slots", "labels", "lr_copy", "document"].includes(operation) ? ""
+        : provider === "delhivery" && ["tracking", "freight_charges", "shipment_status", "serviceability", "serviceability_route", "pickup_status", "pickup_slots", "labels", "lr_copy", "document"].includes(operation) ? ""
         : operation === "tracking" ? JSON.stringify({ Appkey: trackon!.appKey, userId: trackon!.userId, password: trackon!.password, AWBNo: trackingNumber })
           : operation === "shipments" ? JSON.stringify(trackonPayload(payload, trackon!))
             : JSON.stringify({ Appkey: trackon!.appKey, userId: trackon!.userId, password: trackon!.password, AWBNo: trackingNumber });
@@ -2733,7 +2735,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       // XpressBees documents tracking as POST even though it is a read-only
       // lookup. Keep the generic GET behavior for Delhivery/Trackon tracking,
       // but send the XpressBees AWB body with POST to avoid provider HTTP 405.
-       const isGet = (["tracking", "shipment_status", "serviceability", "serviceability_route", "pickup_slots", "labels", "lr_copy", "document"].includes(operation) && provider !== "xpressbees" && provider !== "rivigo" && !(provider === "delhivery" && operation === "labels" && ["ucp", "pdf", "pdf_alt", "pdf_form", "pdf_form_alt"].includes(labelVariant))) || (provider === "trackon" && operation === "labels");
+       const isGet = (["tracking", "freight_charges", "shipment_status", "serviceability", "serviceability_route", "pickup_slots", "labels", "lr_copy", "document"].includes(operation) && provider !== "xpressbees" && provider !== "rivigo" && !(provider === "delhivery" && operation === "labels" && ["ucp", "pdf", "pdf_alt", "pdf_form", "pdf_form_alt"].includes(labelVariant))) || (provider === "trackon" && operation === "labels");
       const method = provider === "rivigo" && operation === "cancellations" ? "DELETE" : provider === "rivigo" && operation === "updates" ? "PUT" : isGet ? "GET" : "POST";
       if (provider === "delhivery" && operation === "labels" && (payload.label_api_variant === "pdf_form" || payload.label_api_variant === "pdf_form_alt")) headers["content-type"] = "application/x-www-form-urlencoded";
       if (provider === "delhivery" && operation === "labels" && payload.label_api_variant === "ucp") {
@@ -6407,11 +6409,11 @@ const worker = {
           await Promise.all(candidates.map(async (row) => {
             const shipmentId = String(row.shipment_id ?? "").trim();
             const accountId = String(row.provider_account_id ?? "").trim() || undefined;
-            const lrOrAwb = String(row.lr_number ?? row.master_awb ?? row.tracking_number ?? row.provider_reference ?? "").trim();
+            const lrOrAwb = String(row.lr_number ?? "").trim();
             const bookingId = String(row.provider_booking_id ?? "").trim();
             if (!shipmentId || (!lrOrAwb && !bookingId)) return;
-            const operation = lrOrAwb ? "tracking" : "shipment_status";
-            await safeProviderRequest(env, "delhivery", operation, { shipment_id: shipmentId, tracking_number: lrOrAwb || undefined, lr_number: String(row.lr_number ?? "").trim() || undefined, provider_reference: String(row.provider_reference ?? "").trim() || undefined, provider_booking_id: bookingId || undefined, provider_account_id: accountId }, id, String(row.client_id), undefined, 10000).catch(() => undefined);
+            if (!lrOrAwb) return;
+            await safeProviderRequest(env, "delhivery", "freight_charges", { shipment_id: shipmentId, tracking_number: lrOrAwb, lr_number: String(row.lr_number ?? "").trim() || lrOrAwb, provider_reference: String(row.provider_reference ?? "").trim() || undefined, provider_booking_id: bookingId || undefined, provider_account_id: accountId }, id, String(row.client_id), undefined, 10000).catch(() => undefined);
           }));
         }
         const rows = await env.DB.prepare(
