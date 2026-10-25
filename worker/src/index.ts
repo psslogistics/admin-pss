@@ -2496,7 +2496,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (provider === "delhivery" && useDelhiveryB2b && !delhiveryB2bToken) return { enabled: true, status: "failed" as const, error: "Delhivery B2B authentication failed" };
   let delhiveryPickupLocation = "";
   let delhiveryCanonicalOrigin: Record<string, unknown> | null = null;
-  if (provider === "delhivery" && ["shipments", "warehouse_prepare"].includes(operation) && useDelhiveryB2b && clientId && delhiveryB2bToken) {
+  if (provider === "delhivery" && ["warehouse_prepare"].includes(operation) && useDelhiveryB2b && clientId && delhiveryB2bToken) {
     const origin = delhiveryAddress(payload.origin_address, String(payload.origin ?? "PSS Logistics"));
     if (!origin) return { enabled: true, status: "invalid_request" as const, reason: "A complete consignor address is required to create or select the pickup warehouse" };
     const selectedWarehouseId = typeof payload.warehouse_id === "string" && payload.warehouse_id.trim() ? payload.warehouse_id.trim() : null;
