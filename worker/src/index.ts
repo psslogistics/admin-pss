@@ -1750,6 +1750,34 @@ function findProviderAmount(value: unknown, keys = new Set(["amount", "total_amo
   return null;
 }
 
+function findDelhiveryCost(value: unknown, depth = 0): number | null {
+  const preferredKeys = [
+    "delhivery_cost", "provider_cost", "provider_amount", "shipping_charge", "freight_charge",
+    "freight", "total_freight", "total_charge", "total_charges", "billing_amount", "billing_total",
+    "amount",
+  ];
+  if (depth > 8 || value === null || value === undefined) return null;
+  if (Array.isArray(value)) {
+    for (const item of value) { const found = findDelhiveryCost(item, depth + 1); if (found !== null) return found; }
+    return null;
+  }
+  if (typeof value !== "object") return null;
+  const object = value as Record<string, unknown>;
+  for (const key of preferredKeys) {
+    const candidate = object[key] ?? object[Object.keys(object).find((item) => item.toLowerCase() === key) ?? ""];
+    const numeric = typeof candidate === "number" ? candidate : Number(String(candidate ?? "").replace(/[^0-9.-]/g, ""));
+    if (candidate !== undefined && Number.isFinite(numeric) && numeric >= 0) return numeric;
+  }
+  for (const [key, child] of Object.entries(object)) {
+    if (/(?:charge|cost|freight|billing)/i.test(key)) {
+      const numeric = typeof child === "number" ? child : Number(String(child ?? "").replace(/[^0-9.-]/g, ""));
+      if (Number.isFinite(numeric) && numeric >= 0) return numeric;
+    }
+  }
+  for (const child of Object.values(object)) { const found = findDelhiveryCost(child, depth + 1); if (found !== null) return found; }
+  return null;
+}
+
 function normalizeProviderEdd(value: unknown): string | null {
   if (typeof value === "number" && Number.isFinite(value)) {
     const milliseconds = value > 10_000_000_000 ? value : value > 1_000_000_000 ? value * 1000 : 0;
@@ -3219,7 +3247,12 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     : /client[- ]warehouse.*not active|warehouse.*inactive|wrong\/inactive center/i.test(providerErrorText)
       ? "Delhivery rejected this booking because the selected pickup warehouse is inactive. Activate that exact saved warehouse for this Delhivery account, then retry."
       : `${lastError}: ${providerErrorText || "Delhivery rejected the booking"}`;
-  return { enabled: true, status: response.ok ? "accepted" as const : "failed" as const, providerStatus: response.status, normalized_status: normalizedTracking?.status, edd: providerEdd, tracking: normalizedTracking ? { status: normalizedTracking.status, location: normalizedTracking.location, description: normalizedTracking.description, event_time: normalizedTracking.eventTime } : undefined, tracking_events: operation === "tracking" ? normalizedTrackingEvents.map((event) => ({ status: event.status, location: event.location, description: event.description, event_time: event.eventTime, source: `provider:${provider}` })) : undefined, amount: provider === "xpressbees" && operation === "quotes" ? findProviderAmount(parsedProviderBody) : undefined, provider_account_id: account?.id, account_name: account?.account_name, confidence_score: account?.confidence_score, priority: account?.priority, rate_card_id: account?.rate_card_id ?? undefined, error: normalizedError };
+  const providerAmountValue = provider === "delhivery" ? findDelhiveryCost(parsedProviderBody) : provider === "xpressbees" && operation === "quotes" ? findProviderAmount(parsedProviderBody) : null;
+  if (response.ok && provider === "delhivery" && providerAmountValue !== null && clientId && typeof payload.shipment_id === "string") {
+    await env.DB.prepare("INSERT OR REPLACE INTO pricing_provider_costs (id, shipment_id, client_id, provider, provider_account_id, provider_amount, provider_status) VALUES (COALESCE((SELECT id FROM pricing_provider_costs WHERE shipment_id = ?), ?), ?, ?, ?, ?, ?, ?)")
+      .bind(payload.shipment_id, crypto.randomUUID(), payload.shipment_id, clientId, provider, account?.id ?? null, providerAmountValue, "accepted").run();
+  }
+  return { enabled: true, status: response.ok ? "accepted" as const : "failed" as const, providerStatus: response.status, normalized_status: normalizedTracking?.status, edd: providerEdd, tracking: normalizedTracking ? { status: normalizedTracking.status, location: normalizedTracking.location, description: normalizedTracking.description, event_time: normalizedTracking.eventTime } : undefined, tracking_events: operation === "tracking" ? normalizedTrackingEvents.map((event) => ({ status: event.status, location: event.location, description: event.description, event_time: event.eventTime, source: `provider:${provider}` })) : undefined, amount: providerAmountValue, provider_account_id: account?.id, account_name: account?.account_name, confidence_score: account?.confidence_score, priority: account?.priority, rate_card_id: account?.rate_card_id ?? undefined, error: normalizedError };
 }
 
 async function recordPickupAttempt(env: Env, details: { pickupId: string; clientId: string; provider: string; providerAccountId?: string | null; requestId?: string | null; idempotencyKey?: string | null; requestedDate?: string | null; requestedWindow?: string | null; status: string; providerStatus?: string | number | null; providerReference?: string | null; providerErrorCode?: string | null; errorMessage?: string | null }) {
@@ -6362,12 +6395,28 @@ const worker = {
         if (requestedClientId && !clientId) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
         const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 200) || 200, 1), 10000);
         const offset = Math.max(Number(url.searchParams.get("offset") ?? 0) || 0, 0);
+        const syncProvider = url.searchParams.get("sync_provider") === "1";
         const where = clientId ? "WHERE b.client_id = ?" : "";
         const bindings = clientId ? [clientId, limit, offset] : [limit, offset];
-        const [count, rows] = await Promise.all([
+        const [count, pendingRows] = await Promise.all([
           env.DB.prepare(`SELECT COUNT(*) AS total FROM billing_records b ${where}`).bind(...(clientId ? [clientId] : [])).first<{ total: number }>(),
-          env.DB.prepare(`SELECT b.id AS billing_id, b.shipment_id, b.client_id, b.invoice_number, b.amount AS pss_amount, b.created_at, c.provider, c.provider_account_id, c.provider_amount, c.provider_status, CASE WHEN c.provider_amount IS NULL THEN NULL ELSE b.amount - c.provider_amount END AS margin FROM billing_records b LEFT JOIN pricing_provider_costs c ON c.shipment_id = b.shipment_id ${where} ORDER BY b.created_at DESC LIMIT ? OFFSET ?`).bind(...bindings).all(),
+          env.DB.prepare(`SELECT b.shipment_id, b.client_id, s.provider, s.provider_account_id, s.provider_booking_id, s.tracking_number, s.lr_number, s.master_awb, s.provider_reference, c.provider_amount FROM billing_records b LEFT JOIN shipments s ON s.id = b.shipment_id LEFT JOIN pricing_provider_costs c ON c.shipment_id = b.shipment_id ${where} ORDER BY b.created_at DESC LIMIT ? OFFSET ?`).bind(...bindings).all<Record<string, unknown>>(),
         ]);
+        if (syncProvider) {
+          const candidates = pendingRows.results.filter((row) => String(row.provider ?? "").toLowerCase() === "delhivery" && row.provider_amount == null && String(row.client_id ?? "").trim()).slice(0, 50);
+          await Promise.all(candidates.map(async (row) => {
+            const shipmentId = String(row.shipment_id ?? "").trim();
+            const accountId = String(row.provider_account_id ?? "").trim() || undefined;
+            const lrOrAwb = String(row.lr_number ?? row.master_awb ?? row.tracking_number ?? row.provider_reference ?? "").trim();
+            const bookingId = String(row.provider_booking_id ?? "").trim();
+            if (!shipmentId || (!lrOrAwb && !bookingId)) return;
+            const operation = lrOrAwb ? "tracking" : "shipment_status";
+            await safeProviderRequest(env, "delhivery", operation, { shipment_id: shipmentId, tracking_number: lrOrAwb || undefined, lr_number: String(row.lr_number ?? "").trim() || undefined, provider_reference: String(row.provider_reference ?? "").trim() || undefined, provider_booking_id: bookingId || undefined, provider_account_id: accountId }, id, String(row.client_id), undefined, 10000).catch(() => undefined);
+          }));
+        }
+        const rows = await env.DB.prepare(
+          `SELECT b.id AS billing_id, b.shipment_id, b.client_id, s.lr_number, s.master_awb, b.invoice_number, b.amount AS pss_amount, b.created_at, c.provider, c.provider_account_id, c.provider_amount, c.provider_status, CASE WHEN c.provider_amount IS NULL THEN NULL ELSE b.amount - c.provider_amount END AS margin FROM billing_records b LEFT JOIN shipments s ON s.id = b.shipment_id LEFT JOIN pricing_provider_costs c ON c.shipment_id = b.shipment_id ${where} ORDER BY b.created_at DESC LIMIT ? OFFSET ?`,
+        ).bind(...bindings).all();
         return json({ ok: true, data: rows.results, pagination: { total: Number(count?.total ?? 0), limit, offset, has_more: offset + rows.results.length < Number(count?.total ?? 0) } }, 200, headers);
       }
       if (route === "/serviceability" && request.method === "POST") {
