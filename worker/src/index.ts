@@ -940,6 +940,7 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   const existingHasConfirmedBooking = existing
     ? await delhiveryWarehouseHasConfirmedBooking(env, clientId, providerAccountId, resolvedOrigin)
     : false;
+  const configuredPickupLocation = String(env.DELHIVERY_DEFAULT_PICKUP_LOCATION ?? "").trim();
   // A saved/previously registered provider location is reusable even when the
   // first shipment has not published an LR yet. Waiting for a confirmed LR
   // here caused every retry to create another PSS-suffixed warehouse, which
@@ -951,6 +952,23 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   // provider's idempotent/already-configured response is the authority.
   const existingProviderLocation = existing && (existing.provider_status === "active" || existing.provider_status === "pending")
     && Boolean((existing.provider_name?.trim() || existing.name?.trim()) && (existing.provider_reference?.trim() || existingHasConfirmedBooking));
+  const warehouseIdentityHash = await sha256(`${baseLocalName}|${resolvedOrigin.pincode}`);
+  // A local warehouse row is not, by itself, a Delhivery facility. In
+  // particular, older rows can be marked active while provider_reference is
+  // still empty. Sending the generated local name in that case makes the
+  // manifest API reject the booking with "warehouse ... has not been
+  // configured". Use the account's configured pickup location until the
+  // provider gives us positive evidence that a custom facility is usable.
+  if (configuredPickupLocation && !existingProviderLocation) {
+    delhiveryWarehouseLog(requestIdValue, "using_configured_pickup_location", {
+      account_id: providerAccountId ?? null,
+      identity_hash: warehouseIdentityHash,
+      configured_pickup_location: configuredPickupLocation,
+      local_warehouse_id: existing?.id ?? null,
+      local_provider_reference: existing?.provider_reference ?? null,
+    });
+    return { ok: true as const, name: configuredPickupLocation, reused: true as const, origin: resolvedOrigin };
+  }
   // Keep one stable provider facility name for an address. Generating a new
   // PSS-suffixed name on every activation retry creates duplicate Delhivery
   // facilities and can leave the manifest service rejecting the newest name
@@ -959,7 +977,6 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   // of truth, followed by the manifest attempt.
   const localName = baseLocalName;
   const providerName = localName;
-  const warehouseIdentityHash = await sha256(`${providerName}|${resolvedOrigin.pincode}`);
   delhiveryWarehouseLog(requestIdValue, "start", { account_id: providerAccountId ?? null, identity_hash: warehouseIdentityHash });
   // Reuse is deliberately evidence-based. A local row alone is not proof that
   // Delhivery accepted and displayed a booking for that pickup location.
