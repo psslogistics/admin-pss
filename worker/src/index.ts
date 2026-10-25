@@ -2495,35 +2495,23 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   const delhiveryB2bAccountName = account?.account_name ?? defaultDelhiveryAccountName;
     const delhiveryLabelAuthBase = provider === "delhivery" && operation === "labels" ? delhiveryLabelApiBase() : undefined;
   let delhiveryB2bToken = useDelhiveryB2b ? await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs, false, delhiveryLabelAuthBase) : null;
-  if (provider === "delhivery" && useDelhiveryB2b && !delhiveryB2bToken) return { enabled: true, status: "failed" as const, error: "Delhivery B2B authentication failed" };
+  // Readiness is a local manifest check. It must not require a B2B token;
+  // the provider token is only needed for the actual provider request or for
+  // explicit pickup/warehouse operations.
+  if (provider === "delhivery" && useDelhiveryB2b && !delhiveryB2bToken && operation !== "warehouse_prepare") return { enabled: true, status: "failed" as const, error: "Delhivery B2B authentication failed" };
   let delhiveryPickupLocation = "";
   let delhiveryCanonicalOrigin: Record<string, unknown> | null = null;
-  if (provider === "delhivery" && ["shipments", "warehouse_prepare"].includes(operation) && useDelhiveryB2b && clientId && delhiveryB2bToken) {
+  if (provider === "delhivery" && ["shipments", "warehouse_prepare"].includes(operation) && useDelhiveryB2b && clientId) {
     const origin = delhiveryAddress(payload.origin_address, String(payload.origin ?? "PSS Logistics"));
     if (!origin) return { enabled: true, status: "invalid_request" as const, reason: "A complete consignor address is required before booking" };
-    const facilityPayload = {
-      ...payload,
-      origin_address: origin,
-      pincode: origin.pincode,
-      delhivery_pickup_location: payload.delhivery_pickup_location ?? payload.pickup_location ?? env.DELHIVERY_DEFAULT_PICKUP_LOCATION ?? "",
-    };
-    // Manifestation and readiness checks must never register a warehouse or
-    // start an OTP flow. Registration belongs to the explicit Warehouses and
-    // Pickup operations; booking only resolves an already active facility.
-    let facility = await resolveDelhiveryFacility(env, delhiveryB2bToken, base, clientId, facilityPayload, requestIdValue, providerTimeoutMs);
-    if (!facility.ok && /\b401\b|invalid token|unauthorized|token decode|not enough segments/i.test(facility.error)) {
-      const refreshedToken = await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs, true);
-      if (refreshedToken) {
-        delhiveryB2bToken = refreshedToken;
-        facility = await resolveDelhiveryFacility(env, delhiveryB2bToken, base, clientId, facilityPayload, requestIdValue, providerTimeoutMs);
-      }
-    }
-    if (!facility.ok) return { enabled: true, status: "failed" as const, code: "WAREHOUSE_FACILITY_NOT_READY", error: facility.error };
-    delhiveryPickupLocation = facility.facility.name;
+    const selectedWarehouseId = typeof payload.warehouse_id === "string" && payload.warehouse_id.trim() ? payload.warehouse_id.trim() : null;
+    const localWarehouse = selectedWarehouseId
+      ? await env.DB.prepare("SELECT name FROM warehouses WHERE id = ? AND client_id = ? LIMIT 1").bind(selectedWarehouseId, clientId).first<{ name: string }>()
+      : null;
+    delhiveryPickupLocation = String(payload.delhivery_pickup_location ?? payload.pickup_location ?? localWarehouse?.name ?? env.DELHIVERY_DEFAULT_PICKUP_LOCATION ?? "").trim();
+    if (!delhiveryPickupLocation) return { enabled: true, status: "invalid_request" as const, reason: "A Delhivery pickup location is required before booking" };
     delhiveryCanonicalOrigin = origin;
-    if (operation === "warehouse_prepare") {
-      return { enabled: true, status: "accepted" as const, providerStatus: 200, providerPending: false, warehouseName: facility.facility.name, warehouseId: typeof payload.warehouse_id === "string" ? payload.warehouse_id.trim() || null : null };
-    }
+    if (operation === "warehouse_prepare") return { enabled: true, status: "accepted" as const, providerStatus: 200, providerPending: false, warehouseName: delhiveryPickupLocation, warehouseId: selectedWarehouseId };
   }
   const xpressToken = provider === "xpressbees" ? await xpressbeesToken(env, credential!, requestIdValue, providerTimeoutMs) : null;
   if (provider === "xpressbees" && !xpressToken) return { enabled: true, status: "failed" as const, error: "XpressBees authentication failed" };
