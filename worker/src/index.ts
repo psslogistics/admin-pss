@@ -1189,7 +1189,9 @@ async function resolveDelhiveryFacility(
   const warehouseSelect = "SELECT id, name, address, city, pincode, provider_reference, provider_status FROM warehouses WHERE client_id = ?";
   const localWarehouse = warehouseId
     ? await env.DB.prepare(`${warehouseSelect} AND id = ? LIMIT 1`).bind(clientId, warehouseId).first<{ id: string; name: string; address: string; city: string; pincode: string; provider_reference: string | null; provider_status: string | null }>()
-    : null;
+    : await env.DB.prepare(`${warehouseSelect} AND provider = 'delhivery' AND lower(trim(COALESCE(address, ''))) = lower(trim(?)) AND lower(trim(COALESCE(city, ''))) = lower(trim(?)) AND lower(trim(COALESCE(pincode, ''))) = lower(trim(?)) ORDER BY updated_at DESC LIMIT 1`)
+      .bind(clientId, String((payload.origin_address as Record<string, unknown> | null)?.line ?? ""), String((payload.origin_address as Record<string, unknown> | null)?.city ?? ""), String(payload.pincode ?? (payload.origin_address as Record<string, unknown> | null)?.pincode ?? ""))
+      .first<{ id: string; name: string; address: string; city: string; pincode: string; provider_reference: string | null; provider_status: string | null }>();
   const name = String(payload.delhivery_pickup_location ?? payload.pickup_location ?? localWarehouse?.name ?? "").trim();
   const pincode = String(payload.pincode ?? localWarehouse?.pincode ?? "").trim();
   if (!name && !localWarehouse?.provider_reference) return { ok: false, error: "A Delhivery pickup facility is required before scheduling this pickup" };
@@ -2498,22 +2500,29 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   let delhiveryCanonicalOrigin: Record<string, unknown> | null = null;
   if (provider === "delhivery" && ["shipments", "warehouse_prepare"].includes(operation) && useDelhiveryB2b && clientId && delhiveryB2bToken) {
     const origin = delhiveryAddress(payload.origin_address, String(payload.origin ?? "PSS Logistics"));
-    if (!origin) return { enabled: true, status: "invalid_request" as const, reason: "A complete consignor address is required to create or select the pickup warehouse" };
-    const selectedWarehouseId = typeof payload.warehouse_id === "string" && payload.warehouse_id.trim() ? payload.warehouse_id.trim() : null;
-    const warehouseApiToken = delhiveryWarehouseApiToken(env, delhiveryB2bAccountName, parsedDelhiveryCredential);
-    let warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId, selectedWarehouseId, warehouseApiToken);
-    if (!warehouse.ok && /\b401\b|invalid token|unauthorized|token decode|not enough segments/i.test(warehouse.error)) {
+    if (!origin) return { enabled: true, status: "invalid_request" as const, reason: "A complete consignor address is required before booking" };
+    const facilityPayload = {
+      ...payload,
+      origin_address: origin,
+      pincode: origin.pincode,
+      delhivery_pickup_location: payload.delhivery_pickup_location ?? payload.pickup_location ?? env.DELHIVERY_DEFAULT_PICKUP_LOCATION ?? "",
+    };
+    // Manifestation and readiness checks must never register a warehouse or
+    // start an OTP flow. Registration belongs to the explicit Warehouses and
+    // Pickup operations; booking only resolves an already active facility.
+    let facility = await resolveDelhiveryFacility(env, delhiveryB2bToken, base, clientId, facilityPayload, requestIdValue, providerTimeoutMs);
+    if (!facility.ok && /\b401\b|invalid token|unauthorized|token decode|not enough segments/i.test(facility.error)) {
       const refreshedToken = await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs, true);
       if (refreshedToken) {
         delhiveryB2bToken = refreshedToken;
-        warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId, selectedWarehouseId, warehouseApiToken);
+        facility = await resolveDelhiveryFacility(env, delhiveryB2bToken, base, clientId, facilityPayload, requestIdValue, providerTimeoutMs);
       }
     }
-    if (!warehouse.ok) return { enabled: true, status: "failed" as const, code: warehouse.code, error: warehouse.error };
-    delhiveryPickupLocation = warehouse.name;
-    delhiveryCanonicalOrigin = warehouse.origin;
+    if (!facility.ok) return { enabled: true, status: "failed" as const, code: "WAREHOUSE_FACILITY_NOT_READY", error: facility.error };
+    delhiveryPickupLocation = facility.facility.name;
+    delhiveryCanonicalOrigin = origin;
     if (operation === "warehouse_prepare") {
-      return { enabled: true, status: "accepted" as const, providerStatus: 200, providerPending: false, warehouseName: warehouse.name, warehouseId: selectedWarehouseId ?? null };
+      return { enabled: true, status: "accepted" as const, providerStatus: 200, providerPending: false, warehouseName: facility.facility.name, warehouseId: typeof payload.warehouse_id === "string" ? payload.warehouse_id.trim() || null : null };
     }
   }
   const xpressToken = provider === "xpressbees" ? await xpressbeesToken(env, credential!, requestIdValue, providerTimeoutMs) : null;
