@@ -4920,8 +4920,13 @@ const worker = {
         if (provider === "delhivery" && (!providerLr && !providerAwb && !providerReference)) {
           const providerBookingId = String((providerResult as { providerBookingId?: string | null }).providerBookingId ?? "").trim() || null;
           const timeoutReason = "Delhivery accepted the manifest but did not return an LR/AWB within the synchronous booking window";
-          await env.DB.prepare("UPDATE shipments SET provider_booking_id = COALESCE(?, provider_booking_id), provider_sync_status = 'pending', status = 'booked', provider_booking_payload_json = NULL, provider_retry_at = NULL, provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
-            .bind(providerBookingId, timeoutReason, shipmentId, clientId).run();
+          // Keep the original provider payload while the asynchronous job is
+          // being published.  The job id is not proof that the shipment is
+          // visible in Delhivery yet; retaining the payload lets the scheduled
+          // reconciler continue polling the same job without creating a
+          // duplicate manifest if Delhivery is slow to materialize it.
+          await env.DB.prepare("UPDATE shipments SET provider_booking_id = COALESCE(?, provider_booking_id), provider_sync_status = 'pending', status = 'booked', provider_booking_payload_json = COALESCE(?, provider_booking_payload_json), provider_retry_at = datetime('now', '+1 minute'), provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+            .bind(providerBookingId, retryPayload ? JSON.stringify(retryPayload) : null, timeoutReason, shipmentId, clientId).run();
           await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'booked', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
             .bind(crypto.randomUUID(), shipmentId, timeoutReason, auth.userId ?? `api:${clientId}`).run();
           const pendingResponse = JSON.stringify({ ok: true, data: { id: shipmentId, client_id: clientId, status: "booked", provider_status: "pending", provider_sync_status: "pending", message: "Delhivery accepted the booking, but the LR/AWB is still being published." }, request_id: id });
