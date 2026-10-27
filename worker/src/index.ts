@@ -2498,40 +2498,29 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     const origin = delhiveryAddress(payload.origin_address, String(payload.origin ?? "PSS Logistics"));
     if (!origin) return { enabled: true, status: "invalid_request" as const, reason: "A complete consignor address is required to create or select the pickup warehouse" };
     const selectedWarehouseId = typeof payload.warehouse_id === "string" && payload.warehouse_id.trim() ? payload.warehouse_id.trim() : null;
-    const warehouseApiToken = delhiveryWarehouseApiToken(env, delhiveryB2bAccountName, parsedDelhiveryCredential);
-    let warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId, selectedWarehouseId, warehouseApiToken);
-    if (!warehouse.ok && /\b401\b|invalid token|unauthorized|token decode|not enough segments/i.test(warehouse.error)) {
-      const refreshedToken = await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs, true, delhiveryLabelAuthBase);
-      if (refreshedToken) {
-        delhiveryB2bToken = refreshedToken;
-        warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId, selectedWarehouseId, warehouseApiToken);
-      }
-    }
-    if (!warehouse.ok) return { enabled: true, status: "failed" as const, code: warehouse.code, error: warehouse.error };
-    delhiveryPickupLocation = warehouse.name;
-    delhiveryCanonicalOrigin = warehouse.origin;
     if (operation === "shipments") {
-      // A successful warehouse-create response only acknowledges the
-      // registration request. It does not prove that the manifestation
-      // service can use the facility yet. Resolve the exact facility before
-      // sending a shipment so we never create a provider job that can only
-      // remain pending without an LR/AWB.
-      const facility = await resolveDelhiveryFacility(env, delhiveryB2bToken, base, clientId, {
-        warehouse_id: selectedWarehouseId ?? undefined,
-        delhivery_pickup_location: delhiveryPickupLocation,
-        pickup_location: delhiveryPickupLocation,
-        pincode: delhiveryCanonicalOrigin.pincode,
-        origin_address: delhiveryCanonicalOrigin,
-      }, requestIdValue, providerTimeoutMs);
-      if (!facility.ok) {
-        return {
-          enabled: true,
-          status: "failed" as const,
-          code: "WAREHOUSE_ACTIVATION_PENDING" as const,
-          error: facility.error,
-        };
+      // Manifestation is deliberately independent of pickup-warehouse
+      // activation. Delhivery's B2B manifest API accepts the provider account's
+      // already-configured pickup location; the consignor address is shipment
+      // data and must not be treated as a new provider warehouse. Warehouse
+      // registration/activation belongs to the explicit warehouse and pickup
+      // flows, where Delhivery may require additional provider-side setup.
+      delhiveryPickupLocation = String(env.DELHIVERY_DEFAULT_PICKUP_LOCATION ?? "").trim();
+      if (!delhiveryPickupLocation) return { enabled: true, status: "failed" as const, code: "PROVIDER_PICKUP_LOCATION_NOT_CONFIGURED", error: "The Delhivery account has no configured B2B pickup location" };
+      delhiveryCanonicalOrigin = origin;
+    } else {
+      const warehouseApiToken = delhiveryWarehouseApiToken(env, delhiveryB2bAccountName, parsedDelhiveryCredential);
+      let warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId, selectedWarehouseId, warehouseApiToken);
+      if (!warehouse.ok && /\b401\b|invalid token|unauthorized|token decode|not enough segments/i.test(warehouse.error)) {
+        const refreshedToken = await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs, true, delhiveryLabelAuthBase);
+        if (refreshedToken) {
+          delhiveryB2bToken = refreshedToken;
+          warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId, selectedWarehouseId, warehouseApiToken);
+        }
       }
-      delhiveryPickupLocation = facility.facility.name;
+      if (!warehouse.ok) return { enabled: true, status: "failed" as const, code: warehouse.code, error: warehouse.error };
+      delhiveryPickupLocation = warehouse.name;
+      delhiveryCanonicalOrigin = warehouse.origin;
     }
     if (operation === "warehouse_prepare") {
       // Warehouse creation is asynchronous on Delhivery. A successful create
@@ -4727,16 +4716,9 @@ const worker = {
         const endpoint = "POST /v1/shipments/preflight";
         const existing = await idempotentResponse(env, key, clientId, endpoint, requestHash);
         if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
-        const providerResult = await safeProviderRequest(env, "delhivery", "warehouse_prepare", {
-          provider: "delhivery",
-          provider_account_id: providerAccountId,
-          warehouse_id: warehouseId || undefined,
-          origin_address: originAddress,
-          origin: `${originAddress.city}, ${originAddress.state}`,
-        }, id, clientId, key);
-        if (providerResult.status !== "accepted") {
-          const reason = String((providerResult as { error?: string; reason?: string }).error ?? (providerResult as { reason?: string }).reason ?? "Delhivery pickup location is not ready").slice(0, 500);
-          const failed = JSON.stringify({ ok: false, error: { code: "PROVIDER_READINESS_FAILED", category: "provider", message: reason, user_safe_message: "The pickup location is not ready with Delhivery yet. Please retry before confirming the booking.", technical_message: reason, request_id: id, retryable: true }, request_id: id });
+        const configuredPickupLocation = String(env.DELHIVERY_DEFAULT_PICKUP_LOCATION ?? "").trim();
+        if (!configuredPickupLocation) {
+          const failed = JSON.stringify({ ok: false, error: { code: "PROVIDER_PICKUP_LOCATION_NOT_CONFIGURED", category: "provider", message: "The Delhivery account has no configured B2B pickup location", user_safe_message: "Delhivery booking is not configured with a pickup location yet. Contact support before confirming the booking.", technical_message: "DELHIVERY_DEFAULT_PICKUP_LOCATION is empty", request_id: id, retryable: false }, request_id: id });
           await saveIdempotent(env, key, clientId, endpoint, 409, failed, requestHash);
           return new Response(failed, { status: 409, headers: { ...headers, "content-type": "application/json" } });
         }
@@ -4748,7 +4730,7 @@ const worker = {
           await saveIdempotent(env, key, clientId, endpoint, 409, failed, requestHash);
           return new Response(failed, { status: 409, headers: { ...headers, "content-type": "application/json" } });
         }
-        const ready = JSON.stringify({ ok: true, data: { ready: true, provider: "delhivery", provider_status: (providerResult as { providerStatus?: number }).providerStatus ?? 200, warehouse_name: (providerResult as { warehouseName?: string }).warehouseName ?? null, serviceable: true, serviceability_provenance: serviceability.provenance }, request_id: id });
+        const ready = JSON.stringify({ ok: true, data: { ready: true, provider: "delhivery", provider_status: 200, warehouse_name: configuredPickupLocation, serviceable: true, serviceability_provenance: serviceability.provenance }, request_id: id });
         await saveIdempotent(env, key, clientId, endpoint, 200, ready, requestHash);
         await audit(env, ctx, auth, id, "shipment.provider_readiness", "shipment", warehouseId || "new-warehouse", { client_id: clientId, provider: "delhivery" });
         return new Response(ready, { status: 200, headers: { ...headers, "content-type": "application/json" } });

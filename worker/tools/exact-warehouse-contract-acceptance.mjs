@@ -25,6 +25,8 @@ const required = [
   ["canonical provider warehouse identity", "canonicalDelhiveryWarehouseName"],
   ["provider uses the selected saved warehouse name exactly", "const providerName = localName;"],
   ["shipment booking registers or reuses the provider warehouse through the API", "ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken"],
+  ["manifestation uses the configured provider pickup location", "delhiveryPickupLocation = String(env.DELHIVERY_DEFAULT_PICKUP_LOCATION ?? \"\").trim()"],
+  ["booking preflight does not activate a pickup warehouse", "const configuredPickupLocation = String(env.DELHIVERY_DEFAULT_PICKUP_LOCATION ?? \"\").trim()"],
   ["shipment booking does not create a pickup request", "operation === \"pickups\""],
   ["registration retry remains scheduled", "provider_booking_payload_json"],
   ["activation retry is scheduled", "retryPendingDelhiveryBookings"],
