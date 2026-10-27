@@ -2682,13 +2682,13 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       : provider === "delhivery" && operation === "freight_charges"
         ? `${base.replace(/\/$/, "")}/lrn/freight-breakup?lrns=${encodeURIComponent(trackingNumber)}`
       : provider === "delhivery" && operation === "shipment_status"
-        ? `${(useDelhiveryB2b ? delhiveryB2bDocsBase() : base).replace(/\/$/, "")}/${useDelhiveryB2b ? "v2/manifest" : "manifest"}?job_id=${encodeURIComponent(String(payload.provider_booking_id ?? ""))}`
+         ? `${base.replace(/\/$/, "")}/manifest?job_id=${encodeURIComponent(String(payload.provider_booking_id ?? ""))}`
       : provider === "delhivery" && operation === "tracking"
         ? useDelhiveryB2b
         ? `${base.replace(/\/$/, "")}/v2/track/${encodeURIComponent(delhiveryB2bNumber(trackingNumber) ?? String(payload.shipment_id ?? trackingNumber))}`
           : `${base.replace(/\/$/, "")}/packages/json/?waybill=${encodeURIComponent(trackingNumber)}&ref_ids=${encodeURIComponent(String(payload.order_id ?? ""))}`
     : provider === "delhivery" && operation === "shipments"
-      ? useDelhiveryB2b ? `${delhiveryB2bDocsBase()}/v2/manifest` : `${delhiveryOrigin}/api/cmu/create.json`
+      ? useDelhiveryB2b ? `${base.replace(/\/$/, "")}/manifest` : `${delhiveryOrigin}/api/cmu/create.json`
        : provider === "delhivery" && operation === "pickups"
          ? useDelhiveryB2b ? `${base.replace(/\/$/, "")}/pickup_requests/` : "https://track.delhivery.com/fm/request/new/"
        : provider === "delhivery" && operation === "pickup_slots"
@@ -2728,7 +2728,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       .bind(labelCallbackToken, payload.shipment_id, clientId, String(payload.label_size ?? "a4")).run();
   }
   const requestBody = provider === "delhivery" && operation === "shipments"
-    ? useDelhiveryB2b ? JSON.stringify(delhiveryCreate) : `format=json&data=${encodeURIComponent(JSON.stringify(delhiveryCreate))}`
+    ? useDelhiveryB2b ? delhiveryB2bManifestForm(delhiveryCreate as Record<string, unknown>, providerPayload.invoice_documents) : `format=json&data=${encodeURIComponent(JSON.stringify(delhiveryCreate))}`
      : provider === "delhivery" && operation === "pickups"
        ? JSON.stringify(delhiveryPickup)
       : provider === "ekart" && operation === "shipments"
@@ -2773,7 +2773,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
           : operation === "shipments" ? JSON.stringify(trackonPayload(payload, trackon!))
             : JSON.stringify({ Appkey: trackon!.appKey, userId: trackon!.userId, password: trackon!.password, AWBNo: trackingNumber });
   if (provider === "delhivery" && operation === "shipments" && !useDelhiveryB2b) headers["content-type"] = "application/x-www-form-urlencoded";
-  if (provider === "delhivery" && operation === "shipments" && useDelhiveryB2b) headers["content-type"] = "application/json";
+  if (provider === "delhivery" && operation === "shipments" && useDelhiveryB2b) delete headers["content-type"];
   let response: Response | null = null; let lastError = "provider_request_failed";
    const readOnlyProviderCall = operation === "tracking" || operation === "serviceability" || operation === "serviceability_route" || operation === "pickup_status" || operation === "pickup_slots";
   const singleManifestCall = provider === "delhivery" && operation === "shipments";
@@ -2995,10 +2995,9 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     })();
     return { enabled: true, status: "accepted" as const, providerStatus: response.status, pickupStatus: pickupStatusFromProviderEvent(pickupStatus), providerStatusDetail: pickupStatus || "Delhivery pickup status response received" };
   }
-  // Delhivery B2B manifestation is asynchronous. The initial POST /manifest
-  // acknowledges the request with a job id; the LR and AWB are returned by a
-  // subsequent GET /manifest status request. Do not classify an accepted job
-  // as a pickup-only request while Delhivery is still processing it.
+  // Delhivery B2B manifestation must return the LR/AWB in the synchronous
+  // manifest response. A job id alone is only an acknowledgement and must not
+  // be surfaced as a successful shipment booking.
   if (response.ok && provider === "delhivery" && useDelhiveryB2b && operation === "shipments") {
     const initialLr = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["lrnum", "lr_num", "lr_number", "lr_no", "lrn", "lrn_number", "lr"])))
       ?? responseBody.match(/(?:lr(?:n|[_ ]?(?:number|num|no))?)[^A-Za-z0-9]{0,12}(\d{6,20})/i)?.[1]
@@ -3008,35 +3007,11 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       ?? null;
     const jobId = findProviderReference(parsedProviderBody, new Set(["job_id", "jobid", "manifest_job_id", "request_id", "requestid"]));
     if (!initialLr && !initialAwb && jobId) {
-      for (let poll = 0; poll < 6; poll += 1) {
-        // Ask for the status immediately, then use a bounded provider-friendly
-        // interval. The manifest response already supplied the job id, so no
-        // second manifest call is ever needed for LR retrieval.
-        await new Promise((resolve) => setTimeout(resolve, poll === 0 ? 0 : 1500));
-        try {
-          const statusUrl = `${delhiveryB2bDocsBase()}/v2/manifest?job_id=${encodeURIComponent(jobId)}`;
-          const statusResponse = await providerFetch(statusUrl, { method: "GET", headers }, Math.max(providerTimeoutMs, 5000));
-          const statusBody = await providerResponseText(statusResponse, Math.max(providerTimeoutMs, 5000));
-          if (statusResponse.ok) {
-            let statusJson: unknown = null;
-            try { statusJson = JSON.parse(statusBody); } catch { statusJson = null; }
-            const statusLr = delhiveryB2bNumber(findProviderReference(statusJson, new Set(["lrnum", "lr_num", "lr_number", "lr_no", "lrn", "lrn_number", "lr"])))
-              ?? statusBody.match(/(?:lr(?:n|[_ ]?(?:number|num|no))?)[^A-Za-z0-9]{0,12}(\d{6,20})/i)?.[1]
-              ?? null;
-            const statusAwb = delhiveryB2bNumber(findProviderReference(statusJson, new Set(["master_awb", "master_awb_number", "masterawb", "master_waybill", "awb", "awb_number", "waybill", "waybill_number", "waybill_no"])))
-              ?? statusBody.match(/(?:master[_ ]?awb|awb|waybill)[^A-Za-z0-9]{0,12}(\d{6,20})/i)?.[1]
-              ?? null;
-            if (statusLr || statusAwb) {
-              parsedProviderBody = statusJson;
-              responseBody = statusBody;
-              break;
-            }
-          }
-        } catch {
-          // Keep polling within the bounded window; the original manifest was
-          // accepted and a delayed status response is expected.
-        }
-      }
+      // A job id is only an acknowledgement, never a shipment reference.
+      // Booking must be decided from this one manifest response so the client
+      // either receives an LR/AWB immediately or receives a deterministic
+      // failure. The reconciler may inspect the job later for audit purposes,
+      // but it must not turn an unreferenced booking into a client success.
     }
   }
   if (response.ok && provider === "delhivery" && useDelhiveryB2b && operation === "tracking" && clientId && typeof payload.shipment_id === "string") {
