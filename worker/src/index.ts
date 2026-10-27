@@ -4872,18 +4872,10 @@ const worker = {
         if (provider && providerResult.status !== "accepted") {
           const failureReason = String((providerResult as { error?: string; reason?: string }).error ?? (providerResult as { reason?: string }).reason ?? `The ${provider} shipment was not accepted`).slice(0, 500);
           const providerCode = String((providerResult as { code?: string }).code ?? "") || (provider === "delhivery" && /awaiting provider activation|not active|not (?:been )?configured|warehouse.*activation|pickup.*warehouse.*pending/i.test(failureReason) ? "WAREHOUSE_ACTIVATION_PENDING" : "");
-          const warehouseActivationPending = provider === "delhivery" && (providerCode === "WAREHOUSE_ACTIVATION_PENDING" || isDelhiveryWarehouseActivationPending(failureReason));
-          if (warehouseActivationPending && retryPayload) {
-            const queuedReason = `Delhivery rejected the pickup warehouse while it activates: ${failureReason}`.slice(0, 500);
-            await env.DB.prepare("UPDATE shipments SET status = 'exception', provider_sync_status = 'pending', provider_booking_payload_json = ?, provider_retry_at = datetime('now', '+5 minutes'), provider_retry_count = 0, provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
-              .bind(JSON.stringify(retryPayload), queuedReason, shipmentId, clientId).run();
-            await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'booked', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
-              .bind(crypto.randomUUID(), shipmentId, "Booking queued for automatic retry after Delhivery pickup-warehouse activation", auth.userId ?? `api:${clientId}`).run();
-            const queuedResponse = JSON.stringify({ ok: true, data: { id: shipmentId, client_id: clientId, status: "booked", provider, provider_status: "pending", retry_at: "scheduled", message: "Delhivery is activating the pickup warehouse; the booking will retry automatically." }, request_id: id });
-            await saveIdempotent(env, key, clientId, "POST /v1/shipments", 202, queuedResponse, requestHash);
-            await audit(env, ctx, auth, id, "shipment.provider_retry_queued", "shipment", shipmentId, { client_id: clientId, provider, reason: failureReason });
-            return new Response(queuedResponse, { status: 202, headers: { ...headers, "content-type": "application/json" } });
-          }
+          // A synchronous booking must never be reported as booked when the
+          // provider rejected the manifest. Pickup activation is a separate
+          // workflow; if a configured provider location is invalid, return the
+          // provider failure and leave the shipment retryable as an exception.
           await env.DB.prepare("UPDATE shipments SET status = 'exception', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(shipmentId, clientId).run();
           await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'exception', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipmentId, `Provider booking failed: ${failureReason}`, auth.userId ?? `api:${clientId}`).run();
           const failureCode = "PROVIDER_REQUEST_FAILED";

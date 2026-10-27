@@ -10,7 +10,7 @@ interface __BaseEnv_Env {
 	DELHIVERY_API_BASE_URL: "https://track.delhivery.com/api/v1";
 	DELHIVERY_B2B_API_BASE_URL: "https://btob.api.delhivery.com";
 	DELHIVERY_CLIENT_NAME: "PSS LOGISTICS";
-	DELHIVERY_DEFAULT_PICKUP_LOCATION: "PSS B2B";
+	DELHIVERY_DEFAULT_PICKUP_LOCATION: "PSS Auth Test Warehouse";
 	DELHIVERY_ENABLE_SHIPMENT_CREATION: "true";
 	DELHIVERY_ENABLE_PICKUP_CREATION: "true";
 	EKART_API_BASE_URL: "https://api.ekartlogistics.com";
