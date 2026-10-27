@@ -1352,10 +1352,10 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
   const ewaybill = String(payload.e_waybill_no ?? payload.ewaybill_number ?? payload.ewaybill ?? "").trim();
   return {
     // These names and nesting follow Delhivery's documented B2B ManifestPayload.
-    // Delhivery requires the Order ID at the top level. Keeping it only on the
-    // suborder lets the async job be accepted without reliably producing the
-    // LR/AWB that the status endpoint is expected to publish.
-    ident: orderId,
+    // Do not send the PSS order ID as the top-level `ident`: Delhivery treats
+    // that field as a manually supplied LR number and validates it as a
+    // numeric LR. Automatic LR allocation is requested by omitting it; the
+    // PSS order ID remains the suborder identifier below.
     pickup_location: pickupLocation,
     d_mode: paymentMode,
     amount: paymentMode === "CoD" ? Number(payload.cod_amount ?? declaredValue) : 0,
