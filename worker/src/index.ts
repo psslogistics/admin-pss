@@ -1112,40 +1112,22 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
     // the manifestation API, so let manifestation be the final authority.
     registrationAccepted = true;
   }
-  // HTTP success from the warehouse-create endpoint is not sufficient: the
-  // manifest service can still reject the facility while Delhivery's
-  // activation/indexing job is pending. Confirm the exact facility on the
-  // provider-side inventory before allowing a booking to be submitted.
-  let facility = await resolveDelhiveryFacility(env, token, b2bBaseUrl, clientId, {
-    warehouse_id: existing?.id,
-    delhivery_pickup_location: providerName,
-    pincode: resolvedOrigin.pincode,
-  }, requestIdValue, timeoutMs);
-  for (let attempt = 1; !facility.ok && attempt < 8; attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
-    facility = await resolveDelhiveryFacility(env, token, b2bBaseUrl, clientId, {
-      warehouse_id: existing?.id,
-      delhivery_pickup_location: providerName,
-      pincode: resolvedOrigin.pincode,
-    }, requestIdValue, timeoutMs);
-  }
-  if (!facility.ok) {
-    if (!delhiveryFacilityNotFound(facility.error)) return { ok: false as const, error: facility.error };
-    if (existing) {
-      await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_reference = COALESCE(?, provider_reference), provider_name = COALESCE(?, provider_name), provider_status = 'pending', provider_error = ?, status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
-        .bind(providerAccountId ?? null, createdProviderReference, createdProviderName || providerName, "Delhivery warehouse was created but is awaiting provider activation", existing.id, clientId).run();
-    }
-    return { ok: false as const, code: "WAREHOUSE_ACTIVATION_PENDING" as const, error: "Delhivery accepted the warehouse request, but the pickup facility is not active yet. Retry after Delhivery activates it." };
-  }
+  // The warehouse-create response and the manifestation endpoint are the
+  // authoritative contract for booking. Delhivery's facility-list projection
+  // can lag behind the registry (and uses a different auth surface), so do
+  // not block a booking on that secondary lookup. If the manifest service is
+  // not ready yet, its explicit rejection is handled by the booking route and
+  // queued for a truthful retry.
+  const registeredName = createdProviderName || providerName;
   if (existing) {
-    await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_status = 'active', provider_reference = COALESCE(provider_reference, ?), provider_name = ?, provider_error = NULL, provider_activated_at = CURRENT_TIMESTAMP, status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
-      .bind(providerAccountId ?? null, facility.facility.id, facility.facility.name || providerName, existing.id, clientId).run();
+    await env.DB.prepare("UPDATE warehouses SET provider = 'delhivery', provider_account_id = ?, provider_status = 'pending', provider_reference = COALESCE(?, provider_reference), provider_name = ?, provider_error = NULL, provider_activated_at = NULL, status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+      .bind(providerAccountId ?? null, createdProviderReference, registeredName, existing.id, clientId).run();
   } else {
-    await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status, provider_reference, provider_name, provider_activated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'active', ?, ?, CURRENT_TIMESTAMP)")
-      .bind(crypto.randomUUID(), clientId, localName, resolvedOrigin.line, resolvedOrigin.city, resolvedOrigin.state, resolvedOrigin.pincode, resolvedOrigin.phone, resolvedOrigin.name, providerAccountId ?? null, facility.facility.id, facility.facility.name || providerName)
+    await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status, provider_reference, provider_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'pending', ?, ?)")
+      .bind(crypto.randomUUID(), clientId, localName, resolvedOrigin.line, resolvedOrigin.city, resolvedOrigin.state, resolvedOrigin.pincode, resolvedOrigin.phone, resolvedOrigin.name, providerAccountId ?? null, createdProviderReference, registeredName)
       .run();
   }
-  return { ok: true as const, name: facility.facility.name || providerName, reused: false as const, origin: resolvedOrigin };
+  return { ok: true as const, name: registeredName, reused: false as const, origin: resolvedOrigin };
 }
 
 type DelhiveryFacility = { id: string; code: string; name: string; pincode: string };
