@@ -583,7 +583,7 @@ async function ensureDefaultClientPricing(env: Env, clientId: string, actor = "s
   return env.DB.prepare("SELECT id, status, effective_at, minimum_weight_kg, volumetric_divisor, gst_percent FROM pricing_versions WHERE client_id = ? AND provider = 'delhivery' AND service_level = 'b2b' AND status = 'active' AND datetime(effective_at) <= CURRENT_TIMESTAMP ORDER BY datetime(effective_at) DESC LIMIT 1").bind(clientId).first<{ id: string; status: string; effective_at: string; minimum_weight_kg: number; volumetric_divisor: number; gst_percent: number }>();
 }
 async function ensureDefaultClientProviderPolicies(env: Env, clientId: string, actor = "system") {
-  const accounts = await env.DB.prepare("SELECT id, credential_secret_name FROM provider_accounts WHERE provider = 'delhivery' AND status = 'active' AND account_name IN ('PSSLOGISTICS10 B2BC', 'PSSCHANDIGARHCARGO6 B2BC', 'PSSBOOKCFT10 B2BC')").all<{ id: string; credential_secret_name: string }>();
+  const accounts = await env.DB.prepare("SELECT id, credential_secret_name FROM provider_accounts WHERE provider = 'delhivery' AND status = 'active' AND account_name IN ('PSSLOGISTICS04 B2BC', 'PSSLOGISTICS08 B2BC', 'PSSLOGISTICS10 B2BC', 'PSSCHANDIGARHCARGO6 B2BC')").all<{ id: string; credential_secret_name: string }>();
   const secretBag = env as unknown as Record<string, unknown>;
   const configured = accounts.results.filter((account) => typeof secretBag[account.credential_secret_name] === "string" && String(secretBag[account.credential_secret_name]).trim());
   if (!configured.length) return;
@@ -2427,15 +2427,17 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   const requestedAccountId = providerAccountId(payload);
   // Delhivery has multiple registered account names. Never fall back to the
   // first row in creation order: that can route a shipment through the wrong
-  // billing/account configuration. The panel's explicit account id wins; if
-  // it is omitted, only the configured safe default account is eligible.
+  // billing/account configuration. The panel's explicit account id wins. For
+  // client bookings without an explicit id, the enabled client policy is the
+  // source of truth; the global default is only valid for system-scoped calls.
   const defaultDelhiveryAccountName = String((env as unknown as Record<string, unknown>).DELHIVERY_DEFAULT_ACCOUNT_NAME ?? "").trim();
   const accountConstraint = provider === "delhivery"
     ? requestedAccountId ? "AND pa.id = ?" : "AND pa.account_name = ?"
     : "AND (? IS NULL OR pa.id = ?)";
   const accountConstraintBinds = provider === "delhivery"
-    ? [requestedAccountId ?? defaultDelhiveryAccountName]
+    ? requestedAccountId ? [requestedAccountId] : clientId ? [] : [defaultDelhiveryAccountName]
     : [requestedAccountId, requestedAccountId];
+  const scopedAccountConstraint = provider === "delhivery" && clientId && !requestedAccountId ? "" : accountConstraint;
   const account = clientId
     ? await env.DB.prepare(`
         SELECT pa.id, pa.provider, pa.account_name, pa.credential_secret_name,
@@ -2448,7 +2450,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
           ON p.provider_account_id = pa.id AND p.client_id = ?
         WHERE pa.provider = ? AND pa.status = 'active'
           AND (pa.client_id = ? OR pa.client_id IS NULL)
-          ${accountConstraint}
+          ${scopedAccountConstraint}
           AND p.provider_account_id IS NOT NULL AND p.enabled = 1
         ORDER BY CASE WHEN p.provider_account_id IS NOT NULL THEN 0 ELSE 1 END,
                  COALESCE(p.priority, 100) ASC,
@@ -2492,6 +2494,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     const delhiveryLabelAuthBase = provider === "delhivery" && operation === "labels" ? delhiveryLabelApiBase() : undefined;
   let delhiveryB2bToken = useDelhiveryB2b ? await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs, false, delhiveryLabelAuthBase) : null;
   if (provider === "delhivery" && useDelhiveryB2b && !delhiveryB2bToken) return { enabled: true, status: "failed" as const, error: "Delhivery B2B authentication failed" };
+  if (provider === "delhivery" && operation === "shipments") removeRetiredDelhiveryPickupLocation(payload);
   let delhiveryPickupLocation = "";
   let delhiveryCanonicalOrigin: Record<string, unknown> | null = null;
   if (provider === "delhivery" && ["shipments", "warehouse_prepare"].includes(operation) && useDelhiveryB2b && clientId && delhiveryB2bToken) {
@@ -3534,6 +3537,12 @@ function isDelhiveryWarehouseActivationPending(value: unknown) {
     || /(?:not active|inactive|not (?:been )?configured).{0,140}(?:warehouse|pickup location|pickup warehouse)/i.test(text);
 }
 
+function removeRetiredDelhiveryPickupLocation(payload: Record<string, unknown>) {
+  for (const field of ["delhivery_pickup_location", "pickup_location"] as const) {
+    if (/^PSS\s+B2B$/i.test(String(payload[field] ?? "").trim())) delete payload[field];
+  }
+}
+
 async function retryPendingDelhiveryBookings(env: Env, cron: string) {
   const pending = await env.DB.prepare("SELECT id, client_id, provider_account_id, provider_booking_payload_json, provider_retry_count FROM shipments WHERE provider = 'delhivery' AND status IN ('booked', 'exception') AND provider_sync_status IN ('pending', 'failed') AND provider_booking_payload_json IS NOT NULL AND provider_booking_id IS NULL AND (provider_retry_at IS NULL OR datetime(provider_retry_at) <= datetime('now')) ORDER BY updated_at ASC LIMIT 10").all<{ id: string; client_id: string; provider_account_id: string | null; provider_booking_payload_json: string; provider_retry_count: number | null }>();
   for (const shipment of pending.results) {
@@ -3543,6 +3552,11 @@ async function retryPendingDelhiveryBookings(env: Env, cron: string) {
       continue;
     }
     try {
+      // Never replay the retired legacy pickup location. Queued shipments
+      // persist the original payload, so changing the current Worker vars is
+      // not enough to repair an old retry. The provider account and active
+      // pickup location are resolved again by safeProviderRequest.
+      removeRetiredDelhiveryPickupLocation(payload);
       // Older queued bookings may not have persisted the selected warehouse id.
       // Recover it only when the queued origin exactly matches one of this
       // client's saved warehouses; unsaved origins remain on registration.
@@ -4963,6 +4977,7 @@ const worker = {
         payload.shipment_id = shipment.id;
         payload.provider = "delhivery";
         payload.provider_account_id = shipment.provider_account_id ?? payload.provider_account_id;
+        removeRetiredDelhiveryPickupLocation(payload);
         let invoiceDocuments: Array<Record<string, unknown>>;
         try {
           invoiceDocuments = await loadShipmentInvoiceDocumentsForRetry(env, shipmentClientId, String(shipment.id), payload);
