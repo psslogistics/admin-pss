@@ -1330,7 +1330,7 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
   // The Delhivery account label and the registered pickup warehouse are
   // separate provider values. Never use the account label as the warehouse.
   const pickupLocation = String(payload.delhivery_pickup_location ?? payload.pickup_location ?? env.DELHIVERY_DEFAULT_PICKUP_LOCATION ?? "").trim();
-  const orderId = String(payload.order_id ?? payload.invoice_reference ?? payload.invoice_number ?? "").trim().slice(0, 50);
+  const orderId = String(payload.order_id ?? payload.shipment_id ?? payload.invoice_reference ?? payload.invoice_number ?? "").trim().slice(0, 50);
   const invoiceNumber = String(payload.invoice_reference ?? payload.invoice_number ?? "").trim();
   const providerInvoiceNumber = invoiceNumber.replace(/[^A-Za-z0-9\/-]/g, "-").replace(/-{2,}/g, "-").replace(/^-|-$/g, "").slice(0, 80);
   const declaredValue = Number(payload.declared_value ?? 0);
@@ -1349,12 +1349,17 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
       }))
       .filter((item) => item.length > 0 && item.width > 0 && item.height > 0)
     : [];
+  const ewaybill = String(payload.e_waybill_no ?? payload.ewaybill_number ?? payload.ewaybill ?? "").trim();
   return {
     // These names and nesting follow Delhivery's documented B2B ManifestPayload.
+    // Delhivery requires the Order ID at the top level. Keeping it only on the
+    // suborder lets the async job be accepted without reliably producing the
+    // LR/AWB that the status endpoint is expected to publish.
+    ident: orderId,
     pickup_location: pickupLocation,
     d_mode: paymentMode,
     amount: paymentMode === "CoD" ? Number(payload.cod_amount ?? declaredValue) : 0,
-    invoices: [{ ident: providerInvoiceNumber, n_value: declaredValue }],
+    invoices: [{ ident: providerInvoiceNumber, n_value: declaredValue, ...(ewaybill ? { ewaybill } : {}) }],
     weight: Math.max(1, Math.round(weightKg * 1000)),
     dropoff_location: {
       consignee: destination.name,
@@ -1595,7 +1600,8 @@ function validPickupDate(value: string) {
 
 function findProviderReference(value: unknown, keys: Set<string>, depth = 0): string | null {
   if (depth > 8 || value === null || value === undefined) return null;
-  const normalizedKeys = new Set([...keys].map((key) => key.toLowerCase()));
+  const normalizeReferenceKey = (key: string) => key.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const normalizedKeys = new Set([...keys].map(normalizeReferenceKey));
   if (Array.isArray(value)) {
     for (const item of value) { const found = findProviderReference(item, keys, depth + 1); if (found) return found; }
     return null;
@@ -1603,7 +1609,14 @@ function findProviderReference(value: unknown, keys: Set<string>, depth = 0): st
   if (typeof value !== "object") return null;
   const object = value as Record<string, unknown>;
   for (const [key, candidate] of Object.entries(object)) {
-    if (normalizedKeys.has(key.toLowerCase()) && (typeof candidate === "string" || typeof candidate === "number") && String(candidate).trim()) return String(candidate).trim().slice(0, 160);
+    if (normalizedKeys.has(normalizeReferenceKey(key)) && (typeof candidate === "string" || typeof candidate === "number") && String(candidate).trim()) return String(candidate).trim().slice(0, 160);
+    if (typeof candidate === "string" && candidate.trim().startsWith("{") && candidate.trim().endsWith("}")) {
+      try {
+        const nested = JSON.parse(candidate);
+        const found = findProviderReference(nested, keys, depth + 1);
+        if (found) return found;
+      } catch { /* Keep walking the provider response. */ }
+    }
   }
   for (const candidate of Object.values(object)) { const found = findProviderReference(candidate, keys, depth + 1); if (found) return found; }
   return null;
