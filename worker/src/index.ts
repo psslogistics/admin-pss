@@ -5759,7 +5759,11 @@ const worker = {
         });
         const seen = new Set<string>();
         const data = orderedRows.filter((row) => {
-          const identity = ["client_id", "provider_account_id", "address", "city", "state", "pincode", "contact", "contact_name"].map((field) => normalizeWarehouseIdentityPart(row[field])).join("|");
+          // Provider identity is part of the selectable pickup location. Two
+          // rows may share the same physical address while pointing to
+          // different Delhivery facilities; collapsing them would hide the
+          // configured facility behind a stale local alias.
+          const identity = ["client_id", "provider_account_id", "address", "city", "state", "pincode", "contact", "contact_name", "provider", "provider_name", "provider_reference"].map((field) => normalizeWarehouseIdentityPart(row[field])).join("|");
           if (seen.has(identity)) return false;
           seen.add(identity);
           return true;
