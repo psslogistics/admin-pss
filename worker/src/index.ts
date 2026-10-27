@@ -918,8 +918,13 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   // A selected saved warehouse is the canonical pickup identity. Never let
   // editable booking fields overwrite it or combine it with another address.
   // The unsaved-address path has no `existing` row and remains unchanged.
+  // The provider warehouse identity is not the same thing as the person
+  // receiving the shipment. For a saved warehouse, preserve the exact name
+  // Delhivery registered; replacing it with contact_name creates a new
+  // pickup name and causes the manifest API to report "warehouse ... has not
+  // been configured" even when the saved warehouse is active.
   const resolvedOrigin = existing ? {
-    name: existing.contact_name?.trim() || origin.name,
+    name: existing.provider_name?.trim() || existing.name?.trim() || origin.name,
     line: existing.address?.trim() || origin.line,
     city: existing.city?.trim() || origin.city,
     state: existing.state?.trim() || origin.state,
@@ -2496,7 +2501,22 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     if (!warehouse.ok) return { enabled: true, status: "failed" as const, code: warehouse.code, error: warehouse.error };
     delhiveryPickupLocation = warehouse.name;
     delhiveryCanonicalOrigin = warehouse.origin;
-    if (operation === "warehouse_prepare") return { enabled: true, status: "accepted" as const, providerStatus: 200, providerPending: false, warehouseName: delhiveryPickupLocation, warehouseId: selectedWarehouseId };
+    if (operation === "warehouse_prepare") {
+      // Warehouse creation is asynchronous on Delhivery. A successful create
+      // response does not mean the manifestation service can use the name.
+      // Confirm the exact active facility before allowing the booking review
+      // step to proceed; otherwise the later shipment call can only fail with
+      // "warehouse ... has not been configured".
+      const facility = await resolveDelhiveryFacility(env, delhiveryB2bToken, base, clientId, {
+        warehouse_id: selectedWarehouseId ?? undefined,
+        delhivery_pickup_location: delhiveryPickupLocation,
+        pickup_location: delhiveryPickupLocation,
+        pincode: delhiveryCanonicalOrigin.pincode,
+        origin_address: delhiveryCanonicalOrigin,
+      }, requestIdValue, providerTimeoutMs);
+      if (!facility.ok) return { enabled: true, status: "failed" as const, code: "WAREHOUSE_ACTIVATION_PENDING", error: facility.error };
+      return { enabled: true, status: "accepted" as const, providerStatus: 200, providerPending: false, warehouseName: facility.facility.name, warehouseId: facility.facility.id };
+    }
   }
   const xpressToken = provider === "xpressbees" ? await xpressbeesToken(env, credential!, requestIdValue, providerTimeoutMs) : null;
   if (provider === "xpressbees" && !xpressToken) return { enabled: true, status: "failed" as const, error: "XpressBees authentication failed" };
