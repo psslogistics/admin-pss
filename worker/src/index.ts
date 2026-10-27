@@ -311,6 +311,9 @@ function providerAccountId(payload: Record<string, unknown>) {
 function delhiveryPricingAccountFromName(accountName: string): PricingAccount {
   return /(^|\D)04(\D|$)/.test(accountName) ? "04" : /(^|\D)08(\D|$)/.test(accountName) ? "08" : "other";
 }
+function canonicalDelhiveryAccountName(accountName: string) {
+  return String(accountName ?? "").trim().toUpperCase().replace(/\s+/g, " ") === "PSSBOOKCFT10 B2BC" ? "PSSBOOKSCFT10 B2BC" : String(accountName ?? "").trim();
+}
 function requireClient(auth: Auth, requested: unknown) {
   const requestedId = typeof requested === "string" ? requested.trim() : "";
   if (auth.kind === "api") return auth.clientId ?? null;
@@ -774,7 +777,7 @@ async function delhiveryWarehouseProviderContext(env: Env, clientId: string, req
   if (!token) return { ok: false as const, error: "Delhivery B2B authentication failed" };
   const warehouseApiToken = delhiveryWarehouseApiToken(env, account.account_name, delhiveryB2bCredential(credential));
   if (!warehouseApiToken) return { ok: false as const, error: "Delhivery warehouse registration requires the production API token for this account" };
-  return { ok: true as const, accountId: account.id, accountName: account.account_name, token, warehouseApiToken, base: env.DELHIVERY_B2B_API_BASE_URL ?? "https://ltl-clients-api.delhivery.com" };
+  return { ok: true as const, accountId: account.id, accountName: canonicalDelhiveryAccountName(account.account_name), token, warehouseApiToken, base: env.DELHIVERY_B2B_API_BASE_URL ?? "https://ltl-clients-api.delhivery.com" };
 }
 
 function delhiveryJwtExpiry(token: string) {
@@ -2490,7 +2493,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   const rivigo = provider === "rivigo" ? rivigoCredentials(env, credential) : null;
   if (!base || (provider === "trackon" ? !trackon : provider === "rivigo" ? !rivigo : !credential)) return { enabled: false, status: "not_configured" as const };
   const providerTimeoutMs = Math.min(timeoutMsOverride ?? (provider === "delhivery" && operation === "shipments" ? 30000 : 10000), provider === "delhivery" && operation === "shipments" ? 30000 : 10000);
-  const delhiveryB2bAccountName = account?.account_name ?? defaultDelhiveryAccountName;
+  const delhiveryB2bAccountName = canonicalDelhiveryAccountName(account?.account_name ?? defaultDelhiveryAccountName);
     const delhiveryLabelAuthBase = provider === "delhivery" && operation === "labels" ? delhiveryLabelApiBase() : undefined;
   let delhiveryB2bToken = useDelhiveryB2b ? await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs, false, delhiveryLabelAuthBase) : null;
   if (provider === "delhivery" && useDelhiveryB2b && !delhiveryB2bToken) return { enabled: true, status: "failed" as const, error: "Delhivery B2B authentication failed" };
@@ -2943,13 +2946,13 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       return { enabled: true, status: "accepted" as const, providerStatus: response.status, providerPending: false, providerBookingId: statusJobId, providerReference: statusAwb ?? statusLr, lr_number: statusLr, master_awb: statusAwb };
     }
     const pendingMessage = "Delhivery accepted the booking but has not published the LR/AWB yet.";
-    await env.DB.prepare("UPDATE shipments SET provider_booking_id = COALESCE(?, provider_booking_id), provider_sync_status = 'pending', status = 'exception', provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ? AND provider_reference IS NULL AND lr_number IS NULL AND master_awb IS NULL")
+    await env.DB.prepare("UPDATE shipments SET provider_booking_id = COALESCE(?, provider_booking_id), provider_sync_status = 'pending', status = 'booked', provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ? AND provider_reference IS NULL AND lr_number IS NULL AND master_awb IS NULL")
       .bind(statusJobId, pendingMessage, payload.shipment_id, clientId).run();
     return { enabled: true, status: "accepted" as const, providerStatus: response.status, providerPending: true, providerBookingId: statusJobId, message: pendingMessage };
   }
   if (response.ok && provider === "delhivery" && operation === "shipment_status" && clientId && typeof payload.shipment_id === "string" && !String(payload.tracking_number ?? payload.lr_number ?? payload.provider_reference ?? "").trim()) {
     const pendingMessage = "Delhivery accepted the booking but has not published the LR/AWB yet.";
-    await env.DB.prepare("UPDATE shipments SET provider_sync_status = 'pending', status = 'exception', provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ? AND provider_booking_id IS NOT NULL AND provider_reference IS NULL AND lr_number IS NULL AND master_awb IS NULL")
+    await env.DB.prepare("UPDATE shipments SET provider_sync_status = 'pending', status = 'booked', provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ? AND provider_booking_id IS NOT NULL AND provider_reference IS NULL AND lr_number IS NULL AND master_awb IS NULL")
       .bind(pendingMessage, payload.shipment_id, clientId).run();
     return { enabled: true, status: "accepted" as const, providerStatus: response.status, providerPending: true, providerBookingId: String(payload.provider_booking_id ?? "").trim() || null, message: pendingMessage };
   }
@@ -3036,7 +3039,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     const providerReference = useDelhiveryB2b ? b2bAwbReference ?? createdReference : createdReference;
     if (useDelhiveryB2b && !createdReference && providerBookingId) {
       const pending = "Delhivery accepted the booking and returned a provider job ID. LR/AWB is still being confirmed.";
-      await env.DB.prepare("UPDATE shipments SET provider_booking_id = COALESCE(?, provider_booking_id), provider_sync_status = 'pending', status = 'exception', provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(providerBookingId, pending, payload.shipment_id, clientId).run();
+      await env.DB.prepare("UPDATE shipments SET provider_booking_id = COALESCE(?, provider_booking_id), provider_sync_status = 'pending', status = 'booked', provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(providerBookingId, pending, payload.shipment_id, clientId).run();
       // `accepted` is a provider result, not a persisted integration-request
       // status. Keep the request pending until Delhivery publishes the LR/AWB;
       // the table intentionally permits only pending/succeeded/failed/retrying.
@@ -4904,14 +4907,14 @@ const worker = {
         if (provider === "delhivery" && (!providerLr && !providerAwb && !providerReference)) {
           const providerBookingId = String((providerResult as { providerBookingId?: string | null }).providerBookingId ?? "").trim() || null;
           const timeoutReason = "Delhivery accepted the manifest but did not return an LR/AWB within the synchronous booking window";
-          await env.DB.prepare("UPDATE shipments SET provider_booking_id = COALESCE(?, provider_booking_id), provider_sync_status = 'pending', status = 'exception', provider_booking_payload_json = NULL, provider_retry_at = NULL, provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+          await env.DB.prepare("UPDATE shipments SET provider_booking_id = COALESCE(?, provider_booking_id), provider_sync_status = 'pending', status = 'booked', provider_booking_payload_json = NULL, provider_retry_at = NULL, provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
             .bind(providerBookingId, timeoutReason, shipmentId, clientId).run();
-          await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'exception', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
+          await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'booked', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
             .bind(crypto.randomUUID(), shipmentId, timeoutReason, auth.userId ?? `api:${clientId}`).run();
-          const timeoutResponse = JSON.stringify({ ok: false, error: { code: "PROVIDER_LR_TIMEOUT", category: "provider", message: timeoutReason, user_safe_message: "Delhivery did not return the LR yet. Booking was not confirmed or billed; retry after checking the provider status.", technical_message: timeoutReason, provider_code: "PROVIDER_LR_TIMEOUT", request_id: id, retryable: true, stale_data: false }, data: { id: shipmentId, client_id: clientId, status: "exception", provider, provider_booking_id: providerBookingId, pricing_amount: null }, request_id: id });
-          await saveIdempotent(env, key, clientId, "POST /v1/shipments", 504, timeoutResponse, requestHash);
-          await audit(env, ctx, auth, id, "shipment.provider_lr_timeout", "shipment", shipmentId, { client_id: clientId, provider, provider_booking_id: providerBookingId });
-          return new Response(timeoutResponse, { status: 504, headers: { ...headers, "content-type": "application/json" } });
+          const pendingResponse = JSON.stringify({ ok: true, data: { id: shipmentId, client_id: clientId, status: "booked", provider_status: "pending", provider_sync_status: "pending", message: "Delhivery accepted the booking, but the LR/AWB is still being published." }, request_id: id });
+          await saveIdempotent(env, key, clientId, "POST /v1/shipments", 202, pendingResponse, requestHash);
+          await audit(env, ctx, auth, id, "shipment.provider_lr_pending", "shipment", shipmentId, { client_id: clientId, provider, provider_booking_id: providerBookingId });
+          return new Response(pendingResponse, { status: 202, headers: { ...headers, "content-type": "application/json" } });
         }
         if (pricingQuote) {
           const completedBilling = await completeShipmentBilling(env, clientId, shipmentId);
