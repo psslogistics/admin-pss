@@ -3495,6 +3495,13 @@ function parseJsonArray(value: string | null | undefined) {
   }
 }
 
+function isDelhiveryWarehouseActivationPending(value: unknown) {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  return /awaiting provider activation/i.test(text)
+    || /(?:warehouse|pickup location|pickup warehouse).{0,140}(?:not active|inactive|not (?:been )?configured|activation)/i.test(text)
+    || /(?:not active|inactive|not (?:been )?configured).{0,140}(?:warehouse|pickup location|pickup warehouse)/i.test(text);
+}
+
 async function retryPendingDelhiveryBookings(env: Env, cron: string) {
   const pending = await env.DB.prepare("SELECT id, client_id, provider_account_id, provider_booking_payload_json, provider_retry_count FROM shipments WHERE provider = 'delhivery' AND status IN ('booked', 'exception') AND provider_sync_status IN ('pending', 'failed') AND provider_booking_payload_json IS NOT NULL AND provider_booking_id IS NULL AND (provider_retry_at IS NULL OR datetime(provider_retry_at) <= datetime('now')) ORDER BY updated_at ASC LIMIT 10").all<{ id: string; client_id: string; provider_account_id: string | null; provider_booking_payload_json: string; provider_retry_count: number | null }>();
   for (const shipment of pending.results) {
@@ -3544,7 +3551,7 @@ async function retryPendingDelhiveryBookings(env: Env, cron: string) {
       }
       const reason = String((result as { error?: string; reason?: string }).error ?? (result as { reason?: string }).reason ?? "Delhivery did not accept the queued booking").slice(0, 500);
       const retryCount = Number(shipment.provider_retry_count ?? 0) + 1;
-      const stillActivationPending = /awaiting provider activation|not active|not configured/i.test(reason);
+      const stillActivationPending = isDelhiveryWarehouseActivationPending(reason);
       if (stillActivationPending) {
         const delayMinutes = Math.min(60, Math.max(5, 5 * 2 ** Math.min(retryCount - 1, 3)));
         await env.DB.prepare("UPDATE shipments SET provider_retry_count = ?, provider_retry_at = datetime('now', ?), provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(retryCount, `+${delayMinutes} minutes`, reason, shipment.id, shipment.client_id).run();
@@ -4837,7 +4844,7 @@ const worker = {
         if (provider && providerResult.status !== "accepted") {
           const failureReason = String((providerResult as { error?: string; reason?: string }).error ?? (providerResult as { reason?: string }).reason ?? `The ${provider} shipment was not accepted`).slice(0, 500);
           const providerCode = String((providerResult as { code?: string }).code ?? "") || (provider === "delhivery" && /awaiting provider activation|not active|not (?:been )?configured|warehouse.*activation|pickup.*warehouse.*pending/i.test(failureReason) ? "WAREHOUSE_ACTIVATION_PENDING" : "");
-          const warehouseActivationPending = provider === "delhivery" && (providerCode === "WAREHOUSE_ACTIVATION_PENDING" || /warehouse.*not (?:been )?configured|warehouse.*activation|pickup.*warehouse.*pending/i.test(failureReason));
+          const warehouseActivationPending = provider === "delhivery" && (providerCode === "WAREHOUSE_ACTIVATION_PENDING" || isDelhiveryWarehouseActivationPending(failureReason));
           if (warehouseActivationPending && retryPayload) {
             const queuedReason = `Delhivery rejected the pickup warehouse while it activates: ${failureReason}`.slice(0, 500);
             await env.DB.prepare("UPDATE shipments SET status = 'exception', provider_sync_status = 'pending', provider_booking_payload_json = ?, provider_retry_at = datetime('now', '+5 minutes'), provider_retry_count = 0, provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
@@ -4950,7 +4957,7 @@ const worker = {
         const providerResult = await safeProviderRequest(env, "delhivery", "shipments", { shipment_id: shipment.id, ...payload, invoice_documents: invoiceDocuments, provider_account_id: shipment.provider_account_id ?? payload.provider_account_id }, id, shipmentClientId, key, 25000);
         if (providerResult.status !== "accepted") {
           const reason = String((providerResult as { error?: string; reason?: string }).error ?? (providerResult as { reason?: string }).reason ?? "Delhivery did not accept the booking retry").slice(0, 500);
-          const activationPending = /awaiting provider activation|not active|not configured|has not been configured|warehouse.*configured/i.test(reason);
+          const activationPending = isDelhiveryWarehouseActivationPending(reason);
           if (activationPending) {
             await env.DB.prepare("UPDATE shipments SET status = 'exception', provider_sync_status = 'pending', provider_retry_at = datetime('now', '+5 minutes'), provider_retry_count = provider_retry_count + 1, provider_last_error = ?, provider_booking_payload_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
               .bind(reason, JSON.stringify(providerRetryPayload(payload)), shipment.id, shipmentClientId).run();
