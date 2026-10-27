@@ -2873,6 +2873,15 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     await env.DB.prepare("UPDATE shipments SET provider_last_attempt_at = CURRENT_TIMESTAMP, provider_last_error_code = ?, provider_last_error_message = ?, provider_last_success_at = CASE WHEN ? IS NULL THEN CURRENT_TIMESTAMP ELSE provider_last_success_at END WHERE id = ? AND client_id = ?")
       .bind(response.ok ? null : `HTTP_${response.status}`, syncError, syncError, payload.shipment_id, clientId).run();
   }
+  if (operation === "shipment_status" && clientId && typeof payload.shipment_id === "string") {
+    // Reference reconciliation is a separate provider operation from normal
+    // tracking. Record its attempt too, otherwise an accepted async booking
+    // remains permanently due and is retried on every scheduler pass without
+    // respecting the intended cadence.
+    const syncError = response.ok ? null : `${lastError}${providerFailureDetail ? `: ${providerFailureDetail}` : ""}`.slice(0, 500);
+    await env.DB.prepare("UPDATE shipments SET provider_last_attempt_at = CURRENT_TIMESTAMP, provider_last_error_code = ?, provider_last_error_message = ?, provider_last_success_at = CASE WHEN ? IS NULL THEN CURRENT_TIMESTAMP ELSE provider_last_success_at END WHERE id = ? AND client_id = ?")
+      .bind(response.ok ? null : `HTTP_${response.status}`, syncError, syncError, payload.shipment_id, clientId).run();
+  }
   if (response.ok && operation === "tracking") {
     try {
       normalizedTrackingEvents = normalizeProviderTrackingEvents(JSON.parse(responseBody));
