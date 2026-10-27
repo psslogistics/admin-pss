@@ -3015,11 +3015,36 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       ?? null;
     const jobId = findProviderReference(parsedProviderBody, new Set(["job_id", "jobid", "manifest_job_id", "request_id", "requestid"]));
     if (!initialLr && !initialAwb && jobId) {
-      // A job id is only an acknowledgement, never a shipment reference.
-      // Booking must be decided from this one manifest response so the client
-      // either receives an LR/AWB immediately or receives a deterministic
-      // failure. The reconciler may inspect the job later for audit purposes,
-      // but it must not turn an unreferenced booking into a client success.
+      // Delhivery's B2B manifest can acknowledge the POST with a job id and
+      // publish the LR/AWB on the immediately-following status response. This
+      // is the synchronous 21-Oct behaviour: bounded, in-request lookup only.
+      // It never sends a second manifest and never turns a late background
+      // retry into a client-visible booking success.
+      for (let poll = 0; poll < 6; poll += 1) {
+        await new Promise((resolve) => setTimeout(resolve, poll === 0 ? 0 : 1500));
+        try {
+          const statusUrl = `${base.replace(/\/$/, "")}/manifest?job_id=${encodeURIComponent(jobId)}`;
+          const statusResponse = await providerFetch(statusUrl, { method: "GET", headers }, Math.max(providerTimeoutMs, 5000));
+          const statusBody = await providerResponseText(statusResponse, Math.max(providerTimeoutMs, 5000));
+          if (!statusResponse.ok) continue;
+          let statusJson: unknown = null;
+          try { statusJson = JSON.parse(statusBody); } catch { statusJson = null; }
+          const statusLr = delhiveryB2bNumber(findProviderReference(statusJson, new Set(["lrnum", "lr_num", "lr_number", "lr_no", "lrn", "lrn_number", "lr"])))
+            ?? statusBody.match(/(?:lr(?:n|[_ ]?(?:number|num|no))?)[^A-Za-z0-9]{0,12}(\d{6,20})/i)?.[1]
+            ?? null;
+          const statusAwb = delhiveryB2bNumber(findProviderReference(statusJson, new Set(["master_awb", "master_awb_number", "masterawb", "master_waybill", "awb", "awb_number", "waybill", "waybill_number", "waybill_no"])))
+            ?? statusBody.match(/(?:master[_ ]?awb|awb|waybill)[^A-Za-z0-9]{0,12}(\d{6,20})/i)?.[1]
+            ?? null;
+          if (statusLr || statusAwb) {
+            parsedProviderBody = statusJson;
+            responseBody = statusBody;
+            break;
+          }
+        } catch {
+          // Keep the lookup bounded. The original manifest was accepted, but
+          // a transient status response must not create a duplicate booking.
+        }
+      }
     }
   }
   if (response.ok && provider === "delhivery" && useDelhiveryB2b && operation === "tracking" && clientId && typeof payload.shipment_id === "string") {
