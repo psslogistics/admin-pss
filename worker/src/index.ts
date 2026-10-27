@@ -2953,9 +2953,13 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     const statusAwb = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["master_awb", "master_awb_number", "masterawb", "master_waybill", "awb", "awb_number", "waybill", "waybill_number", "waybill_no"]))) ?? responseBody.match(/(?:master[_ ]?awb|awb|waybill)[^A-Za-z0-9]{0,12}(\d{6,20})/i)?.[1] ?? null;
     const statusJobId = findProviderReference(parsedProviderBody, new Set(["job_id", "jobid", "manifest_job_id", "request_id", "requestid"])) ?? (String(payload.provider_booking_id ?? "").trim() || null);
     if (statusLr || statusAwb) {
-      await env.DB.prepare("UPDATE shipments SET lr_number = COALESCE(?, lr_number), master_awb = COALESCE(?, master_awb), box_awbs_json = COALESCE(?, box_awbs_json), provider_sync_status = 'confirmed', status = CASE WHEN status = 'exception' THEN 'booked' ELSE status END, tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(provider_reference, ?), provider_last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(statusLr, statusAwb, statusAwb ? JSON.stringify([statusAwb]) : null, statusLr ?? statusAwb, statusAwb ?? statusLr, payload.shipment_id, clientId).run();
-      const completedBilling = await completeShipmentBilling(env, clientId, payload.shipment_id);
-      if (!completedBilling.ok) console.error(JSON.stringify({ event: "shipment_billing_deferred", request_id: requestIdValue, shipment_id: payload.shipment_id, error: completedBilling.error }));
+      const current = await env.DB.prepare("SELECT status, provider_last_error FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(payload.shipment_id, clientId).first<{ status: string | null; provider_last_error: string | null }>();
+      const lateAfterSynchronousFailure = current?.status === "exception" && /synchronous booking window/i.test(String(current.provider_last_error ?? ""));
+      await env.DB.prepare("UPDATE shipments SET lr_number = COALESCE(?, lr_number), master_awb = COALESCE(?, master_awb), box_awbs_json = COALESCE(?, box_awbs_json), provider_sync_status = 'confirmed', status = CASE WHEN ? = 1 THEN 'exception' WHEN status = 'exception' THEN 'booked' ELSE status END, tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(provider_reference, ?), provider_last_error = CASE WHEN ? = 1 THEN provider_last_error ELSE NULL END, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(statusLr, statusAwb, statusAwb ? JSON.stringify([statusAwb]) : null, lateAfterSynchronousFailure ? 1 : 0, statusLr ?? statusAwb, statusAwb ?? statusLr, lateAfterSynchronousFailure ? 1 : 0, payload.shipment_id, clientId).run();
+      if (!lateAfterSynchronousFailure) {
+        const completedBilling = await completeShipmentBilling(env, clientId, payload.shipment_id);
+        if (!completedBilling.ok) console.error(JSON.stringify({ event: "shipment_billing_deferred", request_id: requestIdValue, shipment_id: payload.shipment_id, error: completedBilling.error }));
+      }
       return { enabled: true, status: "accepted" as const, providerStatus: response.status, providerPending: false, providerBookingId: statusJobId, providerReference: statusAwb ?? statusLr, lr_number: statusLr, master_awb: statusAwb };
     }
     const pendingMessage = "Delhivery accepted the booking but has not published the LR/AWB yet.";
@@ -3051,13 +3055,14 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     const createdReference = useDelhiveryB2b ? b2bLrReference ?? b2bAwbReference : findProviderReference(parsedProviderBody, new Set(["waybill", "awb", "tracking_number", "trackingid", "shipment_id"]));
     const providerReference = useDelhiveryB2b ? b2bAwbReference ?? createdReference : createdReference;
     if (useDelhiveryB2b && !createdReference && providerBookingId) {
-      const pending = "Delhivery accepted the booking and returned a provider job ID. LR/AWB is still being confirmed.";
-      await env.DB.prepare("UPDATE shipments SET provider_booking_id = COALESCE(?, provider_booking_id), provider_sync_status = 'pending', status = 'booked', provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(providerBookingId, pending, payload.shipment_id, clientId).run();
-      // `accepted` is a provider result, not a persisted integration-request
-      // status. Keep the request pending until Delhivery publishes the LR/AWB;
-      // the table intentionally permits only pending/succeeded/failed/retrying.
-      await env.DB.prepare("UPDATE integration_requests SET status = 'pending', error_code = NULL, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(pending, integrationId).run();
-      return { enabled: true, status: "accepted" as const, providerStatus: response.status, providerPending: true, providerBookingId, message: pending };
+      const timeoutReason = "Delhivery accepted the manifest but did not return an LR/AWB within the synchronous booking window";
+      // A provider job id proves that Delhivery accepted the request, but it is
+      // not an LR/AWB and must never be shown as a successful booking. Keep the
+      // job id for late reconciliation, but fail this booking attempt so the
+      // client receives a deterministic result and no second manifest is sent.
+      await env.DB.prepare("UPDATE shipments SET provider_booking_id = COALESCE(?, provider_booking_id), provider_sync_status = 'failed', status = 'exception', provider_retry_at = NULL, provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(providerBookingId, timeoutReason, payload.shipment_id, clientId).run();
+      await env.DB.prepare("UPDATE integration_requests SET status = 'failed', error_code = 'PROVIDER_LR_TIMEOUT', error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(timeoutReason, integrationId).run();
+      return { enabled: true, status: "failed" as const, code: "PROVIDER_LR_TIMEOUT", providerStatus: response.status, providerBookingId, error: timeoutReason, retryable: false };
     }
     if (useDelhiveryB2b && !createdReference) {
       const failure = "Delhivery accepted the request but returned no LR or AWB. The pickup request was not treated as a shipment booking.";
@@ -4906,10 +4911,18 @@ const worker = {
           // provider rejected the manifest. Pickup activation is a separate
           // workflow; if a configured provider location is invalid, return the
           // provider failure and leave the shipment retryable as an exception.
-          await env.DB.prepare("UPDATE shipments SET status = 'exception', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(shipmentId, clientId).run();
+          // A failed first attempt must not be picked up by the background
+          // booking queue. If Delhivery issued a job id, retain the payload
+          // for late reference reconciliation; otherwise discard it and leave
+          // any future retry as an explicit user action.
+          await env.DB.prepare("UPDATE shipments SET status = 'exception', provider_sync_status = 'failed', provider_retry_at = NULL, provider_booking_payload_json = CASE WHEN provider_booking_id IS NOT NULL THEN provider_booking_payload_json ELSE NULL END, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(shipmentId, clientId).run();
           await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'exception', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipmentId, `Provider booking failed: ${failureReason}`, auth.userId ?? `api:${clientId}`).run();
-          const failureCode = "PROVIDER_REQUEST_FAILED";
-          const failedResponse = JSON.stringify({ ok: false, error: { code: failureCode, category: "provider", message: "The shipment could not be booked with the courier. You can retry after checking the provider status.", user_safe_message: "The courier did not accept this booking; retry after correcting the provider issue.", technical_message: failureReason, provider_code: providerCode || failureCode, request_id: id, retryable: true, stale_data: false }, data: { id: shipmentId, client_id: clientId, status: "exception", provider, pricing_amount: null }, request_id: id });
+           const failureCode = String((providerResult as { code?: string }).code ?? "PROVIDER_REQUEST_FAILED");
+           const lrTimeout = failureCode === "PROVIDER_LR_TIMEOUT";
+           const userSafeMessage = lrTimeout
+             ? "Delhivery accepted the request but did not return an LR/AWB immediately. The booking was not confirmed and no charge was applied."
+             : "The courier did not accept this booking; correct the provider issue before retrying.";
+           const failedResponse = JSON.stringify({ ok: false, error: { code: failureCode, category: "provider", message: lrTimeout ? "Delhivery did not return an LR/AWB within the synchronous booking window." : "The shipment could not be booked with the courier.", user_safe_message: userSafeMessage, technical_message: failureReason, provider_code: providerCode || failureCode, request_id: id, retryable: !lrTimeout, stale_data: false }, data: { id: shipmentId, client_id: clientId, status: "exception", provider, pricing_amount: null }, request_id: id });
           await saveIdempotent(env, key, clientId, "POST /v1/shipments", 502, failedResponse, requestHash);
           await audit(env, ctx, auth, id, "shipment.provider_failed", "shipment", shipmentId, { client_id: clientId, provider, reason: failureReason });
           return new Response(failedResponse, { status: 502, headers: { ...headers, "content-type": "application/json" } });
