@@ -4837,7 +4837,7 @@ const worker = {
         if (provider && providerResult.status !== "accepted") {
           const failureReason = String((providerResult as { error?: string; reason?: string }).error ?? (providerResult as { reason?: string }).reason ?? `The ${provider} shipment was not accepted`).slice(0, 500);
           const providerCode = String((providerResult as { code?: string }).code ?? "") || (provider === "delhivery" && /awaiting provider activation|not active|not (?:been )?configured|warehouse.*activation|pickup.*warehouse.*pending/i.test(failureReason) ? "WAREHOUSE_ACTIVATION_PENDING" : "");
-          const warehouseActivationPending = provider === "delhivery" && (providerCode === "WAREHOUSE_ACTIVATION_PENDING" || /warehouse.*not configured|warehouse.*activation|pickup.*warehouse.*pending/i.test(failureReason));
+          const warehouseActivationPending = provider === "delhivery" && (providerCode === "WAREHOUSE_ACTIVATION_PENDING" || /warehouse.*not (?:been )?configured|warehouse.*activation|pickup.*warehouse.*pending/i.test(failureReason));
           if (warehouseActivationPending && retryPayload) {
             const queuedReason = `Delhivery rejected the pickup warehouse while it activates: ${failureReason}`.slice(0, 500);
             await env.DB.prepare("UPDATE shipments SET status = 'exception', provider_sync_status = 'pending', provider_booking_payload_json = ?, provider_retry_at = datetime('now', '+5 minutes'), provider_retry_count = 0, provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
