@@ -918,20 +918,32 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   // A selected saved warehouse is the canonical pickup identity. Never let
   // editable booking fields overwrite it or combine it with another address.
   // The unsaved-address path has no `existing` row and remains unchanged.
-  // The provider warehouse identity is not the same thing as the person
-  // receiving the shipment. For a saved warehouse, preserve the exact name
-  // Delhivery registered; replacing it with contact_name creates a new
-  // pickup name and causes the manifest API to report "warehouse ... has not
-  // been configured" even when the saved warehouse is active.
+  // Delhivery matches `pickup_location` by the exact registered warehouse
+  // name. Do not synthesize a new name from the address: that changes the
+  // provider identity and produces "warehouse ... has not been configured"
+  // even when the saved location itself is active. Older local rows may have
+  // stored our display label in provider_name, so until a confirmed booking
+  // proves that value, prefer the saved contact/warehouse name as the stable
+  // provider identity.
+  const existingHasConfirmedBooking = existing
+    ? await delhiveryWarehouseHasConfirmedBooking(env, clientId, providerAccountId, {
+      name: existing.contact_name?.trim() || existing.name?.trim() || origin.name,
+      line: existing.address?.trim() || origin.line,
+      city: existing.city?.trim() || origin.city,
+      state: existing.state?.trim() || origin.state,
+      pincode: existing.pincode?.trim() || origin.pincode,
+      phone: existing.contact?.trim() || origin.phone,
+    })
+    : false;
   const resolvedOrigin = existing ? {
-    name: existing.provider_name?.trim() || existing.name?.trim() || origin.name,
+    name: (existingHasConfirmedBooking ? existing.provider_name?.trim() : null) || existing.contact_name?.trim() || existing.name?.trim() || origin.name,
     line: existing.address?.trim() || origin.line,
     city: existing.city?.trim() || origin.city,
     state: existing.state?.trim() || origin.state,
     pincode: existing.pincode?.trim() || origin.pincode,
     phone: existing.contact?.trim() || origin.phone,
   } : origin;
-  const generatedLocalName = delhiveryWarehouseName(resolvedOrigin);
+  const generatedLocalName = existing ? resolvedOrigin.name : delhiveryWarehouseName(resolvedOrigin);
   // Older retries could persist one or more ` - PSS-xxxxxxxx` suffixes on
   // the same saved warehouse. Treat those names as migration artefacts and
   // always converge back to the deterministic provider identity. Otherwise a
@@ -942,9 +954,6 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   // identity from the canonical saved address on every attempt so stale local
   // names cannot keep a shipment pointed at an unconfigured facility.
   const baseLocalName = generatedLocalName;
-  const existingHasConfirmedBooking = existing
-    ? await delhiveryWarehouseHasConfirmedBooking(env, clientId, providerAccountId, resolvedOrigin)
-    : false;
   // A saved/previously registered provider location is reusable even when the
   // first shipment has not published an LR yet. Waiting for a confirmed LR
   // here caused every retry to create another PSS-suffixed warehouse, which
