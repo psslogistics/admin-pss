@@ -3747,7 +3747,7 @@ async function refreshDelhiveryPickupStatuses(env: Env, cron: string) {
   // returns 403 for B2B credentials. Exclude B2B requests from this poll so a
   // bad endpoint cannot overwrite or obscure the linked-shipment truth.
   const rows = await env.DB.prepare(`
-    SELECT id, client_id, provider_reference, status
+    SELECT pr.id, pr.client_id, pr.provider_reference, pr.status
     FROM pickup_requests pr
     LEFT JOIN provider_accounts pa ON pa.id = pr.provider_account_id
     WHERE pr.provider = 'delhivery'
