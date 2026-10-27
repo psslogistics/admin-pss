@@ -5742,8 +5742,23 @@ const worker = {
           : auth.clientIds.size
             ? await env.DB.prepare(`SELECT * FROM warehouses WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY updated_at DESC`).bind(...auth.clientIds).all<Record<string, unknown>>()
             : { results: [] as Record<string, unknown>[] };
+        // Multiple local warehouse rows can represent the same physical
+        // address while Delhivery activation is being retried. Prefer the
+        // provider-confirmed row before deduplicating; otherwise a newer
+        // pending row can hide the active provider identity from Booking and
+        // send a manifest against a warehouse Delhivery has not configured.
+        const readinessRank = (row: Record<string, unknown>) => {
+          const status = String(row.provider_status ?? "").trim().toLowerCase();
+          const reference = String(row.provider_reference ?? "").trim();
+          return (status === "active" ? 4 : status === "pending" ? 2 : 1) + (reference ? 1 : 0);
+        };
+        const orderedRows = [...rows.results].sort((left, right) => {
+          const rankDifference = readinessRank(right) - readinessRank(left);
+          if (rankDifference) return rankDifference;
+          return String(right.updated_at ?? "").localeCompare(String(left.updated_at ?? ""));
+        });
         const seen = new Set<string>();
-        const data = rows.results.filter((row) => {
+        const data = orderedRows.filter((row) => {
           const identity = ["client_id", "provider_account_id", "address", "city", "state", "pincode", "contact", "contact_name"].map((field) => normalizeWarehouseIdentityPart(row[field])).join("|");
           if (seen.has(identity)) return false;
           seen.add(identity);
