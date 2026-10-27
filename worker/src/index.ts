@@ -3762,7 +3762,7 @@ async function reconcileShipmentLinkedPickupStatuses(env: Env, cron: string) {
       : failedCount > 0
         ? `Delhivery linked shipments: ${failedCount}/${expectedCount} failed or cancelled`
         : 'Delhivery has not reported a pickup scan for the linked shipments';
-    await env.DB.prepare("UPDATE pickup_requests SET status = ?, provider_picked_count = ?, provider_expected_count = ?, provider_status_synced_at = CURRENT_TIMESTAMP, provider_status_detail = ?, provider_status = COALESCE(NULLIF(provider_status, ''), 'delhivery:linked_shipments'), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+    await env.DB.prepare("UPDATE pickup_requests SET status = ?, provider_picked_count = ?, provider_expected_count = ?, provider_status_synced_at = CURRENT_TIMESTAMP, provider_status_detail = ?, provider_status = COALESCE(NULLIF(provider_status, ''), 'delhivery:linked_shipments'), updated_at = CURRENT_TIMESTAMP WHERE pickup_requests.id = ? AND pickup_requests.client_id = ?")
       .bind(nextStatus, pickedCount, expectedCount, detail, pickup.id, pickup.client_id).run();
   }
   if (rows.results.length) console.log(JSON.stringify({ job: "pickup_status_reconciliation", cron, candidates: rows.results.length }));
@@ -3803,7 +3803,7 @@ async function refreshDelhiveryPickupStatuses(env: Env, cron: string) {
       UPDATE pickup_requests
       SET status = ?, provider_status = ?, provider_status_synced_at = CURRENT_TIMESTAMP,
           provider_status_detail = ?, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ? AND client_id = ?
+      WHERE pickup_requests.id = ? AND pickup_requests.client_id = ?
     `).bind(nextStatus, `delhivery:${String(result.providerStatusDetail ?? nextStatus).toLowerCase().replace(/\s+/g, "_").slice(0, 120)}`, detail, pickup.id, pickup.client_id).run();
     if (nextStatus !== pickup.status) updated += 1;
   }
@@ -4079,21 +4079,21 @@ async function handleDelhiveryDocumentWebhook(request: Request, env: Env, reques
 }
 
 async function refreshDelhiveryShipments(env: Env, cron: string) {
-  const columns = "id, client_id, tracking_number, lr_number, provider_reference, provider_booking_id, provider_account_id";
+  const columns = "s.id, s.client_id, s.tracking_number, s.lr_number, s.provider_reference, s.provider_booking_id, s.provider_account_id";
   // Select in small pages for bounded concurrency, but keep paging through the
   // complete due queue. The old single-query LIMIT 50 meant the scheduler could
   // leave the rest of the eligible fleet untouched indefinitely.
-  const order = "ORDER BY CASE status WHEN 'out_for_delivery' THEN 0 WHEN 'in_transit' THEN 1 ELSE 2 END, CASE WHEN provider_last_attempt_at IS NULL THEN 0 ELSE 1 END, provider_last_attempt_at ASC, updated_at ASC LIMIT 50";
-  const latestEvent = "(SELECT lower(COALESCE(te.location, '') || ' ' || COALESCE(te.description, '')) FROM tracking_events te WHERE te.shipment_id = shipments.id ORDER BY te.event_time DESC LIMIT 1)";
+  const order = "ORDER BY CASE s.status WHEN 'out_for_delivery' THEN 0 WHEN 'in_transit' THEN 1 ELSE 2 END, CASE WHEN s.provider_last_attempt_at IS NULL THEN 0 ELSE 1 END, s.provider_last_attempt_at ASC, s.updated_at ASC LIMIT 50";
+  const latestEvent = "(SELECT lower(COALESCE(te.location, '') || ' ' || COALESCE(te.description, '')) FROM tracking_events te WHERE te.shipment_id = s.id ORDER BY te.event_time DESC LIMIT 1)";
   // The Worker wakes every 5 minutes, but each shipment is selected only at
   // its state-specific cadence. Last-mile centre scans are identified from
   // the latest normalized provider event without changing the public status.
-  const due = `(provider_last_attempt_at IS NULL OR
-    (status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery', 'exception', 'rto') AND (edd IS NULL OR weight_override_kg IS NULL) AND datetime(provider_last_attempt_at) <= datetime('now', '-10 minutes')) OR
-    (status = 'out_for_delivery' AND datetime(provider_last_attempt_at) <= datetime('now', '-10 minutes')) OR
-    (status = 'in_transit' AND datetime(provider_last_attempt_at) <= datetime('now', '-30 minutes')) OR
-    (status IN ('booked', 'picked_up', 'cancelled') AND datetime(provider_last_attempt_at) <= datetime('now', '-10 minutes')) OR
-    (status IN ('in_transit', 'exception', 'rto') AND NOT (status = 'in_transit' AND ${latestEvent} GLOB '*last[- ]mile*') AND datetime(provider_last_attempt_at) <= datetime('now', '-4 hours'))) `;
+  const due = `(s.provider_last_attempt_at IS NULL OR
+    (s.status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery', 'exception', 'rto') AND (s.edd IS NULL OR s.weight_override_kg IS NULL) AND datetime(s.provider_last_attempt_at) <= datetime('now', '-10 minutes')) OR
+    (s.status = 'out_for_delivery' AND datetime(s.provider_last_attempt_at) <= datetime('now', '-10 minutes')) OR
+    (s.status = 'in_transit' AND datetime(s.provider_last_attempt_at) <= datetime('now', '-30 minutes')) OR
+    (s.status IN ('booked', 'picked_up', 'cancelled') AND datetime(s.provider_last_attempt_at) <= datetime('now', '-10 minutes')) OR
+    (s.status IN ('in_transit', 'exception', 'rto') AND NOT (s.status = 'in_transit' AND ${latestEvent} GLOB '*last[- ]mile*') AND datetime(s.provider_last_attempt_at) <= datetime('now', '-4 hours'))) `;
   // Delivered shipments are terminal for status polling. Keep their separate
   // POD backfill below, but do not spend tracking calls refreshing them.
   const refreshRows: Array<{ id: string; client_id: string; tracking_number: string | null; lr_number: string | null; provider_reference: string | null; provider_booking_id: string | null; provider_account_id: string | null }> = [];
@@ -4107,7 +4107,7 @@ async function refreshDelhiveryShipments(env: Env, cron: string) {
   // remaining due rows because each attempted shipment receives a new attempt
   // timestamp. There is no fleet-wide 50-record ceiling anymore.
   while (Date.now() - refreshStartedAt < 10000) {
-    const active = await env.DB.prepare(`SELECT ${columns} FROM shipments WHERE provider = 'delhivery' AND status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery', 'exception', 'rto', 'cancelled') AND ((COALESCE(lr_number, tracking_number, provider_reference) IS NOT NULL) OR (provider_booking_id IS NOT NULL AND provider_sync_status = 'pending')) AND ${due} ${order}`).all<{ id: string; client_id: string; tracking_number: string | null; lr_number: string | null; provider_reference: string | null; provider_booking_id: string | null; provider_account_id: string | null }>();
+    const active = await env.DB.prepare(`SELECT ${columns} FROM shipments s WHERE s.provider = 'delhivery' AND s.status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery', 'exception', 'rto', 'cancelled') AND ((COALESCE(s.lr_number, s.tracking_number, s.provider_reference) IS NOT NULL) OR (s.provider_booking_id IS NOT NULL AND s.provider_sync_status = 'pending')) AND ${due} ${order}`).all<{ id: string; client_id: string; tracking_number: string | null; lr_number: string | null; provider_reference: string | null; provider_booking_id: string | null; provider_account_id: string | null }>();
     if (!active.results.length) break;
     const batch = active.results.slice(0, 3);
     refreshRows.push(...batch);
