@@ -2510,6 +2510,29 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     if (!warehouse.ok) return { enabled: true, status: "failed" as const, code: warehouse.code, error: warehouse.error };
     delhiveryPickupLocation = warehouse.name;
     delhiveryCanonicalOrigin = warehouse.origin;
+    if (operation === "shipments") {
+      // A successful warehouse-create response only acknowledges the
+      // registration request. It does not prove that the manifestation
+      // service can use the facility yet. Resolve the exact facility before
+      // sending a shipment so we never create a provider job that can only
+      // remain pending without an LR/AWB.
+      const facility = await resolveDelhiveryFacility(env, delhiveryB2bToken, base, clientId, {
+        warehouse_id: selectedWarehouseId ?? undefined,
+        delhivery_pickup_location: delhiveryPickupLocation,
+        pickup_location: delhiveryPickupLocation,
+        pincode: delhiveryCanonicalOrigin.pincode,
+        origin_address: delhiveryCanonicalOrigin,
+      }, requestIdValue, providerTimeoutMs);
+      if (!facility.ok) {
+        return {
+          enabled: true,
+          status: "failed" as const,
+          code: "WAREHOUSE_ACTIVATION_PENDING" as const,
+          error: facility.error,
+        };
+      }
+      delhiveryPickupLocation = facility.facility.name;
+    }
     if (operation === "warehouse_prepare") {
       // Warehouse creation is asynchronous on Delhivery. A successful create
       // response does not mean the manifestation service can use the name.
