@@ -4068,7 +4068,7 @@ async function handleDelhiveryDocumentWebhook(request: Request, env: Env, reques
 }
 
 async function refreshDelhiveryShipments(env: Env, cron: string) {
-  const columns = "id, client_id, tracking_number, lr_number, provider_reference, provider_account_id";
+  const columns = "id, client_id, tracking_number, lr_number, provider_reference, provider_booking_id, provider_account_id";
   // Select in small pages for bounded concurrency, but keep paging through the
   // complete due queue. The old single-query LIMIT 50 meant the scheduler could
   // leave the rest of the eligible fleet untouched indefinitely.
@@ -4085,7 +4085,7 @@ async function refreshDelhiveryShipments(env: Env, cron: string) {
     (status IN ('in_transit', 'exception', 'rto') AND NOT (status = 'in_transit' AND ${latestEvent} GLOB '*last[- ]mile*') AND datetime(provider_last_attempt_at) <= datetime('now', '-4 hours'))) `;
   // Delivered shipments are terminal for status polling. Keep their separate
   // POD backfill below, but do not spend tracking calls refreshing them.
-  const refreshRows: Array<{ id: string; client_id: string; tracking_number: string | null; lr_number: string | null; provider_reference: string | null; provider_account_id: string | null }> = [];
+  const refreshRows: Array<{ id: string; client_id: string; tracking_number: string | null; lr_number: string | null; provider_reference: string | null; provider_booking_id: string | null; provider_account_id: string | null }> = [];
   let trackingSucceeded = 0;
   let trackingFailed = 0;
   let immediatePodSucceeded = 0;
@@ -4096,17 +4096,20 @@ async function refreshDelhiveryShipments(env: Env, cron: string) {
   // remaining due rows because each attempted shipment receives a new attempt
   // timestamp. There is no fleet-wide 50-record ceiling anymore.
   while (Date.now() - refreshStartedAt < 10000) {
-    const active = await env.DB.prepare(`SELECT ${columns} FROM shipments WHERE provider = 'delhivery' AND COALESCE(lr_number, tracking_number, provider_reference) IS NOT NULL AND status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery', 'exception', 'rto', 'cancelled') AND ${due} ${order}`).all<{ id: string; client_id: string; tracking_number: string | null; lr_number: string | null; provider_reference: string | null; provider_account_id: string | null }>();
+    const active = await env.DB.prepare(`SELECT ${columns} FROM shipments WHERE provider = 'delhivery' AND status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery', 'exception', 'rto', 'cancelled') AND ((COALESCE(lr_number, tracking_number, provider_reference) IS NOT NULL) OR (provider_booking_id IS NOT NULL AND provider_sync_status = 'pending')) AND ${due} ${order}`).all<{ id: string; client_id: string; tracking_number: string | null; lr_number: string | null; provider_reference: string | null; provider_booking_id: string | null; provider_account_id: string | null }>();
     if (!active.results.length) break;
     const batch = active.results.slice(0, 3);
     refreshRows.push(...batch);
     const results = await Promise.all(batch.map(async (shipment) => {
-      const result = await safeProviderRequest(env, "delhivery", "tracking", { shipment_id: shipment.id, tracking_number: shipment.tracking_number, lr_number: shipment.lr_number, provider_reference: shipment.provider_reference, provider_account_id: shipment.provider_account_id }, `cron:${cron}:delhivery:tracking:${shipment.id}`, shipment.client_id, undefined, 10000);
+      const pendingProviderReference = !shipment.tracking_number && !shipment.lr_number && !shipment.provider_reference && shipment.provider_booking_id;
+      const result = pendingProviderReference
+        ? await safeProviderRequest(env, "delhivery", "shipment_status", { shipment_id: shipment.id, provider_booking_id: shipment.provider_booking_id, tracking_number: shipment.tracking_number, lr_number: shipment.lr_number, provider_reference: shipment.provider_reference, provider_account_id: shipment.provider_account_id }, `cron:${cron}:delhivery:reference:${shipment.id}`, shipment.client_id, undefined, 10000)
+        : await safeProviderRequest(env, "delhivery", "tracking", { shipment_id: shipment.id, tracking_number: shipment.tracking_number, lr_number: shipment.lr_number, provider_reference: shipment.provider_reference, provider_account_id: shipment.provider_account_id }, `cron:${cron}:delhivery:tracking:${shipment.id}`, shipment.client_id, undefined, 10000);
       let podStatus: "accepted" | "failed" | null = null;
       // A delivered transition must immediately start POD retrieval. If
       // Delhivery has not published the artifact yet, the delivered shipment
       // remains in the POD backfill queue for the next scheduler run.
-      if (result.status === "accepted" && result.normalized_status === "delivered") {
+      if (!pendingProviderReference && result.status === "accepted" && result.normalized_status === "delivered") {
         const pod = await safeProviderRequest(env, "delhivery", "document", { shipment_id: shipment.id, tracking_number: shipment.tracking_number, lr_number: shipment.lr_number, provider_reference: shipment.provider_reference, provider_account_id: shipment.provider_account_id, doc_type: "LM_POD" }, `cron:${cron}:delhivery:pod:${shipment.id}`, shipment.client_id, undefined, 15000);
         podStatus = pod.status === "accepted" ? "accepted" : "failed";
       }
