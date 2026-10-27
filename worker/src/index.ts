@@ -2916,6 +2916,8 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       .bind(providerEdd, payload.shipment_id, clientId).run();
   }
   if (response.ok && provider === "delhivery" && useDelhiveryB2b && operation === "shipment_status" && clientId && typeof payload.shipment_id === "string") {
+    await env.DB.prepare("UPDATE shipments SET provider_last_attempt_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+      .bind(payload.shipment_id, clientId).run();
     const statusLr = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["lrnum", "lr_num", "lr_number", "lr_no", "lrn", "lrn_number", "lr"]))) ?? responseBody.match(/(?:lr(?:n|[_ ]?(?:number|num|no))?)[^A-Za-z0-9]{0,12}(\d{6,20})/i)?.[1] ?? null;
     const statusAwb = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["master_awb", "master_awb_number", "masterawb", "master_waybill", "awb", "awb_number", "waybill", "waybill_number", "waybill_no"]))) ?? responseBody.match(/(?:master[_ ]?awb|awb|waybill)[^A-Za-z0-9]{0,12}(\d{6,20})/i)?.[1] ?? null;
     const statusJobId = findProviderReference(parsedProviderBody, new Set(["job_id", "jobid", "manifest_job_id", "request_id", "requestid"])) ?? (String(payload.provider_booking_id ?? "").trim() || null);
