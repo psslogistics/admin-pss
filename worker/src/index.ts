@@ -1330,58 +1330,96 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
   // The Delhivery account label and the registered pickup warehouse are
   // separate provider values. Never use the account label as the warehouse.
   const pickupLocation = String(payload.delhivery_pickup_location ?? payload.pickup_location ?? env.DELHIVERY_DEFAULT_PICKUP_LOCATION ?? "").trim();
-  const orderId = String(payload.order_id ?? payload.invoice_reference ?? payload.invoice_number ?? "").trim().slice(0, 50);
+  const orderId = String(payload.order_id ?? payload.invoice_reference ?? payload.invoice_number ?? "").trim().slice(0, 80);
   const invoiceNumber = String(payload.invoice_reference ?? payload.invoice_number ?? "").trim();
   const providerInvoiceNumber = invoiceNumber.replace(/[^A-Za-z0-9\/-]/g, "-").replace(/-{2,}/g, "-").replace(/^-|-$/g, "").slice(0, 80);
   const declaredValue = Number(payload.declared_value ?? 0);
   const weightKg = Number(payload.total_weight_kg ?? 0);
   const pieces = Number(payload.pieces ?? 1);
   if (!origin || !destination || !pickupLocation || !providerInvoiceNumber || !Number.isFinite(declaredValue) || declaredValue < 0 || !Number.isFinite(weightKg) || weightKg <= 0 || !Number.isInteger(pieces) || pieces < 1) return null;
-  const paymentMode = String(payload.payment_mode ?? "prepaid").trim().toLowerCase() === "cod" ? "CoD" : "Prepaid";
-  const dimensions = Array.isArray(payload.dimensions)
-    ? payload.dimensions
-      .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object"))
-      .map((item) => ({
-        length: Number(item.length ?? 0),
-        width: Number(item.width ?? item.breadth ?? 0),
-        height: Number(item.height ?? 0),
-        count: Math.max(1, Math.trunc(Number(item.quantity ?? item.count ?? item.box_count ?? 1))),
-      }))
-      .filter((item) => item.length > 0 && item.width > 0 && item.height > 0)
-    : [];
+  const length = Number(payload.length ?? payload.shipment_length ?? 0);
+  const width = Number(payload.width ?? payload.shipment_width ?? 0);
+  const height = Number(payload.height ?? payload.shipment_height ?? 0);
+  const paymentMode = String(payload.payment_mode ?? "prepaid").trim().toLowerCase() === "cod" ? "COD" : "Prepaid";
   return {
-    // These names and nesting follow Delhivery's documented B2B ManifestPayload.
-    pickup_location: pickupLocation,
-    d_mode: paymentMode,
-    amount: paymentMode === "CoD" ? Number(payload.cod_amount ?? declaredValue) : 0,
-    invoices: [{ ident: providerInvoiceNumber, n_value: declaredValue }],
+    pickup_location_name: pickupLocation,
+    payment_mode: paymentMode.toLowerCase(),
+    cod_amount: paymentMode === "COD" ? Number(payload.cod_amount ?? declaredValue) : undefined,
     weight: Math.max(1, Math.round(weightKg * 1000)),
     dropoff_location: {
-      consignee: destination.name,
+      consignee_name: destination.name,
       address: destination.line,
       city: destination.city,
-      region: destination.state,
+      state: destination.state,
       zip: destination.pincode,
       phone: destination.phone,
       email: destination.email ?? "",
     },
-    suborders: [{
-      ident: orderId,
-      count: Math.max(1, Math.trunc(pieces)),
-      description: String(payload.description ?? "Shipment").trim().slice(0, 200) || "Shipment",
-      // Delhivery requires exactly one waybill slot on the master suborder.
-      // An empty slot preserves Delhivery's server-side waybill allocation.
-      waybills: [""],
-      master: true,
+    return_address: {
+      name: origin.name,
+      address: origin.line,
+      city: origin.city,
+      state: origin.state,
+      zip: origin.pincode,
+      phone: origin.phone,
+      email: origin.email,
+    },
+    shipment_details: [{
+      order_id: orderId,
+      box_count: pieces,
+      description: String(payload.description ?? "Shipment").slice(0, 500),
+      weight: Math.max(1, Math.round(weightKg * 1000)),
+      waybills: [],
+      master: false,
     }],
-    ...(dimensions.length ? { dimensions } : {}),
-    ...(String(payload.client_gst_tin ?? payload.seller_gst_tin ?? "").trim()
-      ? { seller_gst_tin: String(payload.client_gst_tin ?? payload.seller_gst_tin).trim() }
-      : {}),
-    ...(String(payload.consignee_gst_tin ?? "").trim()
-      ? { consignee_gst_tin: String(payload.consignee_gst_tin ?? "").trim() }
-      : {}),
+    dimensions: length > 0 && width > 0 && height > 0 ? [{ length, width, breadth: width, height, box_count: pieces }] : undefined,
+    invoices: [{
+      ewaybill: String(payload.e_way_bill_no ?? payload.e_waybill_no ?? payload.ewaybill_number ?? ""),
+      inv_num: providerInvoiceNumber,
+      inv_amt: declaredValue,
+      inv_qr_code: String(payload.invoice_qr_code ?? ""),
+    }],
+    rov_insurance: payload.rov_type === true,
+    billing_address: {
+      name: origin.name,
+      company: origin.name,
+      consignor: origin.name,
+      address: origin.line,
+      city: origin.city,
+      state: origin.state,
+      pin: origin.pincode,
+      phone: origin.phone,
+      ...(String(payload.client_gst_tin ?? payload.seller_gst_tin ?? "").trim()
+        ? { gst_number: String(payload.client_gst_tin ?? payload.seller_gst_tin).trim() }
+        : String(payload.client_pan ?? payload.client_pan_number ?? payload.pan_number ?? "").trim()
+          ? { pan_number: String(payload.client_pan ?? payload.client_pan_number ?? payload.pan_number).trim() }
+          : {}),
+    },
   };
+}
+
+function delhiveryB2bManifestForm(payload: Record<string, unknown>, invoiceDocuments: unknown) {
+  const form = new FormData();
+  for (const [key, value] of Object.entries(payload)) {
+    if (value === undefined || value === null) continue;
+    const serialized = typeof value === "object" ? JSON.stringify(value) : String(value);
+    form.append(key, typeof value === "object" ? serialized.replace(/\btrue\b/g, "True").replace(/\bfalse\b/g, "False").replace(/\bnull\b/g, "None") : serialized);
+  }
+  const documents = Array.isArray(invoiceDocuments) ? invoiceDocuments.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object") : [];
+  if (documents.length) {
+    const invoices = Array.isArray(payload.invoices) ? payload.invoices as Array<Record<string, unknown>> : [];
+    form.append("doc_data", JSON.stringify(documents.map((document, index) => ({
+      doc_type: "INVOICE_COPY",
+      doc_meta: { invoice_num: [String(document.invoice_number ?? invoices[index]?.inv_num ?? "")] },
+    }))));
+    for (const document of documents) {
+      const encoded = String(document.body_base64 ?? "").replace(/^data:[^,]+,/, "");
+      const binary = atob(encoded);
+      const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+      form.append("doc_file", new Blob([bytes], { type: String(document.content_type ?? "application/pdf") }), String(document.name ?? "invoice.pdf"));
+    }
+  }
+  return form;
 }
 
 async function persistShipmentDocuments(env: Env, clientId: string, shipmentId: string, documents: unknown, uploadedBy: string) {
@@ -2649,13 +2687,13 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       : provider === "delhivery" && operation === "freight_charges"
         ? `${base.replace(/\/$/, "")}/lrn/freight-breakup?lrns=${encodeURIComponent(trackingNumber)}`
       : provider === "delhivery" && operation === "shipment_status"
-         ? `${delhiveryB2bDocsBase()}/v2/manifest?job_id=${encodeURIComponent(String(payload.provider_booking_id ?? ""))}`
+         ? `${base.replace(/\/$/, "")}/manifest?job_id=${encodeURIComponent(String(payload.provider_booking_id ?? ""))}`
       : provider === "delhivery" && operation === "tracking"
         ? useDelhiveryB2b
         ? `${base.replace(/\/$/, "")}/v2/track/${encodeURIComponent(delhiveryB2bNumber(trackingNumber) ?? String(payload.shipment_id ?? trackingNumber))}`
           : `${base.replace(/\/$/, "")}/packages/json/?waybill=${encodeURIComponent(trackingNumber)}&ref_ids=${encodeURIComponent(String(payload.order_id ?? ""))}`
-    : provider === "delhivery" && operation === "shipments"
-      ? useDelhiveryB2b ? `${delhiveryB2bDocsBase()}/v2/manifest` : `${delhiveryOrigin}/api/cmu/create.json`
+      : provider === "delhivery" && operation === "shipments"
+       ? useDelhiveryB2b ? `${base.replace(/\/$/, "")}/manifest` : `${delhiveryOrigin}/api/cmu/create.json`
        : provider === "delhivery" && operation === "pickups"
          ? useDelhiveryB2b ? `${base.replace(/\/$/, "")}/pickup_requests/` : "https://track.delhivery.com/fm/request/new/"
        : provider === "delhivery" && operation === "pickup_slots"
@@ -2695,7 +2733,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       .bind(labelCallbackToken, payload.shipment_id, clientId, String(payload.label_size ?? "a4")).run();
   }
   const requestBody = provider === "delhivery" && operation === "shipments"
-    ? useDelhiveryB2b ? JSON.stringify(delhiveryCreate) : `format=json&data=${encodeURIComponent(JSON.stringify(delhiveryCreate))}`
+    ? useDelhiveryB2b ? delhiveryB2bManifestForm(delhiveryCreate as Record<string, unknown>, providerPayload.invoice_documents) : `format=json&data=${encodeURIComponent(JSON.stringify(delhiveryCreate))}`
      : provider === "delhivery" && operation === "pickups"
        ? JSON.stringify(delhiveryPickup)
       : provider === "ekart" && operation === "shipments"
@@ -2740,7 +2778,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
           : operation === "shipments" ? JSON.stringify(trackonPayload(payload, trackon!))
             : JSON.stringify({ Appkey: trackon!.appKey, userId: trackon!.userId, password: trackon!.password, AWBNo: trackingNumber });
   if (provider === "delhivery" && operation === "shipments" && !useDelhiveryB2b) headers["content-type"] = "application/x-www-form-urlencoded";
-  if (provider === "delhivery" && operation === "shipments" && useDelhiveryB2b) headers["content-type"] = "application/json";
+  if (provider === "delhivery" && operation === "shipments" && useDelhiveryB2b) delete headers["content-type"];
   let response: Response | null = null; let lastError = "provider_request_failed";
    const readOnlyProviderCall = operation === "tracking" || operation === "serviceability" || operation === "serviceability_route" || operation === "pickup_status" || operation === "pickup_slots";
   const singleManifestCall = provider === "delhivery" && operation === "shipments";
@@ -2982,7 +3020,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       for (let poll = 0; poll < 6; poll += 1) {
         await new Promise((resolve) => setTimeout(resolve, poll === 0 ? 0 : 1500));
         try {
-          const statusUrl = `${delhiveryB2bDocsBase()}/v2/manifest?job_id=${encodeURIComponent(jobId)}`;
+          const statusUrl = `${base.replace(/\/$/, "")}/manifest?job_id=${encodeURIComponent(jobId)}`;
           const statusResponse = await providerFetch(statusUrl, { method: "GET", headers }, Math.max(providerTimeoutMs, 5000));
           const statusBody = await providerResponseText(statusResponse, Math.max(providerTimeoutMs, 5000));
           if (!statusResponse.ok) continue;
