@@ -1398,33 +1398,6 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
   };
 }
 
-function delhiveryB2bManifestForm(payload: Record<string, unknown>, invoiceDocuments: unknown) {
-  const form = new FormData();
-  for (const [key, value] of Object.entries(payload)) {
-    if (value === undefined || value === null) continue;
-    const serialized = typeof value === "object" ? JSON.stringify(value) : String(value);
-    // Delhivery's B2B form parser follows the representation used by its
-    // documented curl example for list fields (Python-style booleans).
-    form.append(key, typeof value === "object" ? serialized.replace(/\btrue\b/g, "True").replace(/\bfalse\b/g, "False").replace(/\bnull\b/g, "None") : serialized);
-  }
-  const documents = Array.isArray(invoiceDocuments) ? invoiceDocuments.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object") : [];
-  if (documents.length) {
-    const invoices = Array.isArray(payload.invoices) ? payload.invoices as Array<Record<string, unknown>> : [];
-    form.append("doc_data", JSON.stringify(documents.map((document, index) => ({
-      doc_type: "INVOICE_COPY",
-      doc_meta: { invoice_num: [String(document.invoice_number ?? invoices[index]?.inv_num ?? "")] },
-    }))));
-    for (const document of documents) {
-      const encoded = String(document.body_base64 ?? "").replace(/^data:[^,]+,/, "");
-      const binary = atob(encoded);
-      const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
-      const blob = new Blob([bytes], { type: String(document.content_type ?? "application/pdf") });
-      form.append("doc_file", blob, String(document.name ?? "invoice.pdf"));
-    }
-  }
-  return form;
-}
-
 async function persistShipmentDocuments(env: Env, clientId: string, shipmentId: string, documents: unknown, uploadedBy: string) {
   const items = Array.isArray(documents) ? documents.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object") : [];
   if (!items.length) return { ok: false as const, error: "An invoice document is required for Delhivery B2B booking" };
@@ -2690,13 +2663,13 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       : provider === "delhivery" && operation === "freight_charges"
         ? `${base.replace(/\/$/, "")}/lrn/freight-breakup?lrns=${encodeURIComponent(trackingNumber)}`
       : provider === "delhivery" && operation === "shipment_status"
-         ? `${base.replace(/\/$/, "")}/manifest?job_id=${encodeURIComponent(String(payload.provider_booking_id ?? ""))}`
+         ? `${delhiveryB2bDocsBase()}/v2/manifest?job_id=${encodeURIComponent(String(payload.provider_booking_id ?? ""))}`
       : provider === "delhivery" && operation === "tracking"
         ? useDelhiveryB2b
         ? `${base.replace(/\/$/, "")}/v2/track/${encodeURIComponent(delhiveryB2bNumber(trackingNumber) ?? String(payload.shipment_id ?? trackingNumber))}`
           : `${base.replace(/\/$/, "")}/packages/json/?waybill=${encodeURIComponent(trackingNumber)}&ref_ids=${encodeURIComponent(String(payload.order_id ?? ""))}`
     : provider === "delhivery" && operation === "shipments"
-      ? useDelhiveryB2b ? `${base.replace(/\/$/, "")}/manifest` : `${delhiveryOrigin}/api/cmu/create.json`
+      ? useDelhiveryB2b ? `${delhiveryB2bDocsBase()}/v2/manifest` : `${delhiveryOrigin}/api/cmu/create.json`
        : provider === "delhivery" && operation === "pickups"
          ? useDelhiveryB2b ? `${base.replace(/\/$/, "")}/pickup_requests/` : "https://track.delhivery.com/fm/request/new/"
        : provider === "delhivery" && operation === "pickup_slots"
@@ -2736,7 +2709,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       .bind(labelCallbackToken, payload.shipment_id, clientId, String(payload.label_size ?? "a4")).run();
   }
   const requestBody = provider === "delhivery" && operation === "shipments"
-    ? useDelhiveryB2b ? delhiveryB2bManifestForm(delhiveryCreate as Record<string, unknown>, providerPayload.invoice_documents) : `format=json&data=${encodeURIComponent(JSON.stringify(delhiveryCreate))}`
+    ? useDelhiveryB2b ? JSON.stringify(delhiveryCreate) : `format=json&data=${encodeURIComponent(JSON.stringify(delhiveryCreate))}`
      : provider === "delhivery" && operation === "pickups"
        ? JSON.stringify(delhiveryPickup)
       : provider === "ekart" && operation === "shipments"
@@ -2781,7 +2754,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
           : operation === "shipments" ? JSON.stringify(trackonPayload(payload, trackon!))
             : JSON.stringify({ Appkey: trackon!.appKey, userId: trackon!.userId, password: trackon!.password, AWBNo: trackingNumber });
   if (provider === "delhivery" && operation === "shipments" && !useDelhiveryB2b) headers["content-type"] = "application/x-www-form-urlencoded";
-  if (provider === "delhivery" && operation === "shipments" && useDelhiveryB2b) delete headers["content-type"];
+  if (provider === "delhivery" && operation === "shipments" && useDelhiveryB2b) headers["content-type"] = "application/json";
   let response: Response | null = null; let lastError = "provider_request_failed";
    const readOnlyProviderCall = operation === "tracking" || operation === "serviceability" || operation === "serviceability_route" || operation === "pickup_status" || operation === "pickup_slots";
   const singleManifestCall = provider === "delhivery" && operation === "shipments";
@@ -3023,7 +2996,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       for (let poll = 0; poll < 6; poll += 1) {
         await new Promise((resolve) => setTimeout(resolve, poll === 0 ? 0 : 1500));
         try {
-          const statusUrl = `${base.replace(/\/$/, "")}/manifest?job_id=${encodeURIComponent(jobId)}`;
+          const statusUrl = `${delhiveryB2bDocsBase()}/v2/manifest?job_id=${encodeURIComponent(jobId)}`;
           const statusResponse = await providerFetch(statusUrl, { method: "GET", headers }, Math.max(providerTimeoutMs, 5000));
           const statusBody = await providerResponseText(statusResponse, Math.max(providerTimeoutMs, 5000));
           if (!statusResponse.ok) continue;
