@@ -2510,7 +2510,8 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   const trackon = provider === "trackon" ? trackonCredentials(env, credential) : null;
   const rivigo = provider === "rivigo" ? rivigoCredentials(env, credential) : null;
   if (!base || (provider === "trackon" ? !trackon : provider === "rivigo" ? !rivigo : !credential)) return { enabled: false, status: "not_configured" as const };
-  const providerTimeoutMs = Math.min(timeoutMsOverride ?? (provider === "delhivery" && operation === "shipments" ? 30000 : 10000), provider === "delhivery" && operation === "shipments" ? 30000 : 10000);
+  const providerDefaultTimeoutMs = provider === "delhivery" && operation === "shipments" ? 30000 : provider === "delhivery" && operation === "labels" ? 5000 : 10000;
+  const providerTimeoutMs = Math.min(timeoutMsOverride ?? providerDefaultTimeoutMs, providerDefaultTimeoutMs);
   const delhiveryB2bAccountName = canonicalDelhiveryAccountName(account?.account_name ?? defaultDelhiveryAccountName);
     const delhiveryLabelAuthBase = provider === "delhivery" && operation === "labels" ? delhiveryLabelApiBase() : undefined;
   let delhiveryB2bToken = useDelhiveryB2b ? await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs, false, delhiveryLabelAuthBase) : null;
@@ -2782,7 +2783,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   let response: Response | null = null; let lastError = "provider_request_failed";
    const readOnlyProviderCall = operation === "tracking" || operation === "serviceability" || operation === "serviceability_route" || operation === "pickup_status" || operation === "pickup_slots";
   const singleManifestCall = provider === "delhivery" && operation === "shipments";
-  const maxAttempts = singleManifestCall ? 1 : readOnlyProviderCall ? (provider === "delhivery" && useDelhiveryB2b ? 2 : 1) : 3;
+  const maxAttempts = singleManifestCall || operation === "labels" ? 1 : readOnlyProviderCall ? (provider === "delhivery" && useDelhiveryB2b ? 2 : 1) : 3;
   // Courier tracking/serviceability are read-only, but provider APIs can take
   // longer than a browser request under normal network load. Keep a bounded
   // timeout so public tracking does not hang indefinitely while avoiding false
@@ -3100,27 +3101,10 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       };
     }
     if (operation === "labels" && (payload.label_api_variant === "pdf" || payload.label_api_variant === "pdf_alt") && !isProviderPdfArtifact(artifact)) {
-      // Delhivery queues PDF generation and publishes the resulting PDF URLs
-      // through the label-links endpoint once the task completes. Poll that
-      // provider endpoint briefly so the client receives the actual PDFs in
-      // the same request instead of an empty formats menu.
-      const labelUrl = `${delhiveryLabelApiBase()}/label/get_urls/${encodeURIComponent(delhiveryLabelApiSize(String(payload.label_size ?? "a4")))}/${encodeURIComponent(trackingNumber)}`;
-      // The alternate B2B PDF endpoint returns a job id first. Delhivery's
-      // label-link endpoint usually publishes the completed assets several
-      // seconds later, so poll long enough for the provider job to finish.
-      for (let poll = 0; poll < 12 && !findProviderUrls(artifact).length; poll += 1) {
-        if (poll > 0) await new Promise((resolve) => setTimeout(resolve, 1500));
-        try {
-          const labelResponse = await providerFetch(labelUrl, { method: "GET", headers }, Math.max(providerTimeoutMs, 5000));
-          if (!labelResponse.ok) continue;
-          const labelBody = await providerResponseText(labelResponse, Math.max(providerTimeoutMs, 5000));
-          let labelJson: unknown = null;
-          try { labelJson = JSON.parse(labelBody); } catch { labelJson = labelBody.trim() || null; }
-          if (labelJson && findProviderUrls(labelJson).length) artifact = typeof labelJson === "object" ? labelJson : { urls: findProviderUrls(labelJson, [], 0, "", labelResponse.url) };
-        } catch {
-          // Keep the queued response and continue the bounded retry window.
-        }
-      }
+      // PDF generation is asynchronous. Do not poll the provider inside the
+      // browser request: that made the Client menu hang for 30–45 seconds and
+      // prevented the callback/stored-artifact path from being used. The
+      // callback persists the PDF; a subsequent download reads it from R2.
     }
     if (operation === "labels" && artifact && typeof artifact === "object") {
       const labelUrls = findProviderUrls(artifact, [], 0, "", response.url);
@@ -5273,7 +5257,7 @@ const worker = {
           // Delhivery accounts are split between the documented B2B host and
           // the legacy LTL client host. The native One UI uses the latter for
           // some accounts, so retry the same PDF job contract there as well.
-          const labelVariants = ["pdf", "pdf_alt", "legacy_alt"];
+          const labelVariants = ["pdf"];
           for (const labelApiVariant of labelVariants) {
             for (const candidate of referenceCandidates) {
               if (labelApiVariant === "legacy" && candidate === providerReference) continue;
