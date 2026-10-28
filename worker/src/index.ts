@@ -3111,7 +3111,11 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       if (labelUrls.length) {
         try {
           const labelArtifacts: Array<{ content_base64: string; content_type: string }> = [];
-          const requestedCopies = Math.max(1, Number(payload.boxes ?? payload.pieces ?? 1) + 1);
+          const boxCopies = Math.max(1, Number(payload.boxes ?? payload.pieces ?? 1));
+          // Delhivery appends a document/MPS asset after the box labels. Keep
+          // that extra asset only for A4, where the provider PDF is authoritative;
+          // sticker sheets must contain box labels only.
+          const requestedCopies = boxCopies + (String(payload.label_size ?? "a4") === "a4" ? 1 : 0);
           // get_urls returns one asset per box plus a final MPS document asset.
           // Keep that provider document instead of replacing it with a duplicate
           // box label; the client uses the returned order for the A4 output.
