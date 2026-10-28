@@ -2510,7 +2510,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   const trackon = provider === "trackon" ? trackonCredentials(env, credential) : null;
   const rivigo = provider === "rivigo" ? rivigoCredentials(env, credential) : null;
   if (!base || (provider === "trackon" ? !trackon : provider === "rivigo" ? !rivigo : !credential)) return { enabled: false, status: "not_configured" as const };
-  const providerDefaultTimeoutMs = provider === "delhivery" && operation === "shipments" ? 30000 : provider === "delhivery" && operation === "labels" ? 5000 : 10000;
+  const providerDefaultTimeoutMs = provider === "delhivery" && operation === "shipments" ? 30000 : provider === "delhivery" && operation === "labels" ? 3000 : 10000;
   const providerTimeoutMs = Math.min(timeoutMsOverride ?? providerDefaultTimeoutMs, providerDefaultTimeoutMs);
   const delhiveryB2bAccountName = canonicalDelhiveryAccountName(account?.account_name ?? defaultDelhiveryAccountName);
     const delhiveryLabelAuthBase = provider === "delhivery" && operation === "labels" ? delhiveryLabelApiBase() : undefined;
@@ -3118,12 +3118,12 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
           const labelFetchResults: string[] = [];
           const fetchedArtifacts = await Promise.all(labelUrls.slice(0, requestedCopies).map(async (labelUrl) => {
             try {
-              const labelResponse = await providerFetch(labelUrl, { method: "GET", headers: { ...headers, accept: "application/json,image/*,application/pdf" } }, attemptTimeoutMs);
+              const labelResponse = await providerFetch(labelUrl, { method: "GET", headers: { ...headers, accept: "application/json,image/*,application/pdf" } }, Math.min(attemptTimeoutMs, 3000));
               const labelContentType = labelResponse.headers.get("content-type") ?? "application/octet-stream";
               labelFetchResults.push(`${labelResponse.status}:${labelContentType}`);
               if (!labelResponse.ok) return null;
               if (labelContentType.toLowerCase().includes("json")) {
-                const labelBody = await providerResponseText(labelResponse, attemptTimeoutMs);
+                const labelBody = await providerResponseText(labelResponse, Math.min(attemptTimeoutMs, 3000));
                 let labelJson: unknown = null;
                 try { labelJson = JSON.parse(labelBody); } catch { labelJson = labelBody.trim() || null; }
                 const labelBase64 = findProviderContentBase64(labelJson);
