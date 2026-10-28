@@ -4937,7 +4937,14 @@ const worker = {
         const selectedProviderAccountId = (providerResult as { provider_account_id?: string }).provider_account_id;
         if (selectedProviderAccountId) await env.DB.prepare("UPDATE shipments SET provider_account_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(selectedProviderAccountId, shipmentId, clientId).run();
         if (provider === "delhivery") await env.DB.prepare("INSERT OR REPLACE INTO pricing_provider_costs (id, shipment_id, client_id, provider, provider_account_id, provider_amount, provider_status) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(crypto.randomUUID(), shipmentId, clientId, provider, selectedProviderAccountId ?? null, providerAmount(providerResult), providerResult.status).run();
-        if (provider && providerResult.status !== "accepted") {
+         const providerBookingId = String((providerResult as { providerBookingId?: string | null }).providerBookingId ?? "").trim() || null;
+         const providerResultCode = String((providerResult as { code?: string }).code ?? "");
+         // A Delhivery manifest can be accepted with a provider job id while
+         // the LR/AWB is published a few seconds later. Keep that specific
+         // response on the reconciliation path; every other provider failure
+         // remains a hard failure and is never reported as booked.
+         const delhiveryLrPending = provider === "delhivery" && providerResultCode === "PROVIDER_LR_TIMEOUT" && Boolean(providerBookingId);
+         if (provider && providerResult.status !== "accepted" && !delhiveryLrPending) {
           const failureReason = String((providerResult as { error?: string; reason?: string }).error ?? (providerResult as { reason?: string }).reason ?? `The ${provider} shipment was not accepted`).slice(0, 500);
           const providerCode = String((providerResult as { code?: string }).code ?? "") || (provider === "delhivery" && /awaiting provider activation|not active|not (?:been )?configured|warehouse.*activation|pickup.*warehouse.*pending/i.test(failureReason) ? "WAREHOUSE_ACTIVATION_PENDING" : "");
           // A synchronous booking must never be reported as booked when the
@@ -4966,13 +4973,12 @@ const worker = {
         let reconciledProviderLr = providerLr;
         let reconciledProviderAwb = providerAwb;
         let reconciledProviderReference = providerReference;
-        const providerBookingId = String((providerResult as { providerBookingId?: string | null }).providerBookingId ?? "").trim() || null;
         if (provider === "delhivery" && providerBookingId && !reconciledProviderLr && !reconciledProviderAwb && !reconciledProviderReference) {
           // Delhivery may acknowledge the manifest first and persist the LR/AWB
           // through its callback a few seconds later. Reconcile that callback
           // in this request before exposing a pending booking to the client.
           // This is bounded and never sends a second manifest.
-          for (let attempt = 0; attempt < 8; attempt += 1) {
+           for (let attempt = 0; attempt < 10; attempt += 1) {
             await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? 0 : 1500));
             const reconciled = await env.DB.prepare("SELECT lr_number, master_awb, provider_reference FROM shipments WHERE id = ? AND client_id = ? LIMIT 1")
               .bind(shipmentId, clientId)
