@@ -2854,7 +2854,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   // normalized tracking event is persisted and returned to the internal caller.
   let responseBody = "";
   let responseBytes: Uint8Array | null = null;
-  let lrCopyResponses: Array<{ copyType: string; bytes: Uint8Array }> = [];
+  const lrCopyResponses: Array<{ copyType: string; bytes: Uint8Array }> = [];
   try {
     if (provider === "delhivery" && ["labels", "lr_copy", "document"].includes(operation)) {
       responseBytes = await providerResponseBytes(response, 12 * 1024 * 1024);
@@ -5006,7 +5006,7 @@ const worker = {
             .bind(providerBookingId, retryPayload ? JSON.stringify(retryPayload) : null, timeoutReason, shipmentId, clientId).run();
           await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'booked', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
             .bind(crypto.randomUUID(), shipmentId, timeoutReason, auth.userId ?? `api:${clientId}`).run();
-          const pendingResponse = JSON.stringify({ ok: true, data: { id: shipmentId, client_id: clientId, status: "booked", provider_status: "pending", provider_sync_status: "pending", message: "Delhivery accepted the booking, but the LR/AWB is still being published." }, request_id: id });
+          const pendingResponse = JSON.stringify({ ok: true, data: { id: shipmentId, client_id: clientId, status: "booked", provider_status: "pending", provider_sync_status: "pending", provider_pending: true, provider_booking_id: providerBookingId, retry_at: "scheduled", message: "Delhivery accepted the booking, but the LR/AWB is still being published." }, request_id: id });
           await saveIdempotent(env, key, clientId, "POST /v1/shipments", 202, pendingResponse, requestHash);
           await audit(env, ctx, auth, id, "shipment.provider_lr_pending", "shipment", shipmentId, { client_id: clientId, provider, provider_booking_id: providerBookingId });
           return new Response(pendingResponse, { status: 202, headers: { ...headers, "content-type": "application/json" } });
@@ -5030,7 +5030,7 @@ const worker = {
         // Return only provider-owned references. Delhivery may assign the LR
         // asynchronously, so read persisted courier values after the provider call.
         const bookedShipment = await env.DB.prepare("SELECT tracking_number, lr_number, provider_reference FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(shipmentId, clientId).first<{ tracking_number: string | null; lr_number: string | null; provider_reference: string | null }>();
-        const serialized = JSON.stringify({ ok: true, data: { id: shipmentId, client_id: clientId, status: "booked", provider, tracking_number: bookedShipment?.tracking_number ?? null, lr_number: bookedShipment?.lr_number ?? null, provider_reference: bookedShipment?.provider_reference ?? null, pricing_amount: pricingAmount || null, provider_status: providerResult.status, ...(liveServiceabilityProvenance ? { serviceability_provenance: liveServiceabilityProvenance } : {}) }, request_id: id });
+        const serialized = JSON.stringify({ ok: true, data: { id: shipmentId, client_id: clientId, status: "booked", provider, provider_booking_id: providerBookingId, tracking_number: bookedShipment?.tracking_number ?? null, lr_number: bookedShipment?.lr_number ?? null, master_awb: reconciledProviderAwb || null, provider_reference: bookedShipment?.provider_reference ?? null, pricing_amount: pricingAmount || null, provider_status: providerResult.status, ...(liveServiceabilityProvenance ? { serviceability_provenance: liveServiceabilityProvenance } : {}) }, request_id: id });
         await saveIdempotent(env, key, clientId, "POST /v1/shipments", 201, serialized, requestHash);
         await audit(env, ctx, auth, id, "shipment.created", "shipment", shipmentId, { client_id: clientId, provider });
         return new Response(serialized, { status: 201, headers: { ...headers, "content-type": "application/json" } });
