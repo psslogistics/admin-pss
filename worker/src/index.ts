@@ -3003,6 +3003,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   // Delhivery B2B manifestation must return the LR/AWB in the synchronous
   // manifest response. A job id alone is only an acknowledgement and must not
   // be surfaced as a successful shipment booking.
+  let delhiveryManifestJobId: string | null = null;
   if (response.ok && provider === "delhivery" && useDelhiveryB2b && operation === "shipments") {
     const initialLr = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["lrnum", "lr_num", "lr_number", "lr_no", "lrn", "lrn_number", "lr"])))
       ?? responseBody.match(/(?:lr(?:n|[_ ]?(?:number|num|no))?)[^A-Za-z0-9]{0,12}(\d{6,20})/i)?.[1]
@@ -3011,6 +3012,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       ?? responseBody.match(/(?:master[_ ]?awb|awb|waybill)[^A-Za-z0-9]{0,12}(\d{6,20})/i)?.[1]
       ?? null;
     const jobId = findProviderReference(parsedProviderBody, new Set(["job_id", "jobid", "manifest_job_id", "request_id", "requestid"]));
+    delhiveryManifestJobId = jobId;
     if (!initialLr && !initialAwb && jobId) {
       // Delhivery's B2B manifest can acknowledge the POST with a job id and
       // publish the LR/AWB on the immediately-following status response. This
@@ -3056,18 +3058,20 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     // shipment booking reference.
     const b2bLrReference = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["lrnum", "lr_num", "lr_number", "lr_no", "lrn", "lrn_number", "lr"])));
     const b2bAwbReference = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["mwn", "mwn_number", "master_awb", "master_awb_number", "masterawb", "master_waybill", "master_waybill_number", "awb", "awb_number", "waybill", "waybill_number", "waybill_no"])));
-    const providerBookingId = findProviderReference(parsedProviderBody, new Set(["job_id", "jobid", "manifest_job_id", "request_id", "requestid"]));
+    // Preserve the original manifest job id when the provider's status body
+    // contains only the eventual LR/AWB fields. The job id is the correlation
+    // key for late reconciliation; it is never itself a shipment reference.
+    const providerBookingId = findProviderReference(parsedProviderBody, new Set(["job_id", "jobid", "manifest_job_id", "request_id", "requestid"])) ?? delhiveryManifestJobId;
     const createdReference = useDelhiveryB2b ? b2bLrReference ?? b2bAwbReference : findProviderReference(parsedProviderBody, new Set(["waybill", "awb", "tracking_number", "trackingid", "shipment_id"]));
     const providerReference = useDelhiveryB2b ? b2bAwbReference ?? createdReference : createdReference;
     if (useDelhiveryB2b && !createdReference && providerBookingId) {
-      const timeoutReason = "Delhivery accepted the manifest but did not return an LR/AWB within the synchronous booking window";
-      // A provider job id proves that Delhivery accepted the request, but it is
-      // not an LR/AWB and must never be shown as a successful booking. Keep the
-      // job id for late reconciliation, but fail this booking attempt so the
-      // client receives a deterministic result and no second manifest is sent.
-      await env.DB.prepare("UPDATE shipments SET provider_booking_id = COALESCE(?, provider_booking_id), provider_sync_status = 'failed', status = 'exception', provider_retry_at = NULL, provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(providerBookingId, timeoutReason, payload.shipment_id, clientId).run();
-      await env.DB.prepare("UPDATE integration_requests SET status = 'failed', error_code = 'PROVIDER_LR_TIMEOUT', error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(timeoutReason, integrationId).run();
-      return { enabled: true, status: "failed" as const, code: "PROVIDER_LR_TIMEOUT", providerStatus: response.status, providerBookingId, error: timeoutReason, retryable: false };
+      // A job id is an accepted Delhivery manifest, not a failed booking. Keep
+      // the provider correlation key and let the route perform its bounded
+      // reconciliation pass before returning a truthful pending response.
+      const pending = "Delhivery accepted the booking and returned a provider job ID. LR/AWB is still being confirmed.";
+      await env.DB.prepare("UPDATE shipments SET provider_booking_id = COALESCE(?, provider_booking_id), provider_sync_status = 'pending', status = 'booked', provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(providerBookingId, pending, payload.shipment_id, clientId).run();
+      await env.DB.prepare("UPDATE integration_requests SET status = 'accepted', error_code = NULL, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(pending, integrationId).run();
+      return { enabled: true, status: "accepted" as const, providerStatus: response.status, providerPending: true, providerBookingId, message: pending };
     }
     if (useDelhiveryB2b && !createdReference) {
       const failure = "Delhivery accepted the request but returned no LR or AWB. The pickup request was not treated as a shipment booking.";
