@@ -1342,6 +1342,11 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
   if (!origin || !destination || !pickupLocation || !providerInvoiceNumber || !Number.isFinite(declaredValue) || declaredValue < 0 || !Number.isFinite(weightKg) || weightKg <= 0 || !Number.isInteger(pieces) || pieces < 1) return null;
   const paymentMode = String(payload.payment_mode ?? "prepaid").trim().toLowerCase() === "cod" ? "COD" : "Prepaid";
   return {
+    // Delhivery's manifest schema requires the registered pickup facility in
+    // `pickup_location`. Keep the descriptive alias for older integrations,
+    // but send the canonical field as well so the provider can validate and
+    // manifest the shipment immediately.
+    pickup_location: pickupLocation,
     pickup_location_name: pickupLocation,
     payment_mode: paymentMode.toLowerCase(),
     cod_amount: paymentMode === "COD" ? Number(payload.cod_amount ?? declaredValue) : undefined,
