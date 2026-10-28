@@ -5283,6 +5283,16 @@ const worker = {
             if (isProviderPdfArtifact(providerResult.artifact)) break;
           }
         }
+        if (operation === "labels" && !isProviderPdfArtifact(providerResult.artifact) && providerResult.status === "failed") {
+          return error(
+            providerResult.code ?? "PROVIDER_LABEL_UNAVAILABLE",
+            providerResult.error ?? "Delhivery did not publish a label for this LR yet",
+            Number(providerResult.providerStatus) >= 400 ? Number(providerResult.providerStatus) : 502,
+            id,
+            headers,
+            JSON.stringify({ provider_status: providerResult.providerStatus ?? null, provider_code: providerResult.code ?? null }),
+          );
+        }
         return json({ ok: true, data: providerResult }, 200, headers);
       }
 
@@ -5983,11 +5993,12 @@ const worker = {
         if (route === "/warehouses") {
           if (typeof payload.name !== "string" || typeof payload.address !== "string") return error("VALIDATION_ERROR", "Warehouse name and address are required", 400, id, headers);
           if (typeof payload.pincode !== "string" || !/^\d{6}$/.test(payload.pincode.trim())) return error("VALIDATION_ERROR", "A valid six-digit warehouse PIN code is required", 400, id, headers);
+          const warehouseName = payload.name;
+          const warehouseAddress = payload.address;
+          const warehousePincode = payload.pincode;
           const requestedProviderAccountId = typeof payload.provider_account_id === "string" && payload.provider_account_id.trim() ? payload.provider_account_id.trim() : null;
           const providerAccountId = await resolveDelhiveryProviderAccountId(env, clientId, requestedProviderAccountId);
           if (!providerAccountId) return error("PROVIDER_ACCOUNT_NOT_ALLOWED", "An active Delhivery account is required for warehouse creation", 409, id, headers);
-          const liveServiceability = await verifyDelhiveryServiceability(env, payload.pincode.trim(), payload.pincode.trim(), providerAccountId, id, clientId);
-          if (!liveServiceability.ok) return error("PROVIDER_SERVICEABILITY_FAILED", liveServiceability.reason ?? "Delhivery could not verify this warehouse pickup pincode", 409, id, headers, JSON.stringify({ provenance: liveServiceability.provenance, origin: liveServiceability.origin }));
           const duplicate = await env.DB.prepare("SELECT id, client_id, name, provider, provider_account_id, provider_status, provider_error FROM warehouses WHERE client_id = ? AND lower(trim(COALESCE(provider_account_id, ''))) = lower(trim(COALESCE(?, ''))) AND lower(trim(address)) = lower(trim(?)) AND lower(trim(COALESCE(city, ''))) = lower(trim(COALESCE(?, ''))) AND lower(trim(COALESCE(state, ''))) = lower(trim(COALESCE(?, ''))) AND lower(trim(COALESCE(pincode, ''))) = lower(trim(COALESCE(?, ''))) AND lower(trim(COALESCE(contact, ''))) = lower(trim(COALESCE(?, ''))) AND lower(trim(COALESCE(contact_name, ''))) = lower(trim(COALESCE(?, ''))) ORDER BY updated_at DESC LIMIT 1").bind(clientId, providerAccountId, payload.address, String(payload.city ?? ""), String(payload.state ?? ""), String(payload.pincode ?? ""), String(payload.contact ?? ""), String(payload.contact_name ?? "")).first<{ id: string; client_id: string; name: string; provider: string | null; provider_account_id: string | null; provider_status: string | null; provider_error: string | null }>();
           if (duplicate) {
             const serialized = JSON.stringify({ ok: true, data: duplicate, deduplicated: true, request_id: id });
@@ -5995,32 +6006,35 @@ const worker = {
             return new Response(serialized, { status: 200, headers: { ...headers, "content-type": "application/json" } });
           }
           await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'pending')").bind(recordId, clientId, payload.name, payload.address, String(payload.city ?? ""), String(payload.state ?? ""), String(payload.pincode ?? ""), String(payload.contact ?? ""), String(payload.contact_name ?? ""), providerAccountId).run();
-          const context = await delhiveryWarehouseProviderContext(env, clientId, providerAccountId, id, 30000);
-          if (!context.ok) {
-            providerStatus = "failed";
-            providerError = context.error;
-            delhiveryWarehouseLog(id, "account_context_failed", { requested_account_id: providerAccountId, error: providerError });
-            await env.DB.prepare("UPDATE warehouses SET provider_status = 'failed', provider_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(providerError, recordId, clientId).run();
-          } else {
-            delhiveryWarehouseLog(id, "account_context_ready", { account_id: context.accountId, account_name: context.accountName });
-            const sync = await ensureDelhiveryWarehouse(env, clientId, context.token, {
-              name: String(payload.name),
-              line: payload.address,
-              city: String(payload.city ?? ""),
-              state: String(payload.state ?? ""),
-              pincode: String(payload.pincode ?? ""),
-              phone: String(payload.contact ?? ""),
-            }, id, 30000, context.base, context.accountId, recordId, context.warehouseApiToken);
-            if (!sync.ok) {
-              providerStatus = "failed";
-              providerError = sync.error;
-              await env.DB.prepare("UPDATE warehouses SET provider_status = 'failed', provider_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(providerError, recordId, clientId).run();
-            } else {
-              const saved = await env.DB.prepare("SELECT provider_status, provider_error FROM warehouses WHERE id = ? AND client_id = ? LIMIT 1").bind(recordId, clientId).first<{ provider_status: string | null; provider_error: string | null }>();
-              providerStatus = saved?.provider_status ?? "pending";
-              providerError = saved?.provider_error ?? null;
+          providerStatus = "pending";
+          ctx.waitUntil((async () => {
+            try {
+              const liveServiceability = await verifyDelhiveryServiceability(env, warehousePincode.trim(), warehousePincode.trim(), providerAccountId, id, clientId);
+              if (!liveServiceability.ok) {
+                await env.DB.prepare("UPDATE warehouses SET provider_status = 'failed', provider_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(liveServiceability.reason ?? "Delhivery could not verify this warehouse pickup pincode", recordId, clientId).run();
+                return;
+              }
+              const context = await delhiveryWarehouseProviderContext(env, clientId, providerAccountId, id, 30000);
+              if (!context.ok) {
+                delhiveryWarehouseLog(id, "account_context_failed", { requested_account_id: providerAccountId, error: context.error });
+                await env.DB.prepare("UPDATE warehouses SET provider_status = 'failed', provider_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(context.error, recordId, clientId).run();
+                return;
+              }
+              delhiveryWarehouseLog(id, "account_context_ready", { account_id: context.accountId, account_name: context.accountName });
+              const sync = await ensureDelhiveryWarehouse(env, clientId, context.token, {
+                name: warehouseName,
+                line: warehouseAddress,
+                city: String(payload.city ?? ""),
+                state: String(payload.state ?? ""),
+                pincode: warehousePincode,
+                phone: String(payload.contact ?? ""),
+              }, id, 30000, context.base, context.accountId, recordId, context.warehouseApiToken);
+              if (!sync.ok) await env.DB.prepare("UPDATE warehouses SET provider_status = 'failed', provider_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(sync.error, recordId, clientId).run();
+            } catch (caught) {
+              const message = caught instanceof Error ? caught.message : "Warehouse provider synchronization failed";
+              await env.DB.prepare("UPDATE warehouses SET provider_status = 'failed', provider_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(message, recordId, clientId).run();
             }
-          }
+          })());
         } else {
           if (typeof payload.label !== "string" || typeof payload.address !== "string") return error("VALIDATION_ERROR", "Address label and address are required", 400, id, headers);
           const addressKind = payload.address_kind === "consignee" ? "consignee" : "consignor";
