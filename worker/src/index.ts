@@ -4938,12 +4938,14 @@ const worker = {
         if (selectedProviderAccountId) await env.DB.prepare("UPDATE shipments SET provider_account_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(selectedProviderAccountId, shipmentId, clientId).run();
         if (provider === "delhivery") await env.DB.prepare("INSERT OR REPLACE INTO pricing_provider_costs (id, shipment_id, client_id, provider, provider_account_id, provider_amount, provider_status) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(crypto.randomUUID(), shipmentId, clientId, provider, selectedProviderAccountId ?? null, providerAmount(providerResult), providerResult.status).run();
          const providerBookingId = String((providerResult as { providerBookingId?: string | null }).providerBookingId ?? "").trim() || null;
-         const providerResultCode = String((providerResult as { code?: string }).code ?? "");
+         const providerResultLr = String((providerResult as { lr_number?: string | null }).lr_number ?? "").trim();
+         const providerResultAwb = String((providerResult as { master_awb?: string | null }).master_awb ?? "").trim();
+         const providerResultReference = String((providerResult as { providerReference?: string | null }).providerReference ?? "").trim();
          // A Delhivery manifest can be accepted with a provider job id while
          // the LR/AWB is published a few seconds later. Keep that specific
          // response on the reconciliation path; every other provider failure
          // remains a hard failure and is never reported as booked.
-         const delhiveryLrPending = provider === "delhivery" && providerResultCode === "PROVIDER_LR_TIMEOUT" && Boolean(providerBookingId);
+         const delhiveryLrPending = provider === "delhivery" && Boolean(providerBookingId) && !providerResultLr && !providerResultAwb && !providerResultReference;
          if (provider && providerResult.status !== "accepted" && !delhiveryLrPending) {
           const failureReason = String((providerResult as { error?: string; reason?: string }).error ?? (providerResult as { reason?: string }).reason ?? `The ${provider} shipment was not accepted`).slice(0, 500);
           const providerCode = String((providerResult as { code?: string }).code ?? "") || (provider === "delhivery" && /awaiting provider activation|not active|not (?:been )?configured|warehouse.*activation|pickup.*warehouse.*pending/i.test(failureReason) ? "WAREHOUSE_ACTIVATION_PENDING" : "");
@@ -4967,9 +4969,9 @@ const worker = {
           await audit(env, ctx, auth, id, "shipment.provider_failed", "shipment", shipmentId, { client_id: clientId, provider, reason: failureReason });
           return new Response(failedResponse, { status: 502, headers: { ...headers, "content-type": "application/json" } });
         }
-        const providerLr = String((providerResult as { lr_number?: string | null }).lr_number ?? "").trim();
-        const providerAwb = String((providerResult as { master_awb?: string | null }).master_awb ?? "").trim();
-        const providerReference = String((providerResult as { providerReference?: string | null }).providerReference ?? "").trim();
+         const providerLr = providerResultLr;
+         const providerAwb = providerResultAwb;
+         const providerReference = providerResultReference;
         let reconciledProviderLr = providerLr;
         let reconciledProviderAwb = providerAwb;
         let reconciledProviderReference = providerReference;
