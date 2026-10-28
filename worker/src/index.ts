@@ -4030,9 +4030,28 @@ async function handleProviderWebhook(request: Request, env: Env, provider: "delh
   const stored = await env.DB.prepare("INSERT OR IGNORE INTO webhook_events (id, provider, event_id, event_type, payload, signature_valid, status) VALUES (?, ?, ?, ?, ?, 1, 'received')").bind(crypto.randomUUID(), provider, eventId, String(payload.event_type ?? payload.status ?? "unknown"), rawBody).run();
   if (Number(stored.meta?.changes ?? 0) > 0) {
     const reference = delhiveryDetails?.reference ?? String(payload.tracking_number ?? payload.AWBNo ?? payload.awb ?? payload.waybill ?? payload.provider_reference ?? payload.shipment_id ?? "").trim();
+    // Delhivery can deliver the first manifest callback before an LR/AWB is
+    // available. In that callback the stable correlation value is commonly
+    // the order/reference number or the asynchronous manifest job id, not the
+    // PSS UUID. Keep those values separate from the provider reference so an
+    // order id/job id can locate the shipment without ever being stored as an
+    // LR/AWB.
+    const correlationReferences = Array.from(new Set([
+      findProviderReference(payload, new Set(["order_id", "orderid", "order_number", "client_order_id", "client_reference", "ref_id", "refid", "reference_no", "referenceno"])),
+      findProviderReference(payload, new Set(["job_id", "jobid", "manifest_job_id", "request_id", "requestid"])),
+      String(payload.order_id ?? payload.orderId ?? payload.client_reference ?? payload.reference_no ?? "").trim(),
+    ].map((value) => String(value ?? "").trim()).filter(Boolean)));
+    const providerAwb = findProviderReference(payload, new Set(["awb", "awb_number", "waybill", "waybill_number", "waybill_no", "tracking_number", "trackingnumber"]));
+    const providerLr = findProviderReference(payload, new Set(["lrn", "lrn_number", "lr_number", "lr_no", "lr"]));
     const status = normalizeProviderShipmentStatus(delhiveryDetails?.rawStatus ?? payload.status ?? payload.current_status ?? payload.event_type);
     const description = delhiveryDetails?.description ?? String(payload.description ?? payload.message ?? `Webhook event ${eventId}`); const location = delhiveryDetails?.location ?? String(payload.location ?? payload.city ?? "");
-    const shipment = reference ? await env.DB.prepare("SELECT id FROM shipments WHERE id = ? OR tracking_number = ? OR provider_reference = ? LIMIT 1").bind(reference, reference, reference).first<{ id: string }>() : null;
+    let shipment = reference ? await env.DB.prepare("SELECT id FROM shipments WHERE id = ? OR tracking_number = ? OR provider_reference = ? OR order_id = ? OR provider_booking_id = ? OR pss_reference = ? LIMIT 1").bind(reference, reference, reference, reference, reference, reference).first<{ id: string }>() : null;
+    if (!shipment) {
+      for (const correlation of correlationReferences) {
+        shipment = await env.DB.prepare("SELECT id FROM shipments WHERE id = ? OR tracking_number = ? OR provider_reference = ? OR order_id = ? OR provider_booking_id = ? OR pss_reference = ? LIMIT 1").bind(correlation, correlation, correlation, correlation, correlation, correlation).first<{ id: string }>();
+        if (shipment) break;
+      }
+    }
      const pickupStatus = provider === "delhivery" ? pickupStatusFromProviderEvent(delhiveryDetails?.rawStatus ?? payload.status ?? payload.event_type) : null;
      const pickup = provider === "delhivery" && reference ? await env.DB.prepare(`
        SELECT pr.id, pr.shipment_id
@@ -4053,6 +4072,15 @@ async function handleProviderWebhook(request: Request, env: Env, provider: "delh
     if (shipment) {
       const current = await env.DB.prepare("SELECT status FROM shipments WHERE id = ? LIMIT 1").bind(shipment.id).first<{ status: string }>();
       if (!current || !validShipmentTransition(String(current.status).toLowerCase(), status)) {
+        // Reference reconciliation must not depend on the event's status
+        // ordering. A callback may carry the LR/AWB while its status is an
+        // informational or out-of-order value; retain the provider identity
+        // even when we intentionally leave the local status unchanged.
+        if (providerLr || providerAwb) {
+          await env.DB.prepare("UPDATE shipments SET lr_number = COALESCE(?, lr_number), master_awb = COALESCE(?, master_awb), tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(?, provider_reference), provider_sync_status = 'confirmed', updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(providerLr, providerAwb, providerAwb ?? providerLr, providerAwb ?? providerLr, shipment.id).run();
+          await env.DB.prepare("UPDATE webhook_events SET status = 'processed', processed_at = CURRENT_TIMESTAMP WHERE provider = ? AND event_id = ?").bind(provider, eventId).run();
+          return json({ ok: true, accepted: true, matched: true, applied: false, reference_reconciled: true, request_id: requestIdValue }, 202, headers);
+        }
         // Provider events can arrive out of order. They are authenticated and
         // matched, but must remain available for reconciliation rather than
         // being presented as rejected or silently discarded.
@@ -4060,7 +4088,7 @@ async function handleProviderWebhook(request: Request, env: Env, provider: "delh
         return json({ ok: true, accepted: true, matched: true, applied: false, request_id: requestIdValue }, 202, headers);
       }
       const deliveredAt = status.includes("deliver") ? new Date().toISOString() : null;
-      await env.DB.prepare("UPDATE shipments SET provider = ?, provider_reference = COALESCE(?, provider_reference), status = ?, delivered_at = COALESCE(?, delivered_at), updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(provider, reference || null, status, deliveredAt, shipment.id).run();
+      await env.DB.prepare("UPDATE shipments SET provider = ?, lr_number = COALESCE(?, lr_number), master_awb = COALESCE(?, master_awb), tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(?, provider_reference), provider_sync_status = CASE WHEN ? IS NOT NULL OR ? IS NOT NULL THEN 'confirmed' ELSE provider_sync_status END, provider_booking_id = COALESCE(provider_booking_id, ?), status = ?, delivered_at = COALESCE(?, delivered_at), updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(provider, providerLr, providerAwb, providerAwb ?? providerLr, providerAwb ?? providerLr ?? null, providerLr, providerAwb, findProviderReference(payload, new Set(["job_id", "jobid", "manifest_job_id", "request_id", "requestid"])), status, deliveredAt, shipment.id).run();
       await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, location, description, created_by_user_id, event_time, created_at) VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipment.id, status, location, description, `webhook:${provider}`, delhiveryDetails?.eventTime ?? null).run();
        if (provider === "delhivery") {
          if (pickupStatus && !pickup) {
