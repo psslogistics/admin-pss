@@ -3116,26 +3116,29 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
           // Keep that provider document instead of replacing it with a duplicate
           // box label; the client uses the returned order for the A4 output.
           const labelFetchResults: string[] = [];
-          for (const labelUrl of labelUrls.slice(0, requestedCopies)) {
-            const labelResponse = await providerFetch(labelUrl, { method: "GET", headers: { ...headers, accept: "application/json,image/*,application/pdf" } }, attemptTimeoutMs);
-            const labelContentType = labelResponse.headers.get("content-type") ?? "application/octet-stream";
-            labelFetchResults.push(`${labelResponse.status}:${labelContentType}`);
-            if (!labelResponse.ok) throw new Error(`label_content_http_${labelResponse.status}`);
-            if (labelContentType.toLowerCase().includes("json")) {
-              const labelBody = await providerResponseText(labelResponse, attemptTimeoutMs);
-              let labelJson: unknown = null;
-              try { labelJson = JSON.parse(labelBody); } catch { labelJson = labelBody.trim() || null; }
-              const labelBase64 = findProviderContentBase64(labelJson);
-              if (labelBase64) {
+          const fetchedArtifacts = await Promise.all(labelUrls.slice(0, requestedCopies).map(async (labelUrl) => {
+            try {
+              const labelResponse = await providerFetch(labelUrl, { method: "GET", headers: { ...headers, accept: "application/json,image/*,application/pdf" } }, attemptTimeoutMs);
+              const labelContentType = labelResponse.headers.get("content-type") ?? "application/octet-stream";
+              labelFetchResults.push(`${labelResponse.status}:${labelContentType}`);
+              if (!labelResponse.ok) return null;
+              if (labelContentType.toLowerCase().includes("json")) {
+                const labelBody = await providerResponseText(labelResponse, attemptTimeoutMs);
+                let labelJson: unknown = null;
+                try { labelJson = JSON.parse(labelBody); } catch { labelJson = labelBody.trim() || null; }
+                const labelBase64 = findProviderContentBase64(labelJson);
+                if (!labelBase64) return null;
                 const labelType = providerContentTypeFromBase64(labelBase64, findProviderContentType(labelJson) ?? "application/octet-stream");
-              if (labelType === "application/pdf" || labelType === "image/png" || labelType === "image/jpeg") labelArtifacts.push({ content_base64: labelBase64, content_type: labelType });
+                return labelType === "application/pdf" || labelType === "image/png" || labelType === "image/jpeg" ? { content_base64: labelBase64, content_type: labelType } : null;
               }
-            } else {
               const labelBytes = await providerResponseBytes(labelResponse, 12 * 1024 * 1024);
               const labelType = providerContentTypeFromBytes(labelBytes, labelContentType);
-              if (labelType === "application/pdf" || labelType === "image/png" || labelType === "image/jpeg") labelArtifacts.push({ content_base64: providerBytesToBase64(labelBytes), content_type: labelType });
+              return labelType === "application/pdf" || labelType === "image/png" || labelType === "image/jpeg" ? { content_base64: providerBytesToBase64(labelBytes), content_type: labelType } : null;
+            } catch {
+              return null;
             }
-          }
+          }));
+          labelArtifacts.push(...fetchedArtifacts.filter((value): value is { content_base64: string; content_type: string } => Boolean(value)));
           if (labelArtifacts.length) {
             // Keep only assets Delhivery actually returned. Never fabricate a
             // missing box label or MPS/document by duplicating another asset.
