@@ -2955,7 +2955,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     await env.DB.prepare("UPDATE shipments SET provider_last_attempt_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
       .bind(payload.shipment_id, clientId).run();
     const statusLr = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["lrnum", "lr_num", "lr_number", "lr_no", "lrn", "lrn_number", "lr"]))) ?? responseBody.match(/(?:lr(?:n|[_ ]?(?:number|num|no))?)[^A-Za-z0-9]{0,12}(\d{6,20})/i)?.[1] ?? null;
-    const statusAwb = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["master_awb", "master_awb_number", "masterawb", "master_waybill", "awb", "awb_number", "waybill", "waybill_number", "waybill_no"]))) ?? responseBody.match(/(?:master[_ ]?awb|awb|waybill)[^A-Za-z0-9]{0,12}(\d{6,20})/i)?.[1] ?? null;
+    const statusAwb = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["mwn", "mwn_number", "master_awb", "master_awb_number", "masterawb", "master_waybill", "master_waybill_number", "awb", "awb_number", "waybill", "waybill_number", "waybill_no"]))) ?? responseBody.match(/(?:mwn|master[_ ]?awb|awb|waybill)[^A-Za-z0-9]{0,12}(\d{6,20})/i)?.[1] ?? null;
     const statusJobId = findProviderReference(parsedProviderBody, new Set(["job_id", "jobid", "manifest_job_id", "request_id", "requestid"])) ?? (String(payload.provider_booking_id ?? "").trim() || null);
     if (statusLr || statusAwb) {
       const current = await env.DB.prepare("SELECT status, provider_last_error FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(payload.shipment_id, clientId).first<{ status: string | null; provider_last_error: string | null }>();
@@ -3007,7 +3007,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     const initialLr = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["lrnum", "lr_num", "lr_number", "lr_no", "lrn", "lrn_number", "lr"])))
       ?? responseBody.match(/(?:lr(?:n|[_ ]?(?:number|num|no))?)[^A-Za-z0-9]{0,12}(\d{6,20})/i)?.[1]
       ?? null;
-    const initialAwb = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["master_awb", "master_awb_number", "masterawb", "master_waybill", "awb", "awb_number", "waybill", "waybill_number", "waybill_no"])))
+    const initialAwb = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["mwn", "mwn_number", "master_awb", "master_awb_number", "masterawb", "master_waybill", "master_waybill_number", "awb", "awb_number", "waybill", "waybill_number", "waybill_no"])))
       ?? responseBody.match(/(?:master[_ ]?awb|awb|waybill)[^A-Za-z0-9]{0,12}(\d{6,20})/i)?.[1]
       ?? null;
     const jobId = findProviderReference(parsedProviderBody, new Set(["job_id", "jobid", "manifest_job_id", "request_id", "requestid"]));
@@ -3029,7 +3029,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
           const statusLr = delhiveryB2bNumber(findProviderReference(statusJson, new Set(["lrnum", "lr_num", "lr_number", "lr_no", "lrn", "lrn_number", "lr"])))
             ?? statusBody.match(/(?:lr(?:n|[_ ]?(?:number|num|no))?)[^A-Za-z0-9]{0,12}(\d{6,20})/i)?.[1]
             ?? null;
-          const statusAwb = delhiveryB2bNumber(findProviderReference(statusJson, new Set(["master_awb", "master_awb_number", "masterawb", "master_waybill", "awb", "awb_number", "waybill", "waybill_number", "waybill_no"])))
+          const statusAwb = delhiveryB2bNumber(findProviderReference(statusJson, new Set(["mwn", "mwn_number", "master_awb", "master_awb_number", "masterawb", "master_waybill", "master_waybill_number", "awb", "awb_number", "waybill", "waybill_number", "waybill_no"])))
             ?? statusBody.match(/(?:master[_ ]?awb|awb|waybill)[^A-Za-z0-9]{0,12}(\d{6,20})/i)?.[1]
             ?? null;
           if (statusLr || statusAwb) {
@@ -3046,7 +3046,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   }
   if (response.ok && provider === "delhivery" && useDelhiveryB2b && operation === "tracking" && clientId && typeof payload.shipment_id === "string") {
     const liveLr = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["lrnum", "lr_num", "lr_number", "lr_no", "lrn", "lrn_number", "lr"]))) ?? null;
-    const liveAwb = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["master_awb", "master_awb_number", "masterawb", "master_waybill", "awb", "awb_number", "waybill", "waybill_number", "waybill_no"]))) ?? null;
+    const liveAwb = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["mwn", "mwn_number", "master_awb", "master_awb_number", "masterawb", "master_waybill", "master_waybill_number", "awb", "awb_number", "waybill", "waybill_number", "waybill_no"]))) ?? null;
     if (liveLr || liveAwb) await env.DB.prepare("UPDATE shipments SET lr_number = COALESCE(?, lr_number), master_awb = COALESCE(?, master_awb), tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(provider_reference, ?), provider_sync_status = 'confirmed', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(liveLr, liveAwb, liveLr ?? liveAwb, liveAwb ?? liveLr, payload.shipment_id, clientId).run();
   }
   if (response.ok && provider === "delhivery" && operation === "shipments" && clientId && typeof payload.shipment_id === "string") {
@@ -3055,7 +3055,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     // LR, and never allow the UI to fall back to the pickup reference as the
     // shipment booking reference.
     const b2bLrReference = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["lrnum", "lr_num", "lr_number", "lr_no", "lrn", "lrn_number", "lr"])));
-    const b2bAwbReference = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["master_awb", "master_awb_number", "masterawb", "master_waybill", "awb", "awb_number", "waybill", "waybill_number", "waybill_no"])));
+    const b2bAwbReference = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["mwn", "mwn_number", "master_awb", "master_awb_number", "masterawb", "master_waybill", "master_waybill_number", "awb", "awb_number", "waybill", "waybill_number", "waybill_no"])));
     const providerBookingId = findProviderReference(parsedProviderBody, new Set(["job_id", "jobid", "manifest_job_id", "request_id", "requestid"]));
     const createdReference = useDelhiveryB2b ? b2bLrReference ?? b2bAwbReference : findProviderReference(parsedProviderBody, new Set(["waybill", "awb", "tracking_number", "trackingid", "shipment_id"]));
     const providerReference = useDelhiveryB2b ? b2bAwbReference ?? createdReference : createdReference;
@@ -4041,7 +4041,7 @@ async function handleProviderWebhook(request: Request, env: Env, provider: "delh
       findProviderReference(payload, new Set(["job_id", "jobid", "manifest_job_id", "request_id", "requestid"])),
       String(payload.order_id ?? payload.orderId ?? payload.client_reference ?? payload.reference_no ?? "").trim(),
     ].map((value) => String(value ?? "").trim()).filter(Boolean)));
-    const providerAwb = findProviderReference(payload, new Set(["awb", "awb_number", "waybill", "waybill_number", "waybill_no", "tracking_number", "trackingnumber"]));
+    const providerAwb = findProviderReference(payload, new Set(["mwn", "mwn_number", "master_awb", "master_awb_number", "master_waybill", "master_waybill_number", "awb", "awb_number", "waybill", "waybill_number", "waybill_no", "tracking_number", "trackingnumber"]));
     const providerLr = findProviderReference(payload, new Set(["lrn", "lrn_number", "lr_number", "lr_no", "lr"]));
     const status = normalizeProviderShipmentStatus(delhiveryDetails?.rawStatus ?? payload.status ?? payload.current_status ?? payload.event_type);
     const description = delhiveryDetails?.description ?? String(payload.description ?? payload.message ?? `Webhook event ${eventId}`); const location = delhiveryDetails?.location ?? String(payload.location ?? payload.city ?? "");
@@ -4963,8 +4963,27 @@ const worker = {
         const providerLr = String((providerResult as { lr_number?: string | null }).lr_number ?? "").trim();
         const providerAwb = String((providerResult as { master_awb?: string | null }).master_awb ?? "").trim();
         const providerReference = String((providerResult as { providerReference?: string | null }).providerReference ?? "").trim();
-        if (provider === "delhivery" && (!providerLr && !providerAwb && !providerReference)) {
-          const providerBookingId = String((providerResult as { providerBookingId?: string | null }).providerBookingId ?? "").trim() || null;
+        let reconciledProviderLr = providerLr;
+        let reconciledProviderAwb = providerAwb;
+        let reconciledProviderReference = providerReference;
+        const providerBookingId = String((providerResult as { providerBookingId?: string | null }).providerBookingId ?? "").trim() || null;
+        if (provider === "delhivery" && providerBookingId && !reconciledProviderLr && !reconciledProviderAwb && !reconciledProviderReference) {
+          // Delhivery may acknowledge the manifest first and persist the LR/AWB
+          // through its callback a few seconds later. Reconcile that callback
+          // in this request before exposing a pending booking to the client.
+          // This is bounded and never sends a second manifest.
+          for (let attempt = 0; attempt < 8; attempt += 1) {
+            await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? 0 : 1500));
+            const reconciled = await env.DB.prepare("SELECT lr_number, master_awb, provider_reference FROM shipments WHERE id = ? AND client_id = ? LIMIT 1")
+              .bind(shipmentId, clientId)
+              .first<{ lr_number: string | null; master_awb: string | null; provider_reference: string | null }>();
+            reconciledProviderLr = String(reconciled?.lr_number ?? "").trim();
+            reconciledProviderAwb = String(reconciled?.master_awb ?? "").trim();
+            reconciledProviderReference = String(reconciled?.provider_reference ?? "").trim();
+            if (reconciledProviderLr || reconciledProviderAwb || reconciledProviderReference) break;
+          }
+        }
+        if (provider === "delhivery" && (!reconciledProviderLr && !reconciledProviderAwb && !reconciledProviderReference)) {
           const timeoutReason = "Delhivery accepted the manifest but did not return an LR/AWB within the synchronous booking window";
           // Keep the original provider payload while the asynchronous job is
           // being published.  The job id is not proof that the shipment is
@@ -4979,6 +4998,11 @@ const worker = {
           await saveIdempotent(env, key, clientId, "POST /v1/shipments", 202, pendingResponse, requestHash);
           await audit(env, ctx, auth, id, "shipment.provider_lr_pending", "shipment", shipmentId, { client_id: clientId, provider, provider_booking_id: providerBookingId });
           return new Response(pendingResponse, { status: 202, headers: { ...headers, "content-type": "application/json" } });
+        }
+        if (reconciledProviderLr || reconciledProviderAwb || reconciledProviderReference) {
+          await env.DB.prepare("UPDATE shipments SET lr_number = COALESCE(?, lr_number), master_awb = COALESCE(?, master_awb), tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(?, provider_reference), provider_booking_id = COALESCE(?, provider_booking_id), provider_sync_status = 'confirmed', provider_last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+            .bind(reconciledProviderLr || null, reconciledProviderAwb || null, reconciledProviderLr || reconciledProviderAwb || null, reconciledProviderReference || reconciledProviderAwb || reconciledProviderLr || null, providerBookingId, shipmentId, clientId)
+            .run();
         }
         if (pricingQuote) {
           const completedBilling = await completeShipmentBilling(env, clientId, shipmentId);
