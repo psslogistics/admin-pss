@@ -520,6 +520,7 @@ function billingLineItemStatements(env: Env, billingId: string, shipmentId: stri
 async function completeShipmentBilling(env: Env, clientId: string, shipmentId: string) {
   const existing = await env.DB.prepare("SELECT id FROM billing_records WHERE shipment_id = ? AND client_id = ? LIMIT 1").bind(shipmentId, clientId).first<{ id: string }>();
   if (existing) return { ok: true as const, alreadyCompleted: true as const };
+  const shipment = await env.DB.prepare("SELECT lr_number FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(shipmentId, clientId).first<{ lr_number: string | null }>();
   const snapshot = await env.DB.prepare("SELECT client_breakdown_json FROM pricing_shipment_snapshots WHERE shipment_id = ? AND client_id = ? LIMIT 1").bind(shipmentId, clientId).first<{ client_breakdown_json: string }>();
   if (!snapshot) return { ok: false as const, error: "Pricing snapshot was not found for the completed shipment" };
   let amount = 0;
@@ -530,9 +531,10 @@ async function completeShipmentBilling(env: Env, clientId: string, shipmentId: s
   // Shipment-scoped identifiers make reconciliation idempotent even if the
   // provider-status poll and the scheduled reconciler observe the LR together.
   const billingId = `shipment-${shipmentId}`;
+  const invoiceNumber = shipment?.lr_number ? `INV-${String(shipment.lr_number).replace(/[^A-Za-z0-9-]/g, "-")}` : `INV-${shipmentId.slice(0, 8).toUpperCase()}`;
   try {
     await env.DB.batch([
-      env.DB.prepare("INSERT INTO billing_records (id, client_id, shipment_id, invoice_number, amount, status, paid_at) VALUES (?, ?, ?, ?, ?, 'paid', CURRENT_TIMESTAMP)").bind(billingId, clientId, shipmentId, `INV-${billingId.slice(0, 8).toUpperCase()}`, amount),
+      env.DB.prepare("INSERT INTO billing_records (id, client_id, shipment_id, invoice_number, amount, status, paid_at) VALUES (?, ?, ?, ?, ?, 'paid', CURRENT_TIMESTAMP)").bind(billingId, clientId, shipmentId, invoiceNumber, amount),
       env.DB.prepare("INSERT INTO wallet_transactions (id, client_id, type, amount, reference, status, balance_after) VALUES (?, ?, 'debit', ?, ?, 'posted', 0)").bind(`wallet-${shipmentId}`, clientId, amount, `SHIPMENT-${shipmentId}`),
       ...billingLineItemStatements(env, billingId, shipmentId, clientId, snapshot.client_breakdown_json),
     ]);
