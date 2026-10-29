@@ -19,6 +19,8 @@ const checks = [
   ["reports exclude classified shipments", /const reportShipmentVisibility = testDataVisibilityClause\(auth\)/],
   ["complete reports exclude classified related records", /const sourceAlias = table === "ndr_cases"[\s\S]*const visibilityParts = \[relatedShipmentVisibilityClause\(auth, table, sourceAlias\)\]/],
   ["pickup collections exclude classified standalone pickups", /const pickupVisibility = hidesClientTestData\(auth\)[\s\S]*pickup_requests\.is_test/],
+  ["pickup detail reads exclude classified records", /hidesClientTestData\(auth\)[\s\S]*pickup\.is_test[\s\S]*Pickup not found/],
+  ["administrators can classify pickups without deleting them", /payload\.is_test !== undefined[\s\S]*Only administrators may classify test pickups[\s\S]*is_test = \?/],
   ["warehouses and saved addresses exclude classified records", /const warehouseVisibility = testDataVisibilityClause\(auth\)[\s\S]*const addressVisibility = testDataVisibilityClause\(auth\)/],
   ["billing excludes classified shipment invoices", /COALESCE\(sh\.is_test, 0\) = 0/],
   ["wallet references are linked back to classified shipments", /table === "wallet_transactions"[\s\S]*REPLACE\(\$\{alias\}\.reference, 'SHIPMENT-'/],
