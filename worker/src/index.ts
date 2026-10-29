@@ -1375,11 +1375,11 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
   const pickupLocation = String(payload.delhivery_pickup_location ?? payload.pickup_location ?? env.DELHIVERY_DEFAULT_PICKUP_LOCATION ?? "").trim();
   const orderId = String(payload.order_id ?? payload.invoice_reference ?? payload.invoice_number ?? "").trim().slice(0, 80);
   const invoiceNumber = String(payload.invoice_reference ?? payload.invoice_number ?? "").trim();
-  const providerInvoiceNumber = invoiceNumber.replace(/[^A-Za-z0-9\/-]/g, "-").replace(/-{2,}/g, "-").replace(/^-|-$/g, "").slice(0, 80);
-  const declaredValue = Number(payload.declared_value ?? 0);
+  const providerInvoiceNumber = invoiceNumber.replace(/[^A-Za-z0-9\/-]/g, "-").replace(/-{2,}/g, "-").replace(/^-|-$/g, "").slice(0, 25);
+  const declaredValue = Number(payload.declared_value ?? payload.invoice_value ?? payload.inv_amt ?? 0);
   const weightKg = Number(payload.total_weight_kg ?? 0);
   const pieces = Number(payload.pieces ?? 1);
-  if (!origin || !destination || !pickupLocation || !providerInvoiceNumber || !Number.isFinite(declaredValue) || declaredValue < 0 || !Number.isFinite(weightKg) || weightKg <= 0 || !Number.isInteger(pieces) || pieces < 1) return null;
+  if (!origin || !destination || !pickupLocation || !providerInvoiceNumber || !Number.isFinite(declaredValue) || declaredValue <= 0 || !Number.isFinite(weightKg) || weightKg <= 0 || !Number.isInteger(pieces) || pieces < 1) return null;
   const length = Number(payload.length ?? payload.shipment_length ?? 0);
   const width = Number(payload.width ?? payload.shipment_width ?? 0);
   const height = Number(payload.height ?? payload.shipment_height ?? 0);
