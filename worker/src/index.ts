@@ -5997,9 +5997,12 @@ const worker = {
         if (!hasScope(auth, "reports.read")) return error("FORBIDDEN", "Report read scope required", 403, id, headers);
         const clientIds = [...auth.clientIds];
         const columnsByTable: Record<string, string> = {
-          shipments: "id, client_id, pss_reference, lr_number, master_awb, tracking_number, status, provider, origin, destination, consignee, total_weight_kg, edd, delivered_at, created_at",
-          pickup_requests: "id, client_id, requested_date, requested_time_slot, pickup_address, status, notes, created_at",
-          billing_records: "id, client_id, shipment_id, amount, status, created_at",
+          // Keep this projection aligned with the fields consumed by the
+          // client report preview/export. Omitting an existing field here
+          // silently turns a real value into a misleading "Not recorded".
+          shipments: "id, client_id, pss_reference, lr_number, master_awb, tracking_number, status, provider, origin, destination, consignee, total_weight_kg, declared_value, pieces, dimensions_json, edd, delivered_at, created_at",
+          pickup_requests: "id, client_id, requested_date, requested_time_slot, pickup_address, contact_name, contact_phone, city, state, pincode, country, pieces, total_weight_kg, assigned_to_user_id, status, notes, created_at",
+          billing_records: "id, client_id, shipment_id, invoice_number, amount, currency, status, due_date, created_at",
           ndr_cases: "id, client_id, shipment_id, reason, attempt, deadline, status, notes, created_at",
           exception_cases: "id, client_id, shipment_id, category, severity, title, details, status, created_at",
           weight_reconciliations: "id, client_id, shipment_id, measured_weight_kg, billable_weight_kg, status, updated_at, created_at",
