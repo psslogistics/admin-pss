@@ -5779,7 +5779,11 @@ const worker = {
               : " WHERE 1 = 0";
           const scoped = (sql: string, extra = "", visibilityTable = "") => {
             const visibility = visibilityTable ? relatedShipmentVisibilityClause(auth, visibilityTable) : "";
-            const statement = env.DB.prepare(`${sql}${scopedWhere([extra, visibility].filter(Boolean).join(" AND "))}`);
+            const scopedExtra = visibility
+              ? extra.replace(/\s+ORDER BY\s+/i, ` AND ${visibility} ORDER BY `)
+                || visibility
+              : extra;
+            const statement = env.DB.prepare(`${sql}${scopedWhere(scopedExtra)}`);
             return auth.system || !clientIds.length ? statement : statement.bind(...clientIds);
           };
           const overviewEntries: Array<{ key: string; statement: ReturnType<typeof env.DB.prepare> }> = [];
