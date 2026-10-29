@@ -5833,6 +5833,7 @@ const worker = {
           addOverview("pickups", "pickups.read", "SELECT id, shipment_id, client_id, (SELECT pss_reference FROM shipments WHERE id = pickup_requests.shipment_id) AS shipment_pss_reference, provider_reference AS pickup_reference, requested_date, requested_time_slot, pickup_address, status, created_at, updated_at FROM pickup_requests", "lower(COALESCE(status, '')) NOT IN ('completed', 'cancelled') ORDER BY requested_date ASC LIMIT 100", "pickup_requests");
           addOverview("billing", "billing.read", "SELECT id, client_id, shipment_id, (SELECT pss_reference FROM shipments WHERE id = billing_records.shipment_id) AS shipment_pss_reference, invoice_number, amount, currency, status, due_date, created_at FROM billing_records", "lower(COALESCE(status, '')) = 'pending' ORDER BY created_at DESC LIMIT 100", "billing_records");
           addOverview("wallet", "wallet.read", "SELECT id, client_id, type, amount, balance_after, reference, status, created_at FROM wallet_transactions", "1 = 1 ORDER BY created_at DESC LIMIT 1", "wallet_transactions");
+          addOverview("cod", "cod.read", "SELECT c.id, c.client_id, c.shipment_id, c.amount, c.status, c.created_at, s.pss_reference AS shipment_pss_reference, s.lr_number, s.master_awb, s.tracking_number FROM cod_remittances c LEFT JOIN shipments s ON s.id = c.shipment_id", "1 = 1 ORDER BY c.created_at DESC LIMIT 100", "cod_remittances");
           addOverview("exceptions", "cases.read", "SELECT id, shipment_id, client_id, (SELECT pss_reference FROM shipments WHERE id = exception_cases.shipment_id) AS shipment_pss_reference, (SELECT lr_number FROM shipments WHERE id = exception_cases.shipment_id) AS lr_number, (SELECT master_awb FROM shipments WHERE id = exception_cases.shipment_id) AS master_awb, category, severity, title, details, status, assigned_to_user_id, created_at, updated_at FROM exception_cases", "lower(COALESCE(status, '')) NOT IN ('resolved', 'closed') ORDER BY updated_at DESC LIMIT 8", "exception_cases");
           addOverview("ndr", "cases.read", "SELECT id, shipment_id, client_id, (SELECT pss_reference FROM shipments WHERE id = ndr_cases.shipment_id) AS shipment_pss_reference, (SELECT lr_number FROM shipments WHERE id = ndr_cases.shipment_id) AS lr_number, (SELECT master_awb FROM shipments WHERE id = ndr_cases.shipment_id) AS master_awb, reason, attempt, deadline, status, assigned_to_user_id, created_at, updated_at FROM ndr_cases", "lower(COALESCE(status, '')) NOT IN ('resolved', 'closed', 'delivered', 'cancelled') ORDER BY updated_at DESC LIMIT 8", "ndr_cases");
           addOverview("activity", "activity.read", "SELECT id, actor_user_id, client_id, shipment_id, (SELECT pss_reference FROM shipments WHERE id = activity_events.shipment_id) AS shipment_pss_reference, (SELECT lr_number FROM shipments WHERE id = activity_events.shipment_id) AS lr_number, (SELECT master_awb FROM shipments WHERE id = activity_events.shipment_id) AS master_awb, action, entity_type, entity_id, created_at FROM activity_events", "1 = 1 ORDER BY created_at DESC LIMIT 12", "activity_events");
@@ -5845,6 +5846,7 @@ const worker = {
           const pickups = overviewRowsFor("pickups");
           const billing = overviewRowsFor("billing");
           const wallet = overviewRowsFor("wallet");
+          const cod = overviewRowsFor("cod");
           const exceptions = overviewRowsFor("exceptions");
           const ndr = overviewRowsFor("ndr");
           const activity = overviewRowsFor("activity");
@@ -5872,6 +5874,7 @@ const worker = {
             pickups,
             billing,
             wallet,
+            cod,
             exceptions,
             ndr,
             activity,
