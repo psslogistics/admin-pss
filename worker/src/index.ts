@@ -6270,16 +6270,16 @@ const worker = {
           const warehousePincode = payload.pincode;
           const requestedProviderAccountId = typeof payload.provider_account_id === "string" && payload.provider_account_id.trim() ? payload.provider_account_id.trim() : null;
           const providerAccountId = await resolveDelhiveryProviderAccountId(env, clientId, requestedProviderAccountId);
-          if (!providerAccountId) return error("PROVIDER_ACCOUNT_NOT_ALLOWED", "An active Delhivery account is required for warehouse creation", 409, id, headers);
           const duplicate = await env.DB.prepare("SELECT id, client_id, name, provider, provider_account_id, provider_status, provider_error FROM warehouses WHERE client_id = ? AND lower(trim(COALESCE(provider_account_id, ''))) = lower(trim(COALESCE(?, ''))) AND lower(trim(address)) = lower(trim(?)) AND lower(trim(COALESCE(city, ''))) = lower(trim(COALESCE(?, ''))) AND lower(trim(COALESCE(state, ''))) = lower(trim(COALESCE(?, ''))) AND lower(trim(COALESCE(pincode, ''))) = lower(trim(COALESCE(?, ''))) AND lower(trim(COALESCE(contact, ''))) = lower(trim(COALESCE(?, ''))) AND lower(trim(COALESCE(contact_name, ''))) = lower(trim(COALESCE(?, ''))) ORDER BY updated_at DESC LIMIT 1").bind(clientId, providerAccountId, payload.address, String(payload.city ?? ""), String(payload.state ?? ""), String(payload.pincode ?? ""), String(payload.contact ?? ""), String(payload.contact_name ?? "")).first<{ id: string; client_id: string; name: string; provider: string | null; provider_account_id: string | null; provider_status: string | null; provider_error: string | null }>();
           if (duplicate) {
             const serialized = JSON.stringify({ ok: true, data: duplicate, deduplicated: true, request_id: id });
             await saveIdempotent(env, key, clientId, endpoint, 200, serialized, requestHash);
             return new Response(serialized, { status: 200, headers: { ...headers, "content-type": "application/json" } });
           }
-          await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, 'pending')").bind(recordId, clientId, payload.name, payload.address, String(payload.city ?? ""), String(payload.state ?? ""), String(payload.pincode ?? ""), String(payload.contact ?? ""), String(payload.contact_name ?? ""), providerAccountId).run();
-          providerStatus = "pending";
-          ctx.waitUntil((async () => {
+          providerStatus = providerAccountId ? "pending" : "failed";
+          providerError = providerAccountId ? null : "An active Delhivery account is required before this address can be activated for booking";
+          await env.DB.prepare("INSERT INTO warehouses (id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status, provider_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'delhivery', ?, ?, ?)").bind(recordId, clientId, payload.name, payload.address, String(payload.city ?? ""), String(payload.state ?? ""), String(payload.pincode ?? ""), String(payload.contact ?? ""), String(payload.contact_name ?? ""), providerAccountId, providerStatus, providerError).run();
+          if (providerAccountId) ctx.waitUntil((async () => {
             try {
               const liveServiceability = await verifyDelhiveryServiceability(env, warehousePincode.trim(), warehousePincode.trim(), providerAccountId, id, clientId);
               if (!liveServiceability.ok) {
