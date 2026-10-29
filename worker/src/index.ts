@@ -2567,15 +2567,34 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     if (!origin) return { enabled: true, status: "invalid_request" as const, reason: "A complete consignor address is required to create or select the pickup warehouse" };
     const selectedWarehouseId = typeof payload.warehouse_id === "string" && payload.warehouse_id.trim() ? payload.warehouse_id.trim() : null;
     if (operation === "shipments") {
-      // Manifestation is deliberately independent of pickup-warehouse
-      // activation. Delhivery's B2B manifest API accepts the provider account's
-      // already-configured pickup location; the consignor address is shipment
-      // data and must not be treated as a new provider warehouse. Warehouse
-      // registration/activation belongs to the explicit warehouse and pickup
-      // flows, where Delhivery may require additional provider-side setup.
-      delhiveryPickupLocation = String(env.DELHIVERY_DEFAULT_PICKUP_LOCATION ?? "").trim();
-      if (!delhiveryPickupLocation) return { enabled: true, status: "failed" as const, code: "PROVIDER_PICKUP_LOCATION_NOT_CONFIGURED", error: "The Delhivery account has no configured B2B pickup location" };
-      delhiveryCanonicalOrigin = origin;
+      // The provider pickup facility must represent this shipment's actual
+      // consignor. Falling back to the account-wide facility silently sends a
+      // shipment from (and displays) an unrelated warehouse such as the test
+      // warehouse. A selected saved warehouse is only valid when its identity
+      // matches the editable consignor fields.
+      if (selectedWarehouseId) {
+        const selected = await env.DB.prepare("SELECT address, city, state, pincode, contact, contact_name FROM warehouses WHERE id = ? AND client_id = ? LIMIT 1")
+          .bind(selectedWarehouseId, clientId)
+          .first<{ address: string | null; city: string | null; state: string | null; pincode: string | null; contact: string | null; contact_name: string | null }>();
+        if (!selected) return { enabled: true, status: "invalid_request" as const, code: "WAREHOUSE_NOT_FOUND", error: "The selected consignor address no longer exists. Select or save the consignor again." };
+        const same = (left: unknown, right: unknown) => String(left ?? "").trim().toLowerCase() === String(right ?? "").trim().toLowerCase();
+        const samePhone = (left: unknown, right: unknown) => String(left ?? "").replace(/\D/g, "").slice(-10) === String(right ?? "").replace(/\D/g, "").slice(-10);
+        if (!same(selected.address, origin.line) || !same(selected.city, origin.city) || !same(selected.state, origin.state) || !same(selected.pincode, origin.pincode) || !samePhone(selected.contact, origin.phone) || !same(selected.contact_name, origin.name)) {
+          return { enabled: true, status: "invalid_request" as const, code: "WAREHOUSE_ORIGIN_MISMATCH", error: "The selected saved consignor does not match the shipment consignor. Select the matching saved consignor or save this address before booking." };
+        }
+      }
+      const warehouseApiToken = delhiveryWarehouseApiToken(env, delhiveryB2bAccountName, parsedDelhiveryCredential);
+      let warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId, selectedWarehouseId, warehouseApiToken);
+      if (!warehouse.ok && /\b401\b|invalid token|unauthorized|token decode|not enough segments/i.test(warehouse.error)) {
+        const refreshedToken = await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs, true, delhiveryLabelAuthBase);
+        if (refreshedToken) {
+          delhiveryB2bToken = refreshedToken;
+          warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId, selectedWarehouseId, warehouseApiToken);
+        }
+      }
+      if (!warehouse.ok) return { enabled: true, status: "failed" as const, code: warehouse.code, error: warehouse.error };
+      delhiveryPickupLocation = warehouse.name;
+      delhiveryCanonicalOrigin = warehouse.origin;
     } else {
       const warehouseApiToken = delhiveryWarehouseApiToken(env, delhiveryB2bAccountName, parsedDelhiveryCredential);
       let warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId, selectedWarehouseId, warehouseApiToken);
