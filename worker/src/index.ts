@@ -517,10 +517,15 @@ function billingLineItemStatements(env: Env, billingId: string, shipmentId: stri
   });
 }
 
+function shipmentInvoiceNumber(value: unknown, fallback = "PENDING-REFERENCE") {
+  const normalized = String(value ?? "").trim().replace(/[^A-Za-z0-9-]/g, "-");
+  return `INV-${normalized || fallback}`;
+}
+
 async function completeShipmentBilling(env: Env, clientId: string, shipmentId: string) {
   const existing = await env.DB.prepare("SELECT id FROM billing_records WHERE shipment_id = ? AND client_id = ? LIMIT 1").bind(shipmentId, clientId).first<{ id: string }>();
   if (existing) return { ok: true as const, alreadyCompleted: true as const };
-  const shipment = await env.DB.prepare("SELECT lr_number FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(shipmentId, clientId).first<{ lr_number: string | null }>();
+  const shipment = await env.DB.prepare("SELECT lr_number, master_awb, tracking_number FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(shipmentId, clientId).first<{ lr_number: string | null; master_awb: string | null; tracking_number: string | null }>();
   const snapshot = await env.DB.prepare("SELECT client_breakdown_json FROM pricing_shipment_snapshots WHERE shipment_id = ? AND client_id = ? LIMIT 1").bind(shipmentId, clientId).first<{ client_breakdown_json: string }>();
   if (!snapshot) return { ok: false as const, error: "Pricing snapshot was not found for the completed shipment" };
   let amount = 0;
@@ -531,7 +536,8 @@ async function completeShipmentBilling(env: Env, clientId: string, shipmentId: s
   // Shipment-scoped identifiers make reconciliation idempotent even if the
   // provider-status poll and the scheduled reconciler observe the LR together.
   const billingId = `shipment-${shipmentId}`;
-  const invoiceNumber = shipment?.lr_number ? `INV-${String(shipment.lr_number).replace(/[^A-Za-z0-9-]/g, "-")}` : `INV-${shipmentId.slice(0, 8).toUpperCase()}`;
+  const invoiceReference = shipment?.lr_number || shipment?.master_awb || shipment?.tracking_number;
+  const invoiceNumber = shipmentInvoiceNumber(invoiceReference);
   try {
     await env.DB.batch([
       env.DB.prepare("INSERT INTO billing_records (id, client_id, shipment_id, invoice_number, amount, status, paid_at) VALUES (?, ?, ?, ?, ?, 'paid', CURRENT_TIMESTAMP)").bind(billingId, clientId, shipmentId, invoiceNumber, amount),
@@ -4492,6 +4498,72 @@ const worker = {
         await audit(env, ctx, auth, id, "employee_preferences.updated", "employee_preferences", auth.userId, { user_id: auth.userId });
         const serialized = JSON.stringify({ ok: true, data: { user_id: auth.userId, ...next }, request_id: id }); await saveIdempotent(env, key, auth.userId, endpoint, 200, serialized, requestHash); return new Response(serialized, { status: 200, headers: { ...headers, "content-type": "application/json" } });
       }
+      if (route === "/client-courier-capabilities" && request.method === "GET") {
+        if (!hasScope(auth, "provider_accounts.read") && !hasScope(auth, "quotes.create")) return error("FORBIDDEN", "Courier availability permission required", 403, id, headers);
+        const requestedClient = url.searchParams.get("client_id");
+        const clientId = requireClient(auth, requestedClient);
+        if (!clientId || !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
+        await ensureDefaultClientProviderPolicies(env, clientId, auth.userId ?? `client:${clientId}`);
+        const rows = await env.DB.prepare(`
+          SELECT pa.provider, pa.capabilities_json, pa.credential_secret_name
+            FROM provider_accounts pa
+            LEFT JOIN provider_account_client_policies p
+              ON p.provider_account_id = pa.id AND p.client_id = ?
+           WHERE pa.status = 'active'
+             AND (pa.client_id = ? OR (pa.client_id IS NULL AND p.client_id = ?))
+             AND COALESCE(p.enabled, 1) = 1
+           ORDER BY pa.provider`).bind(clientId, clientId, clientId).all<{ provider: string; capabilities_json: string | null; credential_secret_name: string | null }>();
+        const recentRequests = await env.DB.prepare("SELECT provider, status, error_code, updated_at FROM integration_requests WHERE provider IN ('delhivery', 'ekart', 'trackon', 'xpressbees', 'rivigo') ORDER BY updated_at DESC, id DESC").all<{ provider: CourierProvider; status: string; error_code: string | null; updated_at: string | null }>();
+        const secretBag = env as unknown as Record<string, unknown>;
+        const configured = (provider: string) => {
+          const credentials: Record<string, string[]> = {
+            delhivery: ["DELHIVERY_API_BASE_URL", "DELHIVERY_API_TOKEN"],
+            ekart: ["EKART_API_BASE_URL", "EKART_API_KEY"],
+            trackon: ["TRACKON_API_BASE_URL", "TRACKON_CREDENTIALS_JSON"],
+            xpressbees: ["XPRESSBEES_API_BASE_URL", "XPRESSBEES_CREDENTIALS_JSON"],
+            rivigo: ["RIVIGO_API_BASE_URL", "RIVIGO_CREDENTIALS_JSON"],
+          };
+          return (credentials[provider] ?? []).every((key) => typeof secretBag[key] === "string" && String(secretBag[key]).trim().length > 0);
+        };
+        const displayNames: Record<string, string> = { delhivery: "Delhivery", ekart: "Ekart", trackon: "Trackon", xpressbees: "XpressBees", rivigo: "Rivigo" };
+        const providerRows = new Map<string, { capabilities: Set<string>; accountCount: number; secretNames: Set<string> }>();
+        for (const row of rows.results) {
+          const provider = row.provider.toLowerCase();
+          const current = providerRows.get(provider) ?? { capabilities: new Set<string>(), accountCount: 0, secretNames: new Set<string>() };
+          current.accountCount += 1;
+          if (typeof row.credential_secret_name === "string" && row.credential_secret_name.trim()) current.secretNames.add(row.credential_secret_name.trim());
+          try { for (const capability of JSON.parse(String(row.capabilities_json ?? "[]"))) if (typeof capability === "string") current.capabilities.add(capability.toLowerCase()); } catch { /* use legacy defaults below */ }
+          providerRows.set(provider, current);
+        }
+        const data = Object.fromEntries([...providerRows.entries()].map(([provider, record]) => {
+          const latest = recentRequests.results.find((item) => item.provider === provider);
+          const health = latest?.status === "failed" ? "degraded" : latest?.status === "pending" ? "pending" : latest?.status === "succeeded" ? "healthy" : "unknown";
+          // Older active accounts predate capability metadata. Keep their existing
+          // operational behavior until an administrator explicitly supplies flags.
+          const legacyDefaults = record.capabilities.size === 0;
+          const supports = (name: string) => legacyDefaults || record.capabilities.has(name);
+          const capabilities = ["booking", "tracking", "labels", "rates"].filter((name) => supports(name === "booking" ? "shipment_creation" : name === "rates" ? "quotes" : name));
+          const providerConfigured = record.secretNames.size > 0 ? [...record.secretNames].some((secretName) => typeof secretBag[secretName] === "string" && String(secretBag[secretName]).trim().length > 0) : configured(provider);
+          const providerCallsEnabled = String(env.ENABLE_PROVIDER_CALLS) === "true";
+          const availableForClient = providerConfigured && providerCallsEnabled;
+          return [provider, {
+            courier: provider,
+            display_name: displayNames[provider] ?? provider,
+            available_for_client: availableForClient,
+            booking_enabled: supports("shipment_creation"),
+            tracking_enabled: supports("tracking"),
+            label_enabled: supports("labels"),
+            rate_enabled: supports("quotes"),
+            enabled: availableForClient,
+            configured: providerConfigured,
+            health,
+            last_error_code: latest?.error_code ?? null,
+            capabilities,
+            account_count: record.accountCount,
+          }];
+        }));
+        return json({ ok: true, data }, 200, headers);
+      }
       if (route === "/provider-capabilities" && request.method === "GET") {
         const callsEnabled = String(env.ENABLE_PROVIDER_CALLS) === "true";
         const delhiveryConfigured = Boolean(env.DELHIVERY_API_BASE_URL && env.DELHIVERY_API_TOKEN);
@@ -4595,6 +4667,21 @@ const worker = {
         await saveIdempotent(env, key, auth.userId ?? "system", endpoint, 200, serialized, requestHash);
         return new Response(serialized, { status: 200, headers: { ...headers, "content-type": "application/json" } });
       }
+      if (route === "/kyc-status" && request.method === "GET") {
+        if (!auth.accessToken) return error("FORBIDDEN", "An authenticated client session is required", 403, id, headers);
+        const clientId = requireClient(auth, url.searchParams.get("client_id"));
+        if (!clientId || !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
+        const rows = await supabaseGet<{ status: string | null; gst_number: string | null; pan_number: string | null; aadhaar_last4: string | null; phone_verified_at: string | null }>(env, `client_kyc_profiles?client_id=eq.${encodeURIComponent(clientId)}&select=status,gst_number,pan_number,aadhaar_last4,phone_verified_at&limit=1`, auth.accessToken);
+        const profile = rows[0];
+        const missingFields = [
+          profile?.status === "approved" ? null : "approval",
+          profile?.gst_number?.trim() ? null : "GST",
+          profile?.pan_number?.trim() ? null : "PAN",
+          profile?.aadhaar_last4 ? null : "Aadhaar",
+          profile?.phone_verified_at ? null : "mobile verification",
+        ].filter((value): value is string => Boolean(value));
+        return json({ ok: true, data: { status: profile?.status ?? "not_started", approved: missingFields.length === 0, missing_fields: missingFields } }, 200, headers);
+      }
       if (route === "/security/sessions" && request.method === "GET") {
         if (!auth.userId || !hasRole(auth, ["admin", "super_admin"])) return error("FORBIDDEN", "Security session visibility permission required", 403, id, headers);
         const sessionId = `current-${(await sha256(auth.accessToken ?? "")).slice(0, 24)}`;
@@ -4661,13 +4748,19 @@ const worker = {
         const searchFilter = searchTerm ? "(s.id LIKE ? OR s.pss_reference LIKE ? OR s.tracking_number LIKE ? OR s.lr_number LIKE ? OR s.master_awb LIKE ? OR s.provider_reference LIKE ?)" : "";
         const searchBinds = searchTerm ? Array(6).fill(`%${searchTerm}%`) : [];
         const requestedStatus = String(url.searchParams.get("status") ?? "").trim().toLowerCase().replaceAll(" ", "_");
-        const statusFilter = requestedStatus === "active"
-          ? "status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery', 'delayed', 'exception')"
+        const statusPredicate = requestedStatus === "active"
+          ? "s.status IN ('created', 'booked', 'provider_pending', 'manifested', 'picked_up', 'in_transit', 'out_for_delivery', 'delayed', 'exception')"
+          : requestedStatus === "booked"
+            ? "s.status IN ('created', 'booked', 'provider_pending', 'manifested')"
           : requestedStatus === "returned"
-            ? "status IN ('rto', 'returned')"
-            : new Set(["booked", "picked_up", "in_transit", "out_for_delivery", "delivered", "delayed", "exception", "cancelled", "canceled"]).has(requestedStatus)
-              ? `status = '${requestedStatus === "canceled" ? "cancelled" : requestedStatus}'`
-              : "";
+              ? "s.status IN ('rto', 'returned')"
+            : requestedStatus === "in_transit"
+              ? "s.status IN ('picked_up', 'in_transit')"
+              : requestedStatus === "delayed"
+              ? "s.edd IS NOT NULL AND date(s.edd) < date('now') AND lower(COALESCE(s.status, '')) NOT IN ('delivered', 'cancelled', 'canceled', 'returned', 'rto')"
+              : new Set(["created", "booked", "provider_pending", "manifested", "picked_up", "in_transit", "out_for_delivery", "delivered", "exception", "cancelled", "canceled"]).has(requestedStatus)
+                ? `s.status = '${requestedStatus === "canceled" ? "cancelled" : requestedStatus}'`
+                : "";
         const shipmentColumns = compactShipmentView || shipmentView === "tracking"
           ? "s.id, s.pss_reference, s.client_id, s.tracking_number, s.lr_number, s.master_awb, s.status, s.provider, s.origin, s.destination, s.total_weight_kg, s.weight_override_kg, s.weight_source, s.weight_updated_at, s.pieces, s.edd, s.delivered_at, s.created_at, s.updated_at, s.dimensions_json"
           : internalShipmentView
@@ -4676,8 +4769,8 @@ const worker = {
         const trackingShipmentColumns = "s.id, s.pss_reference, s.client_id, s.tracking_number, s.lr_number, s.master_awb, s.box_awbs_json, s.provider_reference, s.provider_booking_id, s.provider_pickup_id, s.provider_sync_status, s.status, s.provider, s.origin, s.destination, s.origin_address_json, s.destination_address_json, s.consignee, s.total_weight_kg, s.weight_override_kg, s.weight_source, s.weight_updated_at, s.pieces, s.edd, s.delivered_at, s.created_at, s.updated_at, s.dimensions_json, (SELECT sd.id FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS pod_document_id, (SELECT sd.id FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) NOT LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS invoice_document_id, (SELECT pr.provider_reference FROM pickup_requests pr WHERE (pr.shipment_id = s.id OR EXISTS (SELECT 1 FROM pickup_request_shipments prs WHERE prs.pickup_id = pr.id AND prs.shipment_id = s.id)) AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, (SELECT b.invoice_number FROM billing_records b WHERE b.shipment_id = s.id ORDER BY b.created_at DESC LIMIT 1) AS invoice_number";
         const selectedShipmentColumns = shipmentView === "tracking" || !internalShipmentView ? trackingShipmentColumns : shipmentColumns;
         const queryLimit = pageSize + 1;
-        const systemWhere = [statusFilter ? `s.${statusFilter}` : "", searchFilter].filter(Boolean).join(" AND ");
-        const clientWhere = [`s.client_id IN (${[...auth.clientIds].map(() => "?").join(",")})`, statusFilter ? `s.${statusFilter}` : "", searchFilter].filter(Boolean).join(" AND ");
+        const systemWhere = [statusPredicate, searchFilter].filter(Boolean).join(" AND ");
+        const clientWhere = [`s.client_id IN (${[...auth.clientIds].map(() => "?").join(",")})`, statusPredicate, searchFilter].filter(Boolean).join(" AND ");
         const rows = auth.system
           ? await env.DB.prepare(`SELECT ${selectedShipmentColumns} FROM shipments s${systemWhere ? ` WHERE ${systemWhere}` : ""} ORDER BY s.created_at DESC LIMIT ${queryLimit} OFFSET ${offset}`).bind(...searchBinds).all()
           : auth.clientIds.size
@@ -4691,9 +4784,24 @@ const worker = {
         } else {
           const statusRows = auth.system ? await env.DB.prepare("SELECT status, COUNT(*) AS count FROM shipments GROUP BY status").all<{ status: string | null; count: number }>() : auth.clientIds.size ? await env.DB.prepare(`SELECT status, COUNT(*) AS count FROM shipments WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) GROUP BY status`).bind(...[...auth.clientIds]).all<{ status: string | null; count: number }>() : { results: [] as Array<{ status: string | null; count: number }> };
           statusCounts = Object.fromEntries(statusRows.results.map((item) => [String(item.status ?? "unknown"), Number(item.count ?? 0)]));
+          const delayedRow = auth.system
+            ? await env.DB.prepare("SELECT COUNT(*) AS count FROM shipments WHERE edd IS NOT NULL AND date(edd) < date('now') AND lower(COALESCE(status, '')) NOT IN ('delivered', 'cancelled', 'canceled', 'returned', 'rto')").first<{ count: number }>()
+            : auth.clientIds.size
+              ? await env.DB.prepare(`SELECT COUNT(*) AS count FROM shipments WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) AND edd IS NOT NULL AND date(edd) < date('now') AND lower(COALESCE(status, '')) NOT IN ('delivered', 'cancelled', 'canceled', 'returned', 'rto')`).bind(...[...auth.clientIds]).first<{ count: number }>()
+              : { count: 0 };
+          statusCounts.delayed = Number(delayedRow?.count ?? 0);
           shipmentStatusCountsCache.set(scopeKey, { expiresAt: Date.now() + SHIPMENT_STATUS_COUNTS_CACHE_TTL_MS, counts: statusCounts });
         }
-        const totalCount = Object.values(statusCounts).reduce((sum, count) => sum + count, 0);
+        // `delayed` is a derived, due-date view and can overlap a raw status
+        // such as booked. Never derive the pagination total by summing the
+        // tabs, otherwise a delayed shipment is counted twice.
+        const totalWhere = statusPredicate;
+        const totalRow = auth.system
+          ? await env.DB.prepare(`SELECT COUNT(*) AS count FROM shipments s${totalWhere ? ` WHERE ${totalWhere}` : ""}`).first<{ count: number }>()
+          : auth.clientIds.size
+            ? await env.DB.prepare(`SELECT COUNT(*) AS count FROM shipments s WHERE s.client_id IN (${[...auth.clientIds].map(() => "?").join(",")})${totalWhere ? ` AND ${totalWhere}` : ""}`).bind(...auth.clientIds).first<{ count: number }>()
+            : { count: 0 };
+        const totalCount = Number(totalRow?.count ?? 0);
         const pageResults = rows.results.length > pageSize ? rows.results.slice(0, pageSize) : rows.results;
         const pagination = { limit: pageSize, offset, next_offset: offset + pageResults.length, has_more: rows.results.length > pageSize, total: totalCount, status_counts: statusCounts };
         const pageClientIds = [...new Set(pageResults.map((shipment) => String((shipment as Record<string, unknown>).client_id ?? "")).filter(Boolean))];
@@ -5651,13 +5759,13 @@ const worker = {
           const addOverview = (key: string, scope: string, sql: string, extra: string) => {
             if (hasScope(auth, scope)) overviewEntries.push({ key, statement: scoped(sql, extra) });
           };
-          addOverview("shipments", "shipments.read", "SELECT id, client_id, provider, provider_reference, status, origin, destination, total_weight_kg, pieces, edd, delivered_at, created_at FROM shipments", "edd IS NOT NULL AND (date(edd) < date('now') OR (delivered_at IS NOT NULL AND date(delivered_at) > date(edd))) AND lower(COALESCE(status, '')) NOT IN ('delivered', 'cancelled') ORDER BY edd ASC LIMIT 20");
-          addOverview("pickups", "pickups.read", "SELECT id, shipment_id, client_id, requested_date, requested_time_slot, pickup_address, status, created_at, updated_at FROM pickup_requests", "lower(COALESCE(status, '')) NOT IN ('completed', 'cancelled') ORDER BY requested_date ASC LIMIT 100");
-          addOverview("billing", "billing.read", "SELECT id, client_id, shipment_id, invoice_number, amount, currency, status, due_date, created_at FROM billing_records", "lower(COALESCE(status, '')) = 'pending' ORDER BY created_at DESC LIMIT 100");
+          addOverview("shipments", "shipments.read", "SELECT id, client_id, pss_reference, lr_number, master_awb, tracking_number, provider, provider_reference, status, origin, destination, total_weight_kg, pieces, edd, delivered_at, created_at FROM shipments", "edd IS NOT NULL AND (date(edd) < date('now') OR (delivered_at IS NOT NULL AND date(delivered_at) > date(edd))) AND lower(COALESCE(status, '')) NOT IN ('delivered', 'cancelled') ORDER BY edd ASC LIMIT 20");
+          addOverview("pickups", "pickups.read", "SELECT id, shipment_id, client_id, (SELECT pss_reference FROM shipments WHERE id = pickup_requests.shipment_id) AS shipment_pss_reference, provider_reference AS pickup_reference, requested_date, requested_time_slot, pickup_address, status, created_at, updated_at FROM pickup_requests", "lower(COALESCE(status, '')) NOT IN ('completed', 'cancelled') ORDER BY requested_date ASC LIMIT 100");
+          addOverview("billing", "billing.read", "SELECT id, client_id, shipment_id, (SELECT pss_reference FROM shipments WHERE id = billing_records.shipment_id) AS shipment_pss_reference, invoice_number, amount, currency, status, due_date, created_at FROM billing_records", "lower(COALESCE(status, '')) = 'pending' ORDER BY created_at DESC LIMIT 100");
           addOverview("wallet", "wallet.read", "SELECT id, client_id, type, amount, balance_after, reference, status, created_at FROM wallet_transactions", "1 = 1 ORDER BY created_at DESC LIMIT 1");
-          addOverview("exceptions", "cases.read", "SELECT id, shipment_id, client_id, category, severity, title, details, status, assigned_to_user_id, created_at, updated_at FROM exception_cases", "lower(COALESCE(status, '')) NOT IN ('resolved', 'closed') ORDER BY updated_at DESC LIMIT 8");
-          addOverview("ndr", "cases.read", "SELECT id, shipment_id, client_id, reason, attempt, deadline, status, assigned_to_user_id, created_at, updated_at FROM ndr_cases", "lower(COALESCE(status, '')) NOT IN ('resolved', 'closed', 'delivered', 'cancelled') ORDER BY updated_at DESC LIMIT 8");
-          addOverview("activity", "activity.read", "SELECT id, actor_user_id, client_id, shipment_id, action, entity_type, entity_id, created_at FROM activity_events", "1 = 1 ORDER BY created_at DESC LIMIT 12");
+          addOverview("exceptions", "cases.read", "SELECT id, shipment_id, client_id, (SELECT pss_reference FROM shipments WHERE id = exception_cases.shipment_id) AS shipment_pss_reference, (SELECT lr_number FROM shipments WHERE id = exception_cases.shipment_id) AS lr_number, (SELECT master_awb FROM shipments WHERE id = exception_cases.shipment_id) AS master_awb, category, severity, title, details, status, assigned_to_user_id, created_at, updated_at FROM exception_cases", "lower(COALESCE(status, '')) NOT IN ('resolved', 'closed') ORDER BY updated_at DESC LIMIT 8");
+          addOverview("ndr", "cases.read", "SELECT id, shipment_id, client_id, (SELECT pss_reference FROM shipments WHERE id = ndr_cases.shipment_id) AS shipment_pss_reference, (SELECT lr_number FROM shipments WHERE id = ndr_cases.shipment_id) AS lr_number, (SELECT master_awb FROM shipments WHERE id = ndr_cases.shipment_id) AS master_awb, reason, attempt, deadline, status, assigned_to_user_id, created_at, updated_at FROM ndr_cases", "lower(COALESCE(status, '')) NOT IN ('resolved', 'closed', 'delivered', 'cancelled') ORDER BY updated_at DESC LIMIT 8");
+          addOverview("activity", "activity.read", "SELECT id, actor_user_id, client_id, shipment_id, (SELECT pss_reference FROM shipments WHERE id = activity_events.shipment_id) AS shipment_pss_reference, (SELECT lr_number FROM shipments WHERE id = activity_events.shipment_id) AS lr_number, (SELECT master_awb FROM shipments WHERE id = activity_events.shipment_id) AS master_awb, action, entity_type, entity_id, created_at FROM activity_events", "1 = 1 ORDER BY created_at DESC LIMIT 12");
           const overviewResults = overviewEntries.length ? await env.DB.batch<Record<string, unknown>>(overviewEntries.map(({ statement }) => statement)) : [];
           const overviewRowsFor = (key: string) => {
             const index = overviewEntries.findIndex((entry) => entry.key === key);
@@ -5824,18 +5932,31 @@ const worker = {
         if (!hasScope(auth, "reports.read")) return error("FORBIDDEN", "Report read scope required", 403, id, headers);
         const clientIds = [...auth.clientIds];
         const columnsByTable: Record<string, string> = {
-          shipments: "id, client_id, tracking_number, status, provider, origin, destination, consignee, total_weight_kg, edd, delivered_at, created_at",
+          shipments: "id, client_id, pss_reference, lr_number, master_awb, tracking_number, status, provider, origin, destination, consignee, total_weight_kg, edd, delivered_at, created_at",
           pickup_requests: "id, client_id, requested_date, requested_time_slot, pickup_address, status, notes, created_at",
           billing_records: "id, client_id, shipment_id, amount, status, created_at",
           ndr_cases: "id, client_id, shipment_id, reason, attempt, deadline, status, notes, created_at",
           exception_cases: "id, client_id, shipment_id, category, severity, title, details, status, created_at",
           weight_reconciliations: "id, client_id, shipment_id, measured_weight_kg, billable_weight_kg, status, updated_at, created_at",
         };
-        const scoped = (table: string) => auth.system
-          ? env.DB.prepare(`SELECT ${columnsByTable[table] ?? "*"} FROM ${table} ORDER BY created_at DESC`)
-          : clientIds.length
-            ? env.DB.prepare(`SELECT ${columnsByTable[table] ?? "*"} FROM ${table} WHERE client_id IN (${clientIds.map(() => "?").join(",")}) ORDER BY created_at DESC`).bind(...clientIds)
-            : null;
+        const selectFor = (table: string) => {
+          if (table === "ndr_cases") return "c.id, c.client_id, c.shipment_id, c.reason, c.attempt, c.deadline, c.status, c.notes, c.created_at, s.pss_reference AS shipment_pss_reference, s.lr_number, s.master_awb, s.tracking_number";
+          if (table === "exception_cases") return "c.id, c.client_id, c.shipment_id, c.category, c.severity, c.title, c.details, c.status, c.created_at, s.pss_reference AS shipment_pss_reference, s.lr_number, s.master_awb, s.tracking_number";
+          if (table === "weight_reconciliations") return "w.id, w.client_id, w.shipment_id, w.measured_weight_kg, w.billable_weight_kg, w.status, w.updated_at, w.created_at, s.pss_reference AS shipment_pss_reference, s.lr_number, s.master_awb, s.tracking_number";
+          if (table === "pickup_requests") return "p.id, p.client_id, p.provider_reference AS pickup_reference, p.requested_date, p.requested_time_slot, p.pickup_address, p.status, p.notes, p.created_at";
+          return columnsByTable[table] ?? "*";
+        };
+        const scoped = (table: string) => {
+          const columns = selectFor(table);
+          const source = table === "ndr_cases" || table === "exception_cases" ? `${table} c LEFT JOIN shipments s ON s.id = c.shipment_id` : table === "weight_reconciliations" ? `${table} w LEFT JOIN shipments s ON s.id = w.shipment_id` : table === "pickup_requests" ? `${table} p` : table;
+          const clientColumn = table === "ndr_cases" || table === "exception_cases" ? "c.client_id" : table === "weight_reconciliations" ? "w.client_id" : table === "pickup_requests" ? "p.client_id" : "client_id";
+          const createdColumn = table === "ndr_cases" || table === "exception_cases" ? "c.created_at" : table === "weight_reconciliations" ? "w.created_at" : table === "pickup_requests" ? "p.created_at" : "created_at";
+          return auth.system
+            ? env.DB.prepare(`SELECT ${columns} FROM ${source} ORDER BY ${createdColumn} DESC`)
+            : clientIds.length
+              ? env.DB.prepare(`SELECT ${columns} FROM ${source} WHERE ${clientColumn} IN (${clientIds.map(() => "?").join(",")}) ORDER BY ${createdColumn} DESC`).bind(...clientIds)
+              : null;
+        };
         const entries: Array<{ key: string; statement: ReturnType<typeof env.DB.prepare> }> = [];
         const add = (key: string, table: string, scope: string) => {
           if (!hasScope(auth, scope)) return;
@@ -5882,11 +6003,16 @@ const worker = {
       };
       if (route === "/warehouses" && request.method === "GET") {
         if (!hasScope(auth, "addresses.manage")) return error("FORBIDDEN", "Permission required", 403, id, headers);
+        const search = String(url.searchParams.get("search") ?? "").trim().slice(0, 120);
+        const limit = Math.min(Math.max(Number.parseInt(url.searchParams.get("limit") ?? "100", 10) || 100, 1), 200);
+        const offset = Math.max(Number.parseInt(url.searchParams.get("offset") ?? "0", 10) || 0, 0);
+        const searchClause = search ? " AND (name LIKE ? OR address LIKE ? OR city LIKE ? OR state LIKE ? OR pincode LIKE ? OR contact_name LIKE ?)" : "";
+        const searchBinds = search ? Array(6).fill(`%${search}%`) : [];
+        const clientClause = auth.system ? "" : auth.clientIds.size ? `client_id IN (${[...auth.clientIds].map(() => "?").join(",")})` : "0 = 1";
+        const clientBinds = auth.system ? [] : [...auth.clientIds];
         const rows = auth.system
-          ? await env.DB.prepare("SELECT * FROM warehouses ORDER BY updated_at DESC").all<Record<string, unknown>>()
-          : auth.clientIds.size
-            ? await env.DB.prepare(`SELECT * FROM warehouses WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY updated_at DESC`).bind(...auth.clientIds).all<Record<string, unknown>>()
-            : { results: [] as Record<string, unknown>[] };
+          ? await env.DB.prepare(`SELECT * FROM warehouses WHERE 1 = 1${searchClause} ORDER BY updated_at DESC LIMIT ${limit + 1} OFFSET ${offset}`).bind(...searchBinds).all<Record<string, unknown>>()
+          : await env.DB.prepare(`SELECT * FROM warehouses WHERE ${clientClause}${searchClause} ORDER BY updated_at DESC LIMIT ${limit + 1} OFFSET ${offset}`).bind(...clientBinds, ...searchBinds).all<Record<string, unknown>>();
         // Multiple local warehouse rows can represent the same physical
         // address while Delhivery activation is being retried. Prefer the
         // provider-confirmed row before deduplicating; otherwise a newer
@@ -5913,7 +6039,21 @@ const worker = {
           seen.add(identity);
           return true;
         });
-        return json({ ok: true, data }, 200, headers);
+        return json({ ok: true, data: data.slice(0, limit), pagination: { limit, offset, next_offset: offset + Math.min(data.length, limit), has_more: data.length > limit } }, 200, headers);
+      }
+      if (route === "/addresses" && request.method === "GET") {
+        if (!hasScope(auth, "addresses.manage")) return error("FORBIDDEN", "Permission required", 403, id, headers);
+        const search = String(url.searchParams.get("search") ?? "").trim().slice(0, 120);
+        const addressKind = String(url.searchParams.get("address_kind") ?? "").trim().toLowerCase();
+        const activeOnly = url.searchParams.get("active_only") !== "false";
+        const limit = Math.min(Math.max(Number.parseInt(url.searchParams.get("limit") ?? "100", 10) || 100, 1), 200);
+        const offset = Math.max(Number.parseInt(url.searchParams.get("offset") ?? "0", 10) || 0, 0);
+        const clauses = ["1 = 1", activeOnly ? "status = 'active'" : "", addressKind && ["consignor", "consignee"].includes(addressKind) ? "address_kind = ?" : "", search ? "(label LIKE ? OR address LIKE ? OR city LIKE ? OR state LIKE ? OR pincode LIKE ? OR contact_name LIKE ? OR phone LIKE ?)" : ""].filter(Boolean);
+        const binds: unknown[] = []; if (addressKind && ["consignor", "consignee"].includes(addressKind)) binds.push(addressKind); if (search) binds.push(...Array(7).fill(`%${search}%`));
+        if (!auth.system) { if (!auth.clientIds.size) return json({ ok: true, data: [], pagination: { limit, offset, next_offset: offset, has_more: false } }, 200, headers); clauses.unshift(`client_id IN (${[...auth.clientIds].map(() => "?").join(",")})`); binds.unshift(...auth.clientIds); }
+        const rows = await env.DB.prepare(`SELECT * FROM client_addresses WHERE ${clauses.join(" AND ")} ORDER BY updated_at DESC LIMIT ${limit + 1} OFFSET ${offset}`).bind(...binds).all<Record<string, unknown>>();
+        const data = rows.results ?? [];
+        return json({ ok: true, data: data.slice(0, limit), pagination: { limit, offset, next_offset: offset + Math.min(data.length, limit), has_more: data.length > limit } }, 200, headers);
       }
       if (route === "/billing" && request.method === "GET") {
         if (!hasScope(auth, "billing.read")) return error("FORBIDDEN", "Permission required", 403, id, headers);
@@ -5931,23 +6071,40 @@ const worker = {
       }
       if (route === "/weight-reconciliation" && request.method === "GET") {
         if (!hasScope(auth, "weight.read")) return error("FORBIDDEN", "Permission required", 403, id, headers);
-        const clientColumns = "w.id, w.client_id, w.shipment_id, w.declared_weight_kg, w.declared_volumetric_weight_kg, w.initial_billable_weight_kg, w.measured_weight_kg, w.courier_billed_weight_kg, w.billable_weight_kg, w.status, w.provider_weight_received_at, w.client_dispute_deadline_at, w.created_at, w.updated_at, w.client_dispute_deadline_at AS ticket_deadline_at, t.id AS ticket_id, t.status AS ticket_status, t.reason AS ticket_reason";
+        const clientColumns = "w.id, w.client_id, w.shipment_id, s.pss_reference AS shipment_pss_reference, s.lr_number, s.master_awb, s.tracking_number, w.declared_weight_kg, w.declared_volumetric_weight_kg, w.initial_billable_weight_kg, w.measured_weight_kg, w.courier_billed_weight_kg, w.billable_weight_kg, w.status, w.provider_weight_received_at, w.client_dispute_deadline_at, w.created_at, w.updated_at, w.client_dispute_deadline_at AS ticket_deadline_at, t.id AS ticket_id, t.status AS ticket_status, t.reason AS ticket_reason";
         const employeeColumns = `${clientColumns}, w.provider_dispute_status`;
         const internalColumns = `${employeeColumns}, w.provider_recovery_amount, w.retained_recovery_amount, t.client_credit_amount`;
         const columns = hasScope(auth, "provider_cost.view") || hasScope(auth, "weight_dispute.resolve") ? internalColumns : hasRole(auth, ["employee", "admin", "super_admin"]) ? employeeColumns : clientColumns;
-        const rows = auth.system ? await env.DB.prepare(`SELECT ${columns} FROM weight_reconciliations w LEFT JOIN weight_reconciliation_tickets t ON t.reconciliation_id = w.id ORDER BY w.updated_at DESC`).all() : auth.clientIds.size ? await env.DB.prepare(`SELECT ${columns} FROM weight_reconciliations w LEFT JOIN weight_reconciliation_tickets t ON t.reconciliation_id = w.id WHERE w.client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY w.updated_at DESC`).bind(...auth.clientIds).all() : { results: [] };
+        const rows = auth.system ? await env.DB.prepare(`SELECT ${columns} FROM weight_reconciliations w LEFT JOIN weight_reconciliation_tickets t ON t.reconciliation_id = w.id LEFT JOIN shipments s ON s.id = w.shipment_id ORDER BY w.updated_at DESC`).all() : auth.clientIds.size ? await env.DB.prepare(`SELECT ${columns} FROM weight_reconciliations w LEFT JOIN weight_reconciliation_tickets t ON t.reconciliation_id = w.id LEFT JOIN shipments s ON s.id = w.shipment_id WHERE w.client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY w.updated_at DESC`).bind(...auth.clientIds).all() : { results: [] };
+        return json({ ok: true, data: rows.results }, 200, headers);
+      }
+      if (route === "/cod-remittances" && request.method === "GET") {
+        if (!hasScope(auth, "cod.read")) return error("FORBIDDEN", "Permission required", 403, id, headers);
+        const rows = auth.system
+          ? await env.DB.prepare("SELECT c.*, s.pss_reference AS shipment_pss_reference, s.lr_number, s.master_awb, s.tracking_number FROM cod_remittances c LEFT JOIN shipments s ON s.id = c.shipment_id ORDER BY c.created_at DESC LIMIT 100").all()
+          : auth.clientIds.size
+            ? await env.DB.prepare(`SELECT c.*, s.pss_reference AS shipment_pss_reference, s.lr_number, s.master_awb, s.tracking_number FROM cod_remittances c LEFT JOIN shipments s ON s.id = c.shipment_id WHERE c.client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY c.created_at DESC LIMIT 100`).bind(...auth.clientIds).all()
+            : { results: [] };
         return json({ ok: true, data: rows.results }, 200, headers);
       }
       const collection = collectionRoutes[route];
       if (collection && request.method === "GET") {
         if (!hasScope(auth, collection.scope)) return error("FORBIDDEN", "Permission required", 403, id, headers);
         const internalCollectionView = hasRole(auth, ["employee", "admin", "super_admin"]) || auth.system;
+        const clientCaseView = !internalCollectionView && (collection.table === "ndr_cases" || collection.table === "exception_cases");
         const select = collection.table === "return_shipments" && !internalCollectionView
-          ? "id, shipment_id, client_id, reason, status, created_at, updated_at"
-          : "*";
+          ? "r.id, r.client_id, r.reason, r.status, r.created_at, r.updated_at, s.pss_reference AS shipment_pss_reference, s.lr_number, s.master_awb, s.tracking_number"
+          : collection.table === "ndr_cases" && !internalCollectionView
+            ? "c.id, c.client_id, c.reason, c.attempt, c.deadline, c.status, c.notes, c.created_at, c.updated_at, s.pss_reference AS shipment_pss_reference, s.lr_number, s.master_awb, s.tracking_number"
+            : collection.table === "exception_cases" && !internalCollectionView
+              ? "c.id, c.client_id, c.category, c.severity, c.title, c.details, c.status, c.created_at, c.updated_at, s.pss_reference AS shipment_pss_reference, s.lr_number, s.master_awb, s.tracking_number"
+              : "*";
         const unlimitedCollection = ["ndr_cases", "exception_cases", "return_shipments"].includes(collection.table);
         const collectionLimit = unlimitedCollection ? "" : " LIMIT 100";
-        const rows = auth.system ? await env.DB.prepare(`SELECT ${select} FROM ${collection.table} ORDER BY ${collection.order}${collectionLimit}`).all() : auth.clientIds.size ? await env.DB.prepare(`SELECT ${select} FROM ${collection.table} WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY ${collection.order}${collectionLimit}`).bind(...auth.clientIds).all() : { results: [] };
+        const source = collection.table === "return_shipments" && !internalCollectionView ? "return_shipments r LEFT JOIN shipments s ON s.id = r.shipment_id" : clientCaseView ? `${collection.table} c LEFT JOIN shipments s ON s.id = c.shipment_id` : collection.table;
+        const scopeColumn = collection.table === "return_shipments" && !internalCollectionView ? "r.client_id" : clientCaseView ? "c.client_id" : "client_id";
+        const orderColumn = collection.table === "return_shipments" && !internalCollectionView ? collection.order.replaceAll("updated_at", "r.updated_at") : clientCaseView ? collection.order.replaceAll("updated_at", "c.updated_at") : collection.order;
+        const rows = auth.system ? await env.DB.prepare(`SELECT ${select} FROM ${source} ORDER BY ${orderColumn}${collectionLimit}`).all() : auth.clientIds.size ? await env.DB.prepare(`SELECT ${select} FROM ${source} WHERE ${scopeColumn} IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY ${orderColumn}${collectionLimit}`).bind(...auth.clientIds).all() : { results: [] };
         return json({ ok: true, data: rows.results }, 200, headers);
       }
       if ((route === "/billing" || route === "/wallet") && request.method === "POST") {
@@ -5962,7 +6119,11 @@ const worker = {
         const endpoint = `POST /v1${route}`; const existing = await idempotentResponse(env, key, clientId, endpoint, requestHash); if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
         const recordId = crypto.randomUUID();
         if (route === "/billing") {
-          await env.DB.prepare("INSERT INTO billing_records (id, client_id, shipment_id, invoice_number, amount, status, due_date) VALUES (?, ?, ?, ?, ?, 'pending', ?)").bind(recordId, clientId, typeof payload.shipment_id === "string" ? payload.shipment_id : null, typeof payload.invoice_number === "string" ? payload.invoice_number : `INV-${recordId.slice(0, 8).toUpperCase()}`, amount, typeof payload.due_date === "string" ? payload.due_date : null).run();
+          const manualShipmentId = typeof payload.shipment_id === "string" ? payload.shipment_id : null;
+          const manualShipment = manualShipmentId ? await env.DB.prepare("SELECT lr_number, master_awb, tracking_number FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(manualShipmentId, clientId).first<{ lr_number: string | null; master_awb: string | null; tracking_number: string | null }>() : null;
+          const manualInvoiceReference = manualShipment?.lr_number || manualShipment?.master_awb || manualShipment?.tracking_number;
+          const invoiceNumber = manualInvoiceReference ? shipmentInvoiceNumber(manualInvoiceReference) : "INV-PENDING-REFERENCE";
+          await env.DB.prepare("INSERT INTO billing_records (id, client_id, shipment_id, invoice_number, amount, status, due_date) VALUES (?, ?, ?, ?, ?, 'pending', ?)").bind(recordId, clientId, manualShipmentId, invoiceNumber, amount, typeof payload.due_date === "string" ? payload.due_date : null).run();
         } else {
           await env.DB.prepare("INSERT INTO wallet_transactions (id, client_id, type, amount, reference, status, balance_after) VALUES (?, ?, ?, ?, ?, 'pending', 0)").bind(recordId, clientId, String(payload.type).trim().toLowerCase(), amount, typeof payload.reference === "string" ? payload.reference : `ADJ-${recordId.slice(0, 8).toUpperCase()}`).run();
           await recalculateWalletBalances(env, clientId);
@@ -6028,7 +6189,7 @@ const worker = {
         } else {
           if (typeof payload.label !== "string" || typeof payload.address !== "string") return error("VALIDATION_ERROR", "Address label and address are required", 400, id, headers);
           const addressKind = payload.address_kind === "consignee" ? "consignee" : "consignor";
-          await env.DB.prepare("INSERT INTO client_addresses (id, client_id, label, address_kind, contact_name, phone, address, city, state, pincode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(recordId, clientId, payload.label, addressKind, String(payload.contact_name ?? ""), String(payload.phone ?? ""), payload.address, String(payload.city ?? ""), String(payload.state ?? ""), String(payload.pincode ?? "")).run();
+          await env.DB.prepare("INSERT INTO client_addresses (id, client_id, label, address_kind, contact_name, phone, address, city, state, country, pincode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(recordId, clientId, payload.label, addressKind, String(payload.contact_name ?? ""), String(payload.phone ?? ""), payload.address, String(payload.city ?? ""), String(payload.state ?? ""), typeof payload.country === "string" && payload.country.trim() ? payload.country.trim() : "India", String(payload.pincode ?? "")).run();
         }
         await audit(env, ctx, auth, id, `${route.slice(1)}.created`, route.slice(1, -1), recordId, { client_id: clientId });
         const serialized = JSON.stringify({ ok: true, data: { id: recordId, client_id: clientId, ...(route === "/warehouses" ? { provider: "delhivery", provider_status: providerStatus, provider_error: providerError } : {}) }, request_id: id }); await saveIdempotent(env, key, clientId, endpoint, 201, serialized, requestHash);
@@ -6243,7 +6404,7 @@ const worker = {
         const table = map[entityUpdate[1]]; const current = await env.DB.prepare(`SELECT client_id FROM ${table} WHERE id = ? LIMIT 1`).bind(entityUpdate[2]).first<{ client_id: string }>();
         const scopeByEntity: Record<string, string> = { billing: "billing.manage", wallet: "wallet.manage", "cod-remittances": "cod.manage", "weight-reconciliation": "weight.manage" };
         if (!current || !canAccessClient(auth, current.client_id) || (scopeByEntity[entityUpdate[1]] && !hasScope(auth, scopeByEntity[entityUpdate[1]])) || (!scopeByEntity[entityUpdate[1]] && entityUpdate[1] !== "warehouses" && entityUpdate[1] !== "addresses" && !hasRole(auth, ["employee", "admin", "super_admin"]))) return error("NOT_FOUND", "Record not found", 404, id, headers);
-        const payload = await bodyJson(request); const financeStatuses: Record<string, string[]> = { billing: ["pending", "approved", "paid", "void", "cancelled"], wallet: ["pending", "approved", "posted", "rejected", "void"] }; const requestedStatus = payload.status === undefined ? undefined : String(payload.status); if (requestedStatus !== undefined && financeStatuses[entityUpdate[1]] && !financeStatuses[entityUpdate[1]].includes(requestedStatus)) return error("VALIDATION_ERROR", "Invalid finance record status", 400, id, headers); if (entityUpdate[1] === "weight-reconciliation" && (typeof payload.reason !== "string" || !payload.reason.trim())) return error("VALIDATION_ERROR", "A reason is required for weight-record changes", 400, id, headers); const requestHash = await payloadFingerprint(payload); const allowedFields = entityUpdate[1] === "warehouses" ? ["name", "address", "city", "state", "pincode", "contact", "contact_name"] : entityUpdate[1] === "addresses" ? ["label", "address_kind", "contact_name", "phone", "address", "city", "state", "pincode"] : entityUpdate[1] === "weight-reconciliation" ? ["status", "measured_weight_kg", "billable_weight_kg"] : entityUpdate[1] === "wallet" ? ["status"] : entityUpdate[1] === "cod-remittances" ? ["status", "settled_at"] : entityUpdate[1] === "ndr" ? ["status", "assigned_to_user_id", "deadline", "notes", "attempt"] : entityUpdate[1] === "exceptions" ? ["status", "assigned_to_user_id", "severity", "details"] : entityUpdate[1] === "returns" ? ["status", "provider_reference"] : ["status", "assigned_to_user_id", "priority"]; if ((entityUpdate[1] === "ndr" || entityUpdate[1] === "exceptions" || entityUpdate[1] === "tickets") && payload.assigned_to_user_id !== undefined && !(await employeeCanBeAssigned(env, auth, payload.assigned_to_user_id, current.client_id))) return error("FORBIDDEN", "Assigned employee is not active or is outside the client scope", 403, id, headers); const updates = allowedFields.filter((field) => typeof payload[field] === "string" || typeof payload[field] === "number").map((field) => ({ field, value: field === "address_kind" && payload[field] !== "consignee" ? "consignor" : payload[field] }));
+        const payload = await bodyJson(request); const financeStatuses: Record<string, string[]> = { billing: ["pending", "approved", "paid", "void", "cancelled"], wallet: ["pending", "approved", "posted", "rejected", "void"] }; const requestedStatus = payload.status === undefined ? undefined : String(payload.status); if (requestedStatus !== undefined && financeStatuses[entityUpdate[1]] && !financeStatuses[entityUpdate[1]].includes(requestedStatus)) return error("VALIDATION_ERROR", "Invalid finance record status", 400, id, headers); if (entityUpdate[1] === "weight-reconciliation" && (typeof payload.reason !== "string" || !payload.reason.trim())) return error("VALIDATION_ERROR", "A reason is required for weight-record changes", 400, id, headers); const requestHash = await payloadFingerprint(payload); const allowedFields = entityUpdate[1] === "warehouses" ? ["name", "address", "city", "state", "pincode", "contact", "contact_name"] : entityUpdate[1] === "addresses" ? ["label", "address_kind", "contact_name", "phone", "address", "city", "state", "country", "pincode"] : entityUpdate[1] === "weight-reconciliation" ? ["status", "measured_weight_kg", "billable_weight_kg"] : entityUpdate[1] === "wallet" ? ["status"] : entityUpdate[1] === "cod-remittances" ? ["status", "settled_at"] : entityUpdate[1] === "ndr" ? ["status", "assigned_to_user_id", "deadline", "notes", "attempt"] : entityUpdate[1] === "exceptions" ? ["status", "assigned_to_user_id", "severity", "details"] : entityUpdate[1] === "returns" ? ["status", "provider_reference"] : ["status", "assigned_to_user_id", "priority"]; if ((entityUpdate[1] === "ndr" || entityUpdate[1] === "exceptions" || entityUpdate[1] === "tickets") && payload.assigned_to_user_id !== undefined && !(await employeeCanBeAssigned(env, auth, payload.assigned_to_user_id, current.client_id))) return error("FORBIDDEN", "Assigned employee is not active or is outside the client scope", 403, id, headers); const updates = allowedFields.filter((field) => typeof payload[field] === "string" || typeof payload[field] === "number").map((field) => ({ field, value: field === "address_kind" && payload[field] !== "consignee" ? "consignor" : payload[field] }));
         if (!updates.length) return error("VALIDATION_ERROR", "A supported update is required", 400, id, headers);
         const idempotencyKey = request.headers.get("Idempotency-Key"); if (!idempotencyKey) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
         const endpoint = `PATCH /v1/${entityUpdate[1]}/${entityUpdate[2]}`; const existing = await idempotentResponse(env, idempotencyKey, current.client_id, endpoint, requestHash); if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
