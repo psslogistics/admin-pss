@@ -4759,7 +4759,11 @@ const worker = {
           profile?.aadhaar_last4 ? null : "Aadhaar",
           profile?.phone_verified_at ? null : "mobile verification",
         ].filter((value): value is string => Boolean(value));
-        return json({ ok: true, data: { status: profile?.status ?? "not_started", approved: missingFields.length === 0, missing_fields: missingFields } }, 200, headers);
+        const kycTestAccount = await isKycTestAccount(env, auth);
+        // Keep the existing exception account-specific: this test client is
+        // already allow-listed by shipment creation, so the Client panel must
+        // not disable its booking flow based on incomplete production KYC.
+        return json({ ok: true, data: { status: kycTestAccount ? "approved" : (profile?.status ?? "not_started"), approved: kycTestAccount || missingFields.length === 0, missing_fields: kycTestAccount ? [] : missingFields } }, 200, headers);
       }
       if (route === "/security/sessions" && request.method === "GET") {
         if (!auth.userId || !hasRole(auth, ["admin", "super_admin"])) return error("FORBIDDEN", "Security session visibility permission required", 403, id, headers);
