@@ -3142,28 +3142,53 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
           // requested size; the Client places all returned assets on A4 sheets.
           const requestedCopies = boxCopies + 1;
           const labelFetchResults: string[] = [];
-          const fetchedArtifacts = await Promise.all(labelUrls.slice(0, requestedCopies).map(async (labelUrl) => {
-            try {
-              const labelResponse = await providerFetch(labelUrl, { method: "GET", headers: { ...headers, accept: "application/json,image/*,application/pdf" } }, Math.min(attemptTimeoutMs, 3000));
-              const labelContentType = labelResponse.headers.get("content-type") ?? "application/octet-stream";
-              labelFetchResults.push(`${labelResponse.status}:${labelContentType}`);
-              if (!labelResponse.ok) return null;
-              if (labelContentType.toLowerCase().includes("json")) {
-                const labelBody = await providerResponseText(labelResponse, Math.min(attemptTimeoutMs, 3000));
-                let labelJson: unknown = null;
-                try { labelJson = JSON.parse(labelBody); } catch { labelJson = labelBody.trim() || null; }
-                const labelBase64 = findProviderContentBase64(labelJson);
-                if (!labelBase64) return null;
-                const labelType = providerContentTypeFromBase64(labelBase64, findProviderContentType(labelJson) ?? "application/octet-stream");
-                return labelType === "application/pdf" || labelType === "image/png" || labelType === "image/jpeg" ? { content_base64: labelBase64, content_type: labelType } : null;
+          const labelUrlsToFetch = labelUrls.slice(0, requestedCopies);
+          const fetchLabelAsset = async (labelUrl: string) => {
+            // Delhivery can publish all URLs together while throttling the
+            // later asset downloads. A bounded queue with one short retry
+            // prevents a large MPS shipment from silently returning only the
+            // first dozen stickers.
+            for (let attempt = 0; attempt < 2; attempt += 1) {
+              try {
+                const labelResponse = await providerFetch(labelUrl, { method: "GET", headers: { ...headers, accept: "application/json,image/*,application/pdf" } }, Math.min(attemptTimeoutMs, 4000));
+                const labelContentType = labelResponse.headers.get("content-type") ?? "application/octet-stream";
+                labelFetchResults.push(`${labelResponse.status}:${labelContentType}`);
+                if (!labelResponse.ok) {
+                  if (attempt === 0 && (labelResponse.status === 408 || labelResponse.status === 429 || labelResponse.status >= 500)) {
+                    await new Promise((resolve) => setTimeout(resolve, 250));
+                    continue;
+                  }
+                  return null;
+                }
+                if (labelContentType.toLowerCase().includes("json")) {
+                  const labelBody = await providerResponseText(labelResponse, Math.min(attemptTimeoutMs, 4000));
+                  let labelJson: unknown = null;
+                  try { labelJson = JSON.parse(labelBody); } catch { labelJson = labelBody.trim() || null; }
+                  const labelBase64 = findProviderContentBase64(labelJson);
+                  if (!labelBase64) return null;
+                  const labelType = providerContentTypeFromBase64(labelBase64, findProviderContentType(labelJson) ?? "application/octet-stream");
+                  return labelType === "application/pdf" || labelType === "image/png" || labelType === "image/jpeg" ? { content_base64: labelBase64, content_type: labelType } : null;
+                }
+                const labelBytes = await providerResponseBytes(labelResponse, 12 * 1024 * 1024);
+                const labelType = providerContentTypeFromBytes(labelBytes, labelContentType);
+                return labelType === "application/pdf" || labelType === "image/png" || labelType === "image/jpeg" ? { content_base64: providerBytesToBase64(labelBytes), content_type: labelType } : null;
+              } catch {
+                if (attempt === 0) {
+                  await new Promise((resolve) => setTimeout(resolve, 250));
+                  continue;
+                }
+                return null;
               }
-              const labelBytes = await providerResponseBytes(labelResponse, 12 * 1024 * 1024);
-              const labelType = providerContentTypeFromBytes(labelBytes, labelContentType);
-              return labelType === "application/pdf" || labelType === "image/png" || labelType === "image/jpeg" ? { content_base64: providerBytesToBase64(labelBytes), content_type: labelType } : null;
-            } catch {
-              return null;
             }
-          }));
+            return null;
+          };
+          const fetchedArtifacts: Array<{ content_base64: string; content_type: string }> = [];
+          // Keep provider concurrency below the account's throttling threshold
+          // without serialising the complete label job.
+          for (let start = 0; start < labelUrlsToFetch.length; start += 6) {
+            const batch = await Promise.all(labelUrlsToFetch.slice(start, start + 6).map(fetchLabelAsset));
+            fetchedArtifacts.push(...batch.filter((value): value is { content_base64: string; content_type: string } => Boolean(value)));
+          }
           labelArtifacts.push(...fetchedArtifacts.filter((value): value is { content_base64: string; content_type: string } => Boolean(value)));
           if (labelArtifacts.length) {
             // Keep only assets Delhivery actually returned. Never fabricate a
