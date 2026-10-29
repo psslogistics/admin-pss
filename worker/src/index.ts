@@ -6158,6 +6158,41 @@ const worker = {
         return json({ ok: true, data: rows.results }, 200, headers);
       }
       const collection = collectionRoutes[route];
+      // Keep the client wallet read path bounded and independent of a
+      // reference-to-shipment join. The old join made this high-frequency
+      // route wait on an unindexed expression over wallet history and could
+      // leave the Client page loading until its request timeout. Resolve the
+      // small set of shipment references after the bounded transaction read,
+      // while keeping internal/admin reads on the existing collection path.
+      if (route === "/wallet" && request.method === "GET" && !auth.system && !hasRole(auth, ["employee", "admin", "super_admin"])) {
+        if (!hasScope(auth, "wallet.read")) return error("FORBIDDEN", "Wallet read permission required", 403, id, headers);
+        if (!auth.clientIds.size) return json({ ok: true, data: [] }, 200, headers);
+        const clientIds = [...auth.clientIds];
+        const transactions = await env.DB.prepare(`SELECT id, client_id, type, amount, balance_after, reference, status, created_at FROM wallet_transactions WHERE client_id IN (${clientIds.map(() => "?").join(",")}) ORDER BY created_at DESC LIMIT 200`).bind(...clientIds).all<Record<string, unknown>>();
+        const referenceParts = (value: unknown) => {
+          const reference = String(value ?? "").trim();
+          const match = reference.match(/^(SHIPMENT|REVERSAL|WEIGHT-DEBIT|WEIGHT-CREDIT)-(.+)$/);
+          return match ? { category: match[1], shipmentId: match[2] } : null;
+        };
+        const shipmentIds = [...new Set(transactions.results.map((row) => referenceParts(row.reference)?.shipmentId).filter((value): value is string => Boolean(value)))];
+        const shipmentRows = shipmentIds.length
+          ? await env.DB.prepare(`SELECT id, pss_reference, lr_number, master_awb, tracking_number, is_test FROM shipments WHERE id IN (${shipmentIds.map(() => "?").join(",")}) AND client_id IN (${clientIds.map(() => "?").join(",")})`).bind(...shipmentIds, ...clientIds).all<Record<string, unknown>>()
+          : { results: [] as Record<string, unknown>[] };
+        const shipmentById = new Map(shipmentRows.results.map((row) => [String(row.id), row]));
+        const data = transactions.results.filter((row) => {
+          const linked = referenceParts(row.reference)?.shipmentId;
+          return !linked || !shipmentById.get(linked)?.is_test;
+        }).slice(0, 100).map((row) => {
+          const rawReference = String(row.reference ?? "").trim();
+          const parts = referenceParts(rawReference);
+          const linked = parts ? shipmentById.get(parts.shipmentId) : null;
+          const publicReference = parts
+            ? `${parts.category === "SHIPMENT" ? "Shipment" : parts.category === "REVERSAL" ? "Reversal" : "Weight adjustment"} · ${String(linked?.lr_number ?? linked?.master_awb ?? linked?.pss_reference ?? linked?.tracking_number ?? "reference pending")}`
+            : /^PRICING-OVERRIDE-/i.test(rawReference) ? "Pricing adjustment" : /^ADJ-/i.test(rawReference) ? "Finance adjustment" : "Finance activity";
+          return { ...row, reference: publicReference };
+        });
+        return json({ ok: true, data }, 200, headers);
+      }
       if (collection && request.method === "GET") {
         if (!hasScope(auth, collection.scope)) return error("FORBIDDEN", "Permission required", 403, id, headers);
         const internalCollectionView = hasRole(auth, ["employee", "admin", "super_admin"]) || auth.system;
