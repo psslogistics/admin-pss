@@ -6130,7 +6130,7 @@ const worker = {
         const shipmentColumns = "s.pss_reference AS shipment_pss_reference, s.tracking_number, s.lr_number, s.master_awb, s.origin AS shipment_origin, s.destination AS shipment_destination, s.origin_address_json AS shipment_origin_address_json, s.destination_address_json AS shipment_destination_address_json, s.consignee AS shipment_consignee, s.description AS shipment_description, s.total_weight_kg, s.declared_value, s.pieces, s.edd, s.dimensions_json, s.created_at AS shipment_created_at";
         const days = Number(url.searchParams.get("days"));
         const dateClause = Number.isInteger(days) && days >= 1 && days <= 90 ? " AND datetime(b.created_at) >= datetime('now', ?)" : "";
-        const dateBind = dateClause ? [`-${days} days`] : [];
+        const dateBind = dateClause ? [`-${days - 1} days`] : [];
         const rows = auth.system
           ? await env.DB.prepare(`SELECT b.*, ps.account_scope, ps.origin_zone, ps.destination_zone, ps.chargeable_weight_kg, ps.client_breakdown_json, ${shipmentColumns.replaceAll("s.", "sh.")}, w.provider_weight_received_at, w.client_dispute_deadline_at FROM billing_records b LEFT JOIN pricing_shipment_snapshots ps ON ps.shipment_id = b.shipment_id LEFT JOIN shipments sh ON sh.id = b.shipment_id LEFT JOIN weight_reconciliations w ON w.shipment_id = b.shipment_id WHERE 1 = 1${dateClause} ORDER BY b.created_at DESC`).bind(...dateBind).all()
           : auth.clientIds.size

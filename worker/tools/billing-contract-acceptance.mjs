@@ -8,6 +8,7 @@ const checks = [
   ["UUIDs are not used as invoice-number fallbacks", !source.includes("INV-${shipmentId.slice(0, 8).toUpperCase()}")],
   ["manual billing does not derive invoice numbers from record UUIDs", !source.includes("INV-${recordId.slice(0, 8).toUpperCase()}")],
   ["manual billing preserves pending identity when no shipment reference exists", source.includes('"INV-PENDING-REFERENCE"')],
+  ["billing API cycles are inclusive days", source.includes("`-${days - 1} days`")],
 ];
 
 const failed = checks.filter(([, passed]) => !passed).map(([name]) => name);
