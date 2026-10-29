@@ -4,6 +4,7 @@ import path from "node:path";
 
 const source = fs.readFileSync(path.join(process.cwd(), "worker", "src", "index.ts"), "utf8");
 const migration = fs.readFileSync(path.join(process.cwd(), "worker", "migrations", "20261029_client_test_classification.sql"), "utf8");
+const pickupMigration = fs.readFileSync(path.join(process.cwd(), "worker", "migrations", "20261029_pickup_test_classification.sql"), "utf8");
 
 const checks = [
   ["client/API identities hide classified records", /function hidesClientTestData\(auth: Auth\)[\s\S]*auth\.kind === "api"[\s\S]*auth\.audience === "client"/],
@@ -39,5 +40,5 @@ const migrationChecks = new Set([
   "saved-address classification migration is present",
   "pickup classification migration is present",
 ]);
-for (const [label, pattern] of checks) assert.match(migrationChecks.has(label) ? migration : source, pattern, label);
+for (const [label, pattern] of checks) assert.match(label === "pickup classification migration is present" ? pickupMigration : migrationChecks.has(label) ? migration : source, pattern, label);
 console.log(`Test-data visibility contract checks passed (${checks.length} checks).`);
