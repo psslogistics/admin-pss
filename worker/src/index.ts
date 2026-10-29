@@ -6092,7 +6092,18 @@ const worker = {
         if (!hasScope(auth, collection.scope)) return error("FORBIDDEN", "Permission required", 403, id, headers);
         const internalCollectionView = hasRole(auth, ["employee", "admin", "super_admin"]) || auth.system;
         const clientCaseView = !internalCollectionView && (collection.table === "ndr_cases" || collection.table === "exception_cases");
-        const select = collection.table === "return_shipments" && !internalCollectionView
+        const select = collection.table === "wallet_transactions" && !internalCollectionView
+          ? `w.id, w.client_id, w.type, w.amount, w.balance_after,
+             CASE
+               WHEN w.reference LIKE 'SHIPMENT-%' THEN 'Shipment · ' || COALESCE(NULLIF(s.lr_number, ''), NULLIF(s.master_awb, ''), NULLIF(s.pss_reference, ''), 'reference pending')
+               WHEN w.reference LIKE 'REVERSAL-%' THEN 'Reversal · ' || COALESCE(NULLIF(s.lr_number, ''), NULLIF(s.master_awb, ''), NULLIF(s.pss_reference, ''), 'reference pending')
+               WHEN w.reference LIKE 'WEIGHT-DEBIT-%' THEN 'Weight adjustment · ' || COALESCE(NULLIF(s.lr_number, ''), NULLIF(s.master_awb, ''), NULLIF(s.pss_reference, ''), 'reference pending')
+               WHEN w.reference LIKE 'WEIGHT-CREDIT-%' THEN 'Weight adjustment · ' || COALESCE(NULLIF(s.lr_number, ''), NULLIF(s.master_awb, ''), NULLIF(s.pss_reference, ''), 'reference pending')
+               WHEN w.reference LIKE 'PRICING-OVERRIDE-%' THEN 'Pricing adjustment'
+               ELSE w.reference
+             END AS reference,
+             w.status, w.created_at`
+          : collection.table === "return_shipments" && !internalCollectionView
           ? "r.id, r.client_id, r.reason, r.status, r.created_at, r.updated_at, s.pss_reference AS shipment_pss_reference, s.lr_number, s.master_awb, s.tracking_number"
           : collection.table === "ndr_cases" && !internalCollectionView
             ? "c.id, c.client_id, c.reason, c.attempt, c.deadline, c.status, c.notes, c.created_at, c.updated_at, s.pss_reference AS shipment_pss_reference, s.lr_number, s.master_awb, s.tracking_number"
@@ -6101,9 +6112,11 @@ const worker = {
               : "*";
         const unlimitedCollection = ["ndr_cases", "exception_cases", "return_shipments"].includes(collection.table);
         const collectionLimit = unlimitedCollection ? "" : " LIMIT 100";
-        const source = collection.table === "return_shipments" && !internalCollectionView ? "return_shipments r LEFT JOIN shipments s ON s.id = r.shipment_id" : clientCaseView ? `${collection.table} c LEFT JOIN shipments s ON s.id = c.shipment_id` : collection.table;
-        const scopeColumn = collection.table === "return_shipments" && !internalCollectionView ? "r.client_id" : clientCaseView ? "c.client_id" : "client_id";
-        const orderColumn = collection.table === "return_shipments" && !internalCollectionView ? collection.order.replaceAll("updated_at", "r.updated_at") : clientCaseView ? collection.order.replaceAll("updated_at", "c.updated_at") : collection.order;
+        const source = collection.table === "wallet_transactions" && !internalCollectionView
+          ? "wallet_transactions w LEFT JOIN shipments s ON s.id = CASE WHEN w.reference LIKE 'SHIPMENT-%' OR w.reference LIKE 'REVERSAL-%' THEN substr(w.reference, 10) WHEN w.reference LIKE 'WEIGHT-DEBIT-%' THEN substr(w.reference, 14) WHEN w.reference LIKE 'WEIGHT-CREDIT-%' THEN substr(w.reference, 15) ELSE '' END"
+          : collection.table === "return_shipments" && !internalCollectionView ? "return_shipments r LEFT JOIN shipments s ON s.id = r.shipment_id" : clientCaseView ? `${collection.table} c LEFT JOIN shipments s ON s.id = c.shipment_id` : collection.table;
+        const scopeColumn = collection.table === "wallet_transactions" && !internalCollectionView ? "w.client_id" : collection.table === "return_shipments" && !internalCollectionView ? "r.client_id" : clientCaseView ? "c.client_id" : "client_id";
+        const orderColumn = collection.table === "wallet_transactions" && !internalCollectionView ? collection.order.replaceAll("created_at", "w.created_at") : collection.table === "return_shipments" && !internalCollectionView ? collection.order.replaceAll("updated_at", "r.updated_at") : clientCaseView ? collection.order.replaceAll("updated_at", "c.updated_at") : collection.order;
         const rows = auth.system ? await env.DB.prepare(`SELECT ${select} FROM ${source} ORDER BY ${orderColumn}${collectionLimit}`).all() : auth.clientIds.size ? await env.DB.prepare(`SELECT ${select} FROM ${source} WHERE ${scopeColumn} IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY ${orderColumn}${collectionLimit}`).bind(...auth.clientIds).all() : { results: [] };
         return json({ ok: true, data: rows.results }, 200, headers);
       }
