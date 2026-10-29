@@ -10,6 +10,7 @@ const checks = [
   ["internal roles retain classified records", /auth\.roles\.has\("client"\) && !hasRole\(auth, \["employee", "admin", "super_admin"\]\)/],
   ["shipment rows use the visibility predicate", /const shipmentVisibility = testDataVisibilityClause\(auth, "s"\)[\s\S]*const clientWhere = \[[\s\S]*shipmentVisibility/],
   ["shipment status counts use the visibility predicate", /const shipmentVisibilityNoAlias = testDataVisibilityClause\(auth\)[\s\S]*const statusRows =/],
+  ["shipment pagination totals use the visibility predicate", /const totalWhere = \[statusPredicate, shipmentVisibility\]\.filter\(Boolean\)\.join\(" AND "\)/],
   ["status-count cache separates client and internal views", /hidesClientTestData\(auth\) \? "client-visible" : "internal"/],
   ["dashboard overview applies related-shipment visibility", /const addOverview = \(key: string, scope: string, sql: string, extra: string, visibilityTable = ""\)/],
   ["dashboard summary collections apply related-shipment visibility", /const visibility = relatedShipmentVisibilityClause\(auth, table\)/],

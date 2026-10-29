@@ -4814,7 +4814,7 @@ const worker = {
         // `delayed` is a derived, due-date view and can overlap a raw status
         // such as booked. Never derive the pagination total by summing the
         // tabs, otherwise a delayed shipment is counted twice.
-        const totalWhere = statusPredicate;
+        const totalWhere = [statusPredicate, shipmentVisibility].filter(Boolean).join(" AND ");
         const totalRow = auth.system
           ? await env.DB.prepare(`SELECT COUNT(*) AS count FROM shipments s${totalWhere ? ` WHERE ${totalWhere}` : ""}`).first<{ count: number }>()
           : auth.clientIds.size
