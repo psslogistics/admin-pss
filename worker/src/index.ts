@@ -6175,10 +6175,13 @@ const worker = {
           return match ? { category: match[1], shipmentId: match[2] } : null;
         };
         const shipmentIds = [...new Set(transactions.results.map((row) => referenceParts(row.reference)?.shipmentId).filter((value): value is string => Boolean(value)))];
-        const shipmentRows = shipmentIds.length
-          ? await env.DB.prepare(`SELECT id, pss_reference, lr_number, master_awb, tracking_number, is_test FROM shipments WHERE id IN (${shipmentIds.map(() => "?").join(",")}) AND client_id IN (${clientIds.map(() => "?").join(",")})`).bind(...shipmentIds, ...clientIds).all<Record<string, unknown>>()
-          : { results: [] as Record<string, unknown>[] };
-        const shipmentById = new Map(shipmentRows.results.map((row) => [String(row.id), row]));
+        const shipmentRows: Record<string, unknown>[] = [];
+        for (let offset = 0; offset < shipmentIds.length; offset += 40) {
+          const chunk = shipmentIds.slice(offset, offset + 40);
+          const result = await env.DB.prepare(`SELECT id, pss_reference, lr_number, master_awb, tracking_number, is_test FROM shipments WHERE id IN (${chunk.map(() => "?").join(",")}) AND client_id IN (${clientIds.map(() => "?").join(",")})`).bind(...chunk, ...clientIds).all<Record<string, unknown>>();
+          shipmentRows.push(...result.results);
+        }
+        const shipmentById = new Map(shipmentRows.map((row) => [String(row.id), row]));
         const data = transactions.results.filter((row) => {
           const linked = referenceParts(row.reference)?.shipmentId;
           return !linked || !shipmentById.get(linked)?.is_test;
