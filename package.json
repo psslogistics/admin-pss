@@ -20,7 +20,8 @@
     "test:billing": "node worker/tools/billing-contract-acceptance.mjs",
     "test:client-report": "node worker/tools/client-report-contract-acceptance.mjs",
     "test:warehouse": "node worker/tools/exact-warehouse-contract-acceptance.mjs && node --experimental-strip-types worker/tools/exact-warehouse-flow-matrix.mjs",
-    "test:test-data": "node worker/tools/test-data-visibility-acceptance.mjs"
+    "test:test-data": "node worker/tools/test-data-visibility-acceptance.mjs",
+    "test:notifications": "node worker/tools/notification-preference-acceptance.mjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.7.0",

@@ -309,6 +309,24 @@ function canAccessClient(auth: Auth, clientId: string) { return auth.system || a
 function hidesClientTestData(auth: Auth) {
   return !auth.system && (auth.kind === "api" || auth.audience === "client" || (auth.roles.has("client") && !hasRole(auth, ["employee", "admin", "super_admin"])));
 }
+const clientNotificationPreferences: Record<string, string> = { shipments: "Shipments", operations: "Operations", finance: "Billing", support: "Support" };
+async function clientNotificationCategoryFilter(env: Env, auth: Auth): Promise<{ sql: string; params: string[] }> {
+  if (auth.system || auth.audience !== "client" || !auth.clientIds.size) return { sql: "", params: [] };
+  const clientIds = [...auth.clientIds];
+  const rows = await env.DB.prepare(`SELECT preferences_json FROM client_preferences WHERE client_id IN (${clientIds.map(() => "?").join(",")})`).bind(...clientIds).all<{ preferences_json: string }>();
+  const disabled = new Set<string>();
+  for (const row of rows.results ?? []) {
+    try {
+      const preferences = JSON.parse(row.preferences_json) as { notifications?: Record<string, unknown> };
+      for (const [key, category] of Object.entries(clientNotificationPreferences)) if (preferences.notifications?.[key] === false) disabled.add(category);
+    } catch {
+      // Malformed optional preferences must not hide client notifications.
+    }
+  }
+  if (!disabled.size) return { sql: "", params: [] };
+  const placeholders = [...disabled].map(() => "?").join(",");
+  return { sql: ` AND lower(category) NOT IN (${placeholders})`, params: [...disabled].map((category) => category.toLowerCase()) };
+}
 function testDataVisibilityClause(auth: Auth, tableAlias = "") {
   if (!hidesClientTestData(auth)) return "";
   const prefix = tableAlias ? `${tableAlias}.` : "";
@@ -5862,11 +5880,12 @@ const worker = {
           const shipmentStats = { total: Number(stats[0]?.results?.[0]?.total ?? 0), delayed: Number(stats[2]?.results?.[0]?.count ?? 0), statuses: {} as Record<string, number>, providers: {} as Record<string, number> };
           for (const row of stats[1]?.results ?? []) shipmentStats.statuses[String(row.status ?? "unknown")] = Number(row.count ?? 0);
           for (const row of stats[3]?.results ?? []) shipmentStats.providers[String(row.provider ?? "unknown")] = Number(row.count ?? 0);
+          const notificationFilter = hasScope(auth, "notifications.read") ? await clientNotificationCategoryFilter(env, auth) : { sql: "", params: [] };
           const notificationCount = hasScope(auth, "notifications.read")
             ? auth.system
               ? await env.DB.prepare("SELECT COUNT(*) AS count FROM notifications WHERE is_read = 0").first<{ count: number }>()
               : clientIds.length
-                ? await env.DB.prepare(`SELECT COUNT(*) AS count FROM notifications WHERE is_read = 0 AND (client_id IN (${clientPlaceholders}) OR recipient_user_id = ?)`).bind(...clientIds, auth.userId ?? "").first<{ count: number }>()
+                ? await env.DB.prepare(`SELECT COUNT(*) AS count FROM notifications WHERE is_read = 0 AND (client_id IN (${clientPlaceholders}) OR recipient_user_id = ?)${notificationFilter.sql}`).bind(...clientIds, auth.userId ?? "", ...notificationFilter.params).first<{ count: number }>()
                 : { count: 0 }
             : { count: 0 };
           const data = {
@@ -6071,7 +6090,7 @@ const worker = {
       }
 
       if (route === "/tickets" && request.method === "GET") { if (!hasScope(auth, "tickets.read")) return error("FORBIDDEN", "Ticket read permission required", 403, id, headers); await refreshTicketEscalations(env); const rows = auth.system ? await env.DB.prepare("SELECT * FROM support_tickets ORDER BY updated_at DESC LIMIT 100").all() : auth.clientIds.size ? await env.DB.prepare(`SELECT * FROM support_tickets WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")})${hidesClientTestData(auth) ? " AND NOT EXISTS (SELECT 1 FROM shipments test_shipment WHERE test_shipment.id = support_tickets.shipment_id AND test_shipment.is_test = 1)" : ""} ORDER BY updated_at DESC LIMIT 100`).bind(...auth.clientIds).all() : { results: [] }; return json({ ok: true, data: rows.results }, 200, headers); }
-      if (route === "/notifications" && request.method === "GET") { if (!hasScope(auth, "notifications.read")) return error("FORBIDDEN", "Notification read permission required", 403, id, headers); const rows = auth.system ? await env.DB.prepare("SELECT *, is_read, recipient_user_id FROM notifications ORDER BY created_at DESC LIMIT 100").all() : auth.clientIds.size ? await env.DB.prepare(`SELECT *, is_read, recipient_user_id FROM notifications WHERE (client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) OR recipient_user_id = ?)${hidesClientTestData(auth) ? " AND NOT EXISTS (SELECT 1 FROM shipments test_shipment WHERE test_shipment.id = notifications.shipment_id AND test_shipment.is_test = 1)" : ""} ORDER BY created_at DESC LIMIT 100`).bind(...auth.clientIds, auth.userId ?? "").all() : { results: [] }; return json({ ok: true, data: rows.results }, 200, headers); }
+      if (route === "/notifications" && request.method === "GET") { if (!hasScope(auth, "notifications.read")) return error("FORBIDDEN", "Notification read permission required", 403, id, headers); const notificationFilter = await clientNotificationCategoryFilter(env, auth); const visibility = hidesClientTestData(auth) ? " AND NOT EXISTS (SELECT 1 FROM shipments test_shipment WHERE test_shipment.id = notifications.shipment_id AND test_shipment.is_test = 1)" : ""; const rows = auth.system ? await env.DB.prepare("SELECT *, is_read, recipient_user_id FROM notifications ORDER BY created_at DESC LIMIT 100").all() : auth.clientIds.size ? await env.DB.prepare(`SELECT *, is_read, recipient_user_id FROM notifications WHERE (client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) OR recipient_user_id = ?)${visibility}${notificationFilter.sql} ORDER BY created_at DESC LIMIT 100`).bind(...auth.clientIds, auth.userId ?? "", ...notificationFilter.params).all() : { results: [] }; return json({ ok: true, data: rows.results }, 200, headers); }
       const collectionRoutes: Record<string, { table: string; scope: string; order: string }> = {
         "/tickets": { table: "support_tickets", scope: "tickets.read", order: "updated_at DESC" },
         "/notifications": { table: "notifications", scope: "notifications.read", order: "created_at DESC" },
