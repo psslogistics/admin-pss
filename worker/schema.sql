@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS shipments (
   provider_retry_at TEXT,
   provider_retry_count INTEGER NOT NULL DEFAULT 0,
   provider_last_error TEXT,
+  is_test INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -366,6 +367,7 @@ CREATE TABLE IF NOT EXISTS warehouses (
   provider_name TEXT,
   provider_error TEXT,
   provider_activated_at TEXT,
+  is_test INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -383,6 +385,7 @@ CREATE TABLE IF NOT EXISTS client_addresses (
   country TEXT NOT NULL DEFAULT 'India',
   pincode TEXT,
   status TEXT NOT NULL DEFAULT 'active',
+  is_test INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
