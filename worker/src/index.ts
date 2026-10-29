@@ -5528,8 +5528,15 @@ const worker = {
 
       if (route === "/pickups" && request.method === "GET") {
         if (!hasScope(auth, "pickups.read")) return error("FORBIDDEN", "Pickup read scope required", 403, id, headers);
-         const pickupColumns = "id, client_id, shipment_id, requested_date, requested_time_slot, pickup_address, contact_name, contact_phone, contact_email, city, state, pincode, country, pieces, total_weight_kg, status, assigned_to_user_id, notes, provider, provider_account_id, warehouse_id, provider_reference, provider_status, provider_picked_count, provider_expected_count, provider_status_synced_at, provider_status_detail, provider_request_id, provider_slot_id, provider_error_code, idempotency_key, failure_reason, created_at, updated_at, (SELECT COUNT(*) FROM pickup_request_shipments prs WHERE prs.pickup_id = pickup_requests.id) AS shipment_count";
-        const rows = auth.system ? await env.DB.prepare(`SELECT ${pickupColumns} FROM pickup_requests ORDER BY created_at DESC, id DESC LIMIT 200`).all() : auth.clientIds.size ? await env.DB.prepare(`SELECT ${pickupColumns} FROM pickup_requests WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY created_at DESC, id DESC LIMIT 200`).bind(...auth.clientIds).all() : { results: [] };
+        const pickupColumns = "id, client_id, shipment_id, requested_date, requested_time_slot, pickup_address, contact_name, contact_phone, contact_email, city, state, pincode, country, pieces, total_weight_kg, status, assigned_to_user_id, notes, provider, provider_account_id, warehouse_id, provider_reference, provider_status, provider_picked_count, provider_expected_count, provider_status_synced_at, provider_status_detail, provider_request_id, provider_slot_id, provider_error_code, idempotency_key, failure_reason, is_test, created_at, updated_at, (SELECT COUNT(*) FROM pickup_request_shipments prs WHERE prs.pickup_id = pickup_requests.id) AS shipment_count";
+        const pickupVisibility = hidesClientTestData(auth)
+          ? "COALESCE(pickup_requests.is_test, 0) = 0 AND NOT EXISTS (SELECT 1 FROM shipments test_shipment WHERE test_shipment.id = pickup_requests.shipment_id AND COALESCE(test_shipment.is_test, 0) = 1)"
+          : "";
+        const rows = auth.system
+          ? await env.DB.prepare(`SELECT ${pickupColumns} FROM pickup_requests${pickupVisibility ? ` WHERE ${pickupVisibility}` : ""} ORDER BY created_at DESC, id DESC LIMIT 200`).all()
+          : auth.clientIds.size
+            ? await env.DB.prepare(`SELECT ${pickupColumns} FROM pickup_requests WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")})${pickupVisibility ? ` AND ${pickupVisibility}` : ""} ORDER BY created_at DESC, id DESC LIMIT 200`).bind(...auth.clientIds).all()
+            : { results: [] };
         return json({ ok: true, data: rows.results }, 200, headers);
       }
 
@@ -6011,7 +6018,7 @@ const worker = {
           if (table === "ndr_cases") return "c.id, c.client_id, c.shipment_id, c.reason, c.attempt, c.deadline, c.status, c.notes, c.created_at, s.pss_reference AS shipment_pss_reference, s.lr_number, s.master_awb, s.tracking_number";
           if (table === "exception_cases") return "c.id, c.client_id, c.shipment_id, c.category, c.severity, c.title, c.details, c.status, c.created_at, s.pss_reference AS shipment_pss_reference, s.lr_number, s.master_awb, s.tracking_number";
           if (table === "weight_reconciliations") return "w.id, w.client_id, w.shipment_id, w.measured_weight_kg, w.billable_weight_kg, w.status, w.updated_at, w.created_at, s.pss_reference AS shipment_pss_reference, s.lr_number, s.master_awb, s.tracking_number";
-          if (table === "pickup_requests") return "p.id, p.client_id, p.provider_reference AS pickup_reference, p.requested_date, p.requested_time_slot, p.pickup_address, p.status, p.notes, p.created_at";
+          if (table === "pickup_requests") return "p.id, p.client_id, p.provider_reference AS pickup_reference, p.requested_date, p.requested_time_slot, p.pickup_address, p.contact_name, p.contact_phone, p.city, p.state, p.pincode, p.country, p.pieces, p.total_weight_kg, p.assigned_to_user_id, p.status, p.notes, p.is_test, p.created_at";
           return columnsByTable[table] ?? "*";
         };
         const scoped = (table: string) => {
@@ -6020,7 +6027,9 @@ const worker = {
           const clientColumn = table === "ndr_cases" || table === "exception_cases" ? "c.client_id" : table === "weight_reconciliations" ? "w.client_id" : table === "pickup_requests" ? "p.client_id" : "client_id";
           const createdColumn = table === "ndr_cases" || table === "exception_cases" ? "c.created_at" : table === "weight_reconciliations" ? "w.created_at" : table === "pickup_requests" ? "p.created_at" : "created_at";
           const sourceAlias = table === "ndr_cases" || table === "exception_cases" ? "c" : table === "weight_reconciliations" ? "w" : table === "pickup_requests" ? "p" : table;
-          const visibility = relatedShipmentVisibilityClause(auth, table, sourceAlias);
+          const visibilityParts = [relatedShipmentVisibilityClause(auth, table, sourceAlias)];
+          if (table === "pickup_requests" && hidesClientTestData(auth)) visibilityParts.push(testDataVisibilityClause(auth, "p"));
+          const visibility = visibilityParts.filter(Boolean).join(" AND ");
           return auth.system
             ? env.DB.prepare(`SELECT ${columns} FROM ${source}${visibility ? ` WHERE ${visibility}` : ""} ORDER BY ${createdColumn} DESC`)
             : clientIds.length

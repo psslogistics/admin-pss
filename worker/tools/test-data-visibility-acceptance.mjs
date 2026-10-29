@@ -16,7 +16,8 @@ const checks = [
   ["dashboard overview wallet excludes classified shipments", /addOverview\("wallet", "wallet\.read",[\s\S]*"wallet_transactions"\)/],
   ["dashboard summary collections apply related-shipment visibility", /const visibility = relatedShipmentVisibilityClause\(auth, table\)/],
   ["reports exclude classified shipments", /const reportShipmentVisibility = testDataVisibilityClause\(auth\)/],
-  ["complete reports exclude classified related records", /const sourceAlias = table === "ndr_cases"[\s\S]*const visibility = relatedShipmentVisibilityClause\(auth, table, sourceAlias\)/],
+  ["complete reports exclude classified related records", /const sourceAlias = table === "ndr_cases"[\s\S]*const visibilityParts = \[relatedShipmentVisibilityClause\(auth, table, sourceAlias\)\]/],
+  ["pickup collections exclude classified standalone pickups", /const pickupVisibility = hidesClientTestData\(auth\)[\s\S]*pickup_requests\.is_test/],
   ["warehouses and saved addresses exclude classified records", /const warehouseVisibility = testDataVisibilityClause\(auth\)[\s\S]*const addressVisibility = testDataVisibilityClause\(auth\)/],
   ["billing excludes classified shipment invoices", /COALESCE\(sh\.is_test, 0\) = 0/],
   ["wallet references are linked back to classified shipments", /table === "wallet_transactions"[\s\S]*REPLACE\(\$\{alias\}\.reference, 'SHIPMENT-'/],
@@ -29,7 +30,14 @@ const checks = [
   ["classification migration is present", /ALTER TABLE shipments ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0/],
   ["warehouse classification migration is present", /ALTER TABLE warehouses ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0/],
   ["saved-address classification migration is present", /ALTER TABLE client_addresses ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0/],
+  ["pickup classification migration is present", /ALTER TABLE pickup_requests ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0/],
 ];
 
-for (const [label, pattern] of checks) assert.match(label === "classification migration is present" || label === "warehouse classification migration is present" || label === "saved-address classification migration is present" ? migration : source, pattern, label);
+const migrationChecks = new Set([
+  "classification migration is present",
+  "warehouse classification migration is present",
+  "saved-address classification migration is present",
+  "pickup classification migration is present",
+]);
+for (const [label, pattern] of checks) assert.match(migrationChecks.has(label) ? migration : source, pattern, label);
 console.log(`Test-data visibility contract checks passed (${checks.length} checks).`);

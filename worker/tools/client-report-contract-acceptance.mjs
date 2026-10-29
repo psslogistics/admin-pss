@@ -9,7 +9,8 @@ const checks = [
   ["complete report keeps pickup contact fields", /pickup_requests:\s*"[^"]*contact_name, contact_phone, city, state, pincode, country/],
   ["complete report keeps pickup package fields", /pickup_requests:\s*"[^"]*pieces, total_weight_kg, assigned_to_user_id, status/],
   ["complete report keeps billing identity fields", /billing_records:\s*"[^"]*invoice_number, amount, currency, status, due_date/],
-  ["complete report still scopes rows through related visibility", /const visibility = relatedShipmentVisibilityClause\(auth, table, sourceAlias\)/],
+  ["complete report still scopes rows through related visibility", /const visibilityParts = \[relatedShipmentVisibilityClause\(auth, table, sourceAlias\)\]/],
+  ["complete report hides classified standalone pickups", /table === "pickup_requests" && hidesClientTestData\(auth\)[\s\S]*testDataVisibilityClause\(auth, "p"\)/],
 ];
 
 for (const [label, pattern] of checks) assert.match(source, pattern, label);
