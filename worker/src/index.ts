@@ -306,6 +306,21 @@ function normalizeProviderShipmentStatus(value: unknown) {
 }
 function hasRole(auth: Auth, roles: string[]) { return auth.system || roles.some((role) => auth.roles.has(role)); }
 function canAccessClient(auth: Auth, clientId: string) { return auth.system || auth.clientIds.has(clientId); }
+function hidesClientTestData(auth: Auth) {
+  return !auth.system && (auth.kind === "api" || auth.audience === "client" || (auth.roles.has("client") && !hasRole(auth, ["employee", "admin", "super_admin"])));
+}
+function testDataVisibilityClause(auth: Auth, tableAlias = "") {
+  if (!hidesClientTestData(auth)) return "";
+  const prefix = tableAlias ? `${tableAlias}.` : "";
+  return `COALESCE(${prefix}is_test, 0) = 0`;
+}
+function relatedShipmentVisibilityClause(auth: Auth, table: string, tableAlias = "") {
+  if (!hidesClientTestData(auth)) return "";
+  const alias = tableAlias || table;
+  if (table === "shipments") return `COALESCE(${alias}.is_test, 0) = 0`;
+  if (table === "wallet_transactions") return `NOT EXISTS (SELECT 1 FROM shipments test_shipment WHERE test_shipment.client_id = ${alias}.client_id AND (test_shipment.id = REPLACE(${alias}.reference, 'SHIPMENT-', '') OR test_shipment.id = REPLACE(${alias}.reference, 'REVERSAL-', '')) AND test_shipment.is_test = 1)`;
+  return `NOT EXISTS (SELECT 1 FROM shipments test_shipment WHERE test_shipment.id = ${alias}.shipment_id AND test_shipment.is_test = 1)`;
+}
 function providerAccountId(payload: Record<string, unknown>) {
   const value = payload.provider_account_id;
   return typeof value === "string" && value.trim() ? value.trim() : null;
@@ -4771,25 +4786,27 @@ const worker = {
         const trackingShipmentColumns = "s.id, s.pss_reference, s.client_id, s.tracking_number, s.lr_number, s.master_awb, s.box_awbs_json, s.provider_reference, s.provider_booking_id, s.provider_pickup_id, s.provider_sync_status, s.status, s.provider, s.origin, s.destination, s.origin_address_json, s.destination_address_json, s.consignee, s.total_weight_kg, s.weight_override_kg, s.weight_source, s.weight_updated_at, s.pieces, s.edd, s.delivered_at, s.created_at, s.updated_at, s.dimensions_json, (SELECT sd.id FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS pod_document_id, (SELECT sd.id FROM shipment_documents sd WHERE sd.shipment_id = s.id AND lower(sd.original_filename) NOT LIKE 'delhivery-pod-%' ORDER BY sd.created_at DESC LIMIT 1) AS invoice_document_id, (SELECT pr.provider_reference FROM pickup_requests pr WHERE (pr.shipment_id = s.id OR EXISTS (SELECT 1 FROM pickup_request_shipments prs WHERE prs.pickup_id = pr.id AND prs.shipment_id = s.id)) AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, (SELECT b.invoice_number FROM billing_records b WHERE b.shipment_id = s.id ORDER BY b.created_at DESC LIMIT 1) AS invoice_number";
         const selectedShipmentColumns = shipmentView === "tracking" || !internalShipmentView ? trackingShipmentColumns : shipmentColumns;
         const queryLimit = pageSize + 1;
-        const systemWhere = [statusPredicate, searchFilter].filter(Boolean).join(" AND ");
-        const clientWhere = [`s.client_id IN (${[...auth.clientIds].map(() => "?").join(",")})`, statusPredicate, searchFilter].filter(Boolean).join(" AND ");
+        const shipmentVisibility = testDataVisibilityClause(auth, "s");
+        const shipmentVisibilityNoAlias = testDataVisibilityClause(auth);
+        const systemWhere = [statusPredicate, searchFilter, shipmentVisibility].filter(Boolean).join(" AND ");
+        const clientWhere = [`s.client_id IN (${[...auth.clientIds].map(() => "?").join(",")})`, statusPredicate, searchFilter, shipmentVisibility].filter(Boolean).join(" AND ");
         const rows = auth.system
           ? await env.DB.prepare(`SELECT ${selectedShipmentColumns} FROM shipments s${systemWhere ? ` WHERE ${systemWhere}` : ""} ORDER BY s.created_at DESC LIMIT ${queryLimit} OFFSET ${offset}`).bind(...searchBinds).all()
           : auth.clientIds.size
             ? await env.DB.prepare(`SELECT ${selectedShipmentColumns} FROM shipments s WHERE ${clientWhere} ORDER BY s.created_at DESC LIMIT ${queryLimit} OFFSET ${offset}`).bind(...[...auth.clientIds, ...searchBinds]).all()
             : { results: [] };
-        const scopeKey = auth.system ? "system" : [...auth.clientIds].sort().join(",");
+        const scopeKey = `${auth.system ? "system" : [...auth.clientIds].sort().join(",")}:${hidesClientTestData(auth) ? "client-visible" : "internal"}`;
         const cachedStatusCounts = shipmentStatusCountsCache.get(scopeKey);
         let statusCounts: Record<string, number>;
         if (cachedStatusCounts && cachedStatusCounts.expiresAt > Date.now()) {
           statusCounts = cachedStatusCounts.counts;
         } else {
-          const statusRows = auth.system ? await env.DB.prepare("SELECT status, COUNT(*) AS count FROM shipments GROUP BY status").all<{ status: string | null; count: number }>() : auth.clientIds.size ? await env.DB.prepare(`SELECT status, COUNT(*) AS count FROM shipments WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) GROUP BY status`).bind(...[...auth.clientIds]).all<{ status: string | null; count: number }>() : { results: [] as Array<{ status: string | null; count: number }> };
+          const statusRows = auth.system ? await env.DB.prepare(`SELECT status, COUNT(*) AS count FROM shipments${shipmentVisibilityNoAlias ? ` WHERE ${shipmentVisibilityNoAlias}` : ""} GROUP BY status`).all<{ status: string | null; count: number }>() : auth.clientIds.size ? await env.DB.prepare(`SELECT status, COUNT(*) AS count FROM shipments WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")})${shipmentVisibilityNoAlias ? ` AND ${shipmentVisibilityNoAlias}` : ""} GROUP BY status`).bind(...[...auth.clientIds]).all<{ status: string | null; count: number }>() : { results: [] as Array<{ status: string | null; count: number }> };
           statusCounts = Object.fromEntries(statusRows.results.map((item) => [String(item.status ?? "unknown"), Number(item.count ?? 0)]));
           const delayedRow = auth.system
-            ? await env.DB.prepare("SELECT COUNT(*) AS count FROM shipments WHERE edd IS NOT NULL AND date(edd) < date('now') AND lower(COALESCE(status, '')) NOT IN ('delivered', 'cancelled', 'canceled', 'returned', 'rto')").first<{ count: number }>()
+            ? await env.DB.prepare(`SELECT COUNT(*) AS count FROM shipments${shipmentVisibilityNoAlias ? ` WHERE ${shipmentVisibilityNoAlias} AND` : " WHERE"} edd IS NOT NULL AND date(edd) < date('now') AND lower(COALESCE(status, '')) NOT IN ('delivered', 'cancelled', 'canceled', 'returned', 'rto')`).first<{ count: number }>()
             : auth.clientIds.size
-              ? await env.DB.prepare(`SELECT COUNT(*) AS count FROM shipments WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) AND edd IS NOT NULL AND date(edd) < date('now') AND lower(COALESCE(status, '')) NOT IN ('delivered', 'cancelled', 'canceled', 'returned', 'rto')`).bind(...[...auth.clientIds]).first<{ count: number }>()
+            ? await env.DB.prepare(`SELECT COUNT(*) AS count FROM shipments WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")})${shipmentVisibilityNoAlias ? ` AND ${shipmentVisibilityNoAlias}` : ""} AND edd IS NOT NULL AND date(edd) < date('now') AND lower(COALESCE(status, '')) NOT IN ('delivered', 'cancelled', 'canceled', 'returned', 'rto')`).bind(...[...auth.clientIds]).first<{ count: number }>()
               : { count: 0 };
           statusCounts.delayed = Number(delayedRow?.count ?? 0);
           shipmentStatusCountsCache.set(scopeKey, { expiresAt: Date.now() + SHIPMENT_STATUS_COUNTS_CACHE_TTL_MS, counts: statusCounts });
@@ -5322,7 +5339,8 @@ const worker = {
       const shipmentDocuments = route.match(/^\/shipments\/([^/]+)\/documents$/);
       if (shipmentDocuments && request.method === "GET") {
         if (!hasScope(auth, "documents.read")) return error("FORBIDDEN", "Document read scope required", 403, id, headers);
-        const shipment = await env.DB.prepare("SELECT client_id FROM shipments WHERE id = ? LIMIT 1").bind(shipmentDocuments[1]).first<{ client_id: string }>();
+        const documentShipmentVisibility = testDataVisibilityClause(auth);
+        const shipment = await env.DB.prepare(`SELECT client_id FROM shipments WHERE id = ?${documentShipmentVisibility ? ` AND ${documentShipmentVisibility}` : ""} LIMIT 1`).bind(shipmentDocuments[1]).first<{ client_id: string }>();
         if (!shipment || !canAccessClient(auth, shipment.client_id)) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
         const documents = await env.DB.prepare("SELECT id, shipment_id, original_filename, content_type, file_size_bytes, uploaded_by_user_id, created_at FROM shipment_documents WHERE shipment_id = ? ORDER BY created_at DESC").bind(shipmentDocuments[1]).all();
         return json({ ok: true, data: documents.results }, 200, headers);
@@ -5331,7 +5349,8 @@ const worker = {
       const shipmentArtifact = route.match(/^\/shipments\/([^/]+)\/(label|sticker|lr-copy|document)$/);
       if (shipmentArtifact && request.method === "GET") {
         if (!hasScope(auth, "tracking.read") && !hasScope(auth, "documents.read")) return error("FORBIDDEN", "Tracking or document read scope required", 403, id, headers);
-         let shipment = await env.DB.prepare("SELECT s.id, s.client_id, s.provider, s.pss_reference, s.lr_number, s.master_awb, s.tracking_number, s.provider_reference, s.provider_booking_id, s.provider_account_id, s.pieces, (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = s.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference FROM shipments s WHERE s.id = ? LIMIT 1").bind(shipmentArtifact[1]).first<{ id: string; client_id: string; provider: string | null; pss_reference: string | null; lr_number: string | null; master_awb: string | null; tracking_number: string | null; provider_reference: string | null; provider_booking_id: string | null; provider_account_id: string | null; pieces: number | null; pickup_reference: string | null }>();
+         const artifactVisibility = testDataVisibilityClause(auth, "s");
+         let shipment = await env.DB.prepare(`SELECT s.id, s.client_id, s.provider, s.pss_reference, s.lr_number, s.master_awb, s.tracking_number, s.provider_reference, s.provider_booking_id, s.provider_account_id, s.pieces, (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = s.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference FROM shipments s WHERE s.id = ?${artifactVisibility ? ` AND ${artifactVisibility}` : ""} LIMIT 1`).bind(shipmentArtifact[1]).first<{ id: string; client_id: string; provider: string | null; pss_reference: string | null; lr_number: string | null; master_awb: string | null; tracking_number: string | null; provider_reference: string | null; provider_booking_id: string | null; provider_account_id: string | null; pieces: number | null; pickup_reference: string | null }>();
         if (!shipment || !canAccessClient(auth, shipment.client_id)) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
         if (shipment.provider !== "delhivery") return error("UNSUPPORTED_PROVIDER_OPERATION", "Provider documents are currently available only for Delhivery", 409, id, headers);
         const url = new URL(request.url);
@@ -5348,7 +5367,7 @@ const worker = {
             provider_reference: shipment.provider_reference,
             provider_account_id: shipment.provider_account_id,
           }, id, shipment.client_id);
-          shipment = await env.DB.prepare("SELECT s.id, s.client_id, s.provider, s.pss_reference, s.lr_number, s.master_awb, s.tracking_number, s.provider_reference, s.provider_booking_id, s.provider_account_id, s.pieces, (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = s.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference FROM shipments s WHERE s.id = ? LIMIT 1").bind(shipmentArtifact[1]).first<typeof shipment>();
+          shipment = await env.DB.prepare(`SELECT s.id, s.client_id, s.provider, s.pss_reference, s.lr_number, s.master_awb, s.tracking_number, s.provider_reference, s.provider_booking_id, s.provider_account_id, s.pieces, (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = s.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference FROM shipments s WHERE s.id = ?${artifactVisibility ? ` AND ${artifactVisibility}` : ""} LIMIT 1`).bind(shipmentArtifact[1]).first<typeof shipment>();
         }
         if (!shipment) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
         // Delhivery's B2B label endpoint validates its path parameter as an
@@ -5404,7 +5423,8 @@ const worker = {
         if (!hasScope(auth, route.endsWith("/tracking") ? "tracking.read" : "shipments.read")) return error("FORBIDDEN", "Shipment read scope required", 403, id, headers);
         const internalShipmentView = hasRole(auth, ["employee", "admin", "super_admin"]) || auth.system;
         const sensitiveShipmentView = auth.system || hasScope(auth, "shipments.sensitive.read");
-        let shipment = await env.DB.prepare(`SELECT id, pss_reference, client_id, tracking_number, lr_number, master_awb, box_awbs_json, provider_booking_id, provider_pickup_id, provider_sync_status, status, provider, ${sensitiveShipmentView ? "provider_account_id, provider_reference," : "provider_reference,"} (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = shipments.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, (SELECT pr.status FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_status, (SELECT pr.requested_date FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_scheduled_date, (SELECT pr.requested_time_slot FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_time_slot, (SELECT c.provider_status FROM pricing_provider_costs c WHERE c.shipment_id = shipments.id LIMIT 1) AS provider_confirmation_status, description, origin, destination, ${sensitiveShipmentView ? "origin_address_json, destination_address_json, consignee, declared_value," : "NULL AS origin_address_json, NULL AS destination_address_json, NULL AS consignee, NULL AS declared_value,"} total_weight_kg, pieces, edd, delivered_at, created_at, updated_at FROM shipments WHERE (id = ? OR pss_reference = ?) LIMIT 1`).bind(shipmentGet[1], shipmentGet[1]).first<Record<string, unknown> & { client_id: string; provider: string | null; tracking_number: string | null; provider_reference?: string | null; provider_booking_id?: string | null; provider_account_id?: string | null; lr_number?: string | null; master_awb?: string | null }>();
+        const shipmentGetVisibility = testDataVisibilityClause(auth);
+        let shipment = await env.DB.prepare(`SELECT id, pss_reference, client_id, tracking_number, lr_number, master_awb, box_awbs_json, provider_booking_id, provider_pickup_id, provider_sync_status, status, provider, ${sensitiveShipmentView ? "provider_account_id, provider_reference," : "provider_reference,"} (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = shipments.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, (SELECT pr.status FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_status, (SELECT pr.requested_date FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_scheduled_date, (SELECT pr.requested_time_slot FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_time_slot, (SELECT c.provider_status FROM pricing_provider_costs c WHERE c.shipment_id = shipments.id LIMIT 1) AS provider_confirmation_status, description, origin, destination, ${sensitiveShipmentView ? "origin_address_json, destination_address_json, consignee, declared_value," : "NULL AS origin_address_json, NULL AS destination_address_json, NULL AS consignee, NULL AS declared_value,"} total_weight_kg, pieces, edd, delivered_at, created_at, updated_at FROM shipments WHERE (id = ? OR pss_reference = ?)${shipmentGetVisibility ? ` AND ${shipmentGetVisibility}` : ""} LIMIT 1`).bind(shipmentGet[1], shipmentGet[1]).first<Record<string, unknown> & { client_id: string; provider: string | null; tracking_number: string | null; provider_reference?: string | null; provider_booking_id?: string | null; provider_account_id?: string | null; lr_number?: string | null; master_awb?: string | null }>();
         if (shipment) {
           const weight = await env.DB.prepare("SELECT weight_override_kg, weight_source, weight_updated_at FROM shipments WHERE id = ? LIMIT 1").bind(String(shipment.id)).first<{ weight_override_kg: number | null; weight_source: string | null; weight_updated_at: string | null }>();
           shipment = { ...shipment, ...weight };
@@ -5415,7 +5435,7 @@ const worker = {
             ? shipment.provider_account_id
             : (await env.DB.prepare("SELECT provider_account_id FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(String(shipment.id), shipment.client_id).first<{ provider_account_id: string | null }>())?.provider_account_id ?? null;
           await safeProviderRequest(env, "delhivery", "shipment_status", { shipment_id: String(shipment.id), provider_booking_id: shipment.provider_booking_id, tracking_number: shipment.tracking_number, lr_number: shipment.lr_number, provider_reference: shipment.provider_reference, provider_account_id: refreshProviderAccountId }, id, shipment.client_id);
-          shipment = await env.DB.prepare(`SELECT id, pss_reference, client_id, tracking_number, lr_number, master_awb, box_awbs_json, provider_booking_id, provider_pickup_id, provider_sync_status, status, provider, ${sensitiveShipmentView ? "provider_account_id, provider_reference," : "provider_reference,"} (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = shipments.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, (SELECT pr.status FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_status, (SELECT pr.requested_date FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_scheduled_date, (SELECT pr.requested_time_slot FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_time_slot, (SELECT c.provider_status FROM pricing_provider_costs c WHERE c.shipment_id = shipments.id LIMIT 1) AS provider_confirmation_status, description, origin, destination, ${sensitiveShipmentView ? "origin_address_json, destination_address_json, consignee, declared_value," : "NULL AS origin_address_json, NULL AS destination_address_json, NULL AS consignee, NULL AS declared_value,"} total_weight_kg, pieces, edd, delivered_at, created_at, updated_at FROM shipments WHERE id = ? LIMIT 1`).bind(shipment.id).first<typeof shipment>() ?? shipment;
+          shipment = await env.DB.prepare(`SELECT id, pss_reference, client_id, tracking_number, lr_number, master_awb, box_awbs_json, provider_booking_id, provider_pickup_id, provider_sync_status, status, provider, ${sensitiveShipmentView ? "provider_account_id, provider_reference," : "provider_reference,"} (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = shipments.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, (SELECT pr.status FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_status, (SELECT pr.requested_date FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_scheduled_date, (SELECT pr.requested_time_slot FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_time_slot, (SELECT c.provider_status FROM pricing_provider_costs c WHERE c.shipment_id = shipments.id LIMIT 1) AS provider_confirmation_status, description, origin, destination, ${sensitiveShipmentView ? "origin_address_json, destination_address_json, consignee, declared_value," : "NULL AS origin_address_json, NULL AS destination_address_json, NULL AS consignee, NULL AS declared_value,"} total_weight_kg, pieces, edd, delivered_at, created_at, updated_at FROM shipments WHERE id = ?${shipmentGetVisibility ? ` AND ${shipmentGetVisibility}` : ""} LIMIT 1`).bind(shipment.id).first<typeof shipment>() ?? shipment;
         }
         if (shipment) {
           const weight = await env.DB.prepare("SELECT weight_override_kg, weight_source, weight_updated_at FROM shipments WHERE id = ? LIMIT 1").bind(String(shipment.id)).first<{ weight_override_kg: number | null; weight_source: string | null; weight_updated_at: string | null }>();
@@ -5732,7 +5752,8 @@ const worker = {
       const documentMatch = route.match(/^\/documents\/([^/]+)$/);
       if (documentMatch && request.method === "GET") {
         if (!hasScope(auth, "documents.read")) return error("FORBIDDEN", "Document read scope required", 403, id, headers);
-        const row = await env.DB.prepare("SELECT object_key, client_id, content_type FROM shipment_documents WHERE id = ? LIMIT 1").bind(documentMatch[1]).first<{ object_key: string; client_id: string; content_type: string }>();
+        const documentVisibility = hidesClientTestData(auth) ? " AND COALESCE(s.is_test, 0) = 0" : "";
+        const row = await env.DB.prepare(`SELECT d.object_key, d.client_id, d.content_type FROM shipment_documents d LEFT JOIN shipments s ON s.id = d.shipment_id WHERE d.id = ?${documentVisibility} LIMIT 1`).bind(documentMatch[1]).first<{ object_key: string; client_id: string; content_type: string }>();
         if (!row || !canAccessClient(auth, row.client_id)) return error("NOT_FOUND", "Document not found", 404, id, headers);
         const object = await env.FILES.get(row.object_key); if (!object) return error("NOT_FOUND", "Document not found", 404, id, headers);
         return new Response(object.body, { headers: withCors(request, env, { "content-type": object.httpMetadata?.contentType ?? row.content_type, "cache-control": "private, no-store", "content-disposition": "attachment" }) });
@@ -5756,21 +5777,22 @@ const worker = {
             : clientIds.length
               ? ` WHERE client_id IN (${clientPlaceholders})${extra ? ` AND ${extra}` : ""}`
               : " WHERE 1 = 0";
-          const scoped = (sql: string, extra = "") => {
-            const statement = env.DB.prepare(`${sql}${scopedWhere(extra)}`);
+          const scoped = (sql: string, extra = "", visibilityTable = "") => {
+            const visibility = visibilityTable ? relatedShipmentVisibilityClause(auth, visibilityTable) : "";
+            const statement = env.DB.prepare(`${sql}${scopedWhere([extra, visibility].filter(Boolean).join(" AND "))}`);
             return auth.system || !clientIds.length ? statement : statement.bind(...clientIds);
           };
           const overviewEntries: Array<{ key: string; statement: ReturnType<typeof env.DB.prepare> }> = [];
-          const addOverview = (key: string, scope: string, sql: string, extra: string) => {
-            if (hasScope(auth, scope)) overviewEntries.push({ key, statement: scoped(sql, extra) });
+          const addOverview = (key: string, scope: string, sql: string, extra: string, visibilityTable = "") => {
+            if (hasScope(auth, scope)) overviewEntries.push({ key, statement: scoped(sql, extra, visibilityTable) });
           };
-          addOverview("shipments", "shipments.read", "SELECT id, client_id, pss_reference, lr_number, master_awb, tracking_number, provider, provider_reference, status, origin, destination, total_weight_kg, pieces, edd, delivered_at, created_at FROM shipments", "edd IS NOT NULL AND (date(edd) < date('now') OR (delivered_at IS NOT NULL AND date(delivered_at) > date(edd))) AND lower(COALESCE(status, '')) NOT IN ('delivered', 'cancelled') ORDER BY edd ASC LIMIT 20");
-          addOverview("pickups", "pickups.read", "SELECT id, shipment_id, client_id, (SELECT pss_reference FROM shipments WHERE id = pickup_requests.shipment_id) AS shipment_pss_reference, provider_reference AS pickup_reference, requested_date, requested_time_slot, pickup_address, status, created_at, updated_at FROM pickup_requests", "lower(COALESCE(status, '')) NOT IN ('completed', 'cancelled') ORDER BY requested_date ASC LIMIT 100");
-          addOverview("billing", "billing.read", "SELECT id, client_id, shipment_id, (SELECT pss_reference FROM shipments WHERE id = billing_records.shipment_id) AS shipment_pss_reference, invoice_number, amount, currency, status, due_date, created_at FROM billing_records", "lower(COALESCE(status, '')) = 'pending' ORDER BY created_at DESC LIMIT 100");
+          addOverview("shipments", "shipments.read", "SELECT id, client_id, pss_reference, lr_number, master_awb, tracking_number, provider, provider_reference, status, origin, destination, total_weight_kg, pieces, edd, delivered_at, created_at FROM shipments", "edd IS NOT NULL AND (date(edd) < date('now') OR (delivered_at IS NOT NULL AND date(delivered_at) > date(edd))) AND lower(COALESCE(status, '')) NOT IN ('delivered', 'cancelled') ORDER BY edd ASC LIMIT 20", "shipments");
+          addOverview("pickups", "pickups.read", "SELECT id, shipment_id, client_id, (SELECT pss_reference FROM shipments WHERE id = pickup_requests.shipment_id) AS shipment_pss_reference, provider_reference AS pickup_reference, requested_date, requested_time_slot, pickup_address, status, created_at, updated_at FROM pickup_requests", "lower(COALESCE(status, '')) NOT IN ('completed', 'cancelled') ORDER BY requested_date ASC LIMIT 100", "pickup_requests");
+          addOverview("billing", "billing.read", "SELECT id, client_id, shipment_id, (SELECT pss_reference FROM shipments WHERE id = billing_records.shipment_id) AS shipment_pss_reference, invoice_number, amount, currency, status, due_date, created_at FROM billing_records", "lower(COALESCE(status, '')) = 'pending' ORDER BY created_at DESC LIMIT 100", "billing_records");
           addOverview("wallet", "wallet.read", "SELECT id, client_id, type, amount, balance_after, reference, status, created_at FROM wallet_transactions", "1 = 1 ORDER BY created_at DESC LIMIT 1");
-          addOverview("exceptions", "cases.read", "SELECT id, shipment_id, client_id, (SELECT pss_reference FROM shipments WHERE id = exception_cases.shipment_id) AS shipment_pss_reference, (SELECT lr_number FROM shipments WHERE id = exception_cases.shipment_id) AS lr_number, (SELECT master_awb FROM shipments WHERE id = exception_cases.shipment_id) AS master_awb, category, severity, title, details, status, assigned_to_user_id, created_at, updated_at FROM exception_cases", "lower(COALESCE(status, '')) NOT IN ('resolved', 'closed') ORDER BY updated_at DESC LIMIT 8");
-          addOverview("ndr", "cases.read", "SELECT id, shipment_id, client_id, (SELECT pss_reference FROM shipments WHERE id = ndr_cases.shipment_id) AS shipment_pss_reference, (SELECT lr_number FROM shipments WHERE id = ndr_cases.shipment_id) AS lr_number, (SELECT master_awb FROM shipments WHERE id = ndr_cases.shipment_id) AS master_awb, reason, attempt, deadline, status, assigned_to_user_id, created_at, updated_at FROM ndr_cases", "lower(COALESCE(status, '')) NOT IN ('resolved', 'closed', 'delivered', 'cancelled') ORDER BY updated_at DESC LIMIT 8");
-          addOverview("activity", "activity.read", "SELECT id, actor_user_id, client_id, shipment_id, (SELECT pss_reference FROM shipments WHERE id = activity_events.shipment_id) AS shipment_pss_reference, (SELECT lr_number FROM shipments WHERE id = activity_events.shipment_id) AS lr_number, (SELECT master_awb FROM shipments WHERE id = activity_events.shipment_id) AS master_awb, action, entity_type, entity_id, created_at FROM activity_events", "1 = 1 ORDER BY created_at DESC LIMIT 12");
+          addOverview("exceptions", "cases.read", "SELECT id, shipment_id, client_id, (SELECT pss_reference FROM shipments WHERE id = exception_cases.shipment_id) AS shipment_pss_reference, (SELECT lr_number FROM shipments WHERE id = exception_cases.shipment_id) AS lr_number, (SELECT master_awb FROM shipments WHERE id = exception_cases.shipment_id) AS master_awb, category, severity, title, details, status, assigned_to_user_id, created_at, updated_at FROM exception_cases", "lower(COALESCE(status, '')) NOT IN ('resolved', 'closed') ORDER BY updated_at DESC LIMIT 8", "exception_cases");
+          addOverview("ndr", "cases.read", "SELECT id, shipment_id, client_id, (SELECT pss_reference FROM shipments WHERE id = ndr_cases.shipment_id) AS shipment_pss_reference, (SELECT lr_number FROM shipments WHERE id = ndr_cases.shipment_id) AS lr_number, (SELECT master_awb FROM shipments WHERE id = ndr_cases.shipment_id) AS master_awb, reason, attempt, deadline, status, assigned_to_user_id, created_at, updated_at FROM ndr_cases", "lower(COALESCE(status, '')) NOT IN ('resolved', 'closed', 'delivered', 'cancelled') ORDER BY updated_at DESC LIMIT 8", "ndr_cases");
+          addOverview("activity", "activity.read", "SELECT id, actor_user_id, client_id, shipment_id, (SELECT pss_reference FROM shipments WHERE id = activity_events.shipment_id) AS shipment_pss_reference, (SELECT lr_number FROM shipments WHERE id = activity_events.shipment_id) AS lr_number, (SELECT master_awb FROM shipments WHERE id = activity_events.shipment_id) AS master_awb, action, entity_type, entity_id, created_at FROM activity_events", "1 = 1 ORDER BY created_at DESC LIMIT 12", "activity_events");
           const overviewResults = overviewEntries.length ? await env.DB.batch<Record<string, unknown>>(overviewEntries.map(({ statement }) => statement)) : [];
           const overviewRowsFor = (key: string) => {
             const index = overviewEntries.findIndex((entry) => entry.key === key);
@@ -5783,7 +5805,8 @@ const worker = {
           const exceptions = overviewRowsFor("exceptions");
           const ndr = overviewRowsFor("ndr");
           const activity = overviewRowsFor("activity");
-          const shipmentScope = auth.system ? "" : clientIds.length ? ` WHERE client_id IN (${clientPlaceholders})` : " WHERE 1 = 0";
+          const shipmentVisibilityNoAlias = testDataVisibilityClause(auth);
+          const shipmentScope = auth.system ? "" : clientIds.length ? ` WHERE client_id IN (${clientPlaceholders})${shipmentVisibilityNoAlias ? ` AND ${shipmentVisibilityNoAlias}` : ""}` : " WHERE 1 = 0";
           const shipmentParams = auth.system ? [] : clientIds;
           const stats = hasScope(auth, "shipments.read") ? await env.DB.batch<Record<string, unknown>>([
             env.DB.prepare(`SELECT COUNT(*) AS total FROM shipments${shipmentScope}`).bind(...shipmentParams),
@@ -5842,7 +5865,8 @@ const worker = {
           }
           if (!auth.clientIds.size) return;
           const placeholders = [...auth.clientIds].map(() => "?").join(",");
-          entries.push({ key, statement: env.DB.prepare(`SELECT ${columns} FROM ${table} WHERE client_id IN (${placeholders}) ORDER BY ${order}${collectionLimit}`).bind(...auth.clientIds) });
+          const visibility = relatedShipmentVisibilityClause(auth, table);
+          entries.push({ key, statement: env.DB.prepare(`SELECT ${columns} FROM ${table} WHERE client_id IN (${placeholders})${visibility ? ` AND ${visibility}` : ""} ORDER BY ${order}${collectionLimit}`).bind(...auth.clientIds) });
         };
         addCollection("shipments", "shipments", "created_at DESC", "shipments.read");
         addCollection("pickups", "pickup_requests", "requested_date DESC", "pickups.read");
@@ -5881,7 +5905,8 @@ const worker = {
         const preferences = rowsFor("preferences")[0] ?? null;
         const shipmentStats = { total: 0, delayed: 0, statuses: {} as Record<string, number>, providers: {} as Record<string, number> };
         if (hasScope(auth, "shipments.read")) {
-          const shipmentScope = auth.system ? "" : auth.clientIds.size ? ` WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")})` : " WHERE 1 = 0";
+          const shipmentVisibilityNoAlias = testDataVisibilityClause(auth);
+          const shipmentScope = auth.system ? "" : auth.clientIds.size ? ` WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")})${shipmentVisibilityNoAlias ? ` AND ${shipmentVisibilityNoAlias}` : ""}` : " WHERE 1 = 0";
           const shipmentParams = auth.system ? [] : [...auth.clientIds];
           const stats = await env.DB.batch<Record<string, unknown>>([
             env.DB.prepare(`SELECT COUNT(*) AS total FROM shipments${shipmentScope}`).bind(...shipmentParams),
@@ -5916,17 +5941,18 @@ const worker = {
 
       if (route === "/reports/shipments" && request.method === "GET") {
         if (!hasScope(auth, "reports.read")) return error("FORBIDDEN", "Report read scope required", 403, id, headers);
-        const summarySql = "SELECT status, COUNT(*) AS shipments, SUM(CASE WHEN edd IS NOT NULL AND date(COALESCE(delivered_at, CURRENT_TIMESTAMP)) > date(edd) THEN 1 ELSE 0 END) AS delayed FROM shipments";
-        const detailSql = "SELECT id, client_id, tracking_number, status, edd, delivered_at, CASE WHEN edd IS NULL THEN 0 ELSE MAX(0, CAST(julianday(date(COALESCE(delivered_at, CURRENT_TIMESTAMP))) - julianday(date(edd)) AS INTEGER)) END AS delay_days FROM shipments";
+        const reportShipmentVisibility = testDataVisibilityClause(auth);
+        const summarySql = `SELECT status, COUNT(*) AS shipments, SUM(CASE WHEN edd IS NOT NULL AND date(COALESCE(delivered_at, CURRENT_TIMESTAMP)) > date(edd) THEN 1 ELSE 0 END) AS delayed FROM shipments${reportShipmentVisibility ? ` WHERE ${reportShipmentVisibility}` : ""}`;
+        const detailSql = `SELECT id, client_id, tracking_number, status, edd, delivered_at, CASE WHEN edd IS NULL THEN 0 ELSE MAX(0, CAST(julianday(date(COALESCE(delivered_at, CURRENT_TIMESTAMP))) - julianday(date(edd)) AS INTEGER)) END AS delay_days FROM shipments${reportShipmentVisibility ? ` WHERE ${reportShipmentVisibility}` : ""}`;
         const summary = auth.system
           ? await env.DB.prepare(`${summarySql} GROUP BY status ORDER BY status`).all()
           : auth.clientIds.size
-            ? await env.DB.prepare(`${summarySql} WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) GROUP BY status ORDER BY status`).bind(...auth.clientIds).all()
+            ? await env.DB.prepare(`${summarySql}${reportShipmentVisibility ? " AND" : " WHERE"} client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) GROUP BY status ORDER BY status`).bind(...auth.clientIds).all()
             : { results: [] };
         const details = auth.system
           ? await env.DB.prepare(`${detailSql} ORDER BY created_at DESC`).all()
           : auth.clientIds.size
-            ? await env.DB.prepare(`${detailSql} WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY created_at DESC`).bind(...auth.clientIds).all()
+            ? await env.DB.prepare(`${detailSql}${reportShipmentVisibility ? " AND" : " WHERE"} client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY created_at DESC`).bind(...auth.clientIds).all()
             : { results: [] };
         return json({ ok: true, data: summary.results, details: details.results }, 200, headers);
       }
@@ -5956,10 +5982,12 @@ const worker = {
           const source = table === "ndr_cases" || table === "exception_cases" ? `${table} c LEFT JOIN shipments s ON s.id = c.shipment_id` : table === "weight_reconciliations" ? `${table} w LEFT JOIN shipments s ON s.id = w.shipment_id` : table === "pickup_requests" ? `${table} p` : table;
           const clientColumn = table === "ndr_cases" || table === "exception_cases" ? "c.client_id" : table === "weight_reconciliations" ? "w.client_id" : table === "pickup_requests" ? "p.client_id" : "client_id";
           const createdColumn = table === "ndr_cases" || table === "exception_cases" ? "c.created_at" : table === "weight_reconciliations" ? "w.created_at" : table === "pickup_requests" ? "p.created_at" : "created_at";
+          const sourceAlias = table === "ndr_cases" || table === "exception_cases" ? "c" : table === "weight_reconciliations" ? "w" : table === "pickup_requests" ? "p" : table;
+          const visibility = relatedShipmentVisibilityClause(auth, table, sourceAlias);
           return auth.system
-            ? env.DB.prepare(`SELECT ${columns} FROM ${source} ORDER BY ${createdColumn} DESC`)
+            ? env.DB.prepare(`SELECT ${columns} FROM ${source}${visibility ? ` WHERE ${visibility}` : ""} ORDER BY ${createdColumn} DESC`)
             : clientIds.length
-              ? env.DB.prepare(`SELECT ${columns} FROM ${source} WHERE ${clientColumn} IN (${clientIds.map(() => "?").join(",")}) ORDER BY ${createdColumn} DESC`).bind(...clientIds)
+              ? env.DB.prepare(`SELECT ${columns} FROM ${source} WHERE ${clientColumn} IN (${clientIds.map(() => "?").join(",")})${visibility ? ` AND ${visibility}` : ""} ORDER BY ${createdColumn} DESC`).bind(...clientIds)
               : null;
         };
         const entries: Array<{ key: string; statement: ReturnType<typeof env.DB.prepare> }> = [];
@@ -5991,8 +6019,8 @@ const worker = {
         return json({ ok: true, data: { shipments, pickups: rowsFor("pickups"), billing: rowsFor("billing"), ndr: rowsFor("ndr"), exceptions: rowsFor("exceptions"), weights: rowsFor("weights"), shipment_report: { details } }, request_id: id }, 200, headers);
       }
 
-      if (route === "/tickets" && request.method === "GET") { if (!hasScope(auth, "tickets.read")) return error("FORBIDDEN", "Ticket read permission required", 403, id, headers); await refreshTicketEscalations(env); const rows = auth.system ? await env.DB.prepare("SELECT * FROM support_tickets ORDER BY updated_at DESC LIMIT 100").all() : auth.clientIds.size ? await env.DB.prepare(`SELECT * FROM support_tickets WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY updated_at DESC LIMIT 100`).bind(...auth.clientIds).all() : { results: [] }; return json({ ok: true, data: rows.results }, 200, headers); }
-      if (route === "/notifications" && request.method === "GET") { if (!hasScope(auth, "notifications.read")) return error("FORBIDDEN", "Notification read permission required", 403, id, headers); const rows = auth.system ? await env.DB.prepare("SELECT *, is_read, recipient_user_id FROM notifications ORDER BY created_at DESC LIMIT 100").all() : auth.clientIds.size ? await env.DB.prepare(`SELECT *, is_read, recipient_user_id FROM notifications WHERE (client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) OR recipient_user_id = ?) ORDER BY created_at DESC LIMIT 100`).bind(...auth.clientIds, auth.userId ?? "").all() : { results: [] }; return json({ ok: true, data: rows.results }, 200, headers); }
+      if (route === "/tickets" && request.method === "GET") { if (!hasScope(auth, "tickets.read")) return error("FORBIDDEN", "Ticket read permission required", 403, id, headers); await refreshTicketEscalations(env); const rows = auth.system ? await env.DB.prepare("SELECT * FROM support_tickets ORDER BY updated_at DESC LIMIT 100").all() : auth.clientIds.size ? await env.DB.prepare(`SELECT * FROM support_tickets WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")})${hidesClientTestData(auth) ? " AND NOT EXISTS (SELECT 1 FROM shipments test_shipment WHERE test_shipment.id = support_tickets.shipment_id AND test_shipment.is_test = 1)" : ""} ORDER BY updated_at DESC LIMIT 100`).bind(...auth.clientIds).all() : { results: [] }; return json({ ok: true, data: rows.results }, 200, headers); }
+      if (route === "/notifications" && request.method === "GET") { if (!hasScope(auth, "notifications.read")) return error("FORBIDDEN", "Notification read permission required", 403, id, headers); const rows = auth.system ? await env.DB.prepare("SELECT *, is_read, recipient_user_id FROM notifications ORDER BY created_at DESC LIMIT 100").all() : auth.clientIds.size ? await env.DB.prepare(`SELECT *, is_read, recipient_user_id FROM notifications WHERE (client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) OR recipient_user_id = ?)${hidesClientTestData(auth) ? " AND NOT EXISTS (SELECT 1 FROM shipments test_shipment WHERE test_shipment.id = notifications.shipment_id AND test_shipment.is_test = 1)" : ""} ORDER BY created_at DESC LIMIT 100`).bind(...auth.clientIds, auth.userId ?? "").all() : { results: [] }; return json({ ok: true, data: rows.results }, 200, headers); }
       const collectionRoutes: Record<string, { table: string; scope: string; order: string }> = {
         "/tickets": { table: "support_tickets", scope: "tickets.read", order: "updated_at DESC" },
         "/notifications": { table: "notifications", scope: "notifications.read", order: "created_at DESC" },
@@ -6015,9 +6043,10 @@ const worker = {
         const searchBinds = search ? Array(6).fill(`%${search}%`) : [];
         const clientClause = auth.system ? "" : auth.clientIds.size ? `client_id IN (${[...auth.clientIds].map(() => "?").join(",")})` : "0 = 1";
         const clientBinds = auth.system ? [] : [...auth.clientIds];
+        const warehouseVisibility = testDataVisibilityClause(auth);
         const rows = auth.system
-          ? await env.DB.prepare(`SELECT * FROM warehouses WHERE 1 = 1${searchClause} ORDER BY updated_at DESC LIMIT ${limit + 1} OFFSET ${offset}`).bind(...searchBinds).all<Record<string, unknown>>()
-          : await env.DB.prepare(`SELECT * FROM warehouses WHERE ${clientClause}${searchClause} ORDER BY updated_at DESC LIMIT ${limit + 1} OFFSET ${offset}`).bind(...clientBinds, ...searchBinds).all<Record<string, unknown>>();
+          ? await env.DB.prepare(`SELECT * FROM warehouses WHERE 1 = 1${searchClause}${warehouseVisibility ? ` AND ${warehouseVisibility}` : ""} ORDER BY updated_at DESC LIMIT ${limit + 1} OFFSET ${offset}`).bind(...searchBinds).all<Record<string, unknown>>()
+          : await env.DB.prepare(`SELECT * FROM warehouses WHERE ${clientClause}${searchClause}${warehouseVisibility ? ` AND ${warehouseVisibility}` : ""} ORDER BY updated_at DESC LIMIT ${limit + 1} OFFSET ${offset}`).bind(...clientBinds, ...searchBinds).all<Record<string, unknown>>();
         // Multiple local warehouse rows can represent the same physical
         // address while Delhivery activation is being retried. Prefer the
         // provider-confirmed row before deduplicating; otherwise a newer
@@ -6055,6 +6084,8 @@ const worker = {
         const offset = Math.max(Number.parseInt(url.searchParams.get("offset") ?? "0", 10) || 0, 0);
         const clauses = ["1 = 1", activeOnly ? "status = 'active'" : "", addressKind && ["consignor", "consignee"].includes(addressKind) ? "address_kind = ?" : "", search ? "(label LIKE ? OR address LIKE ? OR city LIKE ? OR state LIKE ? OR pincode LIKE ? OR contact_name LIKE ? OR phone LIKE ?)" : ""].filter(Boolean);
         const binds: unknown[] = []; if (addressKind && ["consignor", "consignee"].includes(addressKind)) binds.push(addressKind); if (search) binds.push(...Array(7).fill(`%${search}%`));
+        const addressVisibility = testDataVisibilityClause(auth);
+        if (addressVisibility) clauses.push(addressVisibility);
         if (!auth.system) { if (!auth.clientIds.size) return json({ ok: true, data: [], pagination: { limit, offset, next_offset: offset, has_more: false } }, 200, headers); clauses.unshift(`client_id IN (${[...auth.clientIds].map(() => "?").join(",")})`); binds.unshift(...auth.clientIds); }
         const rows = await env.DB.prepare(`SELECT * FROM client_addresses WHERE ${clauses.join(" AND ")} ORDER BY updated_at DESC LIMIT ${limit + 1} OFFSET ${offset}`).bind(...binds).all<Record<string, unknown>>();
         const data = rows.results ?? [];
@@ -6069,7 +6100,7 @@ const worker = {
         const rows = auth.system
           ? await env.DB.prepare(`SELECT b.*, ps.account_scope, ps.origin_zone, ps.destination_zone, ps.chargeable_weight_kg, ps.client_breakdown_json, ${shipmentColumns.replaceAll("s.", "sh.")}, w.provider_weight_received_at, w.client_dispute_deadline_at FROM billing_records b LEFT JOIN pricing_shipment_snapshots ps ON ps.shipment_id = b.shipment_id LEFT JOIN shipments sh ON sh.id = b.shipment_id LEFT JOIN weight_reconciliations w ON w.shipment_id = b.shipment_id WHERE 1 = 1${dateClause} ORDER BY b.created_at DESC`).bind(...dateBind).all()
           : auth.clientIds.size
-            ? await env.DB.prepare(`SELECT b.*, ps.account_scope, ps.origin_zone, ps.destination_zone, ps.chargeable_weight_kg, ps.client_breakdown_json, ${shipmentColumns.replaceAll("s.", "sh.")}, w.provider_weight_received_at, w.client_dispute_deadline_at FROM billing_records b LEFT JOIN pricing_shipment_snapshots ps ON ps.shipment_id = b.shipment_id LEFT JOIN shipments sh ON sh.id = b.shipment_id LEFT JOIN weight_reconciliations w ON w.shipment_id = b.shipment_id WHERE b.client_id IN (${[...auth.clientIds].map(() => "?").join(",")})${dateClause} ORDER BY b.created_at DESC`).bind(...auth.clientIds, ...dateBind).all()
+            ? await env.DB.prepare(`SELECT b.*, ps.account_scope, ps.origin_zone, ps.destination_zone, ps.chargeable_weight_kg, ps.client_breakdown_json, ${shipmentColumns.replaceAll("s.", "sh.")}, w.provider_weight_received_at, w.client_dispute_deadline_at FROM billing_records b LEFT JOIN pricing_shipment_snapshots ps ON ps.shipment_id = b.shipment_id LEFT JOIN shipments sh ON sh.id = b.shipment_id LEFT JOIN weight_reconciliations w ON w.shipment_id = b.shipment_id WHERE b.client_id IN (${[...auth.clientIds].map(() => "?").join(",")})${hidesClientTestData(auth) ? " AND COALESCE(sh.is_test, 0) = 0" : ""}${dateClause} ORDER BY b.created_at DESC`).bind(...auth.clientIds, ...dateBind).all()
             : { results: [] };
         const data = await Promise.all(rows.results.map(async (row) => { const record = row as Record<string, unknown>; let pricing: unknown = null; if (typeof record.client_breakdown_json === "string") { try { pricing = JSON.parse(record.client_breakdown_json); } catch { pricing = null; } } const adjustments = record.shipment_id ? await env.DB.prepare("SELECT component_code, previous_amount, new_amount, reason, actor_user_id, created_at FROM pricing_overrides WHERE shipment_id = ? ORDER BY created_at ASC").bind(record.shipment_id).all() : { results: [] }; const amendments = record.shipment_id ? await env.DB.prepare("SELECT id, amendment_type, previous_amount, new_amount, reason, weight_received_at, ticket_deadline_at, actor_user_id, created_at FROM billing_amendments WHERE shipment_id = ? ORDER BY created_at ASC").bind(record.shipment_id).all() : { results: [] }; const lineItems = record.id ? await env.DB.prepare("SELECT id, code, label, amount, marker, display_order, created_at FROM billing_line_items WHERE billing_id = ? ORDER BY display_order ASC, code ASC").bind(record.id).all() : { results: [] }; const safe = { ...record }; delete safe.client_breakdown_json; const parseJson = (value: unknown) => { if (typeof value !== "string") return value ?? null; try { return JSON.parse(value); } catch { return null; } }; return { ...safe, pricing, line_items: lineItems.results, adjustments: adjustments.results, amendments: amendments.results, shipment_origin_address: parseJson(record.shipment_origin_address_json), shipment_destination_address: parseJson(record.shipment_destination_address_json), dimensions: parseJson(record.dimensions_json) }; }));
         return json({ ok: true, data }, 200, headers);
@@ -6080,7 +6111,7 @@ const worker = {
         const employeeColumns = `${clientColumns}, w.provider_dispute_status`;
         const internalColumns = `${employeeColumns}, w.provider_recovery_amount, w.retained_recovery_amount, t.client_credit_amount`;
         const columns = hasScope(auth, "provider_cost.view") || hasScope(auth, "weight_dispute.resolve") ? internalColumns : hasRole(auth, ["employee", "admin", "super_admin"]) ? employeeColumns : clientColumns;
-        const rows = auth.system ? await env.DB.prepare(`SELECT ${columns} FROM weight_reconciliations w LEFT JOIN weight_reconciliation_tickets t ON t.reconciliation_id = w.id LEFT JOIN shipments s ON s.id = w.shipment_id ORDER BY w.updated_at DESC`).all() : auth.clientIds.size ? await env.DB.prepare(`SELECT ${columns} FROM weight_reconciliations w LEFT JOIN weight_reconciliation_tickets t ON t.reconciliation_id = w.id LEFT JOIN shipments s ON s.id = w.shipment_id WHERE w.client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY w.updated_at DESC`).bind(...auth.clientIds).all() : { results: [] };
+        const rows = auth.system ? await env.DB.prepare(`SELECT ${columns} FROM weight_reconciliations w LEFT JOIN weight_reconciliation_tickets t ON t.reconciliation_id = w.id LEFT JOIN shipments s ON s.id = w.shipment_id ORDER BY w.updated_at DESC`).all() : auth.clientIds.size ? await env.DB.prepare(`SELECT ${columns} FROM weight_reconciliations w LEFT JOIN weight_reconciliation_tickets t ON t.reconciliation_id = w.id LEFT JOIN shipments s ON s.id = w.shipment_id WHERE w.client_id IN (${[...auth.clientIds].map(() => "?").join(",")})${hidesClientTestData(auth) ? " AND COALESCE(s.is_test, 0) = 0" : ""} ORDER BY w.updated_at DESC`).bind(...auth.clientIds).all() : { results: [] };
         return json({ ok: true, data: rows.results }, 200, headers);
       }
       if (route === "/cod-remittances" && request.method === "GET") {
@@ -6088,7 +6119,7 @@ const worker = {
         const rows = auth.system
           ? await env.DB.prepare("SELECT c.*, s.pss_reference AS shipment_pss_reference, s.lr_number, s.master_awb, s.tracking_number FROM cod_remittances c LEFT JOIN shipments s ON s.id = c.shipment_id ORDER BY c.created_at DESC LIMIT 100").all()
           : auth.clientIds.size
-            ? await env.DB.prepare(`SELECT c.*, s.pss_reference AS shipment_pss_reference, s.lr_number, s.master_awb, s.tracking_number FROM cod_remittances c LEFT JOIN shipments s ON s.id = c.shipment_id WHERE c.client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY c.created_at DESC LIMIT 100`).bind(...auth.clientIds).all()
+            ? await env.DB.prepare(`SELECT c.*, s.pss_reference AS shipment_pss_reference, s.lr_number, s.master_awb, s.tracking_number FROM cod_remittances c LEFT JOIN shipments s ON s.id = c.shipment_id WHERE c.client_id IN (${[...auth.clientIds].map(() => "?").join(",")})${hidesClientTestData(auth) ? " AND COALESCE(s.is_test, 0) = 0" : ""} ORDER BY c.created_at DESC LIMIT 100`).bind(...auth.clientIds).all()
             : { results: [] };
         return json({ ok: true, data: rows.results }, 200, headers);
       }

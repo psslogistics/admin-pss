@@ -18,7 +18,8 @@
     "test:pickup": "node worker/tools/pickup-contract-acceptance.mjs",
     "test:serviceability": "node --experimental-strip-types worker/tools/serviceability-acceptance.mjs",
     "test:billing": "node worker/tools/billing-contract-acceptance.mjs",
-    "test:warehouse": "node worker/tools/exact-warehouse-contract-acceptance.mjs && node --experimental-strip-types worker/tools/exact-warehouse-flow-matrix.mjs"
+    "test:warehouse": "node worker/tools/exact-warehouse-contract-acceptance.mjs && node --experimental-strip-types worker/tools/exact-warehouse-flow-matrix.mjs",
+    "test:test-data": "node worker/tools/test-data-visibility-acceptance.mjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.7.0",
