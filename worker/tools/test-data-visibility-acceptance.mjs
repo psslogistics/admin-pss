@@ -13,6 +13,7 @@ const checks = [
   ["shipment pagination totals use the visibility predicate", /const totalWhere = \[statusPredicate, shipmentVisibility\]\.filter\(Boolean\)\.join\(" AND "\)/],
   ["status-count cache separates client and internal views", /hidesClientTestData\(auth\) \? "client-visible" : "internal"/],
   ["dashboard overview applies related-shipment visibility", /const addOverview = \(key: string, scope: string, sql: string, extra: string, visibilityTable = ""\)/],
+  ["dashboard overview wallet excludes classified shipments", /addOverview\("wallet", "wallet\.read",[\s\S]*"wallet_transactions"\)/],
   ["dashboard summary collections apply related-shipment visibility", /const visibility = relatedShipmentVisibilityClause\(auth, table\)/],
   ["reports exclude classified shipments", /const reportShipmentVisibility = testDataVisibilityClause\(auth\)/],
   ["complete reports exclude classified related records", /const sourceAlias = table === "ndr_cases"[\s\S]*const visibility = relatedShipmentVisibilityClause\(auth, table, sourceAlias\)/],
