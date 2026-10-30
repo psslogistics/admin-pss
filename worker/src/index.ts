@@ -1,6 +1,15 @@
 import { calculatePssRate, defaultRateRows, type ChargeRule, type PricingAccount } from "./pricing-engine";
 import { canonicalDelhiveryWarehouseName, delhiveryFacilityMatches } from "./warehouse-identity";
 import { evaluateDelhiveryServiceability, serviceabilityCacheKey } from "./serviceability";
+import { providerManagedShipmentFields } from "./shipment-protection";
+import { canReadProviderAccountPoliciesForPickup, shapeProviderAccountsForPickup } from "./pickup-account-access";
+import { resolveDelhiveryCostReference } from "./provider-cost-lookup";
+import { ticketUpdatePermissions } from "./ticket-update-policy";
+import { canPerformTicketAction } from "./ticket-access-policy";
+import { TICKET_ATTENTION_SQL } from "./ticket-attention";
+import { isExplicitKycTestOrganization } from "./kyc-test-identity";
+import { providerAmountForBookingResult } from "./provider-cost-amount";
+import { activitySnapshotPair } from "./activity-snapshots";
 
 type DelhiveryTokenCache = {
   get<T>(key: string, type: "json"): Promise<T | null>;
@@ -74,7 +83,6 @@ const SUMMARY_CACHE_TTL_MS = 60_000;
 const SHIPMENT_STATUS_COUNTS_CACHE_TTL_MS = 60_000;
 const DELHIVERY_SERVICEABILITY_CACHE_TTL_MS = 10 * 60_000;
 const delhiveryServiceabilityCache = new Map<string, { expiresAt: number; result: DelhiveryServiceabilityResult }>();
-const KYC_TEST_ACCOUNT_EMAIL = "itismeoogway@gmail.com";
 
 type DelhiveryServiceabilityResult = {
   ok: boolean;
@@ -143,9 +151,10 @@ async function supabaseRpc<T>(env: Env, functionName: string, token: string): Pr
 }
 
 async function isKycTestAccount(env: Env, auth: Auth): Promise<boolean> {
-  if (auth.audience !== "client" || !auth.userId || !auth.accessToken) return false;
-  const users = await supabaseGet<{ email: string | null }>(env, `profiles?id=eq.${encodeURIComponent(auth.userId)}&select=email&limit=1`, auth.accessToken);
-  return users[0]?.email?.trim().toLowerCase() === KYC_TEST_ACCOUNT_EMAIL;
+  if (auth.audience !== "client" || !auth.clientIds.size || !auth.accessToken) return false;
+  const clientIds = [...auth.clientIds];
+  const organizations = await supabaseGet<{ id: string; identity_environment: string | null }>(env, `client_accounts?id=in.(${clientIds.join(",")})&select=id,identity_environment`, auth.accessToken);
+  return isExplicitKycTestOrganization(organizations, clientIds);
 }
 
 async function loadUserAuth(env: Env, token: string): Promise<Auth | null> {
@@ -223,10 +232,11 @@ function hasScope(auth: Auth, scope: string) {
   const permissionMap: Record<string, string[]> = {
     "shipments.read": ["shipments.read", "shipments.view", "admin.shipments.view", "admin.shipments.assigned.view", "admin.tracking.view"], "tracking.read": ["tracking.read", "tracking.view", "admin.tracking.view"],
     "shipments.sensitive.read": ["shipments.sensitive.read", "admin.shipments.sensitive.view"],
+    "provider_data.correct": ["shipments.provider_data.correct"],
     "shipments.create": ["shipments.create", "admin.booking.create"], "pickups.read": ["pickups.read", "pickup.view", "admin.pickup.view"],
     "pickups.create": ["pickups.create", "pickup.create", "admin.pickup.create"], "pickups.manage": ["pickups.manage", "pickup.assign", "admin.pickup.assign"],
     "documents.read": ["documents.read", "admin.documents.pod.view", "admin.documents.pod.download"], "documents.manage": ["documents.manage", "admin.booking.create"],
-    "reports.read": ["reports.read", "reports.view", "admin.reports.view"], "tickets.read": ["tickets.read", "tickets.view", "admin.support.view"],
+    "reports.read": ["reports.read", "reports.view", "admin.reports.view"], "tickets.read": ["tickets.read", "tickets.view", "admin.support.view", "admin.tickets.view"],
     "tickets.create": ["tickets.create", "tickets.reply", "admin.tickets.create"], "notifications.read": ["notifications.read", "notifications.view", "admin.notifications.view"],
     "cases.read": ["cases.read", "exceptions.view", "admin.exceptions.view"], "cases.manage": ["cases.manage", "exceptions.manage", "admin.exceptions.manage", "admin.tracking.update"],
     "addresses.manage": ["addresses.manage", "admin.booking.create"], "quotes.create": ["quotes.create", "admin.booking.create"],
@@ -235,7 +245,7 @@ function hasScope(auth: Auth, scope: string) {
     "cod.read": ["cod.read", "transactions.view"], "cod.manage": ["cod.manage", "billing.approve"], "weight.read": ["weight.read", "billing.view", "admin.weight.view"], "weight.manage": ["weight.manage", "billing.approve", "admin.weight.manage"],
     "tasks.read": ["tasks.read", "tasks.view", "admin.tasks.view"], "tasks.manage": ["tasks.manage", "admin.tasks.manage"],
     "departments.read": ["departments.read", "departments.view", "admin.departments.view"], "departments.manage": ["departments.manage", "admin.departments.manage"],
-    "activity.read": ["activity.read", "employee_activity.view", "admin.activity.view"],
+    "activity.read": ["activity.read", "employee_activity.view", "admin.activity.view", "admin.audit.view", "audit.view"],
     "integrations.read": ["integrations.view", "admin.integrations.view"], "webhooks.read": ["api_keys.view", "integrations.view", "admin.api_keys.view"],
     "provider_accounts.read": ["integrations.view", "admin.integrations.view"], "provider_accounts.manage": ["integrations.manage", "admin.integrations.manage"],
     "pricing.read": ["pricing.view", "admin.pricing.view", "rate_cards.manage", "admin.rate_cards.view", "admin.rate_cards.manage"],
@@ -245,7 +255,7 @@ function hasScope(auth: Auth, scope: string) {
     "provider_cost.view": ["provider_cost.view", "admin.provider_cost.view"],
     "documents.pod.download": ["documents.pod.download", "admin.documents.pod.download"],
     "weight.view": ["weight.view", "admin.weight.view"], "weight.update": ["weight.update", "admin.weight.manage"], "weight.resolve": ["weight.resolve", "admin.weight.resolve"],
-    "tickets.close": ["tickets.close", "admin.tickets.close"], "tickets.reassign": ["tickets.reassign", "admin.tickets.reassign"],
+    "tickets.close": ["tickets.close", "admin.tickets.close"], "tickets.reassign": ["tickets.reassign", "admin.tickets.reassign"], "tickets.escalate": ["tickets.escalate", "admin.tickets.escalate"],
     "weight_dispute.resolve": ["weight_dispute.resolve", "admin.weight_dispute.resolve", "admin.weight.resolve"],
   };
   if (permissionMap[scope]?.some((permission) => auth.permissions.has(permission))) return true;
@@ -499,13 +509,6 @@ function shipmentAddress(value: unknown) {
   return { ...address, name, line, city, state, pincode, phone };
 }
 
-function providerAmount(value: unknown) {
-  if (!value || typeof value !== "object") return null;
-  const record = value as Record<string, unknown>;
-  for (const key of ["amount", "shipping_charge", "freight", "total_amount", "billing_amount"]) { const amount = Number(record[key]); if (Number.isFinite(amount) && amount >= 0) return amount; }
-  return null;
-}
-
 function volumetricWeightFromPayload(payload: Record<string, unknown>) {
   const explicit = Number(payload.volumetric_weight_kg);
   if (Number.isFinite(explicit) && explicit >= 0) return explicit;
@@ -636,7 +639,6 @@ async function ensureDefaultClientProviderPolicies(env: Env, clientId: string, a
   await env.DB.batch(configured.map((account) => env.DB.prepare("INSERT OR IGNORE INTO provider_account_client_policies (provider_account_id, client_id, enabled, priority, confidence_score, rate_card_id, notes, updated_by_user_id, updated_at) VALUES (?, ?, 1, 100, 0, NULL, 'Default Delhivery B2B account assignment', ?, CURRENT_TIMESTAMP)").bind(account.id, clientId, actor)));
 }
 const FUJIYAMA_CLIENT_ID = "bb308dde-aae8-4503-ac7b-f91cd80ada78";
-const FUJIYAMA_DELHIVERY_ACCOUNT_ID = "dlv-psslogistics10-b2bc";
 const FUJIYAMA_FORWARD_RATES: Record<string, number> = { N1: 5.5, N2: 6.2, N3: 6.5, N4: 6.9, C1: 7.9, C2: 8.6, E1: 10.5, E2: 11.2, NE1: 15.9, NE2: 18.8, S1: 8.8, S2: 9.4, S3: 9.8, S4: 10.5, W1: 7.9, W2: 8.7 };
 const FUJIYAMA_REVERSE_RATES: Record<string, number> = { North: 7.5, West: 11, South: 14.5, East: 14.5, Northeast: 18.5 };
 const fujiyamaKey = (value: string | undefined) => String(value ?? "").toLowerCase().replace(/[^a-z]/g, "");
@@ -1009,8 +1011,6 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   // provider facility reference, which produces the provider error
   // "warehouse ... has not been configured". Re-register those rows; the
   // provider's idempotent/already-configured response is the authority.
-  const existingProviderLocation = existing && (existing.provider_status === "active" || existing.provider_status === "pending")
-    && Boolean((existing.provider_name?.trim() || existing.name?.trim()) && (existing.provider_reference?.trim() || existingHasConfirmedBooking));
   const warehouseIdentityHash = await sha256(`${baseLocalName}|${resolvedOrigin.pincode}`);
   // Keep one stable provider facility name for an address. Generating a new
   // PSS-suffixed name on every activation retry creates duplicate Delhivery
@@ -1133,7 +1133,6 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   if (!response) return { ok: false as const, error: lastRegistrationError || "Delhivery warehouse creation failed" };
   let createdProviderReference: string | null = null;
   let createdProviderName: string | null = null;
-  let registrationAccepted = false;
   const providerAlreadyRegistered = !response.ok && (() => {
     const lower = responseText.toLowerCase();
     return lower.includes("already exists") || lower.includes("already configured") || lower.includes("duplicate") || lower.includes("warehouse exists");
@@ -1155,11 +1154,9 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
         delhiveryWarehouseLog(requestIdValue, "registration_rejected", { account_id: providerAccountId ?? null, identity_hash: warehouseIdentityHash, error: (embeddedError || "provider returned success=false").slice(0, 240) });
         return { ok: false as const, error: `Delhivery warehouse registration was rejected: ${(embeddedError || "provider returned success=false").slice(0, 240)}` };
       }
-      registrationAccepted = true;
     } catch {
       // Some Delhivery deployments return an empty/text success response.
       // HTTP success remains sufficient when there is no structured failure.
-      registrationAccepted = true;
     }
   }
   if (!response.ok) {
@@ -1170,7 +1167,6 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
     // A duplicate/already-configured response is also registration evidence.
     // The facility-list endpoint can lag or use a different projection than
     // the manifestation API, so let manifestation be the final authority.
-    registrationAccepted = true;
   }
   // The warehouse-create response and the manifestation endpoint are the
   // authoritative contract for booking. Delhivery's facility-list projection
@@ -1191,10 +1187,6 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
 }
 
 type DelhiveryFacility = { id: string; code: string; name: string; pincode: string };
-
-function delhiveryFacilityNotFound(error: string) {
-  return /not active or could not be resolved|facility lookup failed \(404\)/i.test(error);
-}
 
 function delhiveryFacilityRows(value: unknown): Array<Record<string, unknown>> {
   if (!value || typeof value !== "object") return [];
@@ -1675,17 +1667,6 @@ function validDelhiveryPickupReference(value: unknown) {
   return /^\d{6,20}$/.test(reference) ? reference : null;
 }
 
-function findProviderUrl(value: unknown, depth = 0): string | null {
-  if (depth > 8 || value === null || value === undefined) return null;
-  if (typeof value === "string") return /^https?:\/\//i.test(value.trim()) ? value.trim() : null;
-  if (Array.isArray(value)) { for (const item of value) { const found = findProviderUrl(item, depth + 1); if (found) return found; } return null; }
-  if (typeof value !== "object") return null;
-  const object = value as Record<string, unknown>;
-  for (const key of ["download_url", "downloadUrl", "file_url", "fileUrl", "url", "link"]) { const found = findProviderUrl(object[key], depth + 1); if (found) return found; }
-  for (const item of Object.values(object)) { const found = findProviderUrl(item, depth + 1); if (found) return found; }
-  return null;
-}
-
 function findProviderUrls(value: unknown, result: string[] = [], depth = 0, parentKey = "", baseUrl?: string): string[] {
   if (depth > 8 || value === null || value === undefined) return result;
   if (typeof value === "string") {
@@ -2057,11 +2038,6 @@ function normalizeProviderTrackingEvents(value: unknown, depth = 0): NormalizedP
     return (order[left.status] ?? -1) - (order[right.status] ?? -1);
   });
 }
-function normalizeProviderTracking(value: unknown): NormalizedProviderTracking | null {
-  const events = normalizeProviderTrackingEvents(value);
-  return events.at(-1) ?? null;
-}
-
 type ProviderWeightSnapshot = { measuredKg: number | null; chargeableKg: number | null };
 const minimumShipmentWeightKg = 20;
 function effectiveShipmentWeightKg(declaredKg: number, providerKg: number | null) {
@@ -4686,7 +4662,11 @@ const worker = {
         } }, 200, headers);
       }
       if (route === "/provider-account-policies" && request.method === "GET") {
-        if (!hasScope(auth, "provider_accounts.read") && !hasScope(auth, "quotes.create")) return error("FORBIDDEN", "Provider account visibility permission required", 403, id, headers);
+        const canReadProviderAccounts = hasScope(auth, "provider_accounts.read");
+        const canQuote = hasScope(auth, "quotes.create");
+        const canCreatePickup = hasScope(auth, "pickups.create");
+        if (!canReadProviderAccountPoliciesForPickup({ canReadProviderAccounts, canQuote, canCreatePickup })) return error("FORBIDDEN", "Provider account visibility permission required", 403, id, headers);
+        const pickupOnly = canCreatePickup && !canReadProviderAccounts && !canQuote;
         const requestedClient = new URL(request.url).searchParams.get("client_id");
         const clientId = requireClient(auth, requestedClient);
         if (!clientId || !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
@@ -4714,12 +4694,14 @@ const worker = {
           const secretName = String(row.credential_secret_name ?? "");
           return Boolean(secretName && typeof secretBag[secretName] === "string" && String(secretBag[secretName]).trim().length > 0);
         };
-        return json({ ok: true, data: rows.results.map((row) => {
+        const providerAccounts = rows.results.map((row) => {
           const record = row as Record<string, unknown>;
           const isConfigured = configured(record);
-          const { credential_secret_name: _credentialSecretName, ...safeRow } = record;
+          const safeRow = { ...record };
+          delete safeRow.credential_secret_name;
           return { ...safeRow, capabilities: (() => { try { return JSON.parse(String(record.capabilities_json ?? "[]")); } catch { return []; } })(), configured: isConfigured, enabled: Boolean(Number(record.enabled)) && isConfigured, explicitly_configured: Boolean(Number(record.explicitly_configured)) };
-        }) }, 200, headers);
+        });
+        return json({ ok: true, data: shapeProviderAccountsForPickup(providerAccounts, pickupOnly) }, 200, headers);
       }
       const providerPolicyMatch = route.match(/^\/provider-account-policies\/([^/]+)$/);
       if (providerPolicyMatch && request.method === "PUT") {
@@ -4787,7 +4769,7 @@ const worker = {
           : auth.clientIds.size
             ? await env.DB.prepare(`SELECT id, provider, account_name, account_type, client_id, capabilities_json, status, created_by_user_id, created_at, updated_at FROM provider_accounts WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY provider, account_name LIMIT 100`).bind(...auth.clientIds).all()
             : { results: [] };
-        return json({ ok: true, data: rows.results.map((row) => { const value = row as Record<string, unknown>; let capabilities: unknown[] = []; try { capabilities = JSON.parse(String(value.capabilities_json ?? "[]")); } catch { capabilities = []; } const { capabilities_json: _capabilitiesJson, ...safe } = value; return { ...safe, capabilities }; }) }, 200, headers);
+        return json({ ok: true, data: rows.results.map((row) => { const value = row as Record<string, unknown>; let capabilities: unknown[] = []; try { capabilities = JSON.parse(String(value.capabilities_json ?? "[]")); } catch { capabilities = []; } const safe = { ...value }; delete safe.capabilities_json; return { ...safe, capabilities }; }) }, 200, headers);
       }
       if (route === "/provider-accounts" && request.method === "POST") {
         if (!hasScope(auth, "provider_accounts.manage") || !hasRole(auth, ["admin", "super_admin"])) return error("FORBIDDEN", "Provider account management permission required", 403, id, headers);
@@ -5128,7 +5110,7 @@ const worker = {
         console.log(JSON.stringify({ event: "shipment_booking_timing", request_id: id, shipment_id: shipmentId, provider: provider ?? "none", pricing_ms: pricingDurationMs, provider_ms: Date.now() - providerStartedAt, total_ms: Date.now() - bookingStartedAt, provider_result: providerResult.status }));
         const selectedProviderAccountId = (providerResult as { provider_account_id?: string }).provider_account_id;
         if (selectedProviderAccountId) await env.DB.prepare("UPDATE shipments SET provider_account_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(selectedProviderAccountId, shipmentId, clientId).run();
-        if (provider === "delhivery") await env.DB.prepare("INSERT OR REPLACE INTO pricing_provider_costs (id, shipment_id, client_id, provider, provider_account_id, provider_amount, provider_status) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(crypto.randomUUID(), shipmentId, clientId, provider, selectedProviderAccountId ?? null, providerAmount(providerResult), providerResult.status).run();
+        if (provider === "delhivery") await env.DB.prepare("INSERT OR REPLACE INTO pricing_provider_costs (id, shipment_id, client_id, provider, provider_account_id, provider_amount, provider_status) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(crypto.randomUUID(), shipmentId, clientId, provider, selectedProviderAccountId ?? null, providerAmountForBookingResult(providerResult), providerResult.status).run();
          const providerBookingId = String((providerResult as { providerBookingId?: string | null }).providerBookingId ?? "").trim() || null;
          const providerResultLr = String((providerResult as { lr_number?: string | null }).lr_number ?? "").trim();
          const providerResultAwb = String((providerResult as { master_awb?: string | null }).master_awb ?? "").trim();
@@ -5322,13 +5304,54 @@ const worker = {
       }
 
       const shipmentUpdate = route.match(/^\/shipments\/([^/]+)$/);
+      const providerCorrection = route.match(new RegExp("^/shipments/([^/]+)/provider-corrections$"));
+      if (providerCorrection && (request.method === "GET" || request.method === "POST")) {
+        if (!hasRole(auth, ["super_admin"]) || !hasScope(auth, "provider_data.correct")) return error("FORBIDDEN", "Super Admin provider-data correction permission required", 403, id, headers);
+        const shipment = await env.DB.prepare("SELECT id, client_id, provider, provider_reference, tracking_number, lr_number, master_awb, status, total_weight_kg, weight_override_kg, edd, delivered_at FROM shipments WHERE id = ? LIMIT 1")
+          .bind(providerCorrection[1])
+          .first<Record<string, unknown>>();
+        if (!shipment) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
+        if (request.method === "GET") {
+          const corrections = await env.DB.prepare("SELECT id, field, provider_value, correction_value, reason, actor_user_id, created_at FROM shipment_provider_corrections WHERE shipment_id = ? AND client_id = ? ORDER BY created_at DESC LIMIT 100")
+            .bind(String(shipment.id), String(shipment.client_id))
+            .all<Record<string, unknown>>();
+          return json({ ok: true, data: corrections.results ?? [], request_id: id }, 200, headers);
+        }
+        const payload = await bodyJson(request);
+        const allowedFields = new Set(["lr_number", "master_awb", "provider_reference", "tracking_number", "status", "weight", "eta", "delivered_at"]);
+        const field = String(payload.field ?? "").trim();
+        const correctionValue = String(payload.correction_value ?? "").trim();
+        const reason = String(payload.reason ?? "").trim();
+        if (!allowedFields.has(field)) return error("VALIDATION_ERROR", "Choose a provider-managed field that can be documented", 400, id, headers);
+        if (!correctionValue || correctionValue.length > 250) return error("VALIDATION_ERROR", "Enter a proposed value of 1–250 characters", 400, id, headers);
+        if (reason.length < 8 || reason.length > 500) return error("VALIDATION_ERROR", "Enter a reason of 8–500 characters", 400, id, headers);
+        const providerField: Record<string, string> = { lr_number: "lr_number", master_awb: "master_awb", provider_reference: "provider_reference", tracking_number: "tracking_number", status: "status", weight: "total_weight_kg", eta: "edd", delivered_at: "delivered_at" };
+        const storedProviderValue = shipment[providerField[field]];
+        const providerValue = storedProviderValue == null ? "" : String(storedProviderValue);
+        const key = request.headers.get("Idempotency-Key");
+        if (!key) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
+        const requestHash = await payloadFingerprint({ shipment_id: shipment.id, field, provider_value: providerValue, correction_value: correctionValue, reason });
+        const endpoint = `POST /v1/shipments/${shipment.id}/provider-corrections`;
+        const existing = await idempotentResponse(env, key, String(shipment.client_id), endpoint, requestHash);
+        if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
+        const correctionId = crypto.randomUUID();
+        await env.DB.prepare("INSERT INTO shipment_provider_corrections (id, shipment_id, client_id, field, provider_value, correction_value, reason, actor_user_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)")
+          .bind(correctionId, String(shipment.id), String(shipment.client_id), field, providerValue, correctionValue, reason, auth.userId ?? "unknown")
+          .run();
+        await audit(env, ctx, auth, id, "shipment.provider_data_correction_recorded", "shipment", String(shipment.id), { client_id: shipment.client_id, field, provider_value: providerValue, correction_value: correctionValue, reason, correction_id: correctionId });
+        const responseBody = JSON.stringify({ ok: true, data: { id: correctionId, shipment_id: shipment.id, field, provider_value: providerValue, correction_value: correctionValue, reason, actor_user_id: auth.userId ?? "unknown" }, request_id: id });
+        await saveIdempotent(env, key, String(shipment.client_id), endpoint, 201, responseBody, requestHash);
+        return new Response(responseBody, { status: 201, headers: { ...headers, "content-type": "application/json" } });
+      }
+
       if (shipmentUpdate && request.method === "PATCH") {
         if (!hasRole(auth, ["employee", "admin", "super_admin"]) && !hasScope(auth, "shipments.create")) return error("FORBIDDEN", "Shipment update permission required", 403, id, headers);
-        const current = await env.DB.prepare("SELECT client_id, status, weight_override_kg, is_test FROM shipments WHERE id = ? LIMIT 1").bind(shipmentUpdate[1]).first<{ client_id: string; status: string; weight_override_kg: number | null; is_test: number | null }>();
+        const current = await env.DB.prepare("SELECT client_id, status, total_weight_kg, declared_value, pieces, is_test FROM shipments WHERE id = ? LIMIT 1").bind(shipmentUpdate[1]).first<{ client_id: string; status: string; total_weight_kg: number | null; declared_value: number | null; pieces: number | null; is_test: number | null }>();
         if (!current || !canAccessClient(auth, current.client_id)) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
         const payload = await bodyJson(request);
         const clientActor = hasRole(auth, ["client"]) && !hasRole(auth, ["employee", "admin", "super_admin"]);
         if (clientActor && Object.keys(payload).some((field) => field !== "status")) return error("FORBIDDEN", "Clients may only cancel their own shipment", 403, id, headers);
+        if (!clientActor && providerManagedShipmentFields(payload).length) return error("PROVIDER_DATA_PROTECTED", "Provider references, shipment status, reconciled weight, ETA, and delivery timestamps can only be changed by provider reconciliation.", 409, id, headers);
         if (payload.is_test !== undefined && !hasRole(auth, ["admin", "super_admin"])) return error("FORBIDDEN", "Only administrators may classify test shipments", 403, id, headers);
         if (payload.is_test !== undefined && !isTestFlag(payload.is_test)) return error("VALIDATION_ERROR", "is_test must be a boolean", 400, id, headers);
         const requestHash = await payloadFingerprint(payload);
@@ -5349,7 +5372,7 @@ const worker = {
         const deliveredClause = status === "delivered" ? ", delivered_at = COALESCE(delivered_at, CURRENT_TIMESTAMP)" : "";
         await env.DB.prepare(`UPDATE shipments SET ${normalized.map((update) => `${update.field} = ?`).join(", ")}${weightMeta}, updated_at = CURRENT_TIMESTAMP${deliveredClause} WHERE id = ?`).bind(...normalized.map((update) => update.value), ...(weightUpdate ? [Number(weightUpdate.value)] : []), shipmentUpdate[1]).run();
         if (status) await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipmentUpdate[1], status, "Shipment updated", auth.userId ?? `api:${current.client_id}`).run();
-        await audit(env, ctx, auth, id, "shipment.updated", "shipment", shipmentUpdate[1], { client_id: current.client_id, fields: normalized.map((update) => update.field) });
+        await audit(env, ctx, auth, id, "shipment.updated", "shipment", shipmentUpdate[1], { client_id: current.client_id, fields: normalized.map((update) => update.field), ...activitySnapshotPair(current as unknown as Record<string, unknown>, normalized) });
         const serialized = JSON.stringify({ ok: true, data: { id: shipmentUpdate[1], ...Object.fromEntries(normalized.map((update) => [update.field, update.value])), ...(status === "delivered" ? { delivered_at: "CURRENT_TIMESTAMP" } : {}) }, request_id: id }); await saveIdempotent(env, key, current.client_id, endpoint, 200, serialized, requestHash);
         return new Response(serialized, { status: 200, headers: { ...headers, "content-type": "application/json" } });
       }
@@ -5492,7 +5515,6 @@ const worker = {
       const shipmentGet = route.match(/^\/shipments\/([^/]+)(?:\/tracking)?$/);
       if (shipmentGet && request.method === "GET") {
         if (!hasScope(auth, route.endsWith("/tracking") ? "tracking.read" : "shipments.read")) return error("FORBIDDEN", "Shipment read scope required", 403, id, headers);
-        const internalShipmentView = hasRole(auth, ["employee", "admin", "super_admin"]) || auth.system;
         const sensitiveShipmentView = auth.system || hasScope(auth, "shipments.sensitive.read");
         const shipmentGetVisibility = testDataVisibilityClause(auth);
         let shipment = await env.DB.prepare(`SELECT id, pss_reference, order_id, client_id, tracking_number, lr_number, master_awb, box_awbs_json, provider_booking_id, provider_pickup_id, provider_sync_status, status, provider, ${sensitiveShipmentView ? "provider_account_id, provider_reference," : "provider_reference,"} (SELECT pr.provider_reference FROM pickup_requests pr WHERE pr.shipment_id = shipments.id AND pr.provider_reference IS NOT NULL ORDER BY pr.created_at DESC LIMIT 1) AS pickup_reference, (SELECT pr.status FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_status, (SELECT pr.requested_date FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_scheduled_date, (SELECT pr.requested_time_slot FROM pickup_requests pr WHERE pr.shipment_id = shipments.id ORDER BY pr.created_at DESC LIMIT 1) AS pickup_time_slot, (SELECT c.provider_status FROM pricing_provider_costs c WHERE c.shipment_id = shipments.id LIMIT 1) AS provider_confirmation_status, description, origin, destination, ${sensitiveShipmentView ? "origin_address_json, destination_address_json, consignee, declared_value," : "NULL AS origin_address_json, NULL AS destination_address_json, NULL AS consignee, NULL AS declared_value,"} total_weight_kg, pieces, edd, delivered_at, created_at, updated_at FROM shipments WHERE (id = ? OR pss_reference = ?)${shipmentGetVisibility ? ` AND ${shipmentGetVisibility}` : ""} LIMIT 1`).bind(shipmentGet[1], shipmentGet[1]).first<Record<string, unknown> & { client_id: string; provider: string | null; tracking_number: string | null; provider_reference?: string | null; provider_booking_id?: string | null; provider_account_id?: string | null; lr_number?: string | null; master_awb?: string | null }>();
@@ -6031,7 +6053,7 @@ const worker = {
         if (!hasScope(auth, "reports.read")) return error("FORBIDDEN", "Report read scope required", 403, id, headers);
         const reportShipmentVisibility = testDataVisibilityClause(auth);
         const summarySql = `SELECT status, COUNT(*) AS shipments, SUM(CASE WHEN edd IS NOT NULL AND date(COALESCE(delivered_at, CURRENT_TIMESTAMP)) > date(edd) THEN 1 ELSE 0 END) AS delayed FROM shipments${reportShipmentVisibility ? ` WHERE ${reportShipmentVisibility}` : ""}`;
-        const detailSql = `SELECT id, client_id, tracking_number, status, edd, delivered_at, CASE WHEN edd IS NULL THEN 0 ELSE MAX(0, CAST(julianday(date(COALESCE(delivered_at, CURRENT_TIMESTAMP))) - julianday(date(edd)) AS INTEGER)) END AS delay_days FROM shipments${reportShipmentVisibility ? ` WHERE ${reportShipmentVisibility}` : ""}`;
+        const detailSql = `SELECT id, client_id, pss_reference, lr_number, master_awb, provider_reference, tracking_number, provider, origin, destination, status, total_weight_kg, pieces, declared_value, created_at, edd, delivered_at, CASE WHEN edd IS NULL THEN 0 ELSE MAX(0, CAST(julianday(date(COALESCE(delivered_at, CURRENT_TIMESTAMP))) - julianday(date(edd)) AS INTEGER)) END AS delay_days FROM shipments${reportShipmentVisibility ? ` WHERE ${reportShipmentVisibility}` : ""}`;
         const summary = auth.system
           ? await env.DB.prepare(`${summarySql} GROUP BY status ORDER BY status`).all()
           : auth.clientIds.size
@@ -6112,7 +6134,24 @@ const worker = {
         return json({ ok: true, data: { shipments, pickups: rowsFor("pickups"), billing: rowsFor("billing"), ndr: rowsFor("ndr"), exceptions: rowsFor("exceptions"), weights: rowsFor("weights"), shipment_report: { details } }, request_id: id }, 200, headers);
       }
 
-      if (route === "/tickets" && request.method === "GET") { if (!hasScope(auth, "tickets.read")) return error("FORBIDDEN", "Ticket read permission required", 403, id, headers); await refreshTicketEscalations(env); const rows = auth.system ? await env.DB.prepare("SELECT * FROM support_tickets ORDER BY updated_at DESC LIMIT 100").all() : auth.clientIds.size ? await env.DB.prepare(`SELECT * FROM support_tickets WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")})${hidesClientTestData(auth) ? " AND NOT EXISTS (SELECT 1 FROM shipments test_shipment WHERE test_shipment.id = support_tickets.shipment_id AND test_shipment.is_test = 1)" : ""} ORDER BY updated_at DESC LIMIT 100`).bind(...auth.clientIds).all() : { results: [] }; return json({ ok: true, data: rows.results }, 200, headers); }
+      if (route === "/tickets" && request.method === "GET") {
+        if (!hasScope(auth, "tickets.read")) return error("FORBIDDEN", "Ticket read permission required", 403, id, headers);
+        await refreshTicketEscalations(env);
+        const limit = Math.min(Math.max(Number.parseInt(url.searchParams.get("limit") ?? "100", 10) || 100, 1), 100);
+        const offset = Math.max(Number.parseInt(url.searchParams.get("offset") ?? "0", 10) || 0, 0);
+        const clientClause = auth.system ? "1 = 1" : auth.clientIds.size ? `client_id IN (${[...auth.clientIds].map(() => "?").join(",")})` : "0 = 1";
+        const visibilityClause = hidesClientTestData(auth) ? " AND NOT EXISTS (SELECT 1 FROM shipments test_shipment WHERE test_shipment.id = support_tickets.shipment_id AND test_shipment.is_test = 1)" : "";
+        const where = `${clientClause}${visibilityClause}`;
+        const params = auth.system ? [] : [...auth.clientIds];
+        const [page, aggregate] = await Promise.all([
+          env.DB.prepare(`SELECT * FROM support_tickets WHERE ${where} ORDER BY CASE WHEN lower(COALESCE(status, '')) NOT IN ('resolved', 'closed') AND (lower(COALESCE(escalation_state, '')) IN ('escalated', 'overdue') OR (sla_due_at IS NOT NULL AND datetime(sla_due_at) < datetime('now'))) THEN 0 WHEN lower(COALESCE(status, '')) NOT IN ('resolved', 'closed') AND sla_due_at IS NOT NULL AND datetime(sla_due_at) <= datetime('now', '+1 day') THEN 1 WHEN lower(COALESCE(status, '')) NOT IN ('resolved', 'closed') AND (assigned_to_user_id IS NULL OR trim(assigned_to_user_id) = '') THEN 2 ELSE 3 END, CASE WHEN sla_due_at IS NULL THEN '9999-12-31 23:59:59' ELSE sla_due_at END ASC, updated_at DESC LIMIT ? OFFSET ?`).bind(...params, limit + 1, offset).all<Record<string, unknown>>(),
+          env.DB.prepare(`SELECT COUNT(*) AS total, SUM(CASE WHEN lower(COALESCE(status, '')) NOT IN ('resolved', 'closed') THEN 1 ELSE 0 END) AS open_count, SUM(CASE WHEN lower(COALESCE(status, '')) IN ('resolved', 'closed') THEN 1 ELSE 0 END) AS resolved_count, SUM(CASE WHEN lower(COALESCE(status, '')) NOT IN ('resolved', 'closed') AND ${TICKET_ATTENTION_SQL} THEN 1 ELSE 0 END) AS attention_count, SUM(CASE WHEN lower(COALESCE(status, '')) NOT IN ('resolved', 'closed') AND (assigned_to_user_id IS NULL OR trim(assigned_to_user_id) = '') THEN 1 ELSE 0 END) AS unassigned_count FROM support_tickets WHERE ${where}`).bind(...params).first<Record<string, number | null>>(),
+        ]);
+        const data = page.results.slice(0, limit);
+        const total = Number(aggregate?.total ?? 0);
+        const pagination = { limit, offset, total, next_offset: offset + data.length, has_more: page.results.length > limit, status_counts: { all: total, open: Number(aggregate?.open_count ?? 0), resolved: Number(aggregate?.resolved_count ?? 0), attention: Number(aggregate?.attention_count ?? 0), unassigned: Number(aggregate?.unassigned_count ?? 0) } };
+        return json({ ok: true, data, pagination, request_id: id }, 200, headers);
+      }
       if (route === "/notifications" && request.method === "GET") { if (!hasScope(auth, "notifications.read")) return error("FORBIDDEN", "Notification read permission required", 403, id, headers); const notificationFilter = await clientNotificationCategoryFilter(env, auth); const visibility = hidesClientTestData(auth) ? " AND NOT EXISTS (SELECT 1 FROM shipments test_shipment WHERE test_shipment.id = notifications.shipment_id AND test_shipment.is_test = 1)" : ""; const rows = auth.system ? await env.DB.prepare("SELECT *, is_read, recipient_user_id FROM notifications ORDER BY created_at DESC LIMIT 100").all() : auth.clientIds.size ? await env.DB.prepare(`SELECT *, is_read, recipient_user_id FROM notifications WHERE (client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) OR recipient_user_id = ?)${visibility}${notificationFilter.sql} ORDER BY created_at DESC LIMIT 100`).bind(...auth.clientIds, auth.userId ?? "", ...notificationFilter.params).all() : { results: [] }; return json({ ok: true, data: rows.results }, 200, headers); }
       const collectionRoutes: Record<string, { table: string; scope: string; order: string }> = {
         "/tickets": { table: "support_tickets", scope: "tickets.read", order: "updated_at DESC" },
@@ -6196,13 +6235,22 @@ const worker = {
           ? " AND date(b.created_at) >= date(?) AND date(b.created_at) <= date(?)"
           : Number.isInteger(days) && days >= 1 && days <= 90 ? " AND datetime(b.created_at) >= datetime('now', ?)" : "";
         const dateBind = explicitDateRange ? [startDate, endDate] : dateClause ? [`-${days - 1} days`] : [];
+        const pageLimit = url.searchParams.has("limit") ? Math.min(Math.max(Number.parseInt(url.searchParams.get("limit") ?? "100", 10) || 100, 1), 200) : null;
+        const pageOffset = Math.max(Number.parseInt(url.searchParams.get("offset") ?? "0", 10) || 0, 0);
+        const pageSql = pageLimit === null ? "" : ` LIMIT ${pageLimit + 1} OFFSET ${pageOffset}`;
         const rows = auth.system
-          ? await env.DB.prepare(`SELECT b.*, ps.account_scope, ps.origin_zone, ps.destination_zone, ps.chargeable_weight_kg, ps.client_breakdown_json, ${shipmentColumns.replaceAll("s.", "sh.")}, w.provider_weight_received_at, w.client_dispute_deadline_at FROM billing_records b LEFT JOIN pricing_shipment_snapshots ps ON ps.shipment_id = b.shipment_id LEFT JOIN shipments sh ON sh.id = b.shipment_id LEFT JOIN weight_reconciliations w ON w.shipment_id = b.shipment_id WHERE 1 = 1${dateClause} ORDER BY b.created_at DESC`).bind(...dateBind).all()
+          ? await env.DB.prepare(`SELECT b.*, ps.account_scope, ps.origin_zone, ps.destination_zone, ps.chargeable_weight_kg, ps.client_breakdown_json, ${shipmentColumns.replaceAll("s.", "sh.")}, w.provider_weight_received_at, w.client_dispute_deadline_at FROM billing_records b LEFT JOIN pricing_shipment_snapshots ps ON ps.shipment_id = b.shipment_id LEFT JOIN shipments sh ON sh.id = b.shipment_id LEFT JOIN weight_reconciliations w ON w.shipment_id = b.shipment_id WHERE 1 = 1${dateClause} ORDER BY b.created_at DESC, b.id DESC${pageSql}`).bind(...dateBind).all()
           : auth.clientIds.size
-            ? await env.DB.prepare(`SELECT b.*, ps.account_scope, ps.origin_zone, ps.destination_zone, ps.chargeable_weight_kg, ps.client_breakdown_json, ${shipmentColumns.replaceAll("s.", "sh.")}, w.provider_weight_received_at, w.client_dispute_deadline_at FROM billing_records b LEFT JOIN pricing_shipment_snapshots ps ON ps.shipment_id = b.shipment_id LEFT JOIN shipments sh ON sh.id = b.shipment_id LEFT JOIN weight_reconciliations w ON w.shipment_id = b.shipment_id WHERE b.client_id IN (${[...auth.clientIds].map(() => "?").join(",")})${hidesClientTestData(auth) ? " AND COALESCE(sh.is_test, 0) = 0" : ""}${dateClause} ORDER BY b.created_at DESC`).bind(...auth.clientIds, ...dateBind).all()
+            ? await env.DB.prepare(`SELECT b.*, ps.account_scope, ps.origin_zone, ps.destination_zone, ps.chargeable_weight_kg, ps.client_breakdown_json, ${shipmentColumns.replaceAll("s.", "sh.")}, w.provider_weight_received_at, w.client_dispute_deadline_at FROM billing_records b LEFT JOIN pricing_shipment_snapshots ps ON ps.shipment_id = b.shipment_id LEFT JOIN shipments sh ON sh.id = b.shipment_id LEFT JOIN weight_reconciliations w ON w.shipment_id = b.shipment_id WHERE b.client_id IN (${[...auth.clientIds].map(() => "?").join(",")})${hidesClientTestData(auth) ? " AND COALESCE(sh.is_test, 0) = 0" : ""}${dateClause} ORDER BY b.created_at DESC, b.id DESC${pageSql}`).bind(...auth.clientIds, ...dateBind).all()
             : { results: [] };
-        const data = await Promise.all(rows.results.map(async (row) => { const record = row as Record<string, unknown>; let pricing: unknown = null; if (typeof record.client_breakdown_json === "string") { try { pricing = JSON.parse(record.client_breakdown_json); } catch { pricing = null; } } const adjustments = record.shipment_id ? await env.DB.prepare("SELECT component_code, previous_amount, new_amount, reason, actor_user_id, created_at FROM pricing_overrides WHERE shipment_id = ? ORDER BY created_at ASC").bind(record.shipment_id).all() : { results: [] }; const amendments = record.shipment_id ? await env.DB.prepare("SELECT id, amendment_type, previous_amount, new_amount, reason, weight_received_at, ticket_deadline_at, actor_user_id, created_at FROM billing_amendments WHERE shipment_id = ? ORDER BY created_at ASC").bind(record.shipment_id).all() : { results: [] }; const lineItems = record.id ? await env.DB.prepare("SELECT id, code, label, amount, marker, display_order, created_at FROM billing_line_items WHERE billing_id = ? ORDER BY display_order ASC, code ASC").bind(record.id).all() : { results: [] }; const safe = { ...record }; delete safe.client_breakdown_json; const parseJson = (value: unknown) => { if (typeof value !== "string") return value ?? null; try { return JSON.parse(value); } catch { return null; } }; return { ...safe, pricing, line_items: lineItems.results, adjustments: adjustments.results, amendments: amendments.results, shipment_origin_address: parseJson(record.shipment_origin_address_json), shipment_destination_address: parseJson(record.shipment_destination_address_json), dimensions: parseJson(record.dimensions_json) }; }));
-        return json({ ok: true, data }, 200, headers);
+        const pageRows = pageLimit === null ? rows.results : rows.results.slice(0, pageLimit);
+        const data = await Promise.all(pageRows.map(async (row) => { const record = row as Record<string, unknown>; let pricing: unknown = null; if (typeof record.client_breakdown_json === "string") { try { pricing = JSON.parse(record.client_breakdown_json); } catch { pricing = null; } } const adjustments = record.shipment_id ? await env.DB.prepare("SELECT component_code, previous_amount, new_amount, reason, actor_user_id, created_at FROM pricing_overrides WHERE shipment_id = ? ORDER BY created_at ASC").bind(record.shipment_id).all() : { results: [] }; const amendments = record.shipment_id ? await env.DB.prepare("SELECT id, amendment_type, previous_amount, new_amount, reason, weight_received_at, ticket_deadline_at, actor_user_id, created_at FROM billing_amendments WHERE shipment_id = ? ORDER BY created_at ASC").bind(record.shipment_id).all() : { results: [] }; const lineItems = record.id ? await env.DB.prepare("SELECT id, code, label, amount, marker, display_order, created_at FROM billing_line_items WHERE billing_id = ? ORDER BY display_order ASC, code ASC").bind(record.id).all() : { results: [] }; const safe = { ...record }; delete safe.client_breakdown_json; const parseJson = (value: unknown) => { if (typeof value !== "string") return value ?? null; try { return JSON.parse(value); } catch { return null; } }; return { ...safe, pricing, line_items: lineItems.results, adjustments: adjustments.results, amendments: amendments.results, shipment_origin_address: parseJson(record.shipment_origin_address_json), shipment_destination_address: parseJson(record.shipment_destination_address_json), dimensions: parseJson(record.dimensions_json) }; }));
+        if (pageLimit === null) return json({ ok: true, data }, 200, headers);
+        const countQuery = auth.system
+          ? `SELECT COUNT(*) AS total FROM billing_records b WHERE 1 = 1${dateClause}`
+          : `SELECT COUNT(*) AS total FROM billing_records b LEFT JOIN shipments sh ON sh.id = b.shipment_id WHERE b.client_id IN (${[...auth.clientIds].map(() => "?").join(",")})${hidesClientTestData(auth) ? " AND COALESCE(sh.is_test, 0) = 0" : ""}${dateClause}`;
+        const count = auth.system ? await env.DB.prepare(countQuery).bind(...dateBind).first<{ total: number }>() : auth.clientIds.size ? await env.DB.prepare(countQuery).bind(...auth.clientIds, ...dateBind).first<{ total: number }>() : { total: 0 };
+        return json({ ok: true, data, pagination: { limit: pageLimit, offset: pageOffset, total: Number(count?.total ?? 0), next_offset: pageOffset + data.length, has_more: rows.results.length > pageLimit } }, 200, headers);
       }
       if (route === "/weight-reconciliation" && request.method === "GET") {
         if (!hasScope(auth, "weight.read")) return error("FORBIDDEN", "Permission required", 403, id, headers);
@@ -6284,14 +6332,23 @@ const worker = {
               ? "c.id, c.client_id, c.category, c.severity, c.title, c.details, c.status, c.created_at, c.updated_at, s.pss_reference AS shipment_pss_reference, s.lr_number, s.master_awb, s.tracking_number"
               : "*";
         const unlimitedCollection = ["ndr_cases", "exception_cases", "return_shipments"].includes(collection.table);
-        const collectionLimit = unlimitedCollection ? "" : " LIMIT 100";
+        const pageLimit = collection.table === "wallet_transactions" && internalCollectionView && url.searchParams.has("limit") ? Math.min(Math.max(Number.parseInt(url.searchParams.get("limit") ?? "100", 10) || 100, 1), 200) : null;
+        const pageOffset = Math.max(Number.parseInt(url.searchParams.get("offset") ?? "0", 10) || 0, 0);
+        const collectionLimit = unlimitedCollection ? "" : pageLimit === null ? " LIMIT 100" : ` LIMIT ${pageLimit + 1} OFFSET ${pageOffset}`;
         const source = collection.table === "wallet_transactions" && !internalCollectionView
           ? "wallet_transactions w LEFT JOIN shipments s ON s.id = CASE WHEN w.reference LIKE 'SHIPMENT-%' OR w.reference LIKE 'REVERSAL-%' THEN substr(w.reference, 10) WHEN w.reference LIKE 'WEIGHT-DEBIT-%' THEN substr(w.reference, 14) WHEN w.reference LIKE 'WEIGHT-CREDIT-%' THEN substr(w.reference, 15) ELSE '' END"
           : collection.table === "return_shipments" && !internalCollectionView ? "return_shipments r LEFT JOIN shipments s ON s.id = r.shipment_id" : clientCaseView ? `${collection.table} c LEFT JOIN shipments s ON s.id = c.shipment_id` : collection.table;
         const scopeColumn = collection.table === "wallet_transactions" && !internalCollectionView ? "w.client_id" : collection.table === "return_shipments" && !internalCollectionView ? "r.client_id" : clientCaseView ? "c.client_id" : "client_id";
         const orderColumn = collection.table === "wallet_transactions" && !internalCollectionView ? collection.order.replaceAll("created_at", "w.created_at") : collection.table === "return_shipments" && !internalCollectionView ? collection.order.replaceAll("updated_at", "r.updated_at") : clientCaseView ? collection.order.replaceAll("updated_at", "c.updated_at") : collection.order;
-        const rows = auth.system ? await env.DB.prepare(`SELECT ${select} FROM ${source} ORDER BY ${orderColumn}${collectionLimit}`).all() : auth.clientIds.size ? await env.DB.prepare(`SELECT ${select} FROM ${source} WHERE ${scopeColumn} IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY ${orderColumn}${collectionLimit}`).bind(...auth.clientIds).all() : { results: [] };
-        return json({ ok: true, data: rows.results }, 200, headers);
+        const scopedWhere = auth.system ? "" : auth.clientIds.size ? ` WHERE ${scopeColumn} IN (${[...auth.clientIds].map(() => "?").join(",")})` : " WHERE 1 = 0";
+        const scopeBinds = auth.system ? [] : [...auth.clientIds];
+        const rows = await env.DB.prepare(`SELECT ${select} FROM ${source}${scopedWhere} ORDER BY ${orderColumn}${collectionLimit}`).bind(...scopeBinds).all();
+        if (pageLimit === null) return json({ ok: true, data: rows.results }, 200, headers);
+        const data = rows.results.slice(0, pageLimit);
+        const count = auth.system
+          ? await env.DB.prepare(`SELECT COUNT(*) AS total FROM ${source}`).first<{ total: number }>()
+          : await env.DB.prepare(`SELECT COUNT(*) AS total FROM ${source}${scopedWhere}`).bind(...scopeBinds).first<{ total: number }>();
+        return json({ ok: true, data, pagination: { limit: pageLimit, offset: pageOffset, total: Number(count?.total ?? 0), next_offset: pageOffset + data.length, has_more: rows.results.length > pageLimit } }, 200, headers);
       }
       if ((route === "/billing" || route === "/wallet") && request.method === "POST") {
         const scope = route === "/billing" ? "billing.manage" : "wallet.manage";
@@ -6432,31 +6489,42 @@ const worker = {
         return json({ ok: true, data: messages.results }, 200, headers);
       }
       if (ticketMessages && ticketMessages[1] && request.method === "POST") {
-        if (!hasScope(auth, "tickets.create")) return error("FORBIDDEN", "Ticket reply permission required", 403, id, headers);
+        if (!canPerformTicketAction(auth, "reply")) return error("FORBIDDEN", "Ticket reply permission required", 403, id, headers);
         const ticket = await env.DB.prepare("SELECT client_id FROM support_tickets WHERE id = ? LIMIT 1").bind(ticketMessages[1]).first<{ client_id: string }>();
         if (!ticket || !canAccessClient(auth, ticket.client_id)) return error("NOT_FOUND", "Ticket not found", 404, id, headers);
         const payload = await bodyJson(request); const requestHash = await payloadFingerprint(payload); if (typeof payload.message !== "string" || !payload.message.trim()) return error("VALIDATION_ERROR", "Message is required", 400, id, headers);
         const idempotencyKey = request.headers.get("Idempotency-Key"); if (!idempotencyKey) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
         const endpoint = `POST /v1/tickets/${ticketMessages[1]}/messages`; const existing = await idempotentResponse(env, idempotencyKey, ticket.client_id, endpoint, requestHash); if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
-        const messageId = crypto.randomUUID(); await env.DB.prepare("INSERT INTO support_messages (id, ticket_id, author_user_id, body) VALUES (?, ?, ?, ?)").bind(messageId, ticketMessages[1], auth.userId ?? `api:${ticket.client_id}`, payload.message.trim()).run();
-        await env.DB.prepare("UPDATE support_tickets SET updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(ticketMessages[1]).run();
+        const messageId = crypto.randomUUID();
+        const serialized = JSON.stringify({ ok: true, data: { id: messageId, ticket_id: ticketMessages[1] }, request_id: id });
+        await env.DB.batch([
+          env.DB.prepare("INSERT INTO support_messages (id, ticket_id, author_user_id, body) VALUES (?, ?, ?, ?)").bind(messageId, ticketMessages[1], auth.userId ?? `api:${ticket.client_id}`, payload.message.trim()),
+          env.DB.prepare("UPDATE support_tickets SET updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(ticketMessages[1]),
+          env.DB.prepare("INSERT INTO idempotency_keys (idempotency_key, client_id, endpoint, request_hash, response_status, response_body, expires_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now', '+24 hours'))").bind(idempotencyKey, ticket.client_id, endpoint, requestHash, 201, serialized),
+        ]);
         await audit(env, ctx, auth, id, "ticket.message_created", "ticket", ticketMessages[1], { client_id: ticket.client_id });
-        const serialized = JSON.stringify({ ok: true, data: { id: messageId, ticket_id: ticketMessages[1] }, request_id: id }); await saveIdempotent(env, idempotencyKey, ticket.client_id, endpoint, 201, serialized, requestHash);
         return new Response(serialized, { status: 201, headers: { ...headers, "content-type": "application/json" } });
       }
 
       if (route === "/tickets" && request.method === "POST") {
-        if (!hasScope(auth, "tickets.create")) return error("FORBIDDEN", "Ticket creation scope required", 403, id, headers);
+        if (!canPerformTicketAction(auth, "create")) return error("FORBIDDEN", "Ticket creation permission required", 403, id, headers);
         const payload = await bodyJson(request); const requestHash = await payloadFingerprint(payload); const clientId = requireClient(auth, payload.client_id);
         if (!clientId || !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
-        if (typeof payload.title !== "string" || typeof payload.description !== "string") return error("VALIDATION_ERROR", "Ticket title and description are required", 400, id, headers);
+        if (typeof payload.title !== "string" || !payload.title.trim() || payload.title.trim().length > 240 || typeof payload.description !== "string" || !payload.description.trim() || payload.description.trim().length > 10000) return error("VALIDATION_ERROR", "Ticket subject (1–240 characters) and initial message (1–10000 characters) are required", 400, id, headers);
         const priority = String(payload.priority ?? "normal").trim().toLowerCase();
         if (!["normal", "high", "urgent"].includes(priority)) return error("VALIDATION_ERROR", "Ticket priority must be normal, high, or urgent", 400, id, headers);
         if (payload.shipment_id !== undefined && !(await shipmentBelongsToClient(env, payload.shipment_id, clientId))) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
         const key = request.headers.get("Idempotency-Key"); if (!key) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
         const existing = await idempotentResponse(env, key, clientId, "POST /v1/tickets", requestHash); if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
-        const ticketId = crypto.randomUUID(); await env.DB.prepare("INSERT INTO support_tickets (id, client_id, shipment_id, title, description, priority, status, sla_due_at, escalation_state, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?, 'open', datetime(CURRENT_TIMESTAMP, CASE ? WHEN 'urgent' THEN '+4 hours' WHEN 'high' THEN '+8 hours' ELSE '+24 hours' END), 'normal', ?)").bind(ticketId, clientId, typeof payload.shipment_id === "string" ? payload.shipment_id : null, payload.title.trim(), payload.description.trim(), priority, priority, auth.userId ?? `api:${clientId}`).run();
-        const serialized = JSON.stringify({ ok: true, data: { id: ticketId, client_id: clientId, status: "open", priority, escalation_state: "normal" }, request_id: id }); await saveIdempotent(env, key, clientId, "POST /v1/tickets", 201, serialized, requestHash);
+        const ticketId = crypto.randomUUID();
+        const initialMessageId = crypto.randomUUID();
+        const endpoint = "POST /v1/tickets";
+        const serialized = JSON.stringify({ ok: true, data: { id: ticketId, client_id: clientId, status: "open", priority, escalation_state: "normal" }, request_id: id });
+        await env.DB.batch([
+          env.DB.prepare("INSERT INTO support_tickets (id, client_id, shipment_id, title, description, priority, status, sla_due_at, escalation_state, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?, 'open', datetime(CURRENT_TIMESTAMP, CASE ? WHEN 'urgent' THEN '+4 hours' WHEN 'high' THEN '+8 hours' ELSE '+24 hours' END), 'normal', ?)").bind(ticketId, clientId, typeof payload.shipment_id === "string" ? payload.shipment_id : null, payload.title.trim(), payload.description.trim(), priority, priority, auth.userId ?? `api:${clientId}`),
+          env.DB.prepare("INSERT INTO support_messages (id, ticket_id, author_user_id, body) VALUES (?, ?, ?, ?)").bind(initialMessageId, ticketId, auth.userId ?? `api:${clientId}`, payload.description.trim()),
+          env.DB.prepare("INSERT INTO idempotency_keys (idempotency_key, client_id, endpoint, request_hash, response_status, response_body, expires_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now', '+24 hours'))").bind(key, clientId, endpoint, requestHash, 201, serialized),
+        ]);
         await audit(env, ctx, auth, id, "ticket.created", "ticket", ticketId, { client_id: clientId });
         return new Response(serialized, { status: 201, headers: { ...headers, "content-type": "application/json" } });
       }
@@ -6590,14 +6658,16 @@ const worker = {
         const table = map[entityUpdate[1]]; const current = await env.DB.prepare(`SELECT client_id FROM ${table} WHERE id = ? LIMIT 1`).bind(entityUpdate[2]).first<{ client_id: string }>();
         const scopeByEntity: Record<string, string> = { billing: "billing.manage", wallet: "wallet.manage", "cod-remittances": "cod.manage", "weight-reconciliation": "weight.manage" };
         if (!current || !canAccessClient(auth, current.client_id) || (scopeByEntity[entityUpdate[1]] && !hasScope(auth, scopeByEntity[entityUpdate[1]])) || (!scopeByEntity[entityUpdate[1]] && entityUpdate[1] !== "warehouses" && entityUpdate[1] !== "addresses" && !hasRole(auth, ["employee", "admin", "super_admin"]))) return error("NOT_FOUND", "Record not found", 404, id, headers);
-        const payload = await bodyJson(request); const financeStatuses: Record<string, string[]> = { billing: ["pending", "approved", "paid", "void", "cancelled"], wallet: ["pending", "approved", "posted", "rejected", "void"] }; const requestedStatus = payload.status === undefined ? undefined : String(payload.status); if (requestedStatus !== undefined && financeStatuses[entityUpdate[1]] && !financeStatuses[entityUpdate[1]].includes(requestedStatus)) return error("VALIDATION_ERROR", "Invalid finance record status", 400, id, headers); if (entityUpdate[1] === "weight-reconciliation" && (typeof payload.reason !== "string" || !payload.reason.trim())) return error("VALIDATION_ERROR", "A reason is required for weight-record changes", 400, id, headers); if (payload.is_test !== undefined && !hasRole(auth, ["admin", "super_admin"])) return error("FORBIDDEN", "Only administrators may classify test data", 403, id, headers); if (payload.is_test !== undefined && !isTestFlag(payload.is_test)) return error("VALIDATION_ERROR", "is_test must be a boolean", 400, id, headers); const requestHash = await payloadFingerprint(payload); const allowedFields = entityUpdate[1] === "warehouses" ? ["name", "address", "city", "state", "pincode", "contact", "contact_name", "is_test"] : entityUpdate[1] === "addresses" ? ["label", "address_kind", "contact_name", "phone", "address", "city", "state", "country", "pincode", "is_test"] : entityUpdate[1] === "weight-reconciliation" ? ["status", "measured_weight_kg", "billable_weight_kg"] : entityUpdate[1] === "wallet" ? ["status"] : entityUpdate[1] === "cod-remittances" ? ["status", "settled_at"] : entityUpdate[1] === "ndr" ? ["status", "assigned_to_user_id", "deadline", "notes", "attempt"] : entityUpdate[1] === "exceptions" ? ["status", "assigned_to_user_id", "severity", "details"] : entityUpdate[1] === "returns" ? ["status", "provider_reference"] : ["status", "assigned_to_user_id", "priority"]; if ((entityUpdate[1] === "ndr" || entityUpdate[1] === "exceptions" || entityUpdate[1] === "tickets") && payload.assigned_to_user_id !== undefined && !(await employeeCanBeAssigned(env, auth, payload.assigned_to_user_id, current.client_id))) return error("FORBIDDEN", "Assigned employee is not active or is outside the client scope", 403, id, headers); const updates = allowedFields.filter((field) => typeof payload[field] === "string" || typeof payload[field] === "number" || (field === "is_test" && isTestFlag(payload[field]))).map((field) => ({ field, value: field === "address_kind" && payload[field] !== "consignee" ? "consignor" : field === "is_test" ? testFlagNumber(payload[field]) : payload[field] }));
+        const payload = await bodyJson(request); if (entityUpdate[1] === "tickets") { const status = typeof payload.status === "string" ? payload.status.trim().toLowerCase() : undefined; if (status && !["open", "in_progress", "waiting_for_client", "resolved", "closed", "escalated"].includes(status)) return error("VALIDATION_ERROR", "Unsupported ticket status", 400, id, headers); const isAdmin = hasRole(auth, ["admin", "super_admin"]); const requiredPermission = ticketUpdatePermissions(payload).find((permission) => !isAdmin && (permission === "admin" || !hasScope(auth, permission))); if (requiredPermission) { const messages = { "tickets.reassign": "Ticket reassignment permission required", "tickets.close": "Ticket resolution permission required", "tickets.escalate": "Ticket escalation permission required", admin: "Only administrators may change ticket priority" }; return error("FORBIDDEN", messages[requiredPermission], 403, id, headers); } } const financeStatuses: Record<string, string[]> = { billing: ["pending", "approved", "paid", "void", "cancelled"], wallet: ["pending", "approved", "posted", "rejected", "void"] }; const requestedStatus = payload.status === undefined ? undefined : String(payload.status); if (requestedStatus !== undefined && financeStatuses[entityUpdate[1]] && !financeStatuses[entityUpdate[1]].includes(requestedStatus)) return error("VALIDATION_ERROR", "Invalid finance record status", 400, id, headers); if (entityUpdate[1] === "weight-reconciliation" && (typeof payload.reason !== "string" || !payload.reason.trim())) return error("VALIDATION_ERROR", "A reason is required for weight-record changes", 400, id, headers); if (payload.is_test !== undefined && !hasRole(auth, ["admin", "super_admin"])) return error("FORBIDDEN", "Only administrators may classify test data", 403, id, headers); if (payload.is_test !== undefined && !isTestFlag(payload.is_test)) return error("VALIDATION_ERROR", "is_test must be a boolean", 400, id, headers); const requestHash = await payloadFingerprint(payload); const allowedFields = entityUpdate[1] === "warehouses" ? ["name", "address", "city", "state", "pincode", "contact", "contact_name", "is_test"] : entityUpdate[1] === "addresses" ? ["label", "address_kind", "contact_name", "phone", "address", "city", "state", "country", "pincode", "is_test"] : entityUpdate[1] === "weight-reconciliation" ? ["status", "measured_weight_kg", "billable_weight_kg"] : entityUpdate[1] === "wallet" ? ["status"] : entityUpdate[1] === "cod-remittances" ? ["status", "settled_at"] : entityUpdate[1] === "ndr" ? ["status", "assigned_to_user_id", "deadline", "notes", "attempt"] : entityUpdate[1] === "exceptions" ? ["status", "assigned_to_user_id", "severity", "details"] : entityUpdate[1] === "returns" ? ["status", "provider_reference"] : ["status", "assigned_to_user_id", "priority"]; if ((entityUpdate[1] === "ndr" || entityUpdate[1] === "exceptions" || entityUpdate[1] === "tickets") && payload.assigned_to_user_id !== undefined && !(await employeeCanBeAssigned(env, auth, payload.assigned_to_user_id, current.client_id))) return error("FORBIDDEN", "Assigned employee is not active or is outside the client scope", 403, id, headers); const updates = allowedFields.filter((field) => typeof payload[field] === "string" || typeof payload[field] === "number" || (field === "is_test" && isTestFlag(payload[field]))).map((field) => ({ field, value: field === "address_kind" && payload[field] !== "consignee" ? "consignor" : field === "is_test" ? testFlagNumber(payload[field]) : payload[field] }));
         if (!updates.length) return error("VALIDATION_ERROR", "A supported update is required", 400, id, headers);
+        const safeAuditFields = updates.map((update) => update.field).filter((field) => ["status", "priority", "assigned_to_user_id", "deadline", "attempt", "severity", "settled_at", "measured_weight_kg", "billable_weight_kg"].includes(field));
+        const auditBefore = safeAuditFields.length ? await env.DB.prepare(`SELECT ${safeAuditFields.join(", ")} FROM ${table} WHERE id = ? LIMIT 1`).bind(entityUpdate[2]).first<Record<string, unknown>>() : {};
         const idempotencyKey = request.headers.get("Idempotency-Key"); if (!idempotencyKey) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
         const endpoint = `PATCH /v1/${entityUpdate[1]}/${entityUpdate[2]}`; const existing = await idempotentResponse(env, idempotencyKey, current.client_id, endpoint, requestHash); if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
         const timestampClause = entityUpdate[1] === "wallet" ? "" : ", updated_at = CURRENT_TIMESTAMP";
         await env.DB.prepare(`UPDATE ${table} SET ${updates.map((update) => `${update.field} = ?`).join(", ")}${timestampClause} WHERE id = ?`).bind(...updates.map((update) => update.value), entityUpdate[2]).run();
         if (entityUpdate[1] === "wallet") await recalculateWalletBalances(env, current.client_id);
-        await audit(env, ctx, auth, id, `${entityUpdate[1]}.updated`, entityUpdate[1], entityUpdate[2], { client_id: current.client_id, fields: updates.map((update) => update.field) });
+        await audit(env, ctx, auth, id, `${entityUpdate[1]}.updated`, entityUpdate[1], entityUpdate[2], { client_id: current.client_id, fields: updates.map((update) => update.field), ...activitySnapshotPair(auditBefore ?? {}, updates) });
         const serialized = JSON.stringify({ ok: true, data: { id: entityUpdate[2], ...Object.fromEntries(updates.map((update) => [update.field, update.value])) }, request_id: id }); await saveIdempotent(env, idempotencyKey, current.client_id, endpoint, 200, serialized, requestHash);
         return new Response(serialized, { status: 200, headers: { ...headers, "content-type": "application/json" } });
       }
@@ -6716,7 +6786,6 @@ const worker = {
         const rows = await env.DB.prepare("SELECT id, client_id, provider, service_level, status, effective_at, minimum_weight_kg, volumetric_divisor, gst_percent, source_rate_card_id, source_rate_card_ids_json, source_rate_card_object_path, source_rate_card_filename, source_rate_card_uploaded_at, created_by_user_id, published_by_user_id, created_at, updated_at FROM pricing_versions WHERE client_id = ? ORDER BY datetime(created_at) DESC LIMIT 100").bind(clientId).all();
         return json({ ok: true, data: rows.results }, 200, headers);
       }
-      const pincodeDatasetDetail = route.match(new RegExp("^/pricing/pincode-datasets/([^/]+)$"));
       const pincodeDatasetSource = route.match(new RegExp("^/pricing/pincode-datasets/([^/]+)/source$"));
       const pincodeDatasetChunks = route.match(new RegExp("^/pricing/pincode-datasets/([^/]+)/chunks$"));
       const pincodeDatasetPublish = route.match(new RegExp("^/pricing/pincode-datasets/([^/]+)/publish$"));
@@ -6935,22 +7004,21 @@ const worker = {
         const bindings = clientId ? [clientId, limit, offset] : [limit, offset];
         const [count, pendingRows] = await Promise.all([
           env.DB.prepare(`SELECT COUNT(*) AS total FROM billing_records b ${where}`).bind(...(clientId ? [clientId] : [])).first<{ total: number }>(),
-          env.DB.prepare(`SELECT b.shipment_id, b.client_id, s.provider, s.provider_account_id, s.provider_booking_id, s.tracking_number, s.lr_number, s.master_awb, s.provider_reference, c.provider_amount FROM billing_records b LEFT JOIN shipments s ON s.id = b.shipment_id LEFT JOIN pricing_provider_costs c ON c.shipment_id = b.shipment_id ${where} ORDER BY b.created_at DESC LIMIT ? OFFSET ?`).bind(...bindings).all<Record<string, unknown>>(),
+          env.DB.prepare(`SELECT b.shipment_id, b.client_id, s.provider, s.provider_account_id, s.provider_booking_id, s.tracking_number, s.lr_number, s.master_awb, s.provider_reference, c.provider_amount, c.provider_status FROM billing_records b LEFT JOIN shipments s ON s.id = b.shipment_id LEFT JOIN pricing_provider_costs c ON c.shipment_id = b.shipment_id ${where} ORDER BY b.created_at DESC LIMIT ? OFFSET ?`).bind(...bindings).all<Record<string, unknown>>(),
         ]);
         if (syncProvider) {
           const candidates = pendingRows.results.filter((row) => String(row.provider ?? "").toLowerCase() === "delhivery" && row.provider_amount == null && String(row.client_id ?? "").trim()).slice(0, 50);
           await Promise.all(candidates.map(async (row) => {
             const shipmentId = String(row.shipment_id ?? "").trim();
             const accountId = String(row.provider_account_id ?? "").trim() || undefined;
-            const lrOrAwb = String(row.lr_number ?? "").trim();
             const bookingId = String(row.provider_booking_id ?? "").trim();
-            if (!shipmentId || (!lrOrAwb && !bookingId)) return;
-            if (!lrOrAwb) return;
-            await safeProviderRequest(env, "delhivery", "freight_charges", { shipment_id: shipmentId, tracking_number: lrOrAwb, lr_number: String(row.lr_number ?? "").trim() || lrOrAwb, provider_reference: String(row.provider_reference ?? "").trim() || undefined, provider_booking_id: bookingId || undefined, provider_account_id: accountId }, id, String(row.client_id), undefined, 10000).catch(() => undefined);
+            const reference = resolveDelhiveryCostReference({ lrNumber: row.lr_number, masterAwb: row.master_awb, trackingNumber: row.tracking_number });
+            if (!shipmentId || !reference) return;
+            await safeProviderRequest(env, "delhivery", "freight_charges", { shipment_id: shipmentId, tracking_number: reference.trackingNumber, lr_number: reference.lrNumber, provider_reference: String(row.provider_reference ?? "").trim() || undefined, provider_booking_id: bookingId || undefined, provider_account_id: accountId }, id, String(row.client_id), undefined, 10000).catch(() => undefined);
           }));
         }
         const rows = await env.DB.prepare(
-          `SELECT b.id AS billing_id, b.shipment_id, b.client_id, s.lr_number, s.master_awb, b.invoice_number, b.amount AS pss_amount, b.created_at, c.provider, c.provider_account_id, c.provider_amount, c.provider_status, CASE WHEN c.provider_amount IS NULL THEN NULL ELSE b.amount - c.provider_amount END AS margin FROM billing_records b LEFT JOIN shipments s ON s.id = b.shipment_id LEFT JOIN pricing_provider_costs c ON c.shipment_id = b.shipment_id ${where} ORDER BY b.created_at DESC LIMIT ? OFFSET ?`,
+          `SELECT b.id AS billing_id, b.shipment_id, b.client_id, s.lr_number, s.master_awb, b.invoice_number, b.amount AS pss_amount, b.created_at, c.provider, c.provider_account_id, CASE WHEN lower(COALESCE(c.provider_status, '')) IN ('failed', 'rejected', 'error') THEN NULL ELSE c.provider_amount END AS provider_amount, c.provider_status, CASE WHEN c.provider_amount IS NULL OR lower(COALESCE(c.provider_status, '')) IN ('failed', 'rejected', 'error') THEN NULL ELSE b.amount - c.provider_amount END AS margin FROM billing_records b LEFT JOIN shipments s ON s.id = b.shipment_id LEFT JOIN pricing_provider_costs c ON c.shipment_id = b.shipment_id ${where} ORDER BY b.created_at DESC LIMIT ? OFFSET ?`,
         ).bind(...bindings).all();
         return json({ ok: true, data: rows.results, pagination: { total: Number(count?.total ?? 0), limit, offset, has_more: offset + rows.results.length < Number(count?.total ?? 0) } }, 200, headers);
       }
@@ -7146,7 +7214,7 @@ const worker = {
       const taskMatch = route.match(/^\/tasks\/([^/]+)$/);
       if (taskMatch && request.method === "PATCH") {
         if (!hasScope(auth, "tasks.manage")) return error("FORBIDDEN", "Task management scope required", 403, id, headers);
-        const task = await env.DB.prepare("SELECT client_id FROM tasks WHERE id = ? LIMIT 1").bind(taskMatch[1]).first<{ client_id: string | null }>(); if (!task || (task.client_id && !canAccessClient(auth, task.client_id))) return error("NOT_FOUND", "Task not found", 404, id, headers);
+        const task = await env.DB.prepare("SELECT client_id, status, priority, due_at, assigned_to_user_id, title FROM tasks WHERE id = ? LIMIT 1").bind(taskMatch[1]).first<{ client_id: string | null; status: string; priority: string; due_at: string | null; assigned_to_user_id: string | null; title: string }>(); if (!task || (task.client_id && !canAccessClient(auth, task.client_id))) return error("NOT_FOUND", "Task not found", 404, id, headers);
         const payload = await bodyJson(request);
         const requestHash = await payloadFingerprint(payload);
         const targetClientId = payload.client_id === undefined ? task.client_id : typeof payload.client_id === "string" ? payload.client_id.trim() : undefined;
@@ -7185,7 +7253,7 @@ const worker = {
         const scopeKey = task.client_id ?? auth.clientId ?? auth.userId ?? "system"; const endpoint = `PATCH /v1/tasks/${taskMatch[1]}`; const existing = await idempotentResponse(env, idempotencyKey, scopeKey, endpoint, requestHash); if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
         await env.DB.prepare(`UPDATE tasks SET ${taskUpdates.map((update) => `${update.field} = ?`).join(", ")}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(...taskUpdates.map((update) => update.value), taskMatch[1]).run();
         const changed = Object.fromEntries(taskUpdates.map((update) => [update.field, update.value || null]));
-        await audit(env, ctx, auth, id, "task.updated", "task", taskMatch[1], { client_id: task.client_id, fields: taskUpdates.map((update) => update.field) });
+        await audit(env, ctx, auth, id, "task.updated", "task", taskMatch[1], { client_id: task.client_id, fields: taskUpdates.map((update) => update.field), ...activitySnapshotPair(task as unknown as Record<string, unknown>, taskUpdates) });
         const serialized = JSON.stringify({ ok: true, data: { id: taskMatch[1], ...changed }, request_id: id }); await saveIdempotent(env, idempotencyKey, scopeKey, endpoint, 200, serialized, requestHash); return new Response(serialized, { status: 200, headers: { ...headers, "content-type": "application/json" } });
       }
       if (route === "/activity" && request.method === "POST") {
@@ -7215,8 +7283,30 @@ const worker = {
       }
       if (route === "/activity" && request.method === "GET") {
         if (!hasScope(auth, "activity.read")) return error("FORBIDDEN", "Activity read scope required", 403, id, headers);
-        const rows = auth.system ? await env.DB.prepare("SELECT * FROM activity_events ORDER BY created_at DESC LIMIT 100").all() : auth.clientIds.size ? await env.DB.prepare(`SELECT * FROM activity_events WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) OR actor_user_id = ? ORDER BY created_at DESC LIMIT 100`).bind(...auth.clientIds, auth.userId ?? "").all() : { results: [] };
-        return json({ ok: true, data: rows.results }, 200, headers);
+        const limit = Math.min(Math.max(Number.parseInt(url.searchParams.get("limit") ?? "100", 10) || 100, 1), 200);
+        const offset = Math.max(Number.parseInt(url.searchParams.get("offset") ?? "0", 10) || 0, 0);
+        const scopedSql = auth.system
+          ? "SELECT * FROM activity_events"
+          : auth.clientIds.size
+            ? `SELECT * FROM activity_events WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) OR actor_user_id = ?`
+            : null;
+        const countSql = auth.system
+          ? "SELECT COUNT(*) AS total FROM activity_events"
+          : auth.clientIds.size
+            ? `SELECT COUNT(*) AS total FROM activity_events WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) OR actor_user_id = ?`
+            : null;
+        if (!scopedSql || !countSql) return json({ ok: true, data: [], pagination: { limit, offset, total: 0, next_offset: offset, has_more: false } }, 200, headers);
+        const rowsQuery = `${scopedSql} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`;
+        const countQuery = countSql;
+        const rows = auth.system
+          ? await env.DB.prepare(rowsQuery).bind(limit + 1, offset).all()
+          : await env.DB.prepare(rowsQuery).bind(...auth.clientIds, auth.userId ?? "", limit + 1, offset).all();
+        const count = auth.system
+          ? await env.DB.prepare(countQuery).first<{ total: number }>()
+          : await env.DB.prepare(countQuery).bind(...auth.clientIds, auth.userId ?? "").first<{ total: number }>();
+        const results = rows.results ?? [];
+        const data = results.slice(0, limit);
+        return json({ ok: true, data, pagination: { limit, offset, total: Number(count?.total ?? 0), next_offset: offset + data.length, has_more: results.length > limit } }, 200, headers);
       }
       const notificationMatch = route.match(/^\/notifications\/([^/]+)$/);
       if (notificationMatch && request.method === "PATCH") {
