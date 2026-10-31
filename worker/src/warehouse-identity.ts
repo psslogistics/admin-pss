@@ -21,6 +21,21 @@ export function canonicalDelhiveryWarehouseName(name: string, city?: string, sta
   return [base, suffix].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
 }
 
+export function isVerifiedDelhiveryWarehouse<T extends {
+  provider?: string | null;
+  provider_account_id?: string | null;
+  provider_status?: string | null;
+  provider_reference?: string | null;
+  provider_activated_at?: string | null;
+}>(warehouse: T | null | undefined, providerAccountId?: string | null): warehouse is T {
+  return Boolean(warehouse
+    && String(warehouse.provider ?? "").trim().toLowerCase() === "delhivery"
+    && (warehouse.provider_account_id ?? null) === (providerAccountId ?? null)
+    && String(warehouse.provider_status ?? "").trim().toLowerCase() === "active"
+    && warehouse.provider_reference?.trim()
+    && warehouse.provider_activated_at?.trim());
+}
+
 export function delhiveryFacilityMatches(row: Record<string, unknown>, requestedName: string, requestedPincode: string, storedProviderReference?: string | null, localWarehouseName?: string | null, allowStaleProviderReference = false) {
   const rowStatus = String(row.status ?? row.facility_status ?? row.state ?? "ACTIVE").toLowerCase();
   const activeFlag = row.is_active ?? row.active ?? row.enabled ?? row.is_enabled;

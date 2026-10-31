@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { canonicalDelhiveryWarehouseName, delhiveryFacilityMatches, normalizeDelhiveryWarehouseIdentity } from "../src/warehouse-identity.ts";
+import { canonicalDelhiveryWarehouseName, delhiveryFacilityMatches, isVerifiedDelhiveryWarehouse, normalizeDelhiveryWarehouseIdentity } from "../src/warehouse-identity.ts";
 
 const active = { id: "provider-1", name: "Warehouse Alpha", pincode: "201310", status: "ACTIVE" };
+const verifiedLocal = { provider: "delhivery", provider_account_id: "account-1", provider_status: "active", provider_reference: "facility-1", provider_activated_at: "2026-10-31T10:00:00Z" };
 
 assert.equal(normalizeDelhiveryWarehouseIdentity("Warehouse-Alpha · 201310"), "warehousealpha201310");
 assert.equal(delhiveryFacilityMatches(active, "warehouse alpha", "201310"), true, "exact active warehouse should match");
@@ -21,5 +22,10 @@ assert.equal(delhiveryFacilityMatches({ ...active, name: "Warehouse Alpha Luckno
 assert.equal(delhiveryFacilityMatches({ ...active, name: "Warehouse Alpha" }, "Warehouse Alpha Lucknow Uttar Pradesh 226017", "201310", null, "Warehouse Alpha"), true, "provider base name should match the selected local warehouse");
 assert.equal(delhiveryFacilityMatches({ ...active, name: "Warehouse Beta" }, "Warehouse Alpha Lucknow Uttar Pradesh 226017", "201310", null, "Warehouse Alpha"), false, "different provider base name must not match the selected local warehouse");
 assert.equal(delhiveryFacilityMatches({ ...active, name: "Warehouse Alpha" }, "Warehouse Alpha Lucknow Uttar Pradesh 226017", "201310", "stale-provider-id", "Warehouse Alpha", true), true, "active local identity should recover from a stale provider reference");
+assert.equal(isVerifiedDelhiveryWarehouse(verifiedLocal, "account-1"), true, "a provider-verified local facility is reusable before any LR exists");
+assert.equal(isVerifiedDelhiveryWarehouse(verifiedLocal, "account-2"), false, "a verified facility cannot cross Delhivery accounts");
+assert.equal(isVerifiedDelhiveryWarehouse({ ...verifiedLocal, provider_status: "pending" }, "account-1"), false, "pending provider registration cannot be reused");
+assert.equal(isVerifiedDelhiveryWarehouse({ ...verifiedLocal, provider_reference: null }, "account-1"), false, "a local active flag without provider reference cannot be reused");
+assert.equal(isVerifiedDelhiveryWarehouse({ ...verifiedLocal, provider_activated_at: null }, "account-1"), false, "a facility without verification timestamp cannot be reused");
 
 console.log("Exact warehouse flow matrix passed (17 cases)");
