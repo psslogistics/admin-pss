@@ -502,5 +502,6 @@ CREATE INDEX IF NOT EXISTS idx_billing_client_status ON billing_records(client_i
 CREATE INDEX IF NOT EXISTS idx_wallet_client_time ON wallet_transactions(client_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_cod_client_status ON cod_remittances(client_id, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_weight_client_status ON weight_reconciliations(client_id, status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_weight_reconciliations_shipment_client ON weight_reconciliations(shipment_id, client_id);
 CREATE INDEX IF NOT EXISTS idx_master_records_kind_updated ON master_records(kind, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_master_records_client_kind ON master_records(client_id, kind, updated_at DESC);
