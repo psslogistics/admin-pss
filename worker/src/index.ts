@@ -5905,7 +5905,10 @@ const worker = {
             if (hasScope(auth, scope)) overviewEntries.push({ key, statement: scoped(sql, extra, visibilityTable) });
           };
           addOverview("shipments", "shipments.read", "SELECT id, client_id, pss_reference, lr_number, master_awb, tracking_number, provider, provider_reference, status, origin, destination, total_weight_kg, pieces, edd, delivered_at, created_at FROM shipments", "edd IS NOT NULL AND (date(edd) < date('now') OR (delivered_at IS NOT NULL AND date(delivered_at) > date(edd))) AND lower(COALESCE(status, '')) NOT IN ('delivered', 'cancelled') ORDER BY edd ASC LIMIT 20", "shipments");
-          addOverview("pickups", "pickups.read", "SELECT id, shipment_id, client_id, (SELECT pss_reference FROM shipments WHERE id = pickup_requests.shipment_id) AS shipment_pss_reference, provider_reference AS pickup_reference, requested_date, requested_time_slot, pickup_address, status, created_at, updated_at FROM pickup_requests", "lower(COALESCE(status, '')) NOT IN ('completed', 'cancelled') ORDER BY requested_date ASC LIMIT 100", "pickup_requests");
+          const openPickupStatuses = ["requested", "provider_pending", "scheduled", "rescheduled", "not_picked", "driver_assigned", "en_route"];
+          const openPickupStatusSql = openPickupStatuses.map((status) => `'${status}'`).join(", ");
+          const openPickupStatusPlaceholders = openPickupStatuses.map(() => "?").join(", ");
+          addOverview("pickups", "pickups.read", "SELECT id, shipment_id, client_id, (SELECT pss_reference FROM shipments WHERE id = pickup_requests.shipment_id) AS shipment_pss_reference, provider_reference AS pickup_reference, requested_date, requested_time_slot, pickup_address, status, created_at, updated_at FROM pickup_requests", `lower(COALESCE(status, '')) IN (${openPickupStatusSql})${hidesClientTestData(auth) ? " AND COALESCE(pickup_requests.is_test, 0) = 0" : ""} ORDER BY requested_date ASC LIMIT 100`, "pickup_requests");
           addOverview("billing", "billing.read", "SELECT id, client_id, shipment_id, (SELECT pss_reference FROM shipments WHERE id = billing_records.shipment_id) AS shipment_pss_reference, invoice_number, amount, currency, status, due_date, created_at FROM billing_records", "lower(COALESCE(status, '')) = 'pending' ORDER BY created_at DESC LIMIT 100", "billing_records");
           addOverview("wallet", "wallet.read", "SELECT id, client_id, type, amount, balance_after, reference, status, created_at FROM wallet_transactions", "1 = 1 ORDER BY created_at DESC LIMIT 1", "wallet_transactions");
           addOverview("cod", "cod.read", "SELECT id, client_id, shipment_id, amount, status, created_at FROM cod_remittances", "1 = 1 ORDER BY created_at DESC LIMIT 100", "cod_remittances");
@@ -5919,6 +5922,16 @@ const worker = {
           };
           const delayedShipments = overviewRowsFor("shipments");
           const pickups = overviewRowsFor("pickups");
+          const openPickupScope = auth.system
+            ? `WHERE lower(COALESCE(p.status, '')) IN (${openPickupStatusPlaceholders})`
+            : clientIds.length
+              ? `WHERE p.client_id IN (${clientPlaceholders}) AND lower(COALESCE(p.status, '')) IN (${openPickupStatusPlaceholders})`
+              : "WHERE 1 = 0";
+          const openPickupVisibility = hidesClientTestData(auth)
+            ? " AND COALESCE(p.is_test, 0) = 0 AND NOT EXISTS (SELECT 1 FROM shipments test_shipment WHERE test_shipment.id = p.shipment_id AND COALESCE(test_shipment.is_test, 0) = 1)"
+            : "";
+          const pickupParams = auth.system ? openPickupStatuses : clientIds.length ? [...clientIds, ...openPickupStatuses] : [];
+          const openPickupCountRow = await env.DB.prepare(`SELECT COUNT(*) AS open_count FROM pickup_requests p ${openPickupScope}${openPickupVisibility}`).bind(...pickupParams).first<{ open_count: number }>();
           const billing = overviewRowsFor("billing");
           const wallet = overviewRowsFor("wallet");
           const cod = overviewRowsFor("cod");
@@ -5948,6 +5961,7 @@ const worker = {
           const data = {
             shipments: delayedShipments,
             pickups,
+            pickup_stats: { open_count: Number(openPickupCountRow?.open_count ?? 0) },
             billing,
             wallet,
             cod,
