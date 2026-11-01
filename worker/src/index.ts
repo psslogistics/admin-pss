@@ -5441,6 +5441,22 @@ const worker = {
         const endpoint = `DELETE /v1/shipments/${shipmentUpdate[1]}`;
         const existing = await idempotentResponse(env, key, current.client_id, endpoint, requestHash);
         if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
+        const linkedFinancialEntries = await env.DB.prepare(`
+          SELECT
+            (SELECT COUNT(*) FROM wallet_transactions WHERE client_id = ? AND reference IN (?, ?, ?, ?))
+            + (SELECT COUNT(*) FROM billing_records WHERE client_id = ? AND shipment_id = ?) AS total
+        `).bind(
+          current.client_id,
+          `SHIPMENT-${current.id}`,
+          `REVERSAL-${current.id}`,
+          `WEIGHT-DEBIT-${current.id}`,
+          `WEIGHT-CREDIT-${current.id}`,
+          current.client_id,
+          current.id,
+        ).first<{ total: number }>();
+        if (Number(linkedFinancialEntries?.total ?? 0) > 0) {
+          return error("FINANCIAL_HISTORY_PROTECTED", "This shipment has linked billing or wallet entries and cannot be permanently deleted. Keep the shipment record so its financial history remains traceable.", 409, id, headers);
+        }
         await env.DB.batch([
           env.DB.prepare("DELETE FROM pickup_request_shipments WHERE shipment_id = ?").bind(current.id),
           env.DB.prepare("UPDATE pickup_requests SET shipment_id = NULL WHERE shipment_id = ?").bind(current.id),
