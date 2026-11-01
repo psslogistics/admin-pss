@@ -48,8 +48,8 @@ const migrationChecks = new Set([
 const trackingMigration = fs.readFileSync(path.join(process.cwd(), "worker", "migrations", "20261031_tracking_aggregate_indexes.sql"), "utf8");
 for (const [label, pattern] of checks) assert.match(label === "pickup classification migration is present" ? pickupMigration : migrationChecks.has(label) ? migration : label === "tracking aggregate indexes cover status, EDD, test visibility, and client scope" ? trackingMigration : source, pattern, label);
 const shipmentGetRoute = source.slice(source.indexOf('const shipmentGet = route.match'), source.indexOf('if (route === "/pickup-slots"'));
-assert.match(shipmentGetRoute, /description, origin, destination, origin_address_json, destination_address_json, consignee, declared_value, total_weight_kg/,
-  "direct shipment details must include client-owned addresses and declared value");
-assert.doesNotMatch(shipmentGetRoute, /NULL AS origin_address_json|NULL AS destination_address_json|NULL AS consignee|NULL AS declared_value/,
+assert.match(shipmentGetRoute, /description, origin, destination, origin_address_json, destination_address_json, consignee, declared_value, total_weight_kg, pieces, dimensions_json/,
+  "direct shipment details must include client-owned addresses, invoice value, and dimensions");
+assert.doesNotMatch(shipmentGetRoute, /NULL AS origin_address_json|NULL AS destination_address_json|NULL AS consignee|NULL AS declared_value|NULL AS dimensions_json/,
   "direct shipment details must not redact client-owned fields behind shipments.sensitive.read");
-console.log(`Test-data visibility contract checks passed (${checks.length + 1} checks).`);
+console.log(`Test-data visibility contract checks passed (${checks.length + 2} checks).`);
