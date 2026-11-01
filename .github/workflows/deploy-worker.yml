@@ -22,11 +22,6 @@ jobs:
         run: npm ci
       - name: Verify provider weight reconciliation
         run: npm run test:provider-weight
-      - name: Apply remote D1 migrations
-        run: npx wrangler d1 migrations apply psslogisticsdatabase --remote --config worker/wrangler.jsonc
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: 949019e415f3ecee95a018ded47449a7
       - name: Deploy pss-api
         run: npx wrangler deploy --config worker/wrangler.jsonc
         env:

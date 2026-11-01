@@ -4258,15 +4258,15 @@ async function refreshPendingProviderWeights(env: Env, cron: string) {
   // regular tracking queue cannot delay or starve weight reconciliation.
   const candidates = await env.DB.prepare(`
     SELECT s.id, s.client_id, s.tracking_number, s.lr_number, s.provider_reference, s.provider_account_id,
-           w.provider_weight_last_attempt_at
+           w.updated_at AS provider_weight_last_attempt_at
     FROM shipments s
     JOIN weight_reconciliations w ON w.shipment_id = s.id AND w.client_id = s.client_id
     WHERE s.provider = 'delhivery'
       AND COALESCE(s.lr_number, s.tracking_number, s.provider_reference) IS NOT NULL
       AND s.status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery', 'delivered', 'exception', 'rto')
       AND (w.provider_weight_received_at IS NULL OR s.weight_override_kg IS NULL)
-      AND (w.provider_weight_last_attempt_at IS NULL OR datetime(w.provider_weight_last_attempt_at) <= datetime('now', '-5 minutes'))
-    ORDER BY CASE WHEN w.provider_weight_last_attempt_at IS NULL THEN 0 ELSE 1 END, w.provider_weight_last_attempt_at ASC, s.updated_at ASC
+      AND (w.updated_at IS NULL OR datetime(w.updated_at) <= datetime('now', '-5 minutes'))
+    ORDER BY CASE WHEN w.updated_at IS NULL THEN 0 ELSE 1 END, w.updated_at ASC, s.updated_at ASC
     LIMIT 20
   `).all<{ id: string; client_id: string; tracking_number: string | null; lr_number: string | null; provider_reference: string | null; provider_account_id: string | null; provider_weight_last_attempt_at: string | null }>();
 
@@ -4277,7 +4277,7 @@ async function refreshPendingProviderWeights(env: Env, cron: string) {
     const batch = candidates.results.slice(index, index + 4);
     await Promise.all(batch.map((shipment) => env.DB.prepare(`
       UPDATE weight_reconciliations
-      SET provider_weight_last_attempt_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+      SET updated_at = CURRENT_TIMESTAMP
       WHERE shipment_id = ? AND client_id = ?
     `).bind(shipment.id, shipment.client_id).run()));
     const results = await Promise.allSettled(batch.map((shipment) => safeProviderRequest(
