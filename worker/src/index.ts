@@ -10,6 +10,7 @@ import { TICKET_ATTENTION_SQL } from "./ticket-attention";
 import { isExplicitKycTestOrganization } from "./kyc-test-identity";
 import { providerAmountForBookingResult } from "./provider-cost-amount";
 import { activitySnapshotPair } from "./activity-snapshots";
+import { effectiveShipmentWeightKg, findProviderWeight, type ProviderWeightSnapshot } from "./provider-weight";
 
 type DelhiveryTokenCache = {
   get<T>(key: string, type: "json"): Promise<T | null>;
@@ -2047,59 +2048,10 @@ function normalizeProviderTrackingEvents(value: unknown, depth = 0): NormalizedP
     return (order[left.status] ?? -1) - (order[right.status] ?? -1);
   });
 }
-type ProviderWeightSnapshot = { measuredKg: number | null; chargeableKg: number | null };
-const minimumShipmentWeightKg = 20;
-function effectiveShipmentWeightKg(declaredKg: number, providerKg: number | null) {
-  const declared = Number.isFinite(declaredKg) && declaredKg > 0 ? declaredKg : 0;
-  const provider = providerKg !== null && Number.isFinite(providerKg) && providerKg > 0 ? providerKg : 0;
-  return Number(Math.max(minimumShipmentWeightKg, declared, provider).toFixed(3));
-}
-const providerWeightKey = (key: string) => key.toLowerCase().replace(/[^a-z0-9]/g, "");
-const providerWeightNumber = (value: unknown, key = "", unit?: unknown): number | null => {
-  let raw: unknown = value;
-  let explicitUnit = typeof unit === "string" ? unit.toLowerCase() : "";
-  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
-    const object = raw as Record<string, unknown>;
-    raw = object.value ?? object.amount ?? object.weight ?? object.value_kg ?? object.kg ?? object.grams ?? object.g;
-    explicitUnit = String(object.unit ?? object.uom ?? explicitUnit).toLowerCase();
-  }
-  const number = Number(typeof raw === "string" ? raw.replace(/,/g, "").match(/-?\d+(?:\.\d+)?/)?.[0] : raw);
-  if (!Number.isFinite(number) || number <= 0) return null;
-  const normalizedKey = providerWeightKey(key);
-  const grams = /gram|grams|gramme|gm|gms/.test(explicitUnit) || /gram|grams|gramme|gm|gms/.test(normalizedKey) || (normalizedKey.endsWith("g") && !normalizedKey.endsWith("kg"));
-  const kg = /kg|kilogram/.test(explicitUnit) || /kg|kilogram/.test(normalizedKey);
-  const normalized = grams ? number / 1000 : kg ? number : number > 1000 ? number / 1000 : number;
-  return normalized > 0 && normalized < 100000 ? Number(normalized.toFixed(3)) : null;
-};
-function findProviderWeight(value: unknown, depth = 0): ProviderWeightSnapshot {
-  if (depth > 10 || value === null || value === undefined) return { measuredKg: null, chargeableKg: null };
-  const measuredKeys = new Set(["actualweight", "actualweightkg", "capturedweight", "capturedweightkg", "measuredweight", "measuredweightkg", "shipmentweight", "shipmentweightkg", "weightcaptured", "weightcapturedkg"]);
-  const chargeableKeys = new Set(["chargeableweight", "chargeableweightkg", "billableweight", "billableweightkg", "courierbilledweight", "courierbilledweightkg"]);
-  let measuredKg: number | null = null;
-  let chargeableKg: number | null = null;
-  const walk = (node: unknown, level: number) => {
-    if (level > 10 || node === null || node === undefined || (measuredKg !== null && chargeableKg !== null)) return;
-    if (Array.isArray(node)) { for (const item of node) walk(item, level + 1); return; }
-    if (typeof node !== "object") return;
-    const object = node as Record<string, unknown>;
-    for (const [key, candidate] of Object.entries(object)) {
-      const normalized = providerWeightKey(key);
-      if (chargeableKg === null && (chargeableKeys.has(normalized) || /chargeable.*weight|billable.*weight|courier.*billed.*weight/.test(normalized))) chargeableKg = providerWeightNumber(candidate, key);
-      if (measuredKg === null && (measuredKeys.has(normalized) || /actual.*weight|captured.*weight|measured.*weight|shipment.*weight/.test(normalized))) measuredKg = providerWeightNumber(candidate, key);
-      // Delhivery scan/detail responses sometimes expose only `Weight`; accept
-      // it as measured weight, but never let it overwrite an explicit value.
-      if (measuredKg === null && normalized === "weight") measuredKg = providerWeightNumber(candidate, key);
-      if (candidate && typeof candidate === "object") walk(candidate, level + 1);
-    }
-  };
-  walk(value, depth);
-  return { measuredKg, chargeableKg };
-}
-
-async function persistProviderWeight(env: Env, shipmentId: string, clientId: string, snapshot: ProviderWeightSnapshot) {
+async function persistProviderWeight(env: Env, shipmentId: string, clientId: string, snapshot: ProviderWeightSnapshot): Promise<boolean> {
   const shipment = await env.DB.prepare("SELECT total_weight_kg, weight_source FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(shipmentId, clientId).first<{ total_weight_kg: number | null; weight_source: string | null }>();
   const providerKg = snapshot.chargeableKg ?? snapshot.measuredKg;
-  if (!shipment || providerKg === null) return;
+  if (!shipment || providerKg === null) return false;
   const effectiveKg = effectiveShipmentWeightKg(Number(shipment.total_weight_kg ?? 0), providerKg);
   // Keep the declared booking weight intact. The operational/billable value is
   // the greater of the 20 kg minimum, client declaration, and provider weight.
@@ -2108,6 +2060,7 @@ async function persistProviderWeight(env: Env, shipmentId: string, clientId: str
     env.DB.prepare("UPDATE shipments SET weight_override_kg = ?, weight_source = 'reconciled', weight_updated_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ? AND COALESCE(weight_source, 'booking') <> 'manual'").bind(effectiveKg, shipmentId, clientId),
     env.DB.prepare("UPDATE weight_reconciliations SET measured_weight_kg = COALESCE(?, measured_weight_kg), courier_billed_weight_kg = COALESCE(?, courier_billed_weight_kg), billable_weight_kg = ?, provider_weight_received_at = CURRENT_TIMESTAMP, client_dispute_deadline_at = COALESCE(client_dispute_deadline_at, datetime(CURRENT_TIMESTAMP, '+24 hours')), provider_dispute_status = CASE WHEN provider_dispute_status IN ('dispute_pending', 'recovered') THEN provider_dispute_status ELSE 'received' END, status = CASE WHEN status = 'resolved' THEN status ELSE 'measured' END, updated_at = CURRENT_TIMESTAMP WHERE shipment_id = ? AND client_id = ?").bind(snapshot.measuredKg ?? providerKg, snapshot.chargeableKg ?? providerKg, effectiveKg, shipmentId, clientId),
   ]);
+  return true;
 }
 
 function trackonCredentials(env: Env, accountCredential?: string) {
@@ -2733,7 +2686,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       : provider === "delhivery" && operation === "document"
         ? `${base.replace(/\/$/, "")}/document/download?lrn=${encodeURIComponent(trackingNumber)}${payload.doc_type ? `&doc_type=${encodeURIComponent(String(payload.doc_type))}` : ""}&auto_download=true&version=latest`
       : provider === "delhivery" && operation === "freight_charges"
-        ? `${base.replace(/\/$/, "")}/lrn/freight-breakup?lrns=${encodeURIComponent(trackingNumber)}`
+        ? `${base.replace(/\/$/, "")}/lrn/freight-breakup/lrns=${encodeURIComponent(trackingNumber)}`
       : provider === "delhivery" && operation === "shipment_status"
          ? `${base.replace(/\/$/, "")}/manifest?job_id=${encodeURIComponent(String(payload.provider_booking_id ?? ""))}`
       : provider === "delhivery" && operation === "tracking"
@@ -2950,6 +2903,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     }));
   }
   let providerEdd = response.ok ? findProviderEdd(parsedProviderBody) : null;
+  let providerWeightReceived = false;
   let normalizedTracking: NormalizedProviderTracking | null = null;
   let normalizedTrackingEvents: NormalizedProviderTracking[] = [];
   if (operation === "tracking" && clientId && typeof payload.shipment_id === "string") {
@@ -2972,7 +2926,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       normalizedTracking = normalizedTrackingEvents.at(-1) ?? null;
     } catch { normalizedTracking = null; normalizedTrackingEvents = []; }
     if (clientId && typeof payload.shipment_id === "string") {
-      try { await persistProviderWeight(env, payload.shipment_id, clientId, findProviderWeight(parsedProviderBody)); } catch (caught) { console.error(JSON.stringify({ event: "provider_weight_persist_failed", shipment_id: payload.shipment_id, error: caught instanceof Error ? caught.message : "unknown_error" })); }
+      try { providerWeightReceived = await persistProviderWeight(env, payload.shipment_id, clientId, findProviderWeight(parsedProviderBody)); } catch (caught) { console.error(JSON.stringify({ event: "provider_weight_persist_failed", shipment_id: payload.shipment_id, error: caught instanceof Error ? caught.message : "unknown_error" })); }
     }
     if (!providerEdd) {
       providerEdd = normalizedTrackingEvents.map((event) => normalizeProviderEddFromText(event.description)).find((value): value is string => Boolean(value)) ?? null;
@@ -2993,6 +2947,13 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
         await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, location, description, created_by_user_id, event_time, created_at) VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), payload.shipment_id, event.status, event.location, event.description, `provider:${provider}`, event.eventTime).run();
         existingSignatures.add(signature);
       }
+    }
+  }
+  if (response.ok && operation === "freight_charges" && payload.weight_reconciliation === true && clientId && typeof payload.shipment_id === "string") {
+    try {
+      providerWeightReceived = await persistProviderWeight(env, payload.shipment_id, clientId, findProviderWeight(parsedProviderBody));
+    } catch (caught) {
+      console.error(JSON.stringify({ event: "provider_weight_persist_failed", shipment_id: payload.shipment_id, operation, error: caught instanceof Error ? caught.message : "unknown_error" }));
     }
   }
   if (response.ok && operation === "tracking" && providerEdd && clientId && typeof payload.shipment_id === "string") {
@@ -3393,7 +3354,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     await env.DB.prepare("INSERT OR REPLACE INTO pricing_provider_costs (id, shipment_id, client_id, provider, provider_account_id, provider_amount, provider_status) VALUES (COALESCE((SELECT id FROM pricing_provider_costs WHERE shipment_id = ?), ?), ?, ?, ?, ?, ?, ?)")
       .bind(payload.shipment_id, crypto.randomUUID(), payload.shipment_id, clientId, provider, account?.id ?? null, providerAmountValue, "accepted").run();
   }
-  return { enabled: true, status: response.ok ? "accepted" as const : "failed" as const, providerStatus: response.status, normalized_status: normalizedTracking?.status, edd: providerEdd, tracking: normalizedTracking ? { status: normalizedTracking.status, location: normalizedTracking.location, description: normalizedTracking.description, event_time: normalizedTracking.eventTime } : undefined, tracking_events: operation === "tracking" ? normalizedTrackingEvents.map((event) => ({ status: event.status, location: event.location, description: event.description, event_time: event.eventTime, source: `provider:${provider}` })) : undefined, amount: providerAmountValue, provider_account_id: account?.id, account_name: account?.account_name, confidence_score: account?.confidence_score, priority: account?.priority, rate_card_id: account?.rate_card_id ?? undefined, error: normalizedError };
+  return { enabled: true, status: response.ok ? "accepted" as const : "failed" as const, providerStatus: response.status, normalized_status: normalizedTracking?.status, edd: providerEdd, tracking: normalizedTracking ? { status: normalizedTracking.status, location: normalizedTracking.location, description: normalizedTracking.description, event_time: normalizedTracking.eventTime } : undefined, tracking_events: operation === "tracking" ? normalizedTrackingEvents.map((event) => ({ status: event.status, location: event.location, description: event.description, event_time: event.eventTime, source: `provider:${provider}` })) : undefined, provider_weight_received: operation === "freight_charges" && payload.weight_reconciliation === true ? providerWeightReceived : undefined, amount: providerAmountValue, provider_account_id: account?.id, account_name: account?.account_name, confidence_score: account?.confidence_score, priority: account?.priority, rate_card_id: account?.rate_card_id ?? undefined, error: normalizedError };
 }
 
 async function recordPickupAttempt(env: Env, details: { pickupId: string; clientId: string; provider: string; providerAccountId?: string | null; requestId?: string | null; idempotencyKey?: string | null; requestedDate?: string | null; requestedWindow?: string | null; status: string; providerStatus?: string | number | null; providerReference?: string | null; providerErrorCode?: string | null; errorMessage?: string | null }) {
@@ -4292,41 +4253,48 @@ async function refreshDelhiveryShipments(env: Env, cron: string) {
 }
 
 async function refreshPendingProviderWeights(env: Env, cron: string) {
-  // Weight reconciliation has its own bounded queue so status and POD polling
-  // cannot starve shipments whose provider measurement has not arrived yet.
-  // The provider response is the only source allowed to mark a weight as
-  // received; this job never invents or manually overrides a measurement.
+  // Delhivery's tracking response does not include the freight weight breakup.
+  // Use the dedicated freight_charges endpoint and a separate throttle so the
+  // regular tracking queue cannot delay or starve weight reconciliation.
   const candidates = await env.DB.prepare(`
-    SELECT s.id, s.client_id, s.tracking_number, s.lr_number, s.provider_reference, s.provider_account_id
+    SELECT s.id, s.client_id, s.tracking_number, s.lr_number, s.provider_reference, s.provider_account_id,
+           w.provider_weight_last_attempt_at
     FROM shipments s
-    LEFT JOIN weight_reconciliations w ON w.shipment_id = s.id AND w.client_id = s.client_id
+    JOIN weight_reconciliations w ON w.shipment_id = s.id AND w.client_id = s.client_id
     WHERE s.provider = 'delhivery'
       AND COALESCE(s.lr_number, s.tracking_number, s.provider_reference) IS NOT NULL
       AND s.status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery', 'delivered', 'exception', 'rto')
       AND (w.provider_weight_received_at IS NULL OR s.weight_override_kg IS NULL)
-      AND (s.provider_last_attempt_at IS NULL OR datetime(s.provider_last_attempt_at) <= datetime('now', '-5 minutes'))
-    ORDER BY CASE WHEN s.provider_last_attempt_at IS NULL THEN 0 ELSE 1 END, s.provider_last_attempt_at ASC, s.updated_at ASC
+      AND (w.provider_weight_last_attempt_at IS NULL OR datetime(w.provider_weight_last_attempt_at) <= datetime('now', '-5 minutes'))
+    ORDER BY CASE WHEN w.provider_weight_last_attempt_at IS NULL THEN 0 ELSE 1 END, w.provider_weight_last_attempt_at ASC, s.updated_at ASC
     LIMIT 20
-  `).all<{ id: string; client_id: string; tracking_number: string | null; lr_number: string | null; provider_reference: string | null; provider_account_id: string | null }>();
+  `).all<{ id: string; client_id: string; tracking_number: string | null; lr_number: string | null; provider_reference: string | null; provider_account_id: string | null; provider_weight_last_attempt_at: string | null }>();
 
-  let succeeded = 0;
+  let accepted = 0;
+  let weightsReceived = 0;
   let failed = 0;
   for (let index = 0; index < candidates.results.length; index += 4) {
     const batch = candidates.results.slice(index, index + 4);
+    await Promise.all(batch.map((shipment) => env.DB.prepare(`
+      UPDATE weight_reconciliations
+      SET provider_weight_last_attempt_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+      WHERE shipment_id = ? AND client_id = ?
+    `).bind(shipment.id, shipment.client_id).run()));
     const results = await Promise.allSettled(batch.map((shipment) => safeProviderRequest(
       env,
       "delhivery",
-      "tracking",
-      { shipment_id: shipment.id, tracking_number: shipment.tracking_number, lr_number: shipment.lr_number, provider_reference: shipment.provider_reference, provider_account_id: shipment.provider_account_id },
+      "freight_charges",
+      { shipment_id: shipment.id, tracking_number: shipment.lr_number ?? shipment.tracking_number ?? shipment.provider_reference, lr_number: shipment.lr_number, provider_reference: shipment.provider_reference, provider_account_id: shipment.provider_account_id, weight_reconciliation: true },
       `cron:${cron}:delhivery:weight:${shipment.id}`,
       shipment.client_id,
       undefined,
       10000,
     )));
-    succeeded += results.filter((result) => result.status === "fulfilled" && result.value.status === "accepted").length;
+    accepted += results.filter((result) => result.status === "fulfilled" && result.value.status === "accepted").length;
+    weightsReceived += results.filter((result) => result.status === "fulfilled" && result.value.status === "accepted" && "provider_weight_received" in result.value && result.value.provider_weight_received === true).length;
     failed += results.length - results.filter((result) => result.status === "fulfilled" && result.value.status === "accepted").length;
   }
-  console.log(JSON.stringify({ job: "delhivery_weight_reconciliation", cron, candidates: candidates.results.length, succeeded, failed }));
+  console.log(JSON.stringify({ job: "delhivery_weight_reconciliation", cron, candidates: candidates.results.length, provider_requests_accepted: accepted, weights_received: weightsReceived, failed }));
 }
 
 const worker = {
