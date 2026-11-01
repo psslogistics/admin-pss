@@ -23,6 +23,8 @@ const required = [
   ["unsaved repeat bookings resolve an exact warehouse", "lower(trim(COALESCE(address, ''))) = lower(trim(?)"],
   ["confirmed provider reference is required", "provider_sync_status = 'confirmed' AND provider_reference IS NOT NULL"],
   ["warehouse names are derived deterministically from the origin", "const baseLocalName = generatedLocalName;"],
+  ["saved warehouse facility identity is derived from the saved warehouse label, not contact_name", "const generatedLocalName = delhiveryWarehouseName(resolvedOrigin);"],
+  ["saved provider name or warehouse label takes precedence over consignor contact name", "name: existing.provider_name?.trim() || existing.name?.trim() || origin.name,"],
   ["canonical provider warehouse identity", "canonicalDelhiveryWarehouseName"],
   ["provider uses the selected saved warehouse name exactly", "const providerName = localName;"],
   ["shipment booking registers or reuses the provider warehouse through the API", "ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken"],

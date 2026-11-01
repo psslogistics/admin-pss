@@ -10,6 +10,8 @@ assert.ok(marginRoute.includes("GROUP BY b.shipment_id"), "duplicate billing row
 assert.ok(marginRoute.includes("margin-cost:' || b.shipment_id"), "attempt cooldown is tied to shipment identity");
 assert.ok(marginRoute.includes("datetime('now', '-6 hours')"), "recent failed requests cool down instead of starving later rows");
 assert.ok(marginRoute.includes("NULLIF(trim(s.lr_number), '')"), "only shipments with a provider lookup reference enter the queue");
+assert.ok(!marginRoute.includes("NULLIF(trim(s.master_awb), '')"), "a master AWB is never sent as an LR to freight breakup");
+assert.ok(marginRoute.includes("resolveDelhiveryCostReference({ lrNumber: row.lr_number, trackingNumber: row.tracking_number })"), "freight lookup uses only explicit LR or legacy LR field");
 assert.ok(marginRoute.includes("lower(COALESCE(b.status, '')) = 'paid'"), "provider cost sync ignores unpaid and void charges");
 assert.ok(marginRoute.includes("b.status AS billing_status"), "margin rows expose the authoritative PSS billing status");
 assert.ok(marginRoute.includes("lower(COALESCE(b.status, '')) <> 'paid'"), "non-paid billing records cannot produce provider amount or margin");

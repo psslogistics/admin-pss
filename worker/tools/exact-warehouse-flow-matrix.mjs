@@ -17,6 +17,9 @@ assert.notEqual("client-a|account-a|warehouse-1", "client-a|account-b|warehouse-
 assert.equal(delhiveryFacilityMatches({ ...active, enabled: false }, "Warehouse Alpha", "201310"), false, "provider-deactivated warehouse must block booking");
 assert.equal(canonicalDelhiveryWarehouseName("Warehouse Alpha", "Lucknow", "Uttar Pradesh", "226017"), "Warehouse Alpha Lucknow Uttar Pradesh 226017", "provider name must include the complete selected location identity");
 assert.equal(canonicalDelhiveryWarehouseName("Warehouse Alpha · Lucknow · Uttar Pradesh · 226017", "Lucknow", "Uttar Pradesh", "226017"), "Warehouse Alpha Lucknow Uttar Pradesh 226017", "provider name must not duplicate a saved-label suffix");
+const savedWarehouseProviderName = canonicalDelhiveryWarehouseName("PSS Auth Test Warehouse", "Gurugram", "Haryana", "122001");
+assert.equal(savedWarehouseProviderName, "PSS Auth Test Warehouse Gurugram Haryana 122001", "saved warehouse label, not the contact person's name, must define the provider facility identity");
+assert.notEqual(savedWarehouseProviderName, "Gaurav Meena", "consignor contact name must never be sent as the Delhivery facility name");
 assert.equal(delhiveryFacilityMatches({ ...active, name: "Warehouse Alpha Lucknow Uttar Pradesh 226017" }, "Warehouse Alpha Lucknow Uttar Pradesh 226017", "201310"), true, "canonical active warehouse should match exactly");
 assert.equal(delhiveryFacilityMatches({ ...active, name: "Warehouse Alpha Lucknow Uttar Pradesh 226017" }, "Warehouse Alpha Lucknow Uttar Pradesh 271801", "201310"), false, "same base name at a different selected location must not match");
 assert.equal(delhiveryFacilityMatches({ ...active, name: "Warehouse Alpha" }, "Warehouse Alpha Lucknow Uttar Pradesh 226017", "201310", null, "Warehouse Alpha"), true, "provider base name should match the selected local warehouse");
@@ -28,4 +31,4 @@ assert.equal(isVerifiedDelhiveryWarehouse({ ...verifiedLocal, provider_status: "
 assert.equal(isVerifiedDelhiveryWarehouse({ ...verifiedLocal, provider_reference: null }, "account-1"), false, "a local active flag without provider reference cannot be reused");
 assert.equal(isVerifiedDelhiveryWarehouse({ ...verifiedLocal, provider_activated_at: null }, "account-1"), false, "a facility without verification timestamp cannot be reused");
 
-console.log("Exact warehouse flow matrix passed (17 cases)");
+console.log("Exact warehouse flow matrix passed (19 cases)");

@@ -24,6 +24,10 @@ jobs:
         run: npm run test:provider-weight
       - name: Verify shipment billing reconciliation
         run: npm run test:billing
+      - name: Verify Delhivery warehouse identity
+        run: npm run test:warehouse
+      - name: Verify Delhivery margin cost references
+        run: npm run test:margin-sync
       - name: Deploy pss-api
         run: npx wrangler deploy --config worker/wrangler.jsonc
         env:

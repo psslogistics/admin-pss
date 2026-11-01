@@ -1,19 +1,19 @@
 export type ProviderCostReference = {
-  trackingNumber: string;
-  lrNumber?: string;
+  lrNumber: string;
 };
 
 export function resolveDelhiveryCostReference(input: {
   lrNumber?: unknown;
-  masterAwb?: unknown;
   trackingNumber?: unknown;
 }): ProviderCostReference | null {
   const lrNumber = normalize(input.lrNumber);
-  const masterAwb = normalize(input.masterAwb);
   const trackingNumber = normalize(input.trackingNumber);
-  const lookup = lrNumber || masterAwb || trackingNumber;
-  if (!lookup) return null;
-  return { trackingNumber: lookup, ...(lrNumber ? { lrNumber } : {}) };
+  // The B2B freight-breakup endpoint accepts LRNs. A master AWB or generic
+  // provider reference is a different identifier and produces a provider 404.
+  // Legacy records may store the LR in tracking_number, so keep that fallback.
+  const lookup = lrNumber || trackingNumber;
+  if (!/^\d{9}$/.test(lookup)) return null;
+  return { lrNumber: lookup };
 }
 
 function normalize(value: unknown) {

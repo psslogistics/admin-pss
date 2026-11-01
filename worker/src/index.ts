@@ -992,13 +992,12 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   // A selected saved warehouse is the canonical pickup identity. Never let
   // editable booking fields overwrite it or combine it with another address.
   // The unsaved-address path has no `existing` row and remains unchanged.
-  // Delhivery matches `pickup_location` by the exact registered warehouse
-  // name. Do not synthesize a new name from the address: that changes the
-  // provider identity and produces "warehouse ... has not been configured"
-  // even when the saved location itself is active. Older local rows may have
-  // stored our display label in provider_name, so until a confirmed booking
-  // proves that value, prefer the saved contact/warehouse name as the stable
-  // provider identity.
+  // Delhivery matches `pickup_location` by the configured warehouse name.
+  // The consignor's contact person is not that identity. Preserve the saved
+  // provider/local warehouse label and canonicalize it with the full location
+  // when it has not yet been verified. This is the pre-regression behavior:
+  // using contact_name here sent values such as "Gaurav Meena" as the facility
+  // name, which Delhivery rejected as "warehouse ... has not been configured".
   const existingHasConfirmedBooking = existing
     ? await delhiveryWarehouseHasConfirmedBooking(env, clientId, providerAccountId, {
       name: existing.contact_name?.trim() || existing.name?.trim() || origin.name,
@@ -1016,14 +1015,14 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
   // carries the provider facility reference that was verified there.
   const existingProviderLocation = isVerifiedDelhiveryWarehouse(existing, providerAccountId) ? existing : null;
   const resolvedOrigin = existing ? {
-    name: (existingHasConfirmedBooking ? existing.provider_name?.trim() : null) || existing.contact_name?.trim() || existing.name?.trim() || origin.name,
+    name: existing.provider_name?.trim() || existing.name?.trim() || origin.name,
     line: existing.address?.trim() || origin.line,
     city: existing.city?.trim() || origin.city,
     state: existing.state?.trim() || origin.state,
     pincode: existing.pincode?.trim() || origin.pincode,
     phone: existing.contact?.trim() || origin.phone,
   } : origin;
-  const generatedLocalName = existing ? resolvedOrigin.name : delhiveryWarehouseName(resolvedOrigin);
+  const generatedLocalName = delhiveryWarehouseName(resolvedOrigin);
   // Older retries could persist one or more ` - PSS-xxxxxxxx` suffixes on
   // the same saved warehouse. Treat those names as migration artefacts and
   // always converge back to the deterministic provider identity. Otherwise a
@@ -2431,7 +2430,10 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   // B2B Delhivery tracks by LR number. Historical Fujiyama imports stored the
   // same value in tracking_number, but new bookings can also have a provider
   // reference or master AWB. Prefer the explicit LR whenever one is present.
-  const trackingNumber = String(payload.lr_number ?? payload.tracking_number ?? payload.provider_reference ?? "").trim();
+  const firstReference = (...values: unknown[]) => values.find((value) => typeof value === "string" && value.trim()) as string | undefined;
+  const trackingNumber = String(operation === "freight_charges"
+    ? resolveDelhiveryCostReference({ lrNumber: payload.lr_number, trackingNumber: payload.tracking_number })?.lrNumber ?? ""
+    : firstReference(payload.lr_number, payload.tracking_number, payload.provider_reference) ?? "").trim();
   if (["tracking", "freight_charges", "labels", "lr_copy", "document"].includes(operation) && !trackingNumber) return { enabled: false, status: "invalid_request" as const, reason: "A provider tracking reference is required" };
   if (provider === "delhivery" && operation === "shipments" && String(env.DELHIVERY_ENABLE_SHIPMENT_CREATION) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "Delhivery shipment creation is safety-disabled until live billing approval" };
   if (provider === "delhivery" && operation === "pickups" && String(env.DELHIVERY_ENABLE_PICKUP_CREATION) !== "true") return { enabled: false, status: "safety_disabled" as const, reason: "Delhivery pickup creation is safety-disabled until live operations approval" };
@@ -4300,18 +4302,18 @@ async function refreshPendingProviderWeights(env: Env, cron: string) {
   // Use the dedicated freight_charges endpoint and a separate throttle so the
   // regular tracking queue cannot delay or starve weight reconciliation.
   const candidates = await env.DB.prepare(`
-    SELECT s.id, s.client_id, s.tracking_number, s.lr_number, s.provider_reference, s.provider_account_id,
+    SELECT s.id, s.client_id, s.tracking_number, s.lr_number, s.provider_account_id,
            w.updated_at AS provider_weight_last_attempt_at
     FROM shipments s
     JOIN weight_reconciliations w ON w.shipment_id = s.id AND w.client_id = s.client_id
     WHERE s.provider = 'delhivery'
-      AND COALESCE(s.lr_number, s.tracking_number, s.provider_reference) IS NOT NULL
+      AND (NULLIF(TRIM(s.lr_number), '') IS NOT NULL OR NULLIF(TRIM(s.tracking_number), '') IS NOT NULL)
       AND s.status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery', 'delivered', 'exception', 'rto')
       AND (w.provider_weight_received_at IS NULL OR s.weight_override_kg IS NULL)
       AND (w.updated_at IS NULL OR datetime(w.updated_at) <= datetime('now', '-5 minutes'))
     ORDER BY CASE WHEN w.updated_at IS NULL THEN 0 ELSE 1 END, w.updated_at ASC, s.updated_at ASC
     LIMIT 20
-  `).all<{ id: string; client_id: string; tracking_number: string | null; lr_number: string | null; provider_reference: string | null; provider_account_id: string | null; provider_weight_last_attempt_at: string | null }>();
+  `).all<{ id: string; client_id: string; tracking_number: string | null; lr_number: string | null; provider_account_id: string | null; provider_weight_last_attempt_at: string | null }>();
 
   let accepted = 0;
   let weightsReceived = 0;
@@ -4327,7 +4329,7 @@ async function refreshPendingProviderWeights(env: Env, cron: string) {
       env,
       "delhivery",
       "freight_charges",
-      { shipment_id: shipment.id, tracking_number: shipment.lr_number ?? shipment.tracking_number ?? shipment.provider_reference, lr_number: shipment.lr_number, provider_reference: shipment.provider_reference, provider_account_id: shipment.provider_account_id, weight_reconciliation: true },
+      { shipment_id: shipment.id, tracking_number: shipment.lr_number?.trim() || shipment.tracking_number?.trim(), lr_number: shipment.lr_number, provider_account_id: shipment.provider_account_id, weight_reconciliation: true },
       `cron:${cron}:delhivery:weight:${shipment.id}`,
       shipment.client_id,
       undefined,
@@ -7074,7 +7076,7 @@ const worker = {
           const candidates = await env.DB.prepare(`
             SELECT b.shipment_id, b.client_id, s.provider, s.provider_account_id,
                    s.provider_booking_id, s.tracking_number, s.lr_number,
-                   s.master_awb, s.provider_reference
+                   s.master_awb
             FROM billing_records b
             JOIN shipments s ON s.id = b.shipment_id
             LEFT JOIN pricing_provider_costs c ON c.shipment_id = b.shipment_id
@@ -7083,7 +7085,6 @@ const worker = {
               AND c.provider_amount IS NULL
               AND b.client_id IS NOT NULL AND trim(b.client_id) <> ''
               AND (NULLIF(trim(s.lr_number), '') IS NOT NULL
-                OR NULLIF(trim(s.master_awb), '') IS NOT NULL
                 OR NULLIF(trim(s.tracking_number), '') IS NOT NULL)
               AND NOT EXISTS (
                 SELECT 1 FROM integration_requests ir
@@ -7100,9 +7101,9 @@ const worker = {
             const shipmentId = String(row.shipment_id ?? "").trim();
             const accountId = String(row.provider_account_id ?? "").trim() || undefined;
             const bookingId = String(row.provider_booking_id ?? "").trim();
-            const reference = resolveDelhiveryCostReference({ lrNumber: row.lr_number, masterAwb: row.master_awb, trackingNumber: row.tracking_number });
+            const reference = resolveDelhiveryCostReference({ lrNumber: row.lr_number, trackingNumber: row.tracking_number });
             if (!shipmentId || !reference) return;
-            await safeProviderRequest(env, "delhivery", "freight_charges", { shipment_id: shipmentId, tracking_number: reference.trackingNumber, lr_number: reference.lrNumber, provider_reference: String(row.provider_reference ?? "").trim() || undefined, provider_booking_id: bookingId || undefined, provider_account_id: accountId }, id, String(row.client_id), `margin-cost:${shipmentId}`, 10000).catch(() => undefined);
+            await safeProviderRequest(env, "delhivery", "freight_charges", { shipment_id: shipmentId, tracking_number: reference.lrNumber, lr_number: reference.lrNumber, provider_booking_id: bookingId || undefined, provider_account_id: accountId }, id, String(row.client_id), `margin-cost:${shipmentId}`, 10000).catch(() => undefined);
           }));
         }
         const rows = await env.DB.prepare(
