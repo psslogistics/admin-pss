@@ -11,9 +11,10 @@ const checks = [
     const start = source.indexOf('if (response.ok && provider === "delhivery" && useDelhiveryB2b && operation === "shipment_status"');
     const end = source.indexOf('if (response.ok && provider === "delhivery" && operation === "shipment_status"', start + 1);
     const block = source.slice(start, end > start ? end : undefined);
-    const call = block.indexOf("const completedBilling = await completeShipmentBilling(env, clientId, payload.shipment_id)");
+    const call = block.indexOf("await completeConfirmedShipmentBilling(env, clientId, payload.shipment_id, \"shipment_status\")");
     return start >= 0 && call >= 0 && !block.slice(0, call).includes("if (!lateAfterSynchronousFailure)");
   })()],
+  ["late LR references from tracking and webhook paths enter idempotent billing reconciliation", source.includes('completeConfirmedShipmentBilling(env, clientId, payload.shipment_id, "tracking")') && source.includes('completeConfirmedShipmentBilling(env, shipment.client_id, shipment.id, "out_of_order_webhook")') && source.includes('completeConfirmedShipmentBilling(env, shipment.client_id, shipment.id, "status_webhook")')],
   ["billing is gated on a confirmed provider reference", source.includes('if (!invoiceReference || shipment?.provider_sync_status !== "confirmed")')],
   ["confirmed billing deferrals are explicitly marked for bounded recovery", source.includes("Shipment billing deferred:%") && source.includes("LIMIT 20") && source.includes("await reconcileDeferredShipmentBilling(env, controller.cron)")],
   ["queued accepted bookings do not bill while the provider reference is pending", source.includes("const hasConfirmedReference = Boolean(providerResult.lr_number || providerResult.master_awb || providerResult.providerReference) && providerResult.providerPending !== true")],

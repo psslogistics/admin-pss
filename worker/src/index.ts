@@ -619,6 +619,15 @@ async function completeShipmentBilling(env: Env, clientId: string, shipmentId: s
   await env.DB.prepare("UPDATE shipments SET provider_last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ? AND provider_last_error LIKE 'Shipment billing deferred:%'").bind(shipmentId, clientId).run();
   return { ok: true as const, alreadyCompleted: false as const, amount };
 }
+async function completeConfirmedShipmentBilling(env: Env, clientId: string, shipmentId: string, source: string) {
+  try {
+    const result = await completeShipmentBilling(env, clientId, shipmentId);
+    if (!result.ok) console.error(JSON.stringify({ event: "shipment_billing_deferred", shipment_id: shipmentId, source, error: result.error }));
+  } catch (caught) {
+    console.error(JSON.stringify({ event: "shipment_billing_reconciliation_failed", shipment_id: shipmentId, source, error: caught instanceof Error ? caught.message : "unknown_error" }));
+  }
+}
+
 async function pricingPincode(env: Env, pincode: string) {
   if (!/^\d{6}$/.test(pincode)) return null;
   return env.DB.prepare("SELECT pincode, facility_city, facility_state, oda FROM delhivery_b2b_pincode_zones WHERE pincode = ? LIMIT 1").bind(pincode).first<{ pincode: string; facility_city: string; facility_state: string; oda: number }>();
@@ -2996,8 +3005,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       // arrived synchronously or after the original request timed out. The
       // billing helper is shipment-idempotent, so repeated status polls cannot
       // create another invoice or wallet debit.
-      const completedBilling = await completeShipmentBilling(env, clientId, payload.shipment_id);
-      if (!completedBilling.ok) console.error(JSON.stringify({ event: "shipment_billing_deferred", request_id: requestIdValue, shipment_id: payload.shipment_id, error: completedBilling.error }));
+      await completeConfirmedShipmentBilling(env, clientId, payload.shipment_id, "shipment_status");
       return { enabled: true, status: "accepted" as const, providerStatus: response.status, providerPending: false, providerBookingId: statusJobId, providerReference: statusAwb ?? statusLr, lr_number: statusLr, master_awb: statusAwb };
     }
     const pendingMessage = "Delhivery accepted the booking but has not published the LR/AWB yet.";
@@ -3083,6 +3091,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     const liveLr = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["lrnum", "lr_num", "lr_number", "lr_no", "lrn", "lrn_number", "lr"]))) ?? null;
     const liveAwb = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["mwn", "mwn_number", "master_awb", "master_awb_number", "masterawb", "master_waybill", "master_waybill_number", "awb", "awb_number", "waybill", "waybill_number", "waybill_no"]))) ?? null;
     if (liveLr || liveAwb) await env.DB.prepare("UPDATE shipments SET lr_number = COALESCE(?, lr_number), master_awb = COALESCE(?, master_awb), tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(provider_reference, ?), provider_sync_status = 'confirmed', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(liveLr, liveAwb, liveLr ?? liveAwb, liveAwb ?? liveLr, payload.shipment_id, clientId).run();
+    if (liveLr || liveAwb) await completeConfirmedShipmentBilling(env, clientId, payload.shipment_id, "tracking");
   }
   if (response.ok && provider === "delhivery" && operation === "shipments" && clientId && typeof payload.shipment_id === "string") {
     // A PUR is a pickup-request identifier, not an LR. Keep extraction
@@ -4148,6 +4157,7 @@ async function handleProviderWebhook(request: Request, env: Env, provider: "delh
         // even when we intentionally leave the local status unchanged.
         if (providerLr || providerAwb) {
           await env.DB.prepare("UPDATE shipments SET lr_number = COALESCE(?, lr_number), master_awb = COALESCE(?, master_awb), tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(?, provider_reference), provider_sync_status = 'confirmed', updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(providerLr, providerAwb, providerAwb ?? providerLr, providerAwb ?? providerLr, shipment.id).run();
+           if (provider === "delhivery") await completeConfirmedShipmentBilling(env, shipment.client_id, shipment.id, "out_of_order_webhook");
           await env.DB.prepare("UPDATE webhook_events SET status = 'processed', processed_at = CURRENT_TIMESTAMP WHERE provider = ? AND event_id = ?").bind(provider, eventId).run();
           return json({ ok: true, accepted: true, matched: true, applied: false, reference_reconciled: true, request_id: requestIdValue }, 202, headers);
         }
@@ -4159,6 +4169,7 @@ async function handleProviderWebhook(request: Request, env: Env, provider: "delh
       }
       const deliveredAt = status.includes("deliver") ? new Date().toISOString() : null;
       await env.DB.prepare("UPDATE shipments SET provider = ?, lr_number = COALESCE(?, lr_number), master_awb = COALESCE(?, master_awb), tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(?, provider_reference), provider_sync_status = CASE WHEN ? IS NOT NULL OR ? IS NOT NULL THEN 'confirmed' ELSE provider_sync_status END, provider_booking_id = COALESCE(provider_booking_id, ?), status = ?, delivered_at = COALESCE(?, delivered_at), updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(provider, providerLr, providerAwb, providerAwb ?? providerLr, providerAwb ?? providerLr ?? null, providerLr, providerAwb, findProviderReference(payload, new Set(["job_id", "jobid", "manifest_job_id", "request_id", "requestid"])), status, deliveredAt, shipment.id).run();
+       if (provider === "delhivery" && (providerLr || providerAwb)) await completeConfirmedShipmentBilling(env, shipment.client_id, shipment.id, "status_webhook");
       await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, location, description, created_by_user_id, event_time, created_at) VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipment.id, status, location, description, `webhook:${provider}`, delhiveryDetails?.eventTime ?? null).run();
        if (provider === "delhivery") {
          if (pickupStatus && !pickup) {
