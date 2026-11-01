@@ -6333,8 +6333,13 @@ const worker = {
           const rawReference = String(row.reference ?? "").trim();
           const parts = referenceParts(rawReference);
           const linked = parts ? shipmentById.get(parts.shipmentId) : null;
+          const linkedShipmentReference = linked
+            ? [linked.lr_number, linked.master_awb, linked.pss_reference, linked.tracking_number]
+                .map((value) => String(value ?? "").trim())
+                .find(Boolean) ?? `PSS ID ${String(linked.id)}`
+            : "Shipment record unavailable";
           const publicReference = parts
-            ? `${parts.category === "SHIPMENT" ? "Shipment" : parts.category === "REVERSAL" ? "Reversal" : "Weight adjustment"} · ${String(linked?.lr_number ?? linked?.master_awb ?? linked?.pss_reference ?? linked?.tracking_number ?? "reference pending")}`
+            ? `${parts.category === "SHIPMENT" ? "Shipment" : parts.category === "REVERSAL" ? "Reversal" : "Weight adjustment"} · ${linkedShipmentReference}`
             : /^PRICING-OVERRIDE-/i.test(rawReference) ? "Pricing adjustment" : /^ADJ-/i.test(rawReference) ? "Finance adjustment" : "Finance activity";
           return { ...row, reference: publicReference };
         });
@@ -6347,10 +6352,10 @@ const worker = {
         const select = collection.table === "wallet_transactions" && !internalCollectionView
           ? `w.id, w.client_id, w.type, w.amount, w.balance_after,
              CASE
-               WHEN w.reference LIKE 'SHIPMENT-%' THEN 'Shipment · ' || COALESCE(NULLIF(s.lr_number, ''), NULLIF(s.master_awb, ''), NULLIF(s.pss_reference, ''), 'reference pending')
-               WHEN w.reference LIKE 'REVERSAL-%' THEN 'Reversal · ' || COALESCE(NULLIF(s.lr_number, ''), NULLIF(s.master_awb, ''), NULLIF(s.pss_reference, ''), 'reference pending')
-               WHEN w.reference LIKE 'WEIGHT-DEBIT-%' THEN 'Weight adjustment · ' || COALESCE(NULLIF(s.lr_number, ''), NULLIF(s.master_awb, ''), NULLIF(s.pss_reference, ''), 'reference pending')
-               WHEN w.reference LIKE 'WEIGHT-CREDIT-%' THEN 'Weight adjustment · ' || COALESCE(NULLIF(s.lr_number, ''), NULLIF(s.master_awb, ''), NULLIF(s.pss_reference, ''), 'reference pending')
+               WHEN w.reference LIKE 'SHIPMENT-%' THEN 'Shipment · ' || COALESCE(NULLIF(s.lr_number, ''), NULLIF(s.master_awb, ''), NULLIF(s.pss_reference, ''), NULLIF(s.id, ''), 'Shipment record unavailable')
+               WHEN w.reference LIKE 'REVERSAL-%' THEN 'Reversal · ' || COALESCE(NULLIF(s.lr_number, ''), NULLIF(s.master_awb, ''), NULLIF(s.pss_reference, ''), NULLIF(s.id, ''), 'Shipment record unavailable')
+               WHEN w.reference LIKE 'WEIGHT-DEBIT-%' THEN 'Weight adjustment · ' || COALESCE(NULLIF(s.lr_number, ''), NULLIF(s.master_awb, ''), NULLIF(s.pss_reference, ''), NULLIF(s.id, ''), 'Shipment record unavailable')
+               WHEN w.reference LIKE 'WEIGHT-CREDIT-%' THEN 'Weight adjustment · ' || COALESCE(NULLIF(s.lr_number, ''), NULLIF(s.master_awb, ''), NULLIF(s.pss_reference, ''), NULLIF(s.id, ''), 'Shipment record unavailable')
                WHEN w.reference LIKE 'PRICING-OVERRIDE-%' THEN 'Pricing adjustment'
                ELSE w.reference
              END AS reference,
