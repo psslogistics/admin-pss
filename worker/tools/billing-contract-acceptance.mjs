@@ -6,6 +6,19 @@ const indexes = await readFile(new URL("../migrations/20261031_billing_detail_lo
 const checks = [
   ["billing has a single invoice-number helper", source.includes("function shipmentInvoiceNumber")],
   ["LR is the first invoice reference", source.includes("shipment?.lr_number || shipment?.master_awb || shipment?.tracking_number")],
+  ["late Delhivery LR reconciliation does not preserve the synchronous timeout as shipment failure", source.includes("provider_sync_status = 'confirmed'") && source.includes("provider_last_error = NULL")],
+  ["every provider-confirmed LR attempts shipment billing completion", (() => {
+    const start = source.indexOf('if (response.ok && provider === "delhivery" && useDelhiveryB2b && operation === "shipment_status"');
+    const end = source.indexOf('if (response.ok && provider === "delhivery" && operation === "shipment_status"', start + 1);
+    const block = source.slice(start, end > start ? end : undefined);
+    const call = block.indexOf("const completedBilling = await completeShipmentBilling(env, clientId, payload.shipment_id)");
+    return start >= 0 && call >= 0 && !block.slice(0, call).includes("if (!lateAfterSynchronousFailure)");
+  })()],
+  ["billing is gated on a confirmed provider reference", source.includes('if (!invoiceReference || shipment?.provider_sync_status !== "confirmed")')],
+  ["confirmed billing deferrals are explicitly marked for bounded recovery", source.includes("Shipment billing deferred:%") && source.includes("LIMIT 20") && source.includes("await reconcileDeferredShipmentBilling(env, controller.cron)")],
+  ["queued accepted bookings do not bill while the provider reference is pending", source.includes("const hasConfirmedReference = Boolean(providerResult.lr_number || providerResult.master_awb || providerResult.providerReference) && providerResult.providerPending !== true")],
+  ["wallet funds are rechecked atomically with shipment billing inserts", source.includes("FROM wallet_transactions WHERE client_id = ? AND status IN ('posted', 'approved')) >= ?") && source.includes("WHERE EXISTS (SELECT 1 FROM billing_records WHERE id = ? AND client_id = ? AND status = 'paid')")],
+  ["billing completion stays idempotent by shipment and client", source.includes("SELECT id FROM billing_records WHERE shipment_id = ? AND client_id = ? LIMIT 1") && source.includes('`wallet-${shipmentId}`')],
   ["UUIDs are not used as invoice-number fallbacks", !source.includes("INV-${shipmentId.slice(0, 8).toUpperCase()}")],
   ["manual billing does not derive invoice numbers from record UUIDs", !source.includes("INV-${recordId.slice(0, 8).toUpperCase()}")],
   ["manual billing preserves pending identity when no shipment reference exists", source.includes('"INV-PENDING-REFERENCE"')],

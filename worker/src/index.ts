@@ -555,7 +555,7 @@ function billingLineItemStatements(env: Env, billingId: string, shipmentId: stri
     const label = String(line.label ?? code).trim();
     const amount = Number(line.amount);
     if (!code || !label || !Number.isFinite(amount)) return [];
-    return [env.DB.prepare("INSERT INTO billing_line_items (id, billing_id, shipment_id, client_id, code, label, amount, marker, display_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(crypto.randomUUID(), billingId, shipmentId, clientId, code, label, amount, line.marker === "*" ? "*" : null, displayOrder)];
+    return [env.DB.prepare("INSERT INTO billing_line_items (id, billing_id, shipment_id, client_id, code, label, amount, marker, display_order) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM billing_records WHERE id = ? AND client_id = ? AND status = 'paid')").bind(crypto.randomUUID(), billingId, shipmentId, clientId, code, label, amount, line.marker === "*" ? "*" : null, displayOrder, billingId, clientId)];
   });
 }
 
@@ -566,35 +566,57 @@ function shipmentInvoiceNumber(value: unknown, fallback = "PENDING-REFERENCE") {
 
 async function completeShipmentBilling(env: Env, clientId: string, shipmentId: string) {
   const existing = await env.DB.prepare("SELECT id FROM billing_records WHERE shipment_id = ? AND client_id = ? LIMIT 1").bind(shipmentId, clientId).first<{ id: string }>();
-  if (existing) return { ok: true as const, alreadyCompleted: true as const };
-  const shipment = await env.DB.prepare("SELECT lr_number, master_awb, tracking_number FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(shipmentId, clientId).first<{ lr_number: string | null; master_awb: string | null; tracking_number: string | null }>();
+  if (existing) {
+    await recalculateWalletBalances(env, clientId);
+    await env.DB.prepare("UPDATE shipments SET provider_last_error = CASE WHEN provider_last_error LIKE 'Shipment billing deferred:%' THEN NULL ELSE provider_last_error END WHERE id = ? AND client_id = ?").bind(shipmentId, clientId).run();
+    return { ok: true as const, alreadyCompleted: true as const };
+  }
+  const shipment = await env.DB.prepare("SELECT lr_number, master_awb, tracking_number, provider_reference, provider_sync_status FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(shipmentId, clientId).first<{ lr_number: string | null; master_awb: string | null; tracking_number: string | null; provider_reference: string | null; provider_sync_status: string | null }>();
+  const invoiceReference = shipment?.lr_number || shipment?.master_awb || shipment?.tracking_number || shipment?.provider_reference;
+  if (!invoiceReference || shipment?.provider_sync_status !== "confirmed") return { ok: false as const, error: "Provider shipment reference is not confirmed; billing remains pending" };
+  const markDeferred = async (reason: string) => {
+    await env.DB.prepare("UPDATE shipments SET provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ? AND provider_sync_status = 'confirmed'")
+      .bind(`Shipment billing deferred: ${reason}`.slice(0, 500), shipmentId, clientId).run();
+    return { ok: false as const, error: reason };
+  };
+  await markDeferred("Provider reference confirmed; awaiting safe billing completion");
   const snapshot = await env.DB.prepare("SELECT client_breakdown_json FROM pricing_shipment_snapshots WHERE shipment_id = ? AND client_id = ? LIMIT 1").bind(shipmentId, clientId).first<{ client_breakdown_json: string }>();
-  if (!snapshot) return { ok: false as const, error: "Pricing snapshot was not found for the completed shipment" };
+  if (!snapshot) return markDeferred("Pricing snapshot was not found for the completed shipment");
   let amount = 0;
   try { amount = Number((JSON.parse(snapshot.client_breakdown_json) as { total?: number }).total ?? 0); } catch { amount = 0; }
-  if (!Number.isFinite(amount) || amount <= 0) return { ok: false as const, error: "The completed shipment has an invalid PSS amount" };
+  if (!Number.isFinite(amount) || amount <= 0) return markDeferred("The completed shipment has an invalid PSS amount");
   const wallet = await env.DB.prepare("SELECT COALESCE(SUM(CASE WHEN lower(COALESCE(type, '')) IN ('debit', 'charge', 'withdrawal') THEN -ABS(amount) ELSE ABS(amount) END), 0) AS balance FROM wallet_transactions WHERE client_id = ? AND status IN ('posted', 'approved')").bind(clientId).first<{ balance: number }>();
-  if (Number(wallet?.balance ?? 0) < amount) return { ok: false as const, error: "The client wallet does not have enough balance for this completed PSS booking" };
+  if (Number(wallet?.balance ?? 0) < amount) return markDeferred("The client wallet does not have enough balance for this completed PSS booking");
   // Shipment-scoped identifiers make reconciliation idempotent even if the
   // provider-status poll and the scheduled reconciler observe the LR together.
   const billingId = `shipment-${shipmentId}`;
-  const invoiceReference = shipment?.lr_number || shipment?.master_awb || shipment?.tracking_number;
   const invoiceNumber = shipmentInvoiceNumber(invoiceReference);
   try {
     await env.DB.batch([
-      env.DB.prepare("INSERT INTO billing_records (id, client_id, shipment_id, invoice_number, amount, status, paid_at) VALUES (?, ?, ?, ?, ?, 'paid', CURRENT_TIMESTAMP)").bind(billingId, clientId, shipmentId, invoiceNumber, amount),
-      env.DB.prepare("INSERT INTO wallet_transactions (id, client_id, type, amount, reference, status, balance_after) VALUES (?, ?, 'debit', ?, ?, 'posted', 0)").bind(`wallet-${shipmentId}`, clientId, amount, `SHIPMENT-${shipmentId}`),
+      // Check the balance inside the same D1 batch as the inserts. The earlier
+      // read gives a clear error, while this conditional insert prevents two
+      // simultaneous bookings from both spending the same available balance.
+      env.DB.prepare("INSERT INTO billing_records (id, client_id, shipment_id, invoice_number, amount, status, paid_at) SELECT ?, ?, ?, ?, ?, 'paid', CURRENT_TIMESTAMP WHERE (SELECT COALESCE(SUM(CASE WHEN lower(COALESCE(type, '')) IN ('debit', 'charge', 'withdrawal') THEN -ABS(amount) ELSE ABS(amount) END), 0) FROM wallet_transactions WHERE client_id = ? AND status IN ('posted', 'approved')) >= ?").bind(billingId, clientId, shipmentId, invoiceNumber, amount, clientId, amount),
+      env.DB.prepare("INSERT INTO wallet_transactions (id, client_id, type, amount, reference, status, balance_after) SELECT ?, ?, 'debit', ?, ?, 'posted', 0 WHERE EXISTS (SELECT 1 FROM billing_records WHERE id = ? AND client_id = ? AND status = 'paid')").bind(`wallet-${shipmentId}`, clientId, amount, `SHIPMENT-${shipmentId}`, billingId, clientId),
       ...billingLineItemStatements(env, billingId, shipmentId, clientId, snapshot.client_breakdown_json),
     ]);
+    const completed = await env.DB.prepare("SELECT br.status AS billing_status, wt.status AS wallet_status FROM billing_records br LEFT JOIN wallet_transactions wt ON wt.id = ? AND wt.client_id = br.client_id WHERE br.id = ? AND br.client_id = ? LIMIT 1").bind(`wallet-${shipmentId}`, billingId, clientId).first<{ billing_status: string; wallet_status: string | null }>();
+    if (!completed) return markDeferred("The client wallet balance changed before the booking charge could be committed");
+    if (completed.billing_status !== "paid" || completed.wallet_status !== "posted") return markDeferred("The booking invoice and wallet debit could not be committed together");
   } catch (caught) {
     // The synchronous booking response and the scheduled LR reconciler can
     // observe the same provider reference together. Treat a concurrent
     // winner as success instead of surfacing a false billing failure.
     const winner = await env.DB.prepare("SELECT id, status FROM billing_records WHERE shipment_id = ? AND client_id = ? LIMIT 1").bind(shipmentId, clientId).first<{ id: string; status: string }>();
-    if (winner?.status === "paid") return { ok: true as const, alreadyCompleted: true as const };
+    if (winner?.status === "paid") {
+      await recalculateWalletBalances(env, clientId);
+      await env.DB.prepare("UPDATE shipments SET provider_last_error = CASE WHEN provider_last_error LIKE 'Shipment billing deferred:%' THEN NULL ELSE provider_last_error END WHERE id = ? AND client_id = ?").bind(shipmentId, clientId).run();
+      return { ok: true as const, alreadyCompleted: true as const };
+    }
     throw caught;
   }
   await recalculateWalletBalances(env, clientId);
+  await env.DB.prepare("UPDATE shipments SET provider_last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ? AND provider_last_error LIKE 'Shipment billing deferred:%'").bind(shipmentId, clientId).run();
   return { ok: true as const, alreadyCompleted: false as const, amount };
 }
 async function pricingPincode(env: Env, pincode: string) {
@@ -2967,13 +2989,13 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     const statusAwb = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["mwn", "mwn_number", "master_awb", "master_awb_number", "masterawb", "master_waybill", "master_waybill_number", "awb", "awb_number", "waybill", "waybill_number", "waybill_no"]))) ?? responseBody.match(/(?:mwn|master[_ ]?awb|awb|waybill)[^A-Za-z0-9]{0,12}(\d{6,20})/i)?.[1] ?? null;
     const statusJobId = findProviderReference(parsedProviderBody, new Set(["job_id", "jobid", "manifest_job_id", "request_id", "requestid"])) ?? (String(payload.provider_booking_id ?? "").trim() || null);
     if (statusLr || statusAwb) {
-      const current = await env.DB.prepare("SELECT status, provider_last_error FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(payload.shipment_id, clientId).first<{ status: string | null; provider_last_error: string | null }>();
-      const lateAfterSynchronousFailure = current?.status === "exception" && /synchronous booking window/i.test(String(current.provider_last_error ?? ""));
-      await env.DB.prepare("UPDATE shipments SET lr_number = COALESCE(?, lr_number), master_awb = COALESCE(?, master_awb), box_awbs_json = COALESCE(?, box_awbs_json), provider_sync_status = 'confirmed', status = CASE WHEN ? = 1 THEN 'exception' WHEN status = 'exception' THEN 'booked' ELSE status END, tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(provider_reference, ?), provider_last_error = CASE WHEN ? = 1 THEN provider_last_error ELSE NULL END, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(statusLr, statusAwb, statusAwb ? JSON.stringify([statusAwb]) : null, lateAfterSynchronousFailure ? 1 : 0, statusLr ?? statusAwb, statusAwb ?? statusLr, lateAfterSynchronousFailure ? 1 : 0, payload.shipment_id, clientId).run();
-      if (!lateAfterSynchronousFailure) {
-        const completedBilling = await completeShipmentBilling(env, clientId, payload.shipment_id);
-        if (!completedBilling.ok) console.error(JSON.stringify({ event: "shipment_billing_deferred", request_id: requestIdValue, shipment_id: payload.shipment_id, error: completedBilling.error }));
-      }
+      await env.DB.prepare("UPDATE shipments SET lr_number = COALESCE(?, lr_number), master_awb = COALESCE(?, master_awb), box_awbs_json = COALESCE(?, box_awbs_json), provider_sync_status = 'confirmed', status = CASE WHEN status = 'exception' THEN 'booked' ELSE status END, tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(provider_reference, ?), provider_last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(statusLr, statusAwb, statusAwb ? JSON.stringify([statusAwb]) : null, statusLr ?? statusAwb, statusAwb ?? statusLr, payload.shipment_id, clientId).run();
+      // A provider-confirmed LR is the billing completion signal whether it
+      // arrived synchronously or after the original request timed out. The
+      // billing helper is shipment-idempotent, so repeated status polls cannot
+      // create another invoice or wallet debit.
+      const completedBilling = await completeShipmentBilling(env, clientId, payload.shipment_id);
+      if (!completedBilling.ok) console.error(JSON.stringify({ event: "shipment_billing_deferred", request_id: requestIdValue, shipment_id: payload.shipment_id, error: completedBilling.error }));
       return { enabled: true, status: "accepted" as const, providerStatus: response.status, providerPending: false, providerBookingId: statusJobId, providerReference: statusAwb ?? statusLr, lr_number: statusLr, master_awb: statusAwb };
     }
     const pendingMessage = "Delhivery accepted the booking but has not published the LR/AWB yet.";
@@ -3635,15 +3657,17 @@ async function retryPendingDelhiveryBookings(env: Env, cron: string) {
       const invoiceDocuments = await loadShipmentInvoiceDocumentsForRetry(env, shipment.client_id, shipment.id, payload);
       const result = await safeProviderRequest(env, "delhivery", "shipments", { shipment_id: shipment.id, ...payload, invoice_documents: invoiceDocuments, provider_account_id: shipment.provider_account_id ?? payload.provider_account_id }, `cron:${cron}:booking:${shipment.id}`, shipment.client_id, `queued-booking-${shipment.id}`, 25000);
       if (result.status === "accepted") {
-        const snapshot = await env.DB.prepare("SELECT 1 AS present FROM pricing_shipment_snapshots WHERE shipment_id = ? AND client_id = ? LIMIT 1").bind(shipment.id, shipment.client_id).first<{ present: number }>();
-        if (snapshot) {
+        const providerResult = result as { providerPending?: boolean; providerReference?: string | null; lr_number?: string | null; master_awb?: string | null };
+        const hasConfirmedReference = Boolean(providerResult.lr_number || providerResult.master_awb || providerResult.providerReference) && providerResult.providerPending !== true;
+        let billingDeferred = false;
+        if (hasConfirmedReference) {
           const billing = await completeShipmentBilling(env, shipment.client_id, shipment.id);
           if (!billing.ok) {
-            await env.DB.prepare("UPDATE shipments SET status = 'exception', provider_sync_status = 'failed', provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(billing.error, shipment.id, shipment.client_id).run();
-            continue;
+            billingDeferred = true;
+            console.error(JSON.stringify({ event: "shipment_billing_deferred", request_id: `cron:${cron}:booking:${shipment.id}`, shipment_id: shipment.id, error: billing.error }));
           }
         }
-        await env.DB.prepare("UPDATE shipments SET provider_booking_payload_json = NULL, provider_retry_at = NULL, provider_last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(shipment.id, shipment.client_id).run();
+        await env.DB.prepare("UPDATE shipments SET provider_booking_payload_json = NULL, provider_retry_at = NULL, provider_last_error = CASE WHEN ? = 1 THEN provider_last_error ELSE NULL END, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(providerResult.providerPending === true || billingDeferred ? 1 : 0, shipment.id, shipment.client_id).run();
         continue;
       }
       const reason = String((result as { error?: string; reason?: string }).error ?? (result as { reason?: string }).reason ?? "Delhivery did not accept the queued booking").slice(0, 500);
@@ -3686,6 +3710,25 @@ async function reconcilePendingDelhiveryReferences(env: Env, cron: string) {
     }
   }
   if (pending.results.length) console.log(JSON.stringify({ job: "delhivery_reference_reconciliation", candidates: pending.results.length }));
+}
+async function reconcileDeferredShipmentBilling(env: Env, cron: string) {
+  // Only retry shipments explicitly marked by the billing completion path.
+  // This avoids sweeping older unbilled shipments and unexpectedly charging
+  // historical client wallets while still recovering transient failures.
+  const pending = await env.DB.prepare("SELECT id, client_id FROM shipments WHERE provider = 'delhivery' AND provider_sync_status = 'confirmed' AND provider_last_error LIKE 'Shipment billing deferred:%' ORDER BY updated_at ASC LIMIT 20").all<{ id: string; client_id: string }>();
+  let completed = 0;
+  let deferred = 0;
+  for (const shipment of pending.results) {
+    try {
+      const result = await completeShipmentBilling(env, shipment.client_id, shipment.id);
+      if (result.ok) completed += 1;
+      else deferred += 1;
+    } catch (caught) {
+      deferred += 1;
+      console.error(JSON.stringify({ job: "shipment_billing_reconciliation", cron, shipment_id: shipment.id, error: caught instanceof Error ? caught.message : "unknown_error" }));
+    }
+  }
+  if (pending.results.length) console.log(JSON.stringify({ job: "shipment_billing_reconciliation", cron, candidates: pending.results.length, completed, deferred }));
 }
 async function verifyWebhook(request: Request, env: Env, provider: "delhivery" | "ekart" | "trackon", rawBody: string) {
   const secret = provider === "delhivery" ? env.DELHIVERY_WEBHOOK_SECRET : provider === "ekart" ? env.EKART_WEBHOOK_SECRET : (env as unknown as Record<string, unknown>).TRACKON_WEBHOOK_SECRET as string | undefined;
@@ -7463,6 +7506,7 @@ const worker = {
     ctx.waitUntil((async () => {
       await retryPendingDelhiveryBookings(env, controller.cron);
       await reconcilePendingDelhiveryReferences(env, controller.cron);
+      await reconcileDeferredShipmentBilling(env, controller.cron);
       await refreshPendingProviderWeights(env, controller.cron);
       await refreshDelhiveryShipments(env, controller.cron);
       await refreshDelhiveryPickupStatuses(env, controller.cron);
