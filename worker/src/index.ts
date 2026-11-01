@@ -4820,54 +4820,64 @@ const worker = {
         const shipmentVisibilityNoAlias = testDataVisibilityClause(auth);
         const systemWhere = [statusPredicate, searchFilter, shipmentVisibility].filter(Boolean).join(" AND ");
         const clientWhere = [`s.client_id IN (${[...auth.clientIds].map(() => "?").join(",")})`, statusPredicate, searchFilter, shipmentVisibility].filter(Boolean).join(" AND ");
-        const rows = auth.system
-          ? await env.DB.prepare(`SELECT ${selectedShipmentColumns} FROM shipments s${systemWhere ? ` WHERE ${systemWhere}` : ""} ORDER BY s.created_at DESC LIMIT ${queryLimit} OFFSET ${offset}`).bind(...searchBinds).all()
+        const rowsPromise = auth.system
+          ? env.DB.prepare(`SELECT ${selectedShipmentColumns} FROM shipments s${systemWhere ? ` WHERE ${systemWhere}` : ""} ORDER BY s.created_at DESC LIMIT ${queryLimit} OFFSET ${offset}`).bind(...searchBinds).all()
           : auth.clientIds.size
-            ? await env.DB.prepare(`SELECT ${selectedShipmentColumns} FROM shipments s WHERE ${clientWhere} ORDER BY s.created_at DESC LIMIT ${queryLimit} OFFSET ${offset}`).bind(...[...auth.clientIds, ...searchBinds]).all()
-            : { results: [] };
+            ? env.DB.prepare(`SELECT ${selectedShipmentColumns} FROM shipments s WHERE ${clientWhere} ORDER BY s.created_at DESC LIMIT ${queryLimit} OFFSET ${offset}`).bind(...[...auth.clientIds, ...searchBinds]).all()
+            : Promise.resolve({ results: [] });
         const scopeKey = `${auth.system ? "system" : [...auth.clientIds].sort().join(",")}:${hidesClientTestData(auth) ? "client-visible" : "internal"}`;
         const cachedStatusCounts = shipmentStatusCountsCache.get(scopeKey);
-        let statusCounts: Record<string, number>;
+        let statusCountsPromise: Promise<Record<string, number>>;
         if (cachedStatusCounts && cachedStatusCounts.expiresAt > Date.now()) {
-          statusCounts = cachedStatusCounts.counts;
+          statusCountsPromise = Promise.resolve(cachedStatusCounts.counts);
         } else {
           // Return every tab count and the derived delayed count from a single
           // D1 scan. Previously status and delayed totals were separate,
           // sequential full-history reads on every cache miss.
           const statusAggregateSql = `SELECT status, COUNT(*) AS count, SUM(SUM(CASE WHEN edd IS NOT NULL AND date(edd) < date('now') AND lower(COALESCE(status, '')) NOT IN ('delivered', 'cancelled', 'canceled', 'returned', 'rto') THEN 1 ELSE 0 END)) OVER () AS delayed_count FROM shipments`;
-          const statusRows = auth.system
-            ? await env.DB.prepare(`${statusAggregateSql}${shipmentVisibilityNoAlias ? ` WHERE ${shipmentVisibilityNoAlias}` : ""} GROUP BY status`).all<{ status: string | null; count: number; delayed_count: number }>()
-            : auth.clientIds.size
-              ? await env.DB.prepare(`${statusAggregateSql} WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")})${shipmentVisibilityNoAlias ? ` AND ${shipmentVisibilityNoAlias}` : ""} GROUP BY status`).bind(...[...auth.clientIds]).all<{ status: string | null; count: number; delayed_count: number }>()
-              : { results: [] as Array<{ status: string | null; count: number; delayed_count: number }> };
-          statusCounts = Object.fromEntries(statusRows.results.map((item) => [String(item.status ?? "unknown"), Number(item.count ?? 0)]));
-          statusCounts.delayed = Number(statusRows.results[0]?.delayed_count ?? 0);
-          shipmentStatusCountsCache.set(scopeKey, { expiresAt: Date.now() + SHIPMENT_STATUS_COUNTS_CACHE_TTL_MS, counts: statusCounts });
+          statusCountsPromise = (async () => {
+            const statusRows = auth.system
+              ? await env.DB.prepare(`${statusAggregateSql}${shipmentVisibilityNoAlias ? ` WHERE ${shipmentVisibilityNoAlias}` : ""} GROUP BY status`).all<{ status: string | null; count: number; delayed_count: number }>()
+              : auth.clientIds.size
+                ? await env.DB.prepare(`${statusAggregateSql} WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")})${shipmentVisibilityNoAlias ? ` AND ${shipmentVisibilityNoAlias}` : ""} GROUP BY status`).bind(...[...auth.clientIds]).all<{ status: string | null; count: number; delayed_count: number }>()
+                : { results: [] as Array<{ status: string | null; count: number; delayed_count: number }> };
+            const counts = Object.fromEntries(statusRows.results.map((item) => [String(item.status ?? "unknown"), Number(item.count ?? 0)]));
+            counts.delayed = Number(statusRows.results[0]?.delayed_count ?? 0);
+            shipmentStatusCountsCache.set(scopeKey, { expiresAt: Date.now() + SHIPMENT_STATUS_COUNTS_CACHE_TTL_MS, counts });
+            return counts;
+          })();
         }
         // `delayed` is a derived, due-date view and can overlap a raw status
         // such as booked. Never derive the pagination total by summing the
         // tabs, otherwise a delayed shipment is counted twice.
         const totalWhere = [statusPredicate, shipmentVisibility].filter(Boolean).join(" AND ");
-        const totalRow = auth.system
-          ? await env.DB.prepare(`SELECT COUNT(*) AS count FROM shipments s${totalWhere ? ` WHERE ${totalWhere}` : ""}`).first<{ count: number }>()
+        const totalRowPromise = auth.system
+          ? env.DB.prepare(`SELECT COUNT(*) AS count FROM shipments s${totalWhere ? ` WHERE ${totalWhere}` : ""}`).first<{ count: number }>()
           : auth.clientIds.size
-            ? await env.DB.prepare(`SELECT COUNT(*) AS count FROM shipments s WHERE s.client_id IN (${[...auth.clientIds].map(() => "?").join(",")})${totalWhere ? ` AND ${totalWhere}` : ""}`).bind(...auth.clientIds).first<{ count: number }>()
-            : { count: 0 };
+            ? env.DB.prepare(`SELECT COUNT(*) AS count FROM shipments s WHERE s.client_id IN (${[...auth.clientIds].map(() => "?").join(",")})${totalWhere ? ` AND ${totalWhere}` : ""}`).bind(...auth.clientIds).first<{ count: number }>()
+            : Promise.resolve({ count: 0 });
+        // The page, status totals, and pagination total are independent reads.
+        // Run them together so table size does not add their latencies in series.
+        const [rows, statusCounts, totalRow] = await Promise.all([rowsPromise, statusCountsPromise, totalRowPromise]);
         const totalCount = Number(totalRow?.count ?? 0);
         const pageResults = rows.results.length > pageSize ? rows.results.slice(0, pageSize) : rows.results;
         const pagination = { limit: pageSize, offset, next_offset: offset + pageResults.length, has_more: rows.results.length > pageSize, total: totalCount, status_counts: statusCounts };
         const pageClientIds = [...new Set(pageResults.map((shipment) => String((shipment as Record<string, unknown>).client_id ?? "")).filter(Boolean))];
-        const clientNameRows = auth.accessToken && pageClientIds.length
-          ? await supabaseGet<{ id: string; legal_name: string }>(env, `client_accounts?id=in.(${pageClientIds.map((clientId) => encodeURIComponent(clientId)).join(",")})&select=id,legal_name`, auth.accessToken)
-          : [];
+        // Client-facing shipment lists do not display other client names. Do
+        // not make their critical data path wait on an optional Supabase lookup.
+        const clientNameRowsPromise = !hidesClientTestData(auth) && auth.accessToken && pageClientIds.length
+          ? supabaseGet<{ id: string; legal_name: string }>(env, `client_accounts?id=in.(${pageClientIds.map((clientId) => encodeURIComponent(clientId)).join(",")})&select=id,legal_name`, auth.accessToken)
+          : Promise.resolve([] as Array<{ id: string; legal_name: string }>);
+        const includeTracking = url.searchParams.get("include_tracking") === "1";
+        const shipmentIds = pageResults.map((shipment) => String((shipment as Record<string, unknown>).id));
+        const eventsPromise = includeTracking && shipmentIds.length
+          ? env.DB.prepare(`SELECT shipment_id, status, location, description, created_by_user_id, event_time FROM (SELECT shipment_id, status, location, description, created_by_user_id, event_time, ROW_NUMBER() OVER (PARTITION BY shipment_id ORDER BY event_time ASC) AS event_number FROM tracking_events WHERE shipment_id IN (${shipmentIds.map(() => "?").join(",")})) WHERE event_number <= 50 ORDER BY shipment_id, event_time ASC`).bind(...shipmentIds).all()
+          : Promise.resolve({ results: [] as Array<Record<string, unknown>> });
+        const [clientNameRows, events] = await Promise.all([clientNameRowsPromise, eventsPromise]);
         const clientNames = new Map(clientNameRows.map((client) => [client.id, client.legal_name]));
         const namedPageResults = pageResults.map((shipment) => ({ ...shipment, client_name: clientNames.get(String((shipment as Record<string, unknown>).client_id ?? "")) ?? (shipment as Record<string, unknown>).client_id }));
-        if (url.searchParams.get("include_tracking") === "1") {
+        if (includeTracking) {
           const shipments = namedPageResults as Array<Record<string, unknown>>;
-          const shipmentIds = shipments.map((shipment) => String(shipment.id));
-          const events = shipmentIds.length
-            ? await env.DB.prepare(`SELECT shipment_id, status, location, description, created_by_user_id, event_time FROM tracking_events WHERE shipment_id IN (${shipmentIds.map(() => "?").join(",")}) ORDER BY event_time ASC`).bind(...shipmentIds).all()
-            : { results: [] };
           const eventsByShipment = new Map<string, Array<Record<string, unknown>>>();
           for (const event of events.results as Array<Record<string, unknown>>) {
             const shipmentId = String(event.shipment_id);
