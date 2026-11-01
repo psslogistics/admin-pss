@@ -3,7 +3,7 @@ import { canonicalDelhiveryWarehouseName, delhiveryFacilityMatches, isVerifiedDe
 import { evaluateDelhiveryServiceability, serviceabilityCacheKey } from "./serviceability";
 import { providerManagedShipmentFields } from "./shipment-protection";
 import { canReadProviderAccountPoliciesForPickup, shapeProviderAccountsForPickup } from "./pickup-account-access";
-import { resolveDelhiveryCostReference } from "./provider-cost-lookup";
+import { alternateDelhiveryB2bBase, delhiveryFreightBreakupUrl, resolveDelhiveryCostReference } from "./provider-cost-lookup";
 import { ticketUpdatePermissions } from "./ticket-update-policy";
 import { canPerformTicketAction } from "./ticket-access-policy";
 import { TICKET_ATTENTION_SQL } from "./ticket-attention";
@@ -2689,7 +2689,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (persistIntegration) await env.DB.prepare("INSERT INTO integration_requests (id, provider, client_id, operation, idempotency_key, provider_request_id, status, attempt_count) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0)").bind(integrationId, provider, clientId ?? null, operation, idempotencyKey ?? null, requestIdValue).run();
   const delhiveryOrigin = provider === "delhivery" ? new URL(base).origin : "";
   const delhiveryAlternateB2bBase = provider === "delhivery" && useDelhiveryB2b
-    ? (String(base).replace(/\/$/, "") === "https://btob.api.delhivery.com" ? "https://ltl-clients-api.delhivery.com" : "https://btob.api.delhivery.com")
+    ? alternateDelhiveryB2bBase(String(base))
     : "";
   const labelVariant = String(payload.label_api_variant ?? "");
   // Delhivery's published B2B OpenAPI contract is served from btob.api. The
@@ -2719,7 +2719,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       : provider === "delhivery" && operation === "document"
         ? `${base.replace(/\/$/, "")}/document/download?lrn=${encodeURIComponent(trackingNumber)}${payload.doc_type ? `&doc_type=${encodeURIComponent(String(payload.doc_type))}` : ""}&auto_download=true&version=latest`
       : provider === "delhivery" && operation === "freight_charges"
-        ? `${base.replace(/\/$/, "")}/lrn/freight-breakup/lrns=${encodeURIComponent(trackingNumber)}`
+        ? delhiveryFreightBreakupUrl(base, trackingNumber)
       : provider === "delhivery" && operation === "shipment_status"
          ? `${base.replace(/\/$/, "")}/manifest?job_id=${encodeURIComponent(String(payload.provider_booking_id ?? ""))}`
       : provider === "delhivery" && operation === "tracking"
@@ -2859,11 +2859,20 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       // `No Such Resource` for an otherwise valid LRN. Retry the read-only
       // tracking request against the alternate host before recording a failure.
       if (provider === "delhivery" && useDelhiveryB2b && operation === "tracking" && response.status === 404) {
-        const configuredB2bBase = String(env.DELHIVERY_B2B_API_BASE_URL ?? "https://ltl-clients-api.delhivery.com").replace(/\/$/, "");
-        const alternateB2bBase = configuredB2bBase === "https://btob.api.delhivery.com"
-          ? "https://ltl-clients-api.delhivery.com"
-          : "https://btob.api.delhivery.com";
+        const alternateB2bBase = alternateDelhiveryB2bBase(String(base));
         const alternateUrl = `${alternateB2bBase}/v2/track/${encodeURIComponent(delhiveryB2bNumber(trackingNumber) ?? String(payload.shipment_id ?? trackingNumber))}`;
+        try {
+          const alternateResponse = await providerFetch(alternateUrl, { method: "GET", headers }, attemptTimeoutMs);
+          if (alternateResponse.ok || alternateResponse.status !== 404) response = alternateResponse;
+        } catch { /* Keep the original provider response if the alternate host is unavailable. */ }
+      }
+      // The B2B freight endpoint is read-only. Delhivery serves B2B APIs from
+      // both hosts, and some account environments return 404 on one host for
+      // a valid LR. Retry the same request on the documented alternate host;
+      // keep an original 404 when both hosts report it.
+      if (provider === "delhivery" && useDelhiveryB2b && operation === "freight_charges" && response.status === 404) {
+        const alternateBase = alternateDelhiveryB2bBase(String(base));
+        const alternateUrl = delhiveryFreightBreakupUrl(alternateBase, trackingNumber);
         try {
           const alternateResponse = await providerFetch(alternateUrl, { method: "GET", headers }, attemptTimeoutMs);
           if (alternateResponse.ok || alternateResponse.status !== 404) response = alternateResponse;

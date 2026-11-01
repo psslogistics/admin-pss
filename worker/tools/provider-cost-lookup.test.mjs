@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { resolveDelhiveryCostReference } from "../src/provider-cost-lookup.ts";
+import { alternateDelhiveryB2bBase, delhiveryFreightBreakupUrl, resolveDelhiveryCostReference } from "../src/provider-cost-lookup.ts";
 
 test("uses the LR for provider-cost lookup when available", () => {
   assert.deepEqual(resolveDelhiveryCostReference({ lrNumber: " 321955542 " }), {
@@ -28,4 +28,13 @@ test("rejects malformed explicit LR values rather than querying Delhivery with t
 
 test("returns no lookup reference when all provider identifiers are blank", () => {
   assert.equal(resolveDelhiveryCostReference({ lrNumber: "  ", trackingNumber: undefined }), null);
+});
+
+test("selects the other supported Delhivery B2B host for read-only 404 fallback", () => {
+  assert.equal(alternateDelhiveryB2bBase("https://ltl-clients-api.delhivery.com/"), "https://btob.api.delhivery.com");
+  assert.equal(alternateDelhiveryB2bBase("https://btob.api.delhivery.com"), "https://ltl-clients-api.delhivery.com");
+});
+
+test("builds the freight-breakup request using the LR path format", () => {
+  assert.equal(delhiveryFreightBreakupUrl("https://btob.api.delhivery.com/", "321955542"), "https://btob.api.delhivery.com/lrn/freight-breakup/lrns=321955542");
 });

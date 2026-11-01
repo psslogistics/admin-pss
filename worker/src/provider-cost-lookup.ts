@@ -2,6 +2,20 @@ export type ProviderCostReference = {
   lrNumber: string;
 };
 
+const delhiveryB2bHosts = [
+  "https://btob.api.delhivery.com",
+  "https://ltl-clients-api.delhivery.com",
+] as const;
+
+export function alternateDelhiveryB2bBase(configuredBase: string): string {
+  const normalized = configuredBase.trim().replace(/\/$/, "");
+  return normalized === delhiveryB2bHosts[0] ? delhiveryB2bHosts[1] : delhiveryB2bHosts[0];
+}
+
+export function delhiveryFreightBreakupUrl(base: string, lrNumber: string): string {
+  return `${base.replace(/\/$/, "")}/lrn/freight-breakup/lrns=${encodeURIComponent(lrNumber)}`;
+}
+
 export function resolveDelhiveryCostReference(input: {
   lrNumber?: unknown;
   trackingNumber?: unknown;
