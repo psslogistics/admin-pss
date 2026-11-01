@@ -4323,10 +4323,11 @@ async function refreshDelhiveryShipments(env: Env, cron: string) {
 }
 
 async function refreshPendingProviderWeights(env: Env, cron: string) {
-  // The private freight-breakup route is not in Delhivery's published B2B API
-  // contract and returns 403 for configured accounts. Use the documented LR
-  // tracking endpoint; persist measured/chargeable weight only when Delhivery
-  // includes an explicit weight field in its response.
+  // Delhivery documents the B2B Freight Charges API as a read-only LR lookup
+  // that returns the freight breakup used for reconciliation. Tracking is a
+  // separate endpoint and its successful status response does not guarantee
+  // weight fields, so use freight_charges here and persist only explicit
+  // measured/chargeable weights from that response.
   const candidates = await env.DB.prepare(`
     SELECT s.id, s.client_id, s.tracking_number, s.lr_number, s.provider_account_id,
            w.updated_at AS provider_weight_last_attempt_at
@@ -4356,7 +4357,7 @@ async function refreshPendingProviderWeights(env: Env, cron: string) {
     const results = await Promise.allSettled(batch.map((shipment) => safeProviderRequest(
       env,
       "delhivery",
-      "tracking",
+      "freight_charges",
       { shipment_id: shipment.id, tracking_number: shipment.lr_number?.trim() || shipment.tracking_number?.trim(), lr_number: shipment.lr_number, provider_account_id: shipment.provider_account_id, weight_reconciliation: true },
       `cron:${cron}:delhivery:weight:${shipment.id}`,
       shipment.client_id,
