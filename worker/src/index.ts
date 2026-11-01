@@ -6369,7 +6369,7 @@ const worker = {
       }
       if (route === "/weight-reconciliation" && request.method === "GET") {
         if (!hasScope(auth, "weight.read")) return error("FORBIDDEN", "Permission required", 403, id, headers);
-        const clientColumns = "w.id, w.client_id, w.shipment_id, s.pss_reference AS shipment_pss_reference, s.lr_number, s.master_awb, s.tracking_number, w.declared_weight_kg, w.declared_volumetric_weight_kg, w.initial_billable_weight_kg, w.measured_weight_kg, w.courier_billed_weight_kg, w.billable_weight_kg, w.status, w.provider_weight_received_at, w.client_dispute_deadline_at, w.created_at, w.updated_at, w.client_dispute_deadline_at AS ticket_deadline_at, t.id AS ticket_id, t.status AS ticket_status, t.reason AS ticket_reason";
+        const clientColumns = "w.id, w.client_id, w.shipment_id, s.pss_reference AS shipment_pss_reference, s.lr_number, s.master_awb, s.tracking_number, s.provider_sync_status, s.status AS shipment_status, w.declared_weight_kg, w.declared_volumetric_weight_kg, w.initial_billable_weight_kg, w.measured_weight_kg, w.courier_billed_weight_kg, w.billable_weight_kg, w.status, w.provider_weight_received_at, w.client_dispute_deadline_at, w.created_at, w.updated_at, w.client_dispute_deadline_at AS ticket_deadline_at, t.id AS ticket_id, t.status AS ticket_status, t.reason AS ticket_reason";
         const employeeColumns = `${clientColumns}, w.provider_dispute_status`;
         const internalColumns = `${employeeColumns}, w.provider_recovery_amount, w.retained_recovery_amount, t.client_credit_amount`;
         const columns = hasScope(auth, "provider_cost.view") || hasScope(auth, "weight_dispute.resolve") ? internalColumns : hasRole(auth, ["employee", "admin", "super_admin"]) ? employeeColumns : clientColumns;
