@@ -6333,11 +6333,12 @@ const worker = {
           const rawReference = String(row.reference ?? "").trim();
           const parts = referenceParts(rawReference);
           const linked = parts ? shipmentById.get(parts.shipmentId) : null;
+          const pssShipmentReference = parts ? `PSS ID ${parts.shipmentId}` : "Shipment record unavailable";
           const linkedShipmentReference = linked
             ? [linked.lr_number, linked.master_awb, linked.pss_reference, linked.tracking_number]
                 .map((value) => String(value ?? "").trim())
                 .find(Boolean) ?? `PSS ID ${String(linked.id)}`
-            : "Shipment record unavailable";
+            : parts ? `${pssShipmentReference} (record unavailable)` : "Shipment record unavailable";
           const publicReference = parts
             ? `${parts.category === "SHIPMENT" ? "Shipment" : parts.category === "REVERSAL" ? "Reversal" : "Weight adjustment"} · ${linkedShipmentReference}`
             : /^PRICING-OVERRIDE-/i.test(rawReference) ? "Pricing adjustment" : /^ADJ-/i.test(rawReference) ? "Finance adjustment" : "Finance activity";

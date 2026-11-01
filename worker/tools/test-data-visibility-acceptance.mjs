@@ -28,6 +28,7 @@ const checks = [
   ["wallet references are linked back to classified shipments", /table === "wallet_transactions"[\s\S]*REPLACE\(\$\{alias\}\.reference, 'SHIPMENT-'/],
   ["client wallet reads use a bounded transaction query", /route === "\/wallet" && request\.method === "GET"[\s\S]*wallet_transactions WHERE client_id IN[\s\S]*LIMIT 200/],
   ["client wallet reads remove classified linked shipments", /const data = transactions\.results\.filter[\s\S]*shipmentById\.get\(linked\)\?\.is_test/],
+  ["wallet keeps the PSS shipment ID visible when the shipment row is missing", /pssShipmentReference = parts \? `PSS ID \$\{parts\.shipmentId\}`[\s\S]*record unavailable/],
   ["support and notification records exclude classified shipments", /support_tickets\.shipment_id[\s\S]*notifications\.shipment_id/],
   ["weight and COD records exclude classified shipments", /COALESCE\(s\.is_test, 0\) = 0[\s\S]*weight_reconciliations/],
   ["direct shipment and artifact reads enforce visibility", /const artifactVisibility = testDataVisibilityClause\(auth, "s"\)[\s\S]*const shipmentGetVisibility = testDataVisibilityClause\(auth\)/],
