@@ -1528,6 +1528,20 @@ async function persistShipmentDocuments(env: Env, clientId: string, shipmentId: 
   return { ok: true as const };
 }
 
+function validateEwayBillDocument(value: unknown) {
+  if (!value || typeof value !== "object") return "An E-Way Bill document is required for shipments valued at or above ₹50,000";
+  const document = value as Record<string, unknown>;
+  const name = String(document.name ?? "").trim();
+  const contentType = String(document.content_type ?? "").split(";", 1)[0].trim().toLowerCase();
+  const encoded = String(document.body_base64 ?? "").replace(/^data:[^,]+,/, "");
+  if (!name || name.length > 200 || name.includes("\0") || !["application/pdf", "image/jpeg", "image/png"].includes(contentType) || !encoded || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded) || encoded.length % 4 === 1) return "E-Way Bill must be a valid PDF, JPG, or PNG document";
+  let binary: string;
+  try { binary = atob(encoded); } catch { return "E-Way Bill file content is not valid base64"; }
+  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  if (bytes.byteLength < 1 || bytes.byteLength > 10 * 1024 * 1024 || !documentSignatureMatches(contentType, bytes)) return "E-Way Bill must be a valid PDF, JPG, or PNG document up to 10 MB";
+  return null;
+}
+
 type StagedInvoiceDocument = { object_key: string; name: string; content_type: string; body_base64: string };
 
 async function loadStagedInvoiceDocuments(env: Env, clientId: string, references: unknown) {
@@ -5107,6 +5121,12 @@ const worker = {
         if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
         const provider = typeof payload.provider === "string" && ["delhivery", "ekart", "trackon", "xpressbees", "rivigo"].includes(payload.provider) ? payload.provider : (hasRole(auth, ["employee", "admin", "super_admin"]) ? "delhivery" : null);
         if ((auth.kind === "api" || hasRole(auth, ["client"])) && provider !== "delhivery") return error("DELHIVERY_B2B_ONLY", "Client shipment booking is currently limited to Delhivery B2B", 409, id, headers);
+        if (provider === "delhivery" && declaredValue >= 50000) {
+          const ewayNumber = String(payload.e_waybill_no ?? payload.e_way_bill_no ?? payload.ewaybill_number ?? "").trim();
+          if (!/^\d{12}$/.test(ewayNumber)) return error("EWAY_NUMBER_REQUIRED", "A valid 12-digit E-Way Bill number is required for shipments valued at or above ₹50,000", 400, id, headers);
+          const ewayDocumentError = validateEwayBillDocument(payload.eway_document);
+          if (ewayDocumentError) return error("EWAY_DOCUMENT_REQUIRED", ewayDocumentError, 400, id, headers);
+        }
         let liveServiceabilityProvenance: DelhiveryServiceabilityResult["provenance"] | null = null;
         if (provider === "delhivery") {
           const requestedProviderAccountId = typeof payload.provider_account_id === "string" && payload.provider_account_id.trim() ? payload.provider_account_id.trim() : null;
