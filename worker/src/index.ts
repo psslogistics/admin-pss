@@ -4317,7 +4317,9 @@ async function refreshPendingProviderWeights(env: Env, cron: string) {
 
   let accepted = 0;
   let weightsReceived = 0;
+  let acceptedWithoutWeight = 0;
   let failed = 0;
+  const failureReasons: Record<string, number> = {};
   for (let index = 0; index < candidates.results.length; index += 4) {
     const batch = candidates.results.slice(index, index + 4);
     await Promise.all(batch.map((shipment) => env.DB.prepare(`
@@ -4335,11 +4337,27 @@ async function refreshPendingProviderWeights(env: Env, cron: string) {
       undefined,
       10000,
     )));
-    accepted += results.filter((result) => result.status === "fulfilled" && result.value.status === "accepted").length;
-    weightsReceived += results.filter((result) => result.status === "fulfilled" && result.value.status === "accepted" && "provider_weight_received" in result.value && result.value.provider_weight_received === true).length;
-    failed += results.length - results.filter((result) => result.status === "fulfilled" && result.value.status === "accepted").length;
+    for (const result of results) {
+      if (result.status === "rejected") {
+        failed += 1;
+        const reason = result.reason instanceof Error ? result.reason.name : "provider_request_rejected";
+        failureReasons[reason] = (failureReasons[reason] ?? 0) + 1;
+        continue;
+      }
+      if (result.value.status !== "accepted") {
+        failed += 1;
+        const reason = "providerStatus" in result.value && result.value.providerStatus
+          ? `provider_http_${result.value.providerStatus}`
+          : "provider_request_not_accepted";
+        failureReasons[reason] = (failureReasons[reason] ?? 0) + 1;
+        continue;
+      }
+      accepted += 1;
+      if ("provider_weight_received" in result.value && result.value.provider_weight_received === true) weightsReceived += 1;
+      else acceptedWithoutWeight += 1;
+    }
   }
-  console.log(JSON.stringify({ job: "delhivery_weight_reconciliation", cron, candidates: candidates.results.length, provider_requests_accepted: accepted, weights_received: weightsReceived, failed }));
+  console.log(JSON.stringify({ job: "delhivery_weight_reconciliation", cron, candidates: candidates.results.length, provider_requests_accepted: accepted, weights_received: weightsReceived, accepted_without_weight: acceptedWithoutWeight, failed, failure_reasons: failureReasons }));
 }
 
 const worker = {
