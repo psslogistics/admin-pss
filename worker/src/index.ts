@@ -579,12 +579,15 @@ async function completeShipmentBilling(env: Env, clientId: string, shipmentId: s
       .bind(`Shipment billing deferred: ${reason}`.slice(0, 500), shipmentId, clientId).run();
     return { ok: false as const, error: reason };
   };
-  await markDeferred("Provider reference confirmed; awaiting safe billing completion");
   const snapshot = await env.DB.prepare("SELECT client_breakdown_json FROM pricing_shipment_snapshots WHERE shipment_id = ? AND client_id = ? LIMIT 1").bind(shipmentId, clientId).first<{ client_breakdown_json: string }>();
-  if (!snapshot) return markDeferred("Pricing snapshot was not found for the completed shipment");
+  // Historical imports have no PSS quote to bill. Keep them out of the
+  // automatic billing retry queue rather than repeatedly writing a deferred
+  // error or inventing a charge from current pricing.
+  if (!snapshot) return { ok: false as const, error: "Pricing snapshot was not found for the completed shipment" };
   let amount = 0;
   try { amount = Number((JSON.parse(snapshot.client_breakdown_json) as { total?: number }).total ?? 0); } catch { amount = 0; }
   if (!Number.isFinite(amount) || amount <= 0) return markDeferred("The completed shipment has an invalid PSS amount");
+  await markDeferred("Provider reference confirmed; awaiting safe billing completion");
   const wallet = await env.DB.prepare("SELECT COALESCE(SUM(CASE WHEN lower(COALESCE(type, '')) IN ('debit', 'charge', 'withdrawal') THEN -ABS(amount) ELSE ABS(amount) END), 0) AS balance FROM wallet_transactions WHERE client_id = ? AND status IN ('posted', 'approved')").bind(clientId).first<{ balance: number }>();
   if (Number(wallet?.balance ?? 0) < amount) return markDeferred("The client wallet does not have enough balance for this completed PSS booking");
   // Shipment-scoped identifiers make reconciliation idempotent even if the
@@ -3396,7 +3399,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     await env.DB.prepare("INSERT OR REPLACE INTO pricing_provider_costs (id, shipment_id, client_id, provider, provider_account_id, provider_amount, provider_status) VALUES (COALESCE((SELECT id FROM pricing_provider_costs WHERE shipment_id = ?), ?), ?, ?, ?, ?, ?, ?)")
       .bind(payload.shipment_id, crypto.randomUUID(), payload.shipment_id, clientId, provider, account?.id ?? null, providerAmountValue, "accepted").run();
   }
-  return { enabled: true, status: response.ok ? "accepted" as const : "failed" as const, providerStatus: response.status, normalized_status: normalizedTracking?.status, edd: providerEdd, tracking: normalizedTracking ? { status: normalizedTracking.status, location: normalizedTracking.location, description: normalizedTracking.description, event_time: normalizedTracking.eventTime } : undefined, tracking_events: operation === "tracking" ? normalizedTrackingEvents.map((event) => ({ status: event.status, location: event.location, description: event.description, event_time: event.eventTime, source: `provider:${provider}` })) : undefined, provider_weight_received: operation === "freight_charges" && payload.weight_reconciliation === true ? providerWeightReceived : undefined, amount: providerAmountValue, provider_account_id: account?.id, account_name: account?.account_name, confidence_score: account?.confidence_score, priority: account?.priority, rate_card_id: account?.rate_card_id ?? undefined, error: normalizedError };
+  return { enabled: true, status: response.ok ? "accepted" as const : "failed" as const, providerStatus: response.status, normalized_status: normalizedTracking?.status, edd: providerEdd, tracking: normalizedTracking ? { status: normalizedTracking.status, location: normalizedTracking.location, description: normalizedTracking.description, event_time: normalizedTracking.eventTime } : undefined, tracking_events: operation === "tracking" ? normalizedTrackingEvents.map((event) => ({ status: event.status, location: event.location, description: event.description, event_time: event.eventTime, source: `provider:${provider}` })) : undefined, provider_weight_received: ["freight_charges", "tracking"].includes(operation) && payload.weight_reconciliation === true ? providerWeightReceived : undefined, amount: providerAmountValue, provider_account_id: account?.id, account_name: account?.account_name, confidence_score: account?.confidence_score, priority: account?.priority, rate_card_id: account?.rate_card_id ?? undefined, error: normalizedError };
 }
 
 async function recordPickupAttempt(env: Env, details: { pickupId: string; clientId: string; provider: string; providerAccountId?: string | null; requestId?: string | null; idempotencyKey?: string | null; requestedDate?: string | null; requestedWindow?: string | null; status: string; providerStatus?: string | number | null; providerReference?: string | null; providerErrorCode?: string | null; errorMessage?: string | null }) {
@@ -3735,7 +3738,9 @@ async function reconcileDeferredShipmentBilling(env: Env, cron: string) {
   // Only retry shipments explicitly marked by the billing completion path.
   // This avoids sweeping older unbilled shipments and unexpectedly charging
   // historical client wallets while still recovering transient failures.
-  const pending = await env.DB.prepare("SELECT id, client_id FROM shipments WHERE provider = 'delhivery' AND provider_sync_status = 'confirmed' AND provider_last_error LIKE 'Shipment billing deferred:%' ORDER BY updated_at ASC LIMIT 20").all<{ id: string; client_id: string }>();
+  // Require the original per-shipment pricing snapshot so legacy imports that
+  // cannot be safely billed are not selected on every cron run.
+  const pending = await env.DB.prepare("SELECT s.id, s.client_id FROM shipments s WHERE s.provider = 'delhivery' AND s.provider_sync_status = 'confirmed' AND s.provider_last_error LIKE 'Shipment billing deferred:%' AND EXISTS (SELECT 1 FROM pricing_shipment_snapshots ps WHERE ps.shipment_id = s.id AND ps.client_id = s.client_id) ORDER BY s.updated_at ASC LIMIT 20").all<{ id: string; client_id: string }>();
   let completed = 0;
   let deferred = 0;
   for (const shipment of pending.results) {
@@ -4133,10 +4138,10 @@ async function handleProviderWebhook(request: Request, env: Env, provider: "delh
     const providerLr = findProviderReference(payload, new Set(["lrn", "lrn_number", "lr_number", "lr_no", "lr"]));
     const status = normalizeProviderShipmentStatus(delhiveryDetails?.rawStatus ?? payload.status ?? payload.current_status ?? payload.event_type);
     const description = delhiveryDetails?.description ?? String(payload.description ?? payload.message ?? `Webhook event ${eventId}`); const location = delhiveryDetails?.location ?? String(payload.location ?? payload.city ?? "");
-    let shipment = reference ? await env.DB.prepare("SELECT id FROM shipments WHERE id = ? OR tracking_number = ? OR provider_reference = ? OR order_id = ? OR provider_booking_id = ? OR pss_reference = ? LIMIT 1").bind(reference, reference, reference, reference, reference, reference).first<{ id: string }>() : null;
+    let shipment = reference ? await env.DB.prepare("SELECT id, client_id FROM shipments WHERE id = ? OR tracking_number = ? OR provider_reference = ? OR order_id = ? OR provider_booking_id = ? OR pss_reference = ? LIMIT 1").bind(reference, reference, reference, reference, reference, reference).first<{ id: string; client_id: string }>() : null;
     if (!shipment) {
       for (const correlation of correlationReferences) {
-        shipment = await env.DB.prepare("SELECT id FROM shipments WHERE id = ? OR tracking_number = ? OR provider_reference = ? OR order_id = ? OR provider_booking_id = ? OR pss_reference = ? LIMIT 1").bind(correlation, correlation, correlation, correlation, correlation, correlation).first<{ id: string }>();
+        shipment = await env.DB.prepare("SELECT id, client_id FROM shipments WHERE id = ? OR tracking_number = ? OR provider_reference = ? OR order_id = ? OR provider_booking_id = ? OR pss_reference = ? LIMIT 1").bind(correlation, correlation, correlation, correlation, correlation, correlation).first<{ id: string; client_id: string }>();
         if (shipment) break;
       }
     }
@@ -4318,9 +4323,10 @@ async function refreshDelhiveryShipments(env: Env, cron: string) {
 }
 
 async function refreshPendingProviderWeights(env: Env, cron: string) {
-  // Delhivery's tracking response does not include the freight weight breakup.
-  // Use the dedicated freight_charges endpoint and a separate throttle so the
-  // regular tracking queue cannot delay or starve weight reconciliation.
+  // The private freight-breakup route is not in Delhivery's published B2B API
+  // contract and returns 403 for configured accounts. Use the documented LR
+  // tracking endpoint; persist measured/chargeable weight only when Delhivery
+  // includes an explicit weight field in its response.
   const candidates = await env.DB.prepare(`
     SELECT s.id, s.client_id, s.tracking_number, s.lr_number, s.provider_account_id,
            w.updated_at AS provider_weight_last_attempt_at
@@ -4329,8 +4335,8 @@ async function refreshPendingProviderWeights(env: Env, cron: string) {
     WHERE s.provider = 'delhivery'
       AND (NULLIF(TRIM(s.lr_number), '') IS NOT NULL OR NULLIF(TRIM(s.tracking_number), '') IS NOT NULL)
       AND s.status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery', 'delivered', 'exception', 'rto')
-      AND (w.provider_weight_received_at IS NULL OR s.weight_override_kg IS NULL)
-      AND (w.updated_at IS NULL OR datetime(w.updated_at) <= datetime('now', '-5 minutes'))
+      AND w.provider_weight_received_at IS NULL
+      AND (w.updated_at IS NULL OR datetime(w.updated_at) <= datetime('now', '-30 minutes'))
     ORDER BY CASE WHEN w.updated_at IS NULL THEN 0 ELSE 1 END, w.updated_at ASC, s.updated_at ASC
     LIMIT 20
   `).all<{ id: string; client_id: string; tracking_number: string | null; lr_number: string | null; provider_account_id: string | null; provider_weight_last_attempt_at: string | null }>();
@@ -4350,7 +4356,7 @@ async function refreshPendingProviderWeights(env: Env, cron: string) {
     const results = await Promise.allSettled(batch.map((shipment) => safeProviderRequest(
       env,
       "delhivery",
-      "freight_charges",
+      "tracking",
       { shipment_id: shipment.id, tracking_number: shipment.lr_number?.trim() || shipment.tracking_number?.trim(), lr_number: shipment.lr_number, provider_account_id: shipment.provider_account_id, weight_reconciliation: true },
       `cron:${cron}:delhivery:weight:${shipment.id}`,
       shipment.client_id,
