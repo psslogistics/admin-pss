@@ -6463,7 +6463,7 @@ const worker = {
       }
       if (route === "/billing" && request.method === "GET") {
         if (!hasScope(auth, "billing.read")) return error("FORBIDDEN", "Permission required", 403, id, headers);
-        const shipmentColumns = "s.pss_reference AS shipment_pss_reference, s.tracking_number, s.lr_number, s.master_awb, s.origin AS shipment_origin, s.destination AS shipment_destination, s.origin_address_json AS shipment_origin_address_json, s.destination_address_json AS shipment_destination_address_json, s.consignee AS shipment_consignee, s.description AS shipment_description, s.total_weight_kg, s.declared_value, s.pieces, s.edd, s.dimensions_json, s.created_at AS shipment_created_at";
+        const shipmentColumns = "s.id AS linked_shipment_id, CASE WHEN s.id IS NULL THEN 'unlinked' ELSE 'linked' END AS shipment_link_status, s.pss_reference AS shipment_pss_reference, s.tracking_number, s.lr_number, s.master_awb, s.origin AS shipment_origin, s.destination AS shipment_destination, s.origin_address_json AS shipment_origin_address_json, s.destination_address_json AS shipment_destination_address_json, s.consignee AS shipment_consignee, s.description AS shipment_description, s.total_weight_kg, s.declared_value, s.pieces, s.edd, s.dimensions_json, s.created_at AS shipment_created_at";
         const days = Number(url.searchParams.get("days"));
         const startDate = String(url.searchParams.get("start_date") ?? "");
         const endDate = String(url.searchParams.get("end_date") ?? "");
