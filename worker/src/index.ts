@@ -347,7 +347,7 @@ function relatedShipmentVisibilityClause(auth: Auth, table: string, tableAlias =
   if (!hidesClientTestData(auth)) return "";
   const alias = tableAlias || table;
   if (table === "shipments") return `COALESCE(${alias}.is_test, 0) = 0`;
-  if (table === "wallet_transactions") return `NOT EXISTS (SELECT 1 FROM shipments test_shipment WHERE test_shipment.client_id = ${alias}.client_id AND (test_shipment.id = REPLACE(${alias}.reference, 'SHIPMENT-', '') OR test_shipment.id = REPLACE(${alias}.reference, 'REVERSAL-', '')) AND test_shipment.is_test = 1)`;
+  if (table === "wallet_transactions") return `NOT EXISTS (SELECT 1 FROM shipments test_shipment WHERE test_shipment.client_id = ${alias}.client_id AND test_shipment.id = ${walletShipmentIdExpression(alias)} AND test_shipment.is_test = 1)`;
   return `NOT EXISTS (SELECT 1 FROM shipments test_shipment WHERE test_shipment.id = ${alias}.shipment_id AND test_shipment.is_test = 1)`;
 }
 function providerAccountId(payload: Record<string, unknown>) {
@@ -416,6 +416,15 @@ async function recalculateWalletBalances(env: Env, clientId: string) {
         AND (prior.created_at < current.created_at OR (prior.created_at = current.created_at AND prior.id <= current.id))
     )
     WHERE current.client_id = ?`).bind(clientId).run();
+}
+function walletShipmentIdExpression(walletAlias: string) {
+  return `COALESCE((SELECT link.shipment_id FROM wallet_transaction_shipment_links link WHERE link.wallet_transaction_id = ${walletAlias}.id AND link.client_id = ${walletAlias}.client_id LIMIT 1), CASE WHEN ${walletAlias}.reference LIKE 'SHIPMENT-%' OR ${walletAlias}.reference LIKE 'REVERSAL-%' THEN substr(${walletAlias}.reference, 10) WHEN ${walletAlias}.reference LIKE 'WEIGHT-DEBIT-%' THEN substr(${walletAlias}.reference, 14) WHEN ${walletAlias}.reference LIKE 'WEIGHT-CREDIT-%' THEN substr(${walletAlias}.reference, 15) WHEN ${walletAlias}.reference LIKE 'PRICING-OVERRIDE-%' THEN (SELECT shipment_id FROM pricing_overrides WHERE id = substr(${walletAlias}.reference, 18) AND client_id = ${walletAlias}.client_id LIMIT 1) ELSE NULL END)`;
+}
+function walletShipmentLinkStatement(env: Env, walletTransactionId: string, clientId: string, shipmentId: string) {
+  return env.DB.prepare(`INSERT OR IGNORE INTO wallet_transaction_shipment_links (wallet_transaction_id, shipment_id, client_id)
+    SELECT ?, s.id, ? FROM shipments s
+    JOIN wallet_transactions w ON w.id = ? AND w.client_id = ?
+    WHERE s.id = ? AND s.client_id = ?`).bind(walletTransactionId, clientId, walletTransactionId, clientId, shipmentId, clientId);
 }
 function stableSerialize(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
@@ -601,6 +610,7 @@ async function completeShipmentBilling(env: Env, clientId: string, shipmentId: s
       // simultaneous bookings from both spending the same available balance.
       env.DB.prepare("INSERT INTO billing_records (id, client_id, shipment_id, invoice_number, amount, status, paid_at) SELECT ?, ?, ?, ?, ?, 'paid', CURRENT_TIMESTAMP WHERE (SELECT COALESCE(SUM(CASE WHEN lower(COALESCE(type, '')) IN ('debit', 'charge', 'withdrawal') THEN -ABS(amount) ELSE ABS(amount) END), 0) FROM wallet_transactions WHERE client_id = ? AND status IN ('posted', 'approved')) >= ?").bind(billingId, clientId, shipmentId, invoiceNumber, amount, clientId, amount),
       env.DB.prepare("INSERT INTO wallet_transactions (id, client_id, type, amount, reference, status, balance_after) SELECT ?, ?, 'debit', ?, ?, 'posted', 0 WHERE EXISTS (SELECT 1 FROM billing_records WHERE id = ? AND client_id = ? AND status = 'paid')").bind(`wallet-${shipmentId}`, clientId, amount, `SHIPMENT-${shipmentId}`, billingId, clientId),
+      walletShipmentLinkStatement(env, `wallet-${shipmentId}`, clientId, shipmentId),
       ...billingLineItemStatements(env, billingId, shipmentId, clientId, snapshot.client_breakdown_json),
     ]);
     const completed = await env.DB.prepare("SELECT br.status AS billing_status, wt.status AS wallet_status FROM billing_records br LEFT JOIN wallet_transactions wt ON wt.id = ? AND wt.client_id = br.client_id WHERE br.id = ? AND br.client_id = ? LIMIT 1").bind(`wallet-${shipmentId}`, billingId, clientId).first<{ billing_status: string; wallet_status: string | null }>();
@@ -3719,8 +3729,10 @@ async function retryPendingDelhiveryBookings(env: Env, cron: string) {
       await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'exception', ?, 'system:delhivery-retry', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipment.id, `Queued Delhivery booking failed: ${reason}`).run();
       const billing = await env.DB.prepare("SELECT amount, status FROM billing_records WHERE shipment_id = ? AND client_id = ? LIMIT 1").bind(shipment.id, shipment.client_id).first<{ amount: number; status: string }>();
       if (billing?.status === "paid" && Number(billing.amount) > 0) {
+        const reversalId = crypto.randomUUID();
         await env.DB.batch([
-          env.DB.prepare("INSERT INTO wallet_transactions (id, client_id, type, amount, reference, status, balance_after) VALUES (?, ?, 'credit', ?, ?, 'posted', 0)").bind(crypto.randomUUID(), shipment.client_id, Number(billing.amount), `REVERSAL-${shipment.id}`),
+          env.DB.prepare("INSERT INTO wallet_transactions (id, client_id, type, amount, reference, status, balance_after) VALUES (?, ?, 'credit', ?, ?, 'posted', 0)").bind(reversalId, shipment.client_id, Number(billing.amount), `REVERSAL-${shipment.id}`),
+          walletShipmentLinkStatement(env, reversalId, shipment.client_id, shipment.id),
           env.DB.prepare("UPDATE billing_records SET status = 'void', updated_at = CURRENT_TIMESTAMP WHERE shipment_id = ? AND client_id = ?").bind(shipment.id, shipment.client_id),
         ]);
         await recalculateWalletBalances(env, shipment.client_id);
@@ -5491,6 +5503,7 @@ const worker = {
         const linkedFinancialEntries = await env.DB.prepare(`
           SELECT
             (SELECT COUNT(*) FROM wallet_transactions WHERE client_id = ? AND reference IN (?, ?, ?, ?))
+            + (SELECT COUNT(*) FROM wallet_transaction_shipment_links WHERE client_id = ? AND shipment_id = ?)
             + (SELECT COUNT(*) FROM billing_records WHERE client_id = ? AND shipment_id = ?) AS total
         `).bind(
           current.client_id,
@@ -5498,6 +5511,8 @@ const worker = {
           `REVERSAL-${current.id}`,
           `WEIGHT-DEBIT-${current.id}`,
           `WEIGHT-CREDIT-${current.id}`,
+          current.client_id,
+          current.id,
           current.client_id,
           current.id,
         ).first<{ total: number }>();
@@ -6426,7 +6441,15 @@ const worker = {
           const match = reference.match(/^(SHIPMENT|REVERSAL|WEIGHT-DEBIT|WEIGHT-CREDIT)-(.+)$/);
           return match ? { category: match[1], shipmentId: match[2] } : null;
         };
-        const shipmentIds = [...new Set(transactions.results.map((row) => referenceParts(row.reference)?.shipmentId).filter((value): value is string => Boolean(value)))];
+        const transactionIds = transactions.results.map((row) => String(row.id));
+        const linkedShipmentByTransaction = new Map<string, string>();
+        for (let offset = 0; offset < transactionIds.length; offset += 40) {
+          const chunk = transactionIds.slice(offset, offset + 40);
+          const result = await env.DB.prepare(`SELECT wallet_transaction_id, shipment_id FROM wallet_transaction_shipment_links WHERE wallet_transaction_id IN (${chunk.map(() => "?").join(",")}) AND client_id IN (${clientIds.map(() => "?").join(",")})`).bind(...chunk, ...clientIds).all<{ wallet_transaction_id: string; shipment_id: string }>();
+          result.results.forEach((row) => linkedShipmentByTransaction.set(row.wallet_transaction_id, row.shipment_id));
+        }
+        const shipmentIdFor = (row: Record<string, unknown>) => linkedShipmentByTransaction.get(String(row.id)) ?? referenceParts(row.reference)?.shipmentId ?? null;
+        const shipmentIds = [...new Set(transactions.results.map(shipmentIdFor).filter((value): value is string => Boolean(value)))];
         const shipmentRows: Record<string, unknown>[] = [];
         for (let offset = 0; offset < shipmentIds.length; offset += 40) {
           const chunk = shipmentIds.slice(offset, offset + 40);
@@ -6435,21 +6458,26 @@ const worker = {
         }
         const shipmentById = new Map(shipmentRows.map((row) => [String(row.id), row]));
         const data = transactions.results.filter((row) => {
-          const linked = referenceParts(row.reference)?.shipmentId;
+          const linked = shipmentIdFor(row);
           return !linked || !shipmentById.get(linked)?.is_test;
         }).slice(0, 100).map((row) => {
           const rawReference = String(row.reference ?? "").trim();
           const parts = referenceParts(rawReference);
-          const linked = parts ? shipmentById.get(parts.shipmentId) : null;
-          const pssShipmentReference = parts ? `PSS ID ${parts.shipmentId}` : "Shipment record unavailable";
+          const shipmentId = shipmentIdFor(row);
+          const linked = shipmentId ? shipmentById.get(shipmentId) : null;
+          const pssShipmentReference = shipmentId ? `PSS ID ${shipmentId}` : "Shipment record unavailable";
           const linkedShipmentReference = linked
             ? [linked.lr_number, linked.master_awb, linked.pss_reference, linked.tracking_number]
                 .map((value) => String(value ?? "").trim())
                 .find(Boolean) ?? `PSS ID ${String(linked.id)}`
-            : parts ? `${pssShipmentReference} (record unavailable)` : "Shipment record unavailable";
-          const publicReference = parts
-            ? `${parts.category === "SHIPMENT" ? "Shipment" : parts.category === "REVERSAL" ? "Reversal" : "Weight adjustment"} · ${linkedShipmentReference}`
-            : /^PRICING-OVERRIDE-/i.test(rawReference) ? "Pricing adjustment" : /^ADJ-/i.test(rawReference) ? "Finance adjustment" : "Finance activity";
+            : shipmentId ? `${pssShipmentReference} (record unavailable)` : "Shipment record unavailable";
+          const category = parts?.category === "SHIPMENT" ? "Shipment"
+            : parts?.category === "REVERSAL" ? "Reversal"
+            : parts ? "Weight adjustment"
+            : /^PRICING-OVERRIDE-/i.test(rawReference) ? "Pricing adjustment"
+            : /^ADJ-/i.test(rawReference) ? "Finance adjustment"
+            : "Finance activity";
+          const publicReference = shipmentId ? `${category} · ${linkedShipmentReference}` : category;
           return { ...row, reference: publicReference };
         });
         return json({ ok: true, data }, 200, headers);
@@ -6465,7 +6493,7 @@ const worker = {
                WHEN w.reference LIKE 'REVERSAL-%' THEN 'Reversal · ' || COALESCE(NULLIF(s.lr_number, ''), NULLIF(s.master_awb, ''), NULLIF(s.pss_reference, ''), NULLIF(s.id, ''), 'Shipment record unavailable')
                WHEN w.reference LIKE 'WEIGHT-DEBIT-%' THEN 'Weight adjustment · ' || COALESCE(NULLIF(s.lr_number, ''), NULLIF(s.master_awb, ''), NULLIF(s.pss_reference, ''), NULLIF(s.id, ''), 'Shipment record unavailable')
                WHEN w.reference LIKE 'WEIGHT-CREDIT-%' THEN 'Weight adjustment · ' || COALESCE(NULLIF(s.lr_number, ''), NULLIF(s.master_awb, ''), NULLIF(s.pss_reference, ''), NULLIF(s.id, ''), 'Shipment record unavailable')
-               WHEN w.reference LIKE 'PRICING-OVERRIDE-%' THEN 'Pricing adjustment'
+               WHEN w.reference LIKE 'PRICING-OVERRIDE-%' THEN 'Pricing adjustment · ' || COALESCE(NULLIF(s.lr_number, ''), NULLIF(s.master_awb, ''), NULLIF(s.pss_reference, ''), NULLIF(s.id, ''), 'Shipment record unavailable')
                ELSE w.reference
              END AS reference,
              w.status, w.created_at`
@@ -6481,7 +6509,7 @@ const worker = {
         const pageOffset = Math.max(Number.parseInt(url.searchParams.get("offset") ?? "0", 10) || 0, 0);
         const collectionLimit = unlimitedCollection ? "" : pageLimit === null ? " LIMIT 100" : ` LIMIT ${pageLimit + 1} OFFSET ${pageOffset}`;
         const source = collection.table === "wallet_transactions" && !internalCollectionView
-          ? "wallet_transactions w LEFT JOIN shipments s ON s.id = CASE WHEN w.reference LIKE 'SHIPMENT-%' OR w.reference LIKE 'REVERSAL-%' THEN substr(w.reference, 10) WHEN w.reference LIKE 'WEIGHT-DEBIT-%' THEN substr(w.reference, 14) WHEN w.reference LIKE 'WEIGHT-CREDIT-%' THEN substr(w.reference, 15) ELSE '' END"
+          ? `wallet_transactions w LEFT JOIN shipments s ON s.id = ${walletShipmentIdExpression("w")} AND s.client_id = w.client_id`
           : collection.table === "return_shipments" && !internalCollectionView ? "return_shipments r LEFT JOIN shipments s ON s.id = r.shipment_id" : clientCaseView ? `${collection.table} c LEFT JOIN shipments s ON s.id = c.shipment_id` : collection.table;
         const scopeColumn = collection.table === "wallet_transactions" && !internalCollectionView ? "w.client_id" : collection.table === "return_shipments" && !internalCollectionView ? "r.client_id" : clientCaseView ? "c.client_id" : "client_id";
         const orderColumn = collection.table === "wallet_transactions" && !internalCollectionView ? collection.order.replaceAll("created_at", "w.created_at") : collection.table === "return_shipments" && !internalCollectionView ? collection.order.replaceAll("updated_at", "r.updated_at") : clientCaseView ? collection.order.replaceAll("updated_at", "c.updated_at") : collection.order;
@@ -6500,7 +6528,7 @@ const worker = {
         if (!hasScope(auth, scope) || !hasRole(auth, ["admin", "super_admin"])) return error("FORBIDDEN", "Administrator finance permission required", 403, id, headers);
         const payload = await bodyJson(request); const requestHash = await payloadFingerprint(payload); const clientId = requireClient(auth, payload.client_id);
         if (!clientId || !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
-        if (route === "/billing" && payload.shipment_id !== undefined && !(await shipmentBelongsToClient(env, payload.shipment_id, clientId))) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
+        if (payload.shipment_id !== undefined && !(await shipmentBelongsToClient(env, payload.shipment_id, clientId))) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
         const amount = Number(payload.amount); if (!Number.isFinite(amount) || amount <= 0) return error("VALIDATION_ERROR", "A positive amount is required", 400, id, headers);
         if (route === "/wallet" && !["credit", "debit"].includes(String(payload.type ?? "").trim().toLowerCase())) return error("VALIDATION_ERROR", "Wallet type must be credit or debit", 400, id, headers);
         const key = request.headers.get("Idempotency-Key"); if (!key) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
@@ -6513,7 +6541,9 @@ const worker = {
           const invoiceNumber = manualInvoiceReference ? shipmentInvoiceNumber(manualInvoiceReference) : "INV-PENDING-REFERENCE";
           await env.DB.prepare("INSERT INTO billing_records (id, client_id, shipment_id, invoice_number, amount, status, due_date) VALUES (?, ?, ?, ?, ?, 'pending', ?)").bind(recordId, clientId, manualShipmentId, invoiceNumber, amount, typeof payload.due_date === "string" ? payload.due_date : null).run();
         } else {
-          await env.DB.prepare("INSERT INTO wallet_transactions (id, client_id, type, amount, reference, status, balance_after) VALUES (?, ?, ?, ?, ?, 'pending', 0)").bind(recordId, clientId, String(payload.type).trim().toLowerCase(), amount, typeof payload.reference === "string" ? payload.reference : `ADJ-${recordId.slice(0, 8).toUpperCase()}`).run();
+          const manualShipmentId = typeof payload.shipment_id === "string" ? payload.shipment_id : null;
+          const walletInsert = env.DB.prepare("INSERT INTO wallet_transactions (id, client_id, type, amount, reference, status, balance_after) VALUES (?, ?, ?, ?, ?, 'pending', 0)").bind(recordId, clientId, String(payload.type).trim().toLowerCase(), amount, typeof payload.reference === "string" ? payload.reference : `ADJ-${recordId.slice(0, 8).toUpperCase()}`);
+          await env.DB.batch([walletInsert, ...(manualShipmentId ? [walletShipmentLinkStatement(env, recordId, clientId, manualShipmentId)] : [])]);
           await recalculateWalletBalances(env, clientId);
         }
         await audit(env, ctx, auth, id, `${route.slice(1)}.created`, route.slice(1), recordId, { client_id: clientId, amount });
@@ -6725,6 +6755,7 @@ const worker = {
             repricedQuote = null;
           }
         }
+        const weightDebitTransactionId = invoiceAdjustment > 0 ? crypto.randomUUID() : null;
         const statements = [
           env.DB.prepare("UPDATE weight_reconciliations SET measured_weight_kg = ?, courier_billed_weight_kg = ?, billable_weight_kg = ?, provider_weight_received_at = CURRENT_TIMESTAMP, client_dispute_deadline_at = COALESCE(client_dispute_deadline_at, datetime(CURRENT_TIMESTAMP, '+24 hours')), provider_dispute_status = CASE WHEN provider_dispute_status IN ('dispute_pending', 'recovered') THEN provider_dispute_status ELSE ? END, status = CASE WHEN status = 'resolved' THEN status ELSE 'measured' END, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(measured, courierBilled, effectiveWeightKg, providerStatus, reconciliation.id),
           env.DB.prepare("UPDATE shipments SET weight_override_kg = ?, weight_source = 'reconciled', weight_updated_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ? AND COALESCE(weight_source, 'booking') <> 'manual'").bind(effectiveWeightKg, reconciliation.shipment_id, reconciliation.client_id),
@@ -6737,7 +6768,8 @@ const worker = {
             ...billingLineItemStatements(env, currentBilling.id, reconciliation.shipment_id, reconciliation.client_id, repricedQuote.client_breakdown_json),
             env.DB.prepare("INSERT INTO pricing_overrides (id, shipment_id, client_id, billing_id, component_code, previous_amount, new_amount, reason, actor_user_id) VALUES (?, ?, ?, ?, 'weight_reconciliation_debit', ?, ?, ?, ?)").bind(crypto.randomUUID(), reconciliation.shipment_id, reconciliation.client_id, currentBilling.id, Number(currentBilling.amount), amendedInvoiceAmount, reason, actor),
             env.DB.prepare("INSERT INTO billing_amendments (id, billing_id, shipment_id, client_id, amendment_type, previous_amount, new_amount, reason, weight_received_at, ticket_deadline_at, actor_user_id) VALUES (?, ?, ?, ?, 'courier_weight_debit', ?, ?, ?, CURRENT_TIMESTAMP, datetime(CURRENT_TIMESTAMP, '+24 hours'), ?)").bind(crypto.randomUUID(), currentBilling.id, reconciliation.shipment_id, reconciliation.client_id, Number(currentBilling.amount), amendedInvoiceAmount, reason, actor),
-            env.DB.prepare("INSERT INTO wallet_transactions (id, client_id, type, amount, reference, status, balance_after) VALUES (?, ?, 'debit', ?, ?, 'posted', 0)").bind(crypto.randomUUID(), reconciliation.client_id, invoiceAdjustment, `WEIGHT-DEBIT-${reconciliation.shipment_id}`),
+            env.DB.prepare("INSERT INTO wallet_transactions (id, client_id, type, amount, reference, status, balance_after) VALUES (?, ?, 'debit', ?, ?, 'posted', 0)").bind(weightDebitTransactionId, reconciliation.client_id, invoiceAdjustment, `WEIGHT-DEBIT-${reconciliation.shipment_id}`),
+            walletShipmentLinkStatement(env, weightDebitTransactionId!, reconciliation.client_id, reconciliation.shipment_id),
           );
         }
         await env.DB.batch(statements);
@@ -6781,6 +6813,7 @@ const worker = {
             adjustedSnapshotJson = JSON.stringify(breakdown);
           } catch { return error("CONFLICT", "The pricing snapshot is invalid", 409, id, headers); }
         }
+        const weightCreditTransactionId = clientCredit > 0 ? crypto.randomUUID() : null;
         await env.DB.batch([
           env.DB.prepare("UPDATE weight_reconciliations SET measured_weight_kg = ?, billable_weight_kg = ?, provider_recovery_amount = ?, retained_recovery_amount = ?, provider_dispute_status = CASE WHEN ? > 0 THEN 'recovered' ELSE provider_dispute_status END, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(measured, measured, effectiveProviderRecovery, retained, effectiveProviderRecovery, ticket ? "resolved" : "measured", reconciliation.id),
           ...(ticket ? [env.DB.prepare("UPDATE weight_reconciliation_tickets SET status = 'resolved', resolved_by_user_id = ?, resolution_reason = ?, client_credit_amount = ?, updated_at = CURRENT_TIMESTAMP WHERE reconciliation_id = ?").bind(actor, reason, clientCredit, reconciliation.id)] : []),
@@ -6794,7 +6827,10 @@ const worker = {
             env.DB.prepare("DELETE FROM billing_line_items WHERE billing_id = ?").bind(billing.id),
             ...billingLineItemStatements(env, billing.id, reconciliation.shipment_id, reconciliation.client_id, adjustedSnapshotJson),
           ] : []),
-          ...(clientCredit > 0 ? [env.DB.prepare("INSERT INTO wallet_transactions (id, client_id, type, amount, reference, status, balance_after) VALUES (?, ?, 'credit', ?, ?, 'posted', 0)").bind(crypto.randomUUID(), reconciliation.client_id, clientCredit, `WEIGHT-CREDIT-${reconciliation.shipment_id}`)] : []),
+          ...(clientCredit > 0 ? [
+            env.DB.prepare("INSERT INTO wallet_transactions (id, client_id, type, amount, reference, status, balance_after) VALUES (?, ?, 'credit', ?, ?, 'posted', 0)").bind(weightCreditTransactionId, reconciliation.client_id, clientCredit, `WEIGHT-CREDIT-${reconciliation.shipment_id}`),
+            walletShipmentLinkStatement(env, weightCreditTransactionId!, reconciliation.client_id, reconciliation.shipment_id),
+          ] : []),
           ...(providerRecovery > 0 ? [env.DB.prepare("INSERT INTO pricing_provider_recoveries (id, shipment_id, client_id, reconciliation_id, provider, recovered_amount, client_credit_amount, retained_amount, reason, actor_user_id) VALUES (?, ?, ?, ?, 'delhivery', ?, ?, ?, ?, ?)").bind(crypto.randomUUID(), reconciliation.shipment_id, reconciliation.client_id, reconciliation.id, providerRecovery, clientCredit, retained, reason, actor)] : []),
         ]);
         if (clientCredit > 0) await recalculateWalletBalances(env, reconciliation.client_id);
@@ -7129,7 +7165,8 @@ const worker = {
           if (Number(wallet?.balance ?? 0) < totalDelta) return error("INSUFFICIENT_WALLET_BALANCE", "The client wallet does not have enough balance for this pricing increase", 409, id, headers);
         }
         const overrideId = crypto.randomUUID(); const actor = auth.userId ?? `api:${snapshot.client_id}`;
-        const walletAdjustment = totalDelta > 0 ? env.DB.prepare("INSERT INTO wallet_transactions (id, client_id, type, amount, reference, status, balance_after) VALUES (?, ?, 'debit', ?, ?, 'posted', 0)").bind(crypto.randomUUID(), snapshot.client_id, totalDelta, `PRICING-OVERRIDE-${overrideId}`) : totalDelta < 0 ? env.DB.prepare("INSERT INTO wallet_transactions (id, client_id, type, amount, reference, status, balance_after) VALUES (?, ?, 'credit', ?, ?, 'posted', 0)").bind(crypto.randomUUID(), snapshot.client_id, Math.abs(totalDelta), `PRICING-OVERRIDE-${overrideId}`) : null;
+        const walletAdjustmentId = totalDelta === 0 ? null : crypto.randomUUID();
+        const walletAdjustment = totalDelta > 0 ? env.DB.prepare("INSERT INTO wallet_transactions (id, client_id, type, amount, reference, status, balance_after) VALUES (?, ?, 'debit', ?, ?, 'posted', 0)").bind(walletAdjustmentId, snapshot.client_id, totalDelta, `PRICING-OVERRIDE-${overrideId}`) : totalDelta < 0 ? env.DB.prepare("INSERT INTO wallet_transactions (id, client_id, type, amount, reference, status, balance_after) VALUES (?, ?, 'credit', ?, ?, 'posted', 0)").bind(walletAdjustmentId, snapshot.client_id, Math.abs(totalDelta), `PRICING-OVERRIDE-${overrideId}`) : null;
         await env.DB.batch([
           env.DB.prepare("UPDATE pricing_shipment_snapshots SET client_breakdown_json = ? WHERE id = ?").bind(JSON.stringify(breakdown), snapshot.id),
           env.DB.prepare("UPDATE billing_records SET amount = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(breakdown.total, billing.id),
@@ -7138,6 +7175,7 @@ const worker = {
           env.DB.prepare("INSERT INTO pricing_overrides (id, shipment_id, client_id, billing_id, component_code, previous_amount, new_amount, reason, actor_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(overrideId, shipmentId, snapshot.client_id, billing.id, component, previous, line.amount, reason, actor),
           env.DB.prepare("INSERT INTO billing_amendments (id, billing_id, shipment_id, client_id, amendment_type, previous_amount, new_amount, reason, actor_user_id) VALUES (?, ?, ?, ?, 'component_override', ?, ?, ?, ?)").bind(crypto.randomUUID(), billing.id, shipmentId, snapshot.client_id, Number(billing.amount), Number(breakdown.total), reason, actor),
           ...(walletAdjustment ? [walletAdjustment] : []),
+          ...(walletAdjustmentId ? [walletShipmentLinkStatement(env, walletAdjustmentId, snapshot.client_id, shipmentId)] : []),
         ]);
         if (walletAdjustment) await recalculateWalletBalances(env, snapshot.client_id);
         await audit(env, ctx, auth, id, "pricing.override_applied", "pricing_snapshot", snapshot.id, { client_id: snapshot.client_id, shipment_id: shipmentId, component_code: component, previous_amount: previous, new_amount: line.amount, reason });

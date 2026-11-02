@@ -450,6 +450,13 @@ CREATE TABLE IF NOT EXISTS wallet_transactions (
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS wallet_transaction_shipment_links (
+  wallet_transaction_id TEXT PRIMARY KEY,
+  shipment_id TEXT NOT NULL,
+  client_id TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS cod_remittances (
   id TEXT PRIMARY KEY,
   client_id TEXT NOT NULL,
@@ -500,6 +507,7 @@ CREATE INDEX IF NOT EXISTS idx_warehouses_exact_provider_name ON warehouses(clie
 CREATE INDEX IF NOT EXISTS idx_addresses_client_status ON client_addresses(client_id, status);
 CREATE INDEX IF NOT EXISTS idx_billing_client_status ON billing_records(client_id, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_wallet_client_time ON wallet_transactions(client_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_wallet_tx_shipment_links_client_shipment ON wallet_transaction_shipment_links(client_id, shipment_id);
 CREATE INDEX IF NOT EXISTS idx_cod_client_status ON cod_remittances(client_id, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_weight_client_status ON weight_reconciliations(client_id, status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_weight_reconciliations_shipment_client ON weight_reconciliations(shipment_id, client_id);
