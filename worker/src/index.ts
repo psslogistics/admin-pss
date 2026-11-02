@@ -4402,14 +4402,10 @@ async function refreshDelhiveryShipments(env: Env, cron: string) {
 }
 
 async function refreshPendingProviderWeights(env: Env, cron: string) {
-  // Delhivery documents the B2B Freight Charges API as a read-only LR lookup
-  // that returns the freight breakup used for reconciliation. Tracking is a
-  // separate endpoint and its successful status response does not guarantee
-  // weight fields, so use freight_charges here and persist only explicit
-  // measured/chargeable weights from the provider response. Tracking is the
-  // first path because it was the last known working route for this queue;
-  // the documented freight lookup is a guarded fallback when tracking does
-  // not include a weight.
+  // Keep reconciliation on the historical working path: Delhivery LR
+  // tracking. The freight-breakup endpoint was introduced later, but the
+  // configured B2B accounts return 403 there. Tracking remains read-only and
+  // the provider parser persists only explicit measured/chargeable weights.
   const candidates = await env.DB.prepare(`
     SELECT s.id, s.client_id, s.tracking_number, s.lr_number, s.provider_account_id,
            w.provider_weight_last_attempt_at, w.provider_weight_last_error
@@ -4446,22 +4442,6 @@ async function refreshPendingProviderWeights(env: Env, cron: string) {
         undefined,
         10000,
       );
-      // Tracking was the last known working path for this queue. Keep the
-      // documented freight lookup as a fallback, but only after tracking has
-      // returned successfully without an explicit provider weight.
-      if (attempt.status === "accepted" && "provider_weight_received" in attempt && attempt.provider_weight_received === true) return attempt;
-      if (attempt.status === "accepted") {
-        return safeProviderRequest(
-          env,
-          "delhivery",
-          "freight_charges",
-          { shipment_id: shipment.id, tracking_number: reference, lr_number: shipment.lr_number, provider_account_id: shipment.provider_account_id, weight_reconciliation: true },
-          `cron:${cron}:delhivery:weight:freight:${shipment.id}`,
-          shipment.client_id,
-          undefined,
-          10000,
-        );
-      }
       return attempt;
     }));
     for (let index = 0; index < results.length; index += 1) {
