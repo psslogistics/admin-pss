@@ -51,8 +51,10 @@ they do not create a Delhivery shipment or charge a wallet.
 
 `worker/tools/staging-flow-contract.test.mjs` exercises the complete safe
 contract in order: synthetic KYC gate, immediate LR/AWB, tracking and weight,
-separate pickup, and provider-cost calculation. It uses only values marked
-`TEST ONLY` and the network-free provider double. Run it with:
+separate pickup, provider-cost calculation, rejection, timeout,
+accepted-without-reference, and repeatability for duplicate-click safety. It
+uses only values marked `TEST ONLY` and the network-free provider double. Run
+it with:
 
 ```text
 node --experimental-strip-types --test worker/tools/kyc-test-identity.test.mjs worker/tools/provider-test-double.test.mjs worker/tools/staging-flow-contract.test.mjs

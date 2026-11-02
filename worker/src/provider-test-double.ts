@@ -30,6 +30,8 @@ export type ProviderTestDoubleResult = {
   error?: string;
   reason?: string;
   error_code?: string;
+  retryable?: boolean;
+  message?: string;
   artifact?: unknown;
 };
 
@@ -60,6 +62,17 @@ export function providerTestDouble(operation: string, payload: TestDoublePayload
   const lr = testReference("98", seed, 10);
   const awb = testReference("990", seed, 13);
   const bookingId = `test-job-${stableDigits(seed, 10)}`;
+  const scenario = String(payload.test_scenario ?? "").trim().toLowerCase();
+
+  if (scenario === "rejected" && (operation === "shipments" || operation === "pickups")) {
+    return { enabled: true, status: "failed", providerStatus: 422, code: "TEST_PROVIDER_REJECTED", error: "Synthetic provider rejection", reason: "TEST ONLY: provider rejected the request", retryable: false, provenance: "staging_test_double" };
+  }
+  if (scenario === "timeout" && (operation === "shipments" || operation === "pickups")) {
+    return { enabled: true, status: "timeout", providerStatus: null, code: "TEST_PROVIDER_TIMEOUT", error: "Synthetic provider timeout", reason: "TEST ONLY: provider did not respond within the timeout", retryable: true, provenance: "staging_test_double" };
+  }
+  if (scenario === "missing_reference" && operation === "shipments") {
+    return { enabled: true, status: "accepted", providerStatus: 202, providerPending: true, providerBookingId: bookingId, providerReference: null, lr_number: null, master_awb: null, message: "TEST ONLY: accepted, provider reference pending", provenance: "staging_test_double" };
+  }
 
   if (operation === "serviceability") {
     return { enabled: true, status: "accepted", providerStatus: 200, serviceable: true, pickup: true, prepaid: true, cod: true, provenance: "staging_test_double" };

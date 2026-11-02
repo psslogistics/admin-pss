@@ -35,3 +35,32 @@ test("staging booking contract returns immediate LR/AWB and keeps pickup separat
   const freight = providerTestDouble("freight_charges", { shipment_id: STAGING_TEST_SHIPMENT.id });
   assert.equal(freight.provider_cost, 100);
 });
+
+test("staging error scenarios are deterministic and truthful", () => {
+  const rejected = providerTestDouble("shipments", { shipment_id: "staging-rejected-test-only", test_scenario: "rejected" });
+  assert.equal(rejected.status, "failed");
+  assert.equal(rejected.code, "TEST_PROVIDER_REJECTED");
+  assert.equal(rejected.retryable, false);
+
+  const timeout = providerTestDouble("shipments", { shipment_id: "staging-timeout-test-only", test_scenario: "timeout" });
+  assert.equal(timeout.status, "timeout");
+  assert.equal(timeout.code, "TEST_PROVIDER_TIMEOUT");
+  assert.equal(timeout.retryable, true);
+
+  const pending = providerTestDouble("shipments", { shipment_id: "staging-pending-test-only", test_scenario: "missing_reference" });
+  assert.equal(pending.status, "accepted");
+  assert.equal(pending.providerPending, true);
+  assert.equal(pending.lr_number, null);
+  assert.equal(pending.master_awb, null);
+  assert.ok(pending.providerBookingId);
+});
+
+test("repeated staging booking input produces the same provider identity", () => {
+  const payload = { shipment_id: "staging-idempotency-test-only" };
+  const first = providerTestDouble("shipments", payload);
+  const second = providerTestDouble("shipments", payload);
+  assert.deepEqual(
+    { lr_number: first.lr_number, master_awb: first.master_awb, providerBookingId: first.providerBookingId },
+    { lr_number: second.lr_number, master_awb: second.master_awb, providerBookingId: second.providerBookingId },
+  );
+});
