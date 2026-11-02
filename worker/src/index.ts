@@ -5715,6 +5715,17 @@ const worker = {
         if (operation === "labels") {
           const storedLabelArtifacts = await loadStoredDelhiveryLabels(env, shipment.id, String(providerReference), requestedSize);
           if (storedLabelArtifacts.length) return json({ ok: true, data: { enabled: true, status: "accepted", providerStatus: 200, artifact: { artifacts: storedLabelArtifacts, content_type: "application/pdf", copies: storedLabelArtifacts.length, source: "delhivery_label_callback" } } }, 200, headers);
+          // A PDF label request may be accepted before Delhivery publishes the
+          // callback artifact. During a client-side wait, report that state
+          // without submitting another provider print job. An explicit normal
+          // request is still allowed to start a fresh job after the bounded
+          // client wait has ended.
+          if (url.searchParams.get("wait") === "1") {
+            const pendingLabel = await env.DB.prepare("SELECT token FROM delhivery_label_callback_tokens WHERE shipment_id = ? AND label_size = ? AND datetime(expires_at) > CURRENT_TIMESTAMP ORDER BY datetime(created_at) DESC LIMIT 1")
+              .bind(shipment.id, requestedSize)
+              .first<{ token: string }>();
+            if (pendingLabel) return json({ ok: true, data: { enabled: true, status: "pending", providerStatus: 202, pending: true } }, 200, headers);
+          }
         }
         let providerResult = await safeProviderRequest(env, "delhivery", operation, { shipment_id: shipment.id, tracking_number: providerReference, provider_reference: providerReference, provider_account_id: shipment.provider_account_id, label_size: requestedSize, boxes: Math.max(1, Number(shipment.pieces ?? 1)), lr_copy_type: url.searchParams.get("lr_copy_type") ?? undefined, doc_type: url.searchParams.get("doc_type") ?? "LM_POD" }, id, shipment.client_id);
         if (operation === "labels" && !isProviderPdfArtifact(providerResult.artifact)) {
