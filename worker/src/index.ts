@@ -4417,7 +4417,10 @@ async function refreshPendingProviderWeights(env: Env, cron: string) {
       AND w.provider_weight_received_at IS NULL
       AND (COALESCE(w.provider_weight_last_attempt_at, w.updated_at) IS NULL OR datetime(COALESCE(w.provider_weight_last_attempt_at, w.updated_at)) <= datetime('now', '-30 minutes'))
     ORDER BY CASE WHEN COALESCE(w.provider_weight_last_attempt_at, w.updated_at) IS NULL THEN 0 ELSE 1 END, COALESCE(w.provider_weight_last_attempt_at, w.updated_at) ASC, s.updated_at ASC
-    LIMIT 20
+    -- Weight reconciliation shares the Delhivery account and egress path
+    -- with the normal tracking refresh. Keep each cron pass bounded so a
+    -- burst of LR lookups cannot turn a valid read into a provider 403.
+    LIMIT 8
   `).all<{ id: string; client_id: string; tracking_number: string | null; lr_number: string | null; provider_account_id: string | null; provider_weight_last_attempt_at: string | null; provider_weight_last_error: string | null }>();
 
   let accepted = 0;
@@ -4425,8 +4428,8 @@ async function refreshPendingProviderWeights(env: Env, cron: string) {
   let acceptedWithoutWeight = 0;
   let failed = 0;
   const failureReasons: Record<string, number> = {};
-  for (let index = 0; index < candidates.results.length; index += 4) {
-    const batch = candidates.results.slice(index, index + 4);
+  for (let index = 0; index < candidates.results.length; index += 2) {
+    const batch = candidates.results.slice(index, index + 2);
     const results = await Promise.allSettled(batch.map(async (shipment) => {
       const reference = shipment.lr_number?.trim() || shipment.tracking_number?.trim();
       const attempt = await safeProviderRequest(
@@ -4483,6 +4486,7 @@ async function refreshPendingProviderWeights(env: Env, cron: string) {
       await env.DB.prepare("UPDATE weight_reconciliations SET provider_weight_last_attempt_at = CURRENT_TIMESTAMP, provider_weight_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE shipment_id = ? AND client_id = ?")
         .bind(diagnostic, shipment.id, shipment.client_id).run();
     }
+    if (index + 2 < candidates.results.length) await new Promise((resolve) => setTimeout(resolve, 1500));
   }
   console.log(JSON.stringify({ job: "delhivery_weight_reconciliation", cron, candidates: candidates.results.length, provider_requests_accepted: accepted, weights_received: weightsReceived, accepted_without_weight: acceptedWithoutWeight, failed, failure_reasons: failureReasons }));
 }
