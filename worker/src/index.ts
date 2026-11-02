@@ -426,6 +426,55 @@ function walletShipmentLinkStatement(env: Env, walletTransactionId: string, clie
     JOIN wallet_transactions w ON w.id = ? AND w.client_id = ?
     WHERE s.id = ? AND s.client_id = ?`).bind(walletTransactionId, clientId, walletTransactionId, clientId, shipmentId, clientId);
 }
+
+let walletShipmentLinkSchemaPromise: Promise<void> | null = null;
+
+function ensureWalletShipmentLinkSchema(env: Env): Promise<void> {
+  if (walletShipmentLinkSchemaPromise) return walletShipmentLinkSchemaPromise;
+  walletShipmentLinkSchemaPromise = env.DB.batch([
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS wallet_transaction_shipment_links (
+      wallet_transaction_id TEXT PRIMARY KEY,
+      shipment_id TEXT NOT NULL,
+      client_id TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`),
+    env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_wallet_tx_shipment_links_client_shipment ON wallet_transaction_shipment_links(client_id, shipment_id)"),
+    env.DB.prepare(`INSERT OR IGNORE INTO wallet_transaction_shipment_links (wallet_transaction_id, shipment_id, client_id)
+      SELECT w.id,
+        CASE
+          WHEN w.reference LIKE 'SHIPMENT-%' OR w.reference LIKE 'REVERSAL-%' THEN substr(w.reference, 10)
+          WHEN w.reference LIKE 'WEIGHT-DEBIT-%' THEN substr(w.reference, 14)
+          WHEN w.reference LIKE 'WEIGHT-CREDIT-%' THEN substr(w.reference, 15)
+        END,
+        w.client_id
+      FROM wallet_transactions w
+      JOIN shipments s
+        ON s.client_id = w.client_id
+       AND s.id = CASE
+          WHEN w.reference LIKE 'SHIPMENT-%' OR w.reference LIKE 'REVERSAL-%' THEN substr(w.reference, 10)
+          WHEN w.reference LIKE 'WEIGHT-DEBIT-%' THEN substr(w.reference, 14)
+          WHEN w.reference LIKE 'WEIGHT-CREDIT-%' THEN substr(w.reference, 15)
+        END
+      WHERE w.reference LIKE 'SHIPMENT-%'
+         OR w.reference LIKE 'REVERSAL-%'
+         OR w.reference LIKE 'WEIGHT-DEBIT-%'
+         OR w.reference LIKE 'WEIGHT-CREDIT-%'`),
+    env.DB.prepare(`INSERT OR IGNORE INTO wallet_transaction_shipment_links (wallet_transaction_id, shipment_id, client_id)
+      SELECT w.id, p.shipment_id, w.client_id
+      FROM wallet_transactions w
+      JOIN pricing_overrides p
+        ON p.id = substr(w.reference, 18)
+       AND p.client_id = w.client_id
+      JOIN shipments s
+        ON s.id = p.shipment_id
+       AND s.client_id = w.client_id
+      WHERE w.reference LIKE 'PRICING-OVERRIDE-%'`),
+  ]).then(() => undefined).catch((cause) => {
+    walletShipmentLinkSchemaPromise = null;
+    throw cause;
+  });
+  return walletShipmentLinkSchemaPromise;
+}
 function stableSerialize(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map((item) => stableSerialize(item)).join(",")}]`;
@@ -4517,6 +4566,7 @@ const worker = {
     // Strip only the `/v1` prefix and preserve the leading slash expected by route matchers.
     let route = url.pathname.slice(3);
     try {
+      await ensureWalletShipmentLinkSchema(env);
       const limited = route === "/pricing/quotes" && request.method === "POST" ? pricingPreviewRateLimited(request, auth) : await rateLimited(env, request, auth, route);
       if (limited) return new Response(JSON.stringify({ ok: false, error: { code: "RATE_LIMITED", message: "Too many requests" }, request_id: id }), { status: 429, headers: { ...headers, "content-type": "application/json", "retry-after": "60" } });
       if (route === "/me" && request.method === "GET") return json({ ok: true, authenticated: true, user_id: auth.userId, client_id: auth.clientId, client_ids: [...auth.clientIds], audience: auth.audience, roles: [...auth.roles], permissions: [...auth.permissions], system: auth.system }, 200, withCors(request, env));
@@ -7628,6 +7678,7 @@ const worker = {
   },
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
     ctx.waitUntil((async () => {
+      await ensureWalletShipmentLinkSchema(env);
       await retryPendingDelhiveryBookings(env, controller.cron);
       await reconcilePendingDelhiveryReferences(env, controller.cron);
       await reconcileDeferredShipmentBilling(env, controller.cron);

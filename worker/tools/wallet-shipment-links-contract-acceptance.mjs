@@ -19,7 +19,8 @@ const checks = [
   ["client wallet reads prefer explicit links", source.includes("linkedShipmentByTransaction.get(String(row.id)) ?? referenceParts(row.reference)?.shipmentId")],
   ["collection joins are tenant scoped", source.includes('walletShipmentIdExpression("w")} AND s.client_id = w.client_id')],
   ["test-data filtering and deletion protection use explicit links", source.includes("test_shipment.id = ${walletShipmentIdExpression(alias)}") && source.includes("SELECT COUNT(*) FROM wallet_transaction_shipment_links WHERE client_id = ? AND shipment_id = ?")],
-  ["deployment applies the exact migration before Worker deploy", workflow.indexOf("Apply wallet shipment-link migration") > 0 && workflow.indexOf("Apply wallet shipment-link migration") < workflow.indexOf("Deploy pss-api") && workflow.includes("20261102_wallet_transaction_shipment_links.sql")],
+  ["runtime bootstrap creates and safely backfills the table", source.includes("function ensureWalletShipmentLinkSchema") && source.includes("CREATE TABLE IF NOT EXISTS wallet_transaction_shipment_links") && source.includes("await ensureWalletShipmentLinkSchema(env)") && source.includes("s.client_id = w.client_id")],
+  ["deployment does not require D1 import permission", !workflow.includes("wrangler d1 execute") && workflow.includes("Deploy pss-api")],
 ];
 
 const failed = checks.filter(([, passed]) => !passed).map(([name]) => name);
