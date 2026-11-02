@@ -1,0 +1,2 @@
+ALTER TABLE weight_reconciliations ADD COLUMN provider_weight_last_attempt_at TEXT;
+ALTER TABLE weight_reconciliations ADD COLUMN provider_weight_last_error TEXT;

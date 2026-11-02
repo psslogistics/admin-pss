@@ -90,7 +90,9 @@ CREATE TABLE IF NOT EXISTS cod_remittances (
 );
 CREATE TABLE IF NOT EXISTS weight_reconciliations (
   id TEXT PRIMARY KEY, shipment_id TEXT NOT NULL, client_id TEXT NOT NULL, declared_weight_kg REAL NOT NULL,
-  measured_weight_kg REAL, billable_weight_kg REAL, status TEXT NOT NULL DEFAULT 'pending',
+  measured_weight_kg REAL, billable_weight_kg REAL,
+  provider_weight_last_attempt_at TEXT, provider_weight_last_error TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_ndr_client_status ON ndr_cases(client_id, status, updated_at);

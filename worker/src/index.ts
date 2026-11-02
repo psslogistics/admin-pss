@@ -4402,20 +4402,23 @@ async function refreshPendingProviderWeights(env: Env, cron: string) {
   // that returns the freight breakup used for reconciliation. Tracking is a
   // separate endpoint and its successful status response does not guarantee
   // weight fields, so use freight_charges here and persist only explicit
-  // measured/chargeable weights from that response.
+  // measured/chargeable weights from the provider response. Tracking is the
+  // first path because it was the last known working route for this queue;
+  // the documented freight lookup is a guarded fallback when tracking does
+  // not include a weight.
   const candidates = await env.DB.prepare(`
     SELECT s.id, s.client_id, s.tracking_number, s.lr_number, s.provider_account_id,
-           w.updated_at AS provider_weight_last_attempt_at
+           w.provider_weight_last_attempt_at, w.provider_weight_last_error
     FROM shipments s
     JOIN weight_reconciliations w ON w.shipment_id = s.id AND w.client_id = s.client_id
     WHERE s.provider = 'delhivery'
       AND (NULLIF(TRIM(s.lr_number), '') IS NOT NULL OR NULLIF(TRIM(s.tracking_number), '') IS NOT NULL)
       AND s.status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery', 'delivered', 'exception', 'rto')
       AND w.provider_weight_received_at IS NULL
-      AND (w.updated_at IS NULL OR datetime(w.updated_at) <= datetime('now', '-30 minutes'))
-    ORDER BY CASE WHEN w.updated_at IS NULL THEN 0 ELSE 1 END, w.updated_at ASC, s.updated_at ASC
+      AND (COALESCE(w.provider_weight_last_attempt_at, w.updated_at) IS NULL OR datetime(COALESCE(w.provider_weight_last_attempt_at, w.updated_at)) <= datetime('now', '-30 minutes'))
+    ORDER BY CASE WHEN COALESCE(w.provider_weight_last_attempt_at, w.updated_at) IS NULL THEN 0 ELSE 1 END, COALESCE(w.provider_weight_last_attempt_at, w.updated_at) ASC, s.updated_at ASC
     LIMIT 20
-  `).all<{ id: string; client_id: string; tracking_number: string | null; lr_number: string | null; provider_account_id: string | null; provider_weight_last_attempt_at: string | null }>();
+  `).all<{ id: string; client_id: string; tracking_number: string | null; lr_number: string | null; provider_account_id: string | null; provider_weight_last_attempt_at: string | null; provider_weight_last_error: string | null }>();
 
   let accepted = 0;
   let weightsReceived = 0;
@@ -4424,39 +4427,61 @@ async function refreshPendingProviderWeights(env: Env, cron: string) {
   const failureReasons: Record<string, number> = {};
   for (let index = 0; index < candidates.results.length; index += 4) {
     const batch = candidates.results.slice(index, index + 4);
-    await Promise.all(batch.map((shipment) => env.DB.prepare(`
-      UPDATE weight_reconciliations
-      SET updated_at = CURRENT_TIMESTAMP
-      WHERE shipment_id = ? AND client_id = ?
-    `).bind(shipment.id, shipment.client_id).run()));
-    const results = await Promise.allSettled(batch.map((shipment) => safeProviderRequest(
-      env,
-      "delhivery",
-      "freight_charges",
-      { shipment_id: shipment.id, tracking_number: shipment.lr_number?.trim() || shipment.tracking_number?.trim(), lr_number: shipment.lr_number, provider_account_id: shipment.provider_account_id, weight_reconciliation: true },
-      `cron:${cron}:delhivery:weight:${shipment.id}`,
-      shipment.client_id,
-      undefined,
-      10000,
-    )));
-    for (const result of results) {
+    const results = await Promise.allSettled(batch.map(async (shipment) => {
+      const reference = shipment.lr_number?.trim() || shipment.tracking_number?.trim();
+      const attempt = await safeProviderRequest(
+        env,
+        "delhivery",
+        "tracking",
+        { shipment_id: shipment.id, tracking_number: reference, lr_number: shipment.lr_number, provider_account_id: shipment.provider_account_id, weight_reconciliation: true },
+        `cron:${cron}:delhivery:weight:tracking:${shipment.id}`,
+        shipment.client_id,
+        undefined,
+        10000,
+      );
+      // Tracking was the last known working path for this queue. Keep the
+      // documented freight lookup as a fallback, but only after tracking has
+      // returned successfully without an explicit provider weight.
+      if (attempt.status === "accepted" && "provider_weight_received" in attempt && attempt.provider_weight_received === true) return attempt;
+      if (attempt.status === "accepted") {
+        return safeProviderRequest(
+          env,
+          "delhivery",
+          "freight_charges",
+          { shipment_id: shipment.id, tracking_number: reference, lr_number: shipment.lr_number, provider_account_id: shipment.provider_account_id, weight_reconciliation: true },
+          `cron:${cron}:delhivery:weight:freight:${shipment.id}`,
+          shipment.client_id,
+          undefined,
+          10000,
+        );
+      }
+      return attempt;
+    }));
+    for (let index = 0; index < results.length; index += 1) {
+      const result = results[index];
+      const shipment = batch[index];
+      let diagnostic: string | null = null;
       if (result.status === "rejected") {
         failed += 1;
-        const reason = result.reason instanceof Error ? result.reason.name : "provider_request_rejected";
-        failureReasons[reason] = (failureReasons[reason] ?? 0) + 1;
-        continue;
-      }
-      if (result.value.status !== "accepted") {
+        diagnostic = result.reason instanceof Error ? result.reason.name : "provider_request_rejected";
+        failureReasons[diagnostic] = (failureReasons[diagnostic] ?? 0) + 1;
+      } else if (result.value.status !== "accepted") {
         failed += 1;
-        const reason = "providerStatus" in result.value && result.value.providerStatus
+        diagnostic = "providerStatus" in result.value && result.value.providerStatus
           ? `provider_http_${result.value.providerStatus}`
           : "provider_request_not_accepted";
-        failureReasons[reason] = (failureReasons[reason] ?? 0) + 1;
-        continue;
+        failureReasons[diagnostic] = (failureReasons[diagnostic] ?? 0) + 1;
+      } else {
+        accepted += 1;
+        if ("provider_weight_received" in result.value && result.value.provider_weight_received === true) weightsReceived += 1;
+        else {
+          acceptedWithoutWeight += 1;
+          diagnostic = "provider_accepted_without_weight";
+          failureReasons[diagnostic] = (failureReasons[diagnostic] ?? 0) + 1;
+        }
       }
-      accepted += 1;
-      if ("provider_weight_received" in result.value && result.value.provider_weight_received === true) weightsReceived += 1;
-      else acceptedWithoutWeight += 1;
+      await env.DB.prepare("UPDATE weight_reconciliations SET provider_weight_last_attempt_at = CURRENT_TIMESTAMP, provider_weight_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE shipment_id = ? AND client_id = ?")
+        .bind(diagnostic, shipment.id, shipment.client_id).run();
     }
   }
   console.log(JSON.stringify({ job: "delhivery_weight_reconciliation", cron, candidates: candidates.results.length, provider_requests_accepted: accepted, weights_received: weightsReceived, accepted_without_weight: acceptedWithoutWeight, failed, failure_reasons: failureReasons }));
@@ -6458,7 +6483,7 @@ const worker = {
       }
       if (route === "/weight-reconciliation" && request.method === "GET") {
         if (!hasScope(auth, "weight.read")) return error("FORBIDDEN", "Permission required", 403, id, headers);
-        const clientColumns = "w.id, w.client_id, w.shipment_id, s.pss_reference AS shipment_pss_reference, s.lr_number, s.master_awb, s.tracking_number, s.provider_sync_status, s.status AS shipment_status, w.declared_weight_kg, w.declared_volumetric_weight_kg, w.initial_billable_weight_kg, w.measured_weight_kg, w.courier_billed_weight_kg, w.billable_weight_kg, w.status, w.provider_weight_received_at, w.client_dispute_deadline_at, w.created_at, w.updated_at, w.client_dispute_deadline_at AS ticket_deadline_at, t.id AS ticket_id, t.status AS ticket_status, t.reason AS ticket_reason";
+        const clientColumns = "w.id, w.client_id, w.shipment_id, s.pss_reference AS shipment_pss_reference, s.lr_number, s.master_awb, s.tracking_number, s.provider_sync_status, s.status AS shipment_status, w.declared_weight_kg, w.declared_volumetric_weight_kg, w.initial_billable_weight_kg, w.measured_weight_kg, w.courier_billed_weight_kg, w.billable_weight_kg, w.status, w.provider_weight_received_at, w.provider_weight_last_attempt_at, w.client_dispute_deadline_at, w.created_at, w.updated_at, w.client_dispute_deadline_at AS ticket_deadline_at, t.id AS ticket_id, t.status AS ticket_status, t.reason AS ticket_reason";
         const employeeColumns = `${clientColumns}, w.provider_dispute_status`;
         const internalColumns = `${employeeColumns}, w.provider_recovery_amount, w.retained_recovery_amount, t.client_credit_amount`;
         const columns = hasScope(auth, "provider_cost.view") || hasScope(auth, "weight_dispute.resolve") ? internalColumns : hasRole(auth, ["employee", "admin", "super_admin"]) ? employeeColumns : clientColumns;

@@ -476,6 +476,8 @@ CREATE TABLE IF NOT EXISTS weight_reconciliations (
   declared_weight_kg REAL NOT NULL,
   measured_weight_kg REAL,
   billable_weight_kg REAL,
+  provider_weight_last_attempt_at TEXT,
+  provider_weight_last_error TEXT,
   status TEXT NOT NULL DEFAULT 'pending',
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
