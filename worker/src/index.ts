@@ -11,6 +11,7 @@ import { isExplicitKycTestOrganization, isKycTestModeEnabled } from "./kyc-test-
 import { providerAmountForBookingResult } from "./provider-cost-amount";
 import { activitySnapshotPair } from "./activity-snapshots";
 import { effectiveShipmentWeightKg, findProviderWeight, type ProviderWeightSnapshot } from "./provider-weight";
+import { providerTestDouble } from "./provider-test-double";
 
 type DelhiveryTokenCache = {
   get<T>(key: string, type: "json"): Promise<T | null>;
@@ -161,6 +162,14 @@ async function isKycTestAccount(env: Env, auth: Auth): Promise<boolean> {
   const clientIds = [...auth.clientIds];
   const organizations = await supabaseGet<{ id: string; identity_environment: string | null }>(env, `client_accounts?id=in.(${clientIds.join(",")})&select=id,identity_environment`, auth.accessToken);
   return isExplicitKycTestOrganization(organizations, clientIds);
+}
+
+async function isProviderTestDoubleEnabled(env: Env, clientId?: string) {
+  if (!clientId || !isKycTestModeEnabled(env.ENVIRONMENT, env.KYC_TEST_MODE)) return false;
+  const account = await env.DB.prepare("SELECT identity_environment FROM client_accounts WHERE id = ? LIMIT 1")
+    .bind(clientId)
+    .first<{ identity_environment: string | null }>();
+  return String(account?.identity_environment ?? "").trim().toLowerCase() === "test";
 }
 
 async function loadUserAuth(env: Env, token: string): Promise<Auth | null> {
@@ -2517,6 +2526,10 @@ function providerPaymentFlags(value: Record<string, unknown> | null | undefined)
 
 async function providerRequest(env: Env, provider: CourierProvider, operation: string, payload: Record<string, unknown>, requestIdValue: string, clientId?: string, idempotencyKey?: string, timeoutMsOverride?: number) {
   if (String(env.ENABLE_PROVIDER_CALLS) !== "true") return { enabled: false, status: "disabled" as const };
+  if (provider === "delhivery" && await isProviderTestDoubleEnabled(env, clientId)) {
+    const testResult = providerTestDouble(operation, payload);
+    if (testResult) return testResult;
+  }
   // B2B Delhivery tracks by LR number. Historical Fujiyama imports stored the
   // same value in tracking_number, but new bookings can also have a provider
   // reference or master AWB. Prefer the explicit LR whenever one is present.
@@ -5725,13 +5738,14 @@ const worker = {
           }
         }
         if (operation === "labels" && !isProviderPdfArtifact(providerResult.artifact) && providerResult.status === "failed") {
+          const providerCode = (providerResult as { code?: string }).code;
           return error(
-            providerResult.code ?? "PROVIDER_LABEL_UNAVAILABLE",
+            providerCode ?? "PROVIDER_LABEL_UNAVAILABLE",
             providerResult.error ?? "Delhivery did not publish a label for this LR yet",
             Number(providerResult.providerStatus) >= 400 ? Number(providerResult.providerStatus) : 502,
             id,
             headers,
-            JSON.stringify({ provider_status: providerResult.providerStatus ?? null, provider_code: providerResult.code ?? null }),
+            JSON.stringify({ provider_status: providerResult.providerStatus ?? null, provider_code: providerCode ?? null }),
           );
         }
         return json({ ok: true, data: providerResult }, 200, headers);
