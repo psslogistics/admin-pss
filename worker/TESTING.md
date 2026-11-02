@@ -20,13 +20,29 @@ closed. The production Wrangler configuration intentionally does not enable
 this mode.
 
 The fixture does not store or upload GST, PAN, Aadhaar, documents, or OTPs. The
-application should provide mocked KYC responses and mocked OTP verification in
-the test harness. Never point this fixture at the production Worker or a live
-Delhivery account.
+booking gate is satisfied by the Worker-side KYC fixture; no OTP is accepted or
+persisted by this path. Never point this fixture at the production Worker or a
+live Delhivery account.
 
 ## Provider boundary
 
-KYC approval in this mode only unlocks the application flow. A booking test
-must still use a provider sandbox/mock adapter with deterministic LR/AWB,
-tracking, weight, and pickup responses. Do not enable production provider
-creation flags for this fixture.
+KYC approval in this mode only unlocks the application flow. The provider
+boundary now has a deterministic, network-free adapter for serviceability,
+manifest/LR/AWB, tracking/weight, freight, and pickup operations. It is reached
+only when all of these are true: Worker environment is `test` or `staging`,
+`KYC_TEST_MODE=true`, and the scoped client account has
+`identity_environment = test`. Do not enable production provider creation
+flags for this fixture and do not add `KYC_TEST_MODE` to the production
+Wrangler configuration.
+
+## Local verification
+
+Run the focused checks from `admin-pss`:
+
+```text
+node --experimental-strip-types --test worker/tools/kyc-test-identity.test.mjs worker/tools/provider-test-double.test.mjs
+npx tsc --noEmit --pretty false
+```
+
+These tests prove the production gate and the deterministic provider contract;
+they do not create a Delhivery shipment or charge a wallet.
