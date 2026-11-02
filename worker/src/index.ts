@@ -7,7 +7,7 @@ import { alternateDelhiveryB2bBase, delhiveryFreightBreakupUrl, resolveDelhivery
 import { ticketUpdatePermissions } from "./ticket-update-policy";
 import { canPerformTicketAction } from "./ticket-access-policy";
 import { TICKET_ATTENTION_SQL } from "./ticket-attention";
-import { isExplicitKycTestOrganization } from "./kyc-test-identity";
+import { isExplicitKycTestOrganization, isKycTestModeEnabled } from "./kyc-test-identity";
 import { providerAmountForBookingResult } from "./provider-cost-amount";
 import { activitySnapshotPair } from "./activity-snapshots";
 import { effectiveShipmentWeightKg, findProviderWeight, type ProviderWeightSnapshot } from "./provider-weight";
@@ -47,6 +47,7 @@ export interface Env extends Omit<Cloudflare.Env, "SUPABASE_PUBLISHABLE_KEY" | "
   RIVIGO_TRACKING_URL?: string;
   RIVIGO_CREDENTIALS_JSON?: string;
   RIVIGO_WEBHOOK_SECRET?: string;
+  KYC_TEST_MODE?: string;
 }
 
 type CourierProvider = "delhivery" | "ekart" | "trackon" | "xpressbees" | "rivigo";
@@ -152,6 +153,10 @@ async function supabaseRpc<T>(env: Env, functionName: string, token: string): Pr
 }
 
 async function isKycTestAccount(env: Env, auth: Auth): Promise<boolean> {
+  // Test KYC is available only to an explicitly configured non-production
+  // Worker. An identity_environment marker alone must never unlock booking
+  // on the production Worker.
+  if (!isKycTestModeEnabled(env.ENVIRONMENT, env.KYC_TEST_MODE)) return false;
   if (auth.audience !== "client" || !auth.clientIds.size || !auth.accessToken) return false;
   const clientIds = [...auth.clientIds];
   const organizations = await supabaseGet<{ id: string; identity_environment: string | null }>(env, `client_accounts?id=in.(${clientIds.join(",")})&select=id,identity_environment`, auth.accessToken);

@@ -1,3 +1,9 @@
+export function isKycTestModeEnabled(environment: unknown, flag: unknown) {
+  const normalizedEnvironment = String(environment ?? "").trim().toLowerCase();
+  const normalizedFlag = String(flag ?? "").trim().toLowerCase();
+  return normalizedEnvironment !== "production" && (normalizedEnvironment === "test" || normalizedEnvironment === "staging") && normalizedFlag === "true";
+}
+
 export function isExplicitKycTestOrganization(
   organizations: Array<{ id: string; identity_environment: string | null }>,
   clientIds: string[],
