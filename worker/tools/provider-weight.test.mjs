@@ -9,6 +9,13 @@ test("reads nested measured and charged weight fields and converts grams", () =>
   });
 });
 
+test("reads Delhivery-style dead and billed weight aliases", () => {
+  assert.deepEqual(findProviderWeight({ data: [{ dead_weight: "24 kg", billed_weight: { value: 26500, unit: "g" } }] }), {
+    measuredKg: 24,
+    chargeableKg: 26.5,
+  });
+});
+
 test("keeps client weight above provider weight and enforces the 20 kg minimum", () => {
   assert.equal(effectiveShipmentWeightKg(24, 22), 24);
   assert.equal(effectiveShipmentWeightKg(12, 18), 20);

@@ -29,8 +29,22 @@ const providerWeightNumber = (value: unknown, key = "", unit?: unknown): number 
 
 export function findProviderWeight(value: unknown, depth = 0): ProviderWeightSnapshot {
   if (depth > 10 || value === null || value === undefined) return { measuredKg: null, chargeableKg: null };
-  const measuredKeys = new Set(["actualweight", "actualweightkg", "capturedweight", "capturedweightkg", "measuredweight", "measuredweightkg", "shipmentweight", "shipmentweightkg", "weightcaptured", "weightcapturedkg"]);
-  const chargeableKeys = new Set(["chargeableweight", "chargeableweightkg", "billableweight", "billableweightkg", "courierbilledweight", "courierbilledweightkg", "chargedweight", "chargedweightkg"]);
+  // Delhivery's B2B surfaces use more than one name for the same concepts:
+  // dead/actual/total/package weight is the measured shipment weight, while
+  // chargeable/billed/freight weight is the provider's billable weight. Keep
+  // these aliases explicit so an unrelated numeric field cannot be mistaken
+  // for a courier weight.
+  const measuredKeys = new Set([
+    "actualweight", "actualweightkg", "capturedweight", "capturedweightkg",
+    "measuredweight", "measuredweightkg", "shipmentweight", "shipmentweightkg",
+    "weightcaptured", "weightcapturedkg", "deadweight", "deadweightkg",
+    "totalweight", "totalweightkg", "packageweight", "packageweightkg",
+  ]);
+  const chargeableKeys = new Set([
+    "chargeableweight", "chargeableweightkg", "billableweight", "billableweightkg",
+    "courierbilledweight", "courierbilledweightkg", "billedweight", "billedweightkg",
+    "chargedweight", "chargedweightkg", "freightweight", "freightweightkg",
+  ]);
   let measuredKg: number | null = null;
   let chargeableKg: number | null = null;
   const walk = (node: unknown, level: number) => {
@@ -40,8 +54,8 @@ export function findProviderWeight(value: unknown, depth = 0): ProviderWeightSna
     const object = node as Record<string, unknown>;
     for (const [key, candidate] of Object.entries(object)) {
       const normalized = providerWeightKey(key);
-      if (chargeableKg === null && (chargeableKeys.has(normalized) || /chargeable.*weight|billable.*weight|courier.*billed.*weight|charged.*weight/.test(normalized))) chargeableKg = providerWeightNumber(candidate, key);
-      if (measuredKg === null && (measuredKeys.has(normalized) || /actual.*weight|captured.*weight|measured.*weight|shipment.*weight/.test(normalized))) measuredKg = providerWeightNumber(candidate, key);
+      if (chargeableKg === null && (chargeableKeys.has(normalized) || /(?:chargeable|billable|courierbilled|billed|charged|freight)weight(?:kg|grams?|gm|g)?$/.test(normalized))) chargeableKg = providerWeightNumber(candidate, key);
+      if (measuredKg === null && (measuredKeys.has(normalized) || /(?:actual|captured|measured|shipment|dead|total|package)weight(?:kg|grams?|gm|g)?$/.test(normalized))) measuredKg = providerWeightNumber(candidate, key);
       // Some Delhivery details expose only `Weight`; treat it as measured, never
       // as the courier-billed weight when an explicit billable field is absent.
       if (measuredKg === null && normalized === "weight") measuredKg = providerWeightNumber(candidate, key);
