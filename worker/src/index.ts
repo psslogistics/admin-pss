@@ -2932,14 +2932,18 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       // Delhivery exposes the same B2B tracking contract through two hosts in
       // different account environments. Login already tries both hosts, but a
       // token may authenticate successfully while the configured host returns
-      // `No Such Resource` for an otherwise valid LRN. Retry the read-only
-      // tracking request against the alternate host before recording a failure.
-      if (provider === "delhivery" && useDelhiveryB2b && operation === "tracking" && response.status === 404) {
+      // `No Such Resource` or an account-scoped 403 for an otherwise valid LRN.
+      // Retry the read-only tracking request against the alternate host with a
+      // token issued for that host before recording a reconciliation failure.
+      if (provider === "delhivery" && useDelhiveryB2b && operation === "tracking" && (response.status === 403 || response.status === 404)) {
         const alternateB2bBase = alternateDelhiveryB2bBase(String(base));
         const alternateUrl = `${alternateB2bBase}/v2/track/${encodeURIComponent(delhiveryB2bNumber(trackingNumber) ?? String(payload.shipment_id ?? trackingNumber))}`;
         try {
-          const alternateResponse = await providerFetch(alternateUrl, { method: "GET", headers }, attemptTimeoutMs);
-          if (alternateResponse.ok || alternateResponse.status !== 404) response = alternateResponse;
+          const alternateToken = await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, `${requestIdValue}:alternate`, providerTimeoutMs, response.status === 403, alternateB2bBase);
+          const alternateHeaders = { ...headers };
+          if (alternateToken) alternateHeaders.Authorization = `Bearer ${alternateToken}`;
+          const alternateResponse = await providerFetch(alternateUrl, { method: "GET", headers: alternateHeaders }, attemptTimeoutMs);
+          if (alternateResponse.ok || alternateResponse.status !== response.status) response = alternateResponse;
         } catch { /* Keep the original provider response if the alternate host is unavailable. */ }
       }
       // The B2B freight endpoint is read-only. Delhivery serves B2B APIs from
