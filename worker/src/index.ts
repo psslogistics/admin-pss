@@ -3002,6 +3002,32 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (persistIntegration) await env.DB.prepare("UPDATE integration_requests SET status = ?, error_code = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(response.ok ? "succeeded" : "failed", response.ok ? null : `HTTP_${response.status}`, response.ok ? null : `${lastError}${providerFailureDetail ? `: ${providerFailureDetail}` : ""}`.slice(0, 500), integrationId).run();
   let parsedProviderBody: unknown = null;
   try { parsedProviderBody = JSON.parse(responseBody); } catch { parsedProviderBody = responseBody.trim() || null; }
+  if (provider === "delhivery" && operation === "tracking" && payload.weight_reconciliation === true) {
+    // Keep weight debugging useful without logging provider values, addresses,
+    // invoice data, or the raw response. Field names are enough to extend the
+    // parser safely when Delhivery changes its response contract.
+    const matchingWeightPaths: string[] = [];
+    const collectWeightPaths = (node: unknown, path = "", depth = 0) => {
+      if (depth > 8 || matchingWeightPaths.length >= 50 || node === null || node === undefined) return;
+      if (Array.isArray(node)) {
+        node.slice(0, 20).forEach((item, index) => collectWeightPaths(item, `${path}[${index}]`, depth + 1));
+        return;
+      }
+      if (typeof node !== "object") return;
+      for (const [key, child] of Object.entries(node as Record<string, unknown>)) {
+        const childPath = path ? `${path}.${key}` : key;
+        if (/(?:weight|mass|freight|charge|bill)/i.test(key)) matchingWeightPaths.push(childPath);
+        if (child && typeof child === "object") collectWeightPaths(child, childPath, depth + 1);
+      }
+    };
+    collectWeightPaths(parsedProviderBody);
+    console.log(JSON.stringify({
+      event: "delhivery_weight_response_fields",
+      request_id: requestIdValue,
+      http_status: response.status,
+      fields: matchingWeightPaths,
+    }));
+  }
   if (!response.ok && provider === "delhivery" && operation === "shipment_status" && clientId && typeof payload.shipment_id === "string" && response.status === 404 && /invalid job id/i.test(responseBody)) {
     // Only Delhivery's explicit invalid-job response is strong enough to
     // release an asynchronous booking for a safe retry. Other failures must
