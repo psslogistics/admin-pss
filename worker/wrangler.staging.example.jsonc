@@ -1,0 +1,24 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "pss-api-staging-example",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-17",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "ENVIRONMENT": "staging",
+    "KYC_TEST_MODE": "true",
+    "ENABLE_PROVIDER_CALLS": "false",
+    "DELHIVERY_ENABLE_SHIPMENT_CREATION": "false",
+    "DELHIVERY_ENABLE_PICKUP_CREATION": "false",
+    "DELHIVERY_DEFAULT_ACCOUNT_NAME": "",
+    "DELHIVERY_DEFAULT_PICKUP_LOCATION": "TEST ONLY"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "REPLACE_WITH_ISOLATED_STAGING_D1",
+      "database_id": "REPLACE_WITH_ISOLATED_STAGING_D1_ID",
+      "migrations_dir": "./migrations"
+    }
+  ]
+}

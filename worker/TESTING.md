@@ -46,3 +46,20 @@ npx tsc --noEmit --pretty false
 
 These tests prove the production gate and the deterministic provider contract;
 they do not create a Delhivery shipment or charge a wallet.
+
+## Safe end-to-end contract fixture
+
+`worker/tools/staging-flow-contract.test.mjs` exercises the complete safe
+contract in order: synthetic KYC gate, immediate LR/AWB, tracking and weight,
+separate pickup, and provider-cost calculation. It uses only values marked
+`TEST ONLY` and the network-free provider double. Run it with:
+
+```text
+node --experimental-strip-types --test worker/tools/kyc-test-identity.test.mjs worker/tools/provider-test-double.test.mjs worker/tools/staging-flow-contract.test.mjs
+```
+
+`wrangler.staging.example.jsonc` is a template only. It deliberately contains
+placeholders for a separate D1 database and must never be deployed until those
+placeholders are replaced with an isolated non-production binding. It must not
+reuse the production D1 ID, R2 bucket, KV namespace, provider credentials, or
+Delhivery account.
