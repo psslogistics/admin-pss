@@ -2698,6 +2698,42 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       return { enabled: true, status: "accepted" as const, providerStatus: 200, providerPending: false, warehouseName: facility.facility.name, warehouseId: facility.facility.id };
     }
   }
+  if (provider === "delhivery" && operation === "shipments" && useDelhiveryB2b && clientId) {
+    // A consignor is shipment data; it is not automatically a Delhivery
+    // pickup facility. Never silently replace an unsaved/manual consignor
+    // with DELHIVERY_DEFAULT_PICKUP_LOCATION (for example, a QA warehouse).
+    // Manifest only against the explicitly selected, account-scoped provider
+    // warehouse that has already been verified through warehouse_prepare.
+    const selectedWarehouseId = typeof payload.warehouse_id === "string" && payload.warehouse_id.trim() ? payload.warehouse_id.trim() : null;
+    if (!selectedWarehouseId) {
+      return { enabled: true, status: "invalid_request" as const, code: "PROVIDER_WAREHOUSE_REQUIRED", error: "Select a verified Delhivery pickup warehouse before booking this shipment. The consignor address is not a provider facility." };
+    }
+    const selectedWarehouse = await env.DB.prepare("SELECT id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status, provider_reference, provider_name FROM warehouses WHERE id = ? AND client_id = ? LIMIT 1")
+      .bind(selectedWarehouseId, clientId)
+      .first<{ id: string; name: string | null; address: string | null; city: string | null; state: string | null; pincode: string | null; contact: string | null; contact_name: string | null; provider: string | null; provider_account_id: string | null; provider_status: string | null; provider_reference: string | null; provider_name: string | null }>();
+    if (!selectedWarehouse) {
+      return { enabled: true, status: "invalid_request" as const, code: "PROVIDER_WAREHOUSE_NOT_FOUND", error: "The selected Delhivery pickup warehouse no longer exists. Select it again before booking." };
+    }
+    if (selectedWarehouse.provider !== "delhivery") {
+      return { enabled: true, status: "invalid_request" as const, code: "PROVIDER_WAREHOUSE_MISMATCH", error: "The selected pickup warehouse is not mapped to Delhivery." };
+    }
+    if (selectedWarehouse.provider_account_id && account?.id && selectedWarehouse.provider_account_id !== account.id) {
+      return { enabled: true, status: "invalid_request" as const, code: "PROVIDER_ACCOUNT_MISMATCH", error: "The selected pickup warehouse belongs to a different Delhivery account. Select a warehouse assigned to the active account." };
+    }
+    if (selectedWarehouse.provider_status !== "active" || !selectedWarehouse.provider_reference || !selectedWarehouse.provider_name) {
+      return { enabled: true, status: "invalid_request" as const, code: "PROVIDER_WAREHOUSE_NOT_VERIFIED", error: "The selected Delhivery pickup warehouse is not verified yet. Verify or activate it from Warehouses before booking." };
+    }
+    delhiveryPickupLocation = selectedWarehouse.provider_name.trim();
+    delhiveryCanonicalOrigin = {
+      name: selectedWarehouse.contact_name?.trim() || selectedWarehouse.name?.trim() || "PSS Logistics",
+      line: selectedWarehouse.address?.trim() || "",
+      city: selectedWarehouse.city?.trim() || "",
+      state: selectedWarehouse.state?.trim() || "",
+      pincode: selectedWarehouse.pincode?.trim() || "",
+      phone: selectedWarehouse.contact?.trim() || "",
+      country: "India",
+    };
+  }
   const xpressToken = provider === "xpressbees" ? await xpressbeesToken(env, credential!, requestIdValue, providerTimeoutMs) : null;
   if (provider === "xpressbees" && !xpressToken) return { enabled: true, status: "failed" as const, error: "XpressBees authentication failed" };
   const rivigoToken = provider === "rivigo" ? await rivigoAccessToken(env, rivigo!, requestIdValue, providerTimeoutMs) : null;
