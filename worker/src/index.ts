@@ -1480,7 +1480,7 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
   const destination = delhiveryAddress(payload.destination_address, String(payload.consignee ?? "Consignee"));
   // The Delhivery account label and the registered pickup warehouse are
   // separate provider values. Never use the account label as the warehouse.
-  const pickupLocation = String(payload.delhivery_pickup_location ?? payload.pickup_location ?? env.DELHIVERY_DEFAULT_PICKUP_LOCATION ?? "").trim();
+  const pickupLocation = String(payload.delhivery_pickup_location ?? payload.pickup_location ?? "").trim();
   const orderId = String(payload.order_id ?? payload.invoice_reference ?? payload.invoice_number ?? "").trim().slice(0, 80);
   const invoiceNumber = String(payload.invoice_reference ?? payload.invoice_number ?? "").trim();
   const providerInvoiceNumber = invoiceNumber.replace(/[^A-Za-z0-9\/-]/g, "-").replace(/-{2,}/g, "-").replace(/^-|-$/g, "").slice(0, 25);
@@ -5217,12 +5217,17 @@ const worker = {
         const endpoint = "POST /v1/shipments/preflight";
         const existing = await idempotentResponse(env, key, clientId, endpoint, requestHash);
         if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
-        const configuredPickupLocation = String(env.DELHIVERY_DEFAULT_PICKUP_LOCATION ?? "").trim();
-        if (!configuredPickupLocation) {
-          const failed = JSON.stringify({ ok: false, error: { code: "PROVIDER_PICKUP_LOCATION_NOT_CONFIGURED", category: "provider", message: "The Delhivery account has no configured B2B pickup location", user_safe_message: "Delhivery booking is not configured with a pickup location yet. Contact support before confirming the booking.", technical_message: "DELHIVERY_DEFAULT_PICKUP_LOCATION is empty", request_id: id, retryable: false }, request_id: id });
-          await saveIdempotent(env, key, clientId, endpoint, 409, failed, requestHash);
-          return new Response(failed, { status: 409, headers: { ...headers, "content-type": "application/json" } });
+        if (!warehouseId) return error("PROVIDER_WAREHOUSE_REQUIRED", "Select a verified Delhivery pickup warehouse before confirming the booking", 409, id, headers);
+        const selectedWarehouse = await env.DB.prepare("SELECT provider, provider_account_id, provider_status, provider_reference, provider_name FROM warehouses WHERE id = ? AND client_id = ? LIMIT 1")
+          .bind(warehouseId, clientId)
+          .first<{ provider: string | null; provider_account_id: string | null; provider_status: string | null; provider_reference: string | null; provider_name: string | null }>();
+        if (!selectedWarehouse) return error("PROVIDER_WAREHOUSE_NOT_FOUND", "The selected Delhivery pickup warehouse no longer exists. Select it again before confirming the booking.", 409, id, headers);
+        if (selectedWarehouse.provider !== "delhivery") return error("PROVIDER_WAREHOUSE_MISMATCH", "The selected pickup warehouse is not mapped to Delhivery.", 409, id, headers);
+        if (selectedWarehouse.provider_account_id !== providerAccountId) return error("PROVIDER_ACCOUNT_MISMATCH", "The selected pickup warehouse belongs to a different Delhivery account. Select a warehouse assigned to the active account.", 409, id, headers);
+        if (selectedWarehouse.provider_status !== "active" || !selectedWarehouse.provider_reference || !selectedWarehouse.provider_name?.trim()) {
+          return error("PROVIDER_WAREHOUSE_NOT_VERIFIED", "The selected Delhivery pickup warehouse is not verified yet. Verify or activate it from Warehouses before booking.", 409, id, headers);
         }
+        const selectedPickupLocation = selectedWarehouse.provider_name.trim();
         const destinationPincode = String((payload.destination_address as Record<string, unknown> | null)?.pincode ?? "").trim();
         const serviceability = await verifyDelhiveryServiceability(env, originAddress.pincode, destinationPincode, providerAccountId, id, clientId, paymentMode);
         if (!serviceability.ok) {
@@ -5231,7 +5236,7 @@ const worker = {
           await saveIdempotent(env, key, clientId, endpoint, 409, failed, requestHash);
           return new Response(failed, { status: 409, headers: { ...headers, "content-type": "application/json" } });
         }
-        const ready = JSON.stringify({ ok: true, data: { ready: true, provider: "delhivery", provider_status: 200, warehouse_name: configuredPickupLocation, serviceable: true, serviceability_provenance: serviceability.provenance }, request_id: id });
+        const ready = JSON.stringify({ ok: true, data: { ready: true, provider: "delhivery", provider_status: 200, warehouse_name: selectedPickupLocation, serviceable: true, serviceability_provenance: serviceability.provenance }, request_id: id });
         await saveIdempotent(env, key, clientId, endpoint, 200, ready, requestHash);
         await audit(env, ctx, auth, id, "shipment.provider_readiness", "shipment", warehouseId || "new-warehouse", { client_id: clientId, provider: "delhivery" });
         return new Response(ready, { status: 200, headers: { ...headers, "content-type": "application/json" } });
