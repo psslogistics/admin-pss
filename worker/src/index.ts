@@ -3995,7 +3995,7 @@ function pickupStatusFromProviderEvent(rawStatus: unknown) {
 
 async function reconcileShipmentLinkedPickupStatuses(env: Env, cron: string) {
   const rows = await env.DB.prepare(`
-    SELECT pr.id, pr.client_id, pr.status, pr.provider_status,
+    SELECT pr.id, pr.client_id, pr.status, pr.provider_status, pr.requested_date,
       COUNT(DISTINCT s.id) AS expected_count,
       COUNT(DISTINCT CASE WHEN s.status IN ('picked_up', 'in_transit', 'out_for_delivery', 'delivered') THEN s.id END) AS picked_count,
       COUNT(DISTINCT CASE WHEN s.status = 'delivered' THEN s.id END) AS delivered_count,
@@ -4018,13 +4018,15 @@ async function reconcileShipmentLinkedPickupStatuses(env: Env, cron: string) {
     WHERE pr.provider = 'delhivery' AND pr.status NOT IN ('cancelled', 'completed', 'failed')
     GROUP BY pr.id, pr.client_id, pr.status, pr.provider_status
     ORDER BY pr.updated_at ASC LIMIT 75
-  `).all<{ id: string; client_id: string; status: string; provider_status: string | null; expected_count: number; picked_count: number; delivered_count: number; failed_count: number; en_route_count: number }>();
+  `).all<{ id: string; client_id: string; status: string; provider_status: string | null; requested_date: string | null; expected_count: number; picked_count: number; delivered_count: number; failed_count: number; en_route_count: number }>();
+  const today = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata" }).format(new Date());
   for (const pickup of rows.results) {
     const expectedCount = Math.max(0, Number(pickup.expected_count ?? 0));
     const pickedCount = Math.max(0, Number(pickup.picked_count ?? 0));
     const deliveredCount = Math.max(0, Number(pickup.delivered_count ?? 0));
     const failedCount = Math.max(0, Number(pickup.failed_count ?? 0));
     const enRouteCount = Math.max(0, Number(pickup.en_route_count ?? 0));
+    const pastDateWithoutProviderScan = Boolean(pickup.requested_date && pickup.requested_date < today && pickedCount === 0 && enRouteCount === 0 && failedCount === 0);
     const nextStatus = expectedCount > 0 && deliveredCount === expectedCount
       ? 'completed'
       : pickedCount > 0
@@ -4033,6 +4035,8 @@ async function reconcileShipmentLinkedPickupStatuses(env: Env, cron: string) {
           ? 'en_route'
         : failedCount === expectedCount && expectedCount > 0
           ? 'failed'
+          : pastDateWithoutProviderScan
+            ? 'provider_pending'
           : pickup.status;
     const detail = pickedCount > 0
       ? `Delhivery linked shipments: ${pickedCount}/${expectedCount} picked`
@@ -4040,6 +4044,8 @@ async function reconcileShipmentLinkedPickupStatuses(env: Env, cron: string) {
         ? `Delhivery linked shipments: ${enRouteCount}/${expectedCount} out for pickup`
       : failedCount > 0
         ? `Delhivery linked shipments: ${failedCount}/${expectedCount} failed or cancelled`
+        : pastDateWithoutProviderScan
+          ? 'Pickup date passed; Delhivery has not reported a pickup scan'
         : 'Delhivery has not reported a pickup scan for the linked shipments';
     await env.DB.prepare("UPDATE pickup_requests SET status = ?, provider_picked_count = ?, provider_expected_count = ?, provider_status_synced_at = CURRENT_TIMESTAMP, provider_status_detail = ?, provider_status = COALESCE(NULLIF(provider_status, ''), 'delhivery:linked_shipments'), updated_at = CURRENT_TIMESTAMP WHERE pickup_requests.id = ? AND pickup_requests.client_id = ?")
       .bind(nextStatus, pickedCount, expectedCount, detail, pickup.id, pickup.client_id).run();
