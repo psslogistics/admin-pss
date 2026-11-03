@@ -2805,8 +2805,12 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
           ? "https://ucp-egw.delhivery.com/101/api/v1/doc/label/print"
           : (labelVariant === "pdf" || labelVariant === "pdf_alt" || labelVariant === "pdf_form" || labelVariant === "pdf_form_alt")
           ? `${String(delhiveryLabelBase).replace(/\/$/, "")}/docket/generate_label_pdf`
-          : labelVariant === "legacy" || labelVariant === "legacy_alt"
-            ? `${String(delhiveryLabelBase).replace(/\/$/, "")}/label/get_urls/${encodeURIComponent(delhiveryLabelApiSize(String(payload.label_size ?? "std")))}/${encodeURIComponent(trackingNumber)}`
+          : labelVariant === "legacy_primary"
+            ? `${delhiveryLabelApiBase()}/label/get_urls/${encodeURIComponent(delhiveryLabelApiSize(String(payload.label_size ?? "std")))}/${encodeURIComponent(trackingNumber)}`
+          : labelVariant === "legacy_alt"
+            ? `${alternateDelhiveryB2bBase(String(base))}/label/get_urls/${encodeURIComponent(delhiveryLabelApiSize(String(payload.label_size ?? "std")))}/${encodeURIComponent(trackingNumber)}`
+          : labelVariant === "legacy"
+            ? `${delhiveryB2bDocsBase()}/label/get_urls/${encodeURIComponent(delhiveryLabelApiSize(String(payload.label_size ?? "std")))}/${encodeURIComponent(trackingNumber)}`
             : `${delhiveryLabelApiBase()}/label/get_urls/${encodeURIComponent(delhiveryLabelApiSize(String(payload.label_size ?? "std")))}/${encodeURIComponent(trackingNumber)}`
       : provider === "delhivery" && operation === "lr_copy"
         ? `${base.replace(/\/$/, "")}/lr_copy/print/${encodeURIComponent(trackingNumber)}?lr_copy_type=${encodeURIComponent(String(payload.lr_copy_type ?? "SHIPPER COPY"))}`
@@ -5754,22 +5758,29 @@ const worker = {
           // converts the returned raster asset to the required PDF container,
           // preserving the source pixels and keeping the download PDF-only.
           if (requestedSize === "3x2" && !isProviderPdfArtifact(providerResult.artifact)) {
-            try {
-              const legacyResult = await safeProviderRequest(env, "delhivery", operation, {
-                shipment_id: shipment.id,
-                tracking_number: providerReference,
-                provider_reference: providerReference,
-                provider_account_id: shipment.provider_account_id,
-                label_size: requestedSize,
-                label_api_variant: "legacy",
-                boxes: Math.max(1, Number(shipment.pieces ?? 1)),
-              }, id, shipment.client_id);
-              const legacyArtifact = legacyResult.artifact;
-              const legacyHasArtifact = legacyArtifact !== null && legacyArtifact !== undefined;
-              if (legacyHasArtifact) providerResult = legacyResult;
-            } catch {
-              // Preserve the original provider result so the Client receives
-              // the truthful pending/failed state if the fallback is absent.
+            // The original working label-link call used the LTL client host.
+            // Keep that route first; only then try the alternate B2B host and
+            // finally the documented host. All three calls are read-only and
+            // bounded: none creates a manifest, pickup, or wallet charge.
+            for (const legacyVariant of ["legacy_primary", "legacy_alt", "legacy"]) {
+              try {
+                const legacyResult = await safeProviderRequest(env, "delhivery", operation, {
+                  shipment_id: shipment.id,
+                  tracking_number: providerReference,
+                  provider_reference: providerReference,
+                  provider_account_id: shipment.provider_account_id,
+                  label_size: requestedSize,
+                  label_api_variant: legacyVariant,
+                  boxes: Math.max(1, Number(shipment.pieces ?? 1)),
+                }, id, shipment.client_id);
+                const legacyArtifact = legacyResult.artifact;
+                const legacyHasArtifact = legacyArtifact !== null && legacyArtifact !== undefined;
+                if (legacyHasArtifact) providerResult = legacyResult;
+                if (isProviderPdfArtifact(providerResult.artifact) || (providerResult.artifact && typeof providerResult.artifact === "object" && findProviderContentBase64(providerResult.artifact))) break;
+              } catch {
+                // Preserve the original provider result so the Client receives
+                // the truthful pending/failed state if every fallback is absent.
+              }
             }
           }
         }
