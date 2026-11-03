@@ -6553,6 +6553,34 @@ const worker = {
         });
         return json({ ok: true, data: data.slice(0, limit), pagination: { limit, offset, next_offset: offset + Math.min(data.length, limit), has_more: data.length > limit } }, 200, headers);
       }
+      const warehouseVerification = route.match(/^\/warehouses\/([^/]+)\/verify$/);
+      if (warehouseVerification && request.method === "POST") {
+        if (!hasScope(auth, "addresses.manage")) return error("FORBIDDEN", "Permission required", 403, id, headers);
+        const warehouseId = decodeURIComponent(warehouseVerification[1]);
+        const warehouse = await env.DB.prepare("SELECT id, client_id, name, address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status, provider_reference, provider_name FROM warehouses WHERE id = ? LIMIT 1").bind(warehouseId).first<Record<string, unknown>>();
+        if (!warehouse || !canAccessClient(auth, String(warehouse.client_id))) return error("NOT_FOUND", "Warehouse not found", 404, id, headers);
+        if (String(warehouse.provider ?? "").toLowerCase() !== "delhivery") return error("PROVIDER_UNSUPPORTED", "Only Delhivery warehouses can be verified here", 409, id, headers);
+        const key = request.headers.get("Idempotency-Key");
+        if (!key) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
+        const clientId = String(warehouse.client_id);
+        const requestHash = await payloadFingerprint({ warehouse_id: warehouseId, verify: true });
+        const endpoint = `POST /v1/warehouses/${warehouseId}/verify`;
+        const existing = await idempotentResponse(env, key, clientId, endpoint, requestHash);
+        if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
+        const origin = { name: String(warehouse.contact_name ?? warehouse.name ?? "PSS Logistics"), line: String(warehouse.address ?? ""), city: String(warehouse.city ?? ""), state: String(warehouse.state ?? ""), pincode: String(warehouse.pincode ?? ""), phone: String(warehouse.contact ?? "") };
+        if (!origin.line || !origin.city || !origin.state || !/^\d{6}$/.test(origin.pincode) || !/^\d{10}$/.test(origin.phone.replace(/\D/g, "").slice(-10))) return error("VALIDATION_ERROR", "The warehouse needs a complete address and ten-digit contact number before verification", 400, id, headers);
+        const result = await safeProviderRequest(env, "delhivery", "warehouse_prepare", { client_id: clientId, warehouse_id: warehouseId, provider_account_id: String(warehouse.provider_account_id ?? ""), origin, origin_address: origin, pincode: origin.pincode, pickup_location: String(warehouse.provider_name ?? warehouse.name ?? "") }, id, clientId, key, 30000) as Record<string, unknown>;
+        const accepted = result.status === "accepted";
+        const current = await env.DB.prepare("SELECT provider, provider_status, provider_error, provider_reference, provider_name, provider_activated_at FROM warehouses WHERE id = ? AND client_id = ? LIMIT 1").bind(warehouseId, clientId).first<Record<string, unknown>>();
+        if (!accepted) {
+          const pending = String(result.code ?? "") === "WAREHOUSE_ACTIVATION_PENDING";
+          await env.DB.prepare("UPDATE warehouses SET provider_status = ?, provider_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(pending ? "pending" : "failed", String(result.error ?? result.reason ?? "Delhivery verification did not complete").slice(0, 500), warehouseId, clientId).run();
+        }
+        const refreshed = await env.DB.prepare("SELECT provider, provider_status, provider_error, provider_reference, provider_name, provider_activated_at FROM warehouses WHERE id = ? AND client_id = ? LIMIT 1").bind(warehouseId, clientId).first<Record<string, unknown>>();
+        const responseBody = JSON.stringify({ ok: accepted, data: { id: warehouseId, ...(refreshed ?? current ?? {}), ready_for_booking: String(refreshed?.provider_status ?? current?.provider_status ?? "") === "active" && Boolean(refreshed?.provider_reference && refreshed?.provider_name) }, ...(accepted ? {} : { error: { code: result.code ?? "WAREHOUSE_VERIFICATION_FAILED", message: String(result.error ?? result.reason ?? "Delhivery could not verify this warehouse"), retryable: true } }), request_id: id });
+        await saveIdempotent(env, key, clientId, endpoint, accepted ? 200 : 409, responseBody, requestHash);
+        return new Response(responseBody, { status: accepted ? 200 : 409, headers: { ...headers, "content-type": "application/json" } });
+      }
       if (route === "/addresses" && request.method === "GET") {
         if (!hasScope(auth, "addresses.manage")) return error("FORBIDDEN", "Permission required", 403, id, headers);
         const search = String(url.searchParams.get("search") ?? "").trim().slice(0, 120);
