@@ -2627,7 +2627,14 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (provider === "delhivery" && operation === "shipments") removeRetiredDelhiveryPickupLocation(payload);
   let delhiveryPickupLocation = "";
   let delhiveryCanonicalOrigin: Record<string, unknown> | null = null;
-  if (provider === "delhivery" && ["shipments", "warehouse_prepare"].includes(operation) && useDelhiveryB2b && clientId && delhiveryB2bToken) {
+  // Shipment manifestation must use the Delhivery account's already-configured
+  // pickup location. Do not register the editable consignor as a new provider
+  // warehouse inside the booking request: registration is asynchronous and the
+  // manifest service can reject that name as "not configured" even when the
+  // registration request was accepted. Warehouse registration/activation stays
+  // in the explicit warehouse_prepare flow, and pickup scheduling remains a
+  // separate operation.
+  if (provider === "delhivery" && ["warehouse_prepare"].includes(operation) && useDelhiveryB2b && clientId && delhiveryB2bToken) {
     const origin = delhiveryAddress(payload.origin_address, String(payload.origin ?? "PSS Logistics"));
     if (!origin) return { enabled: true, status: "invalid_request" as const, reason: "A complete consignor address is required to create or select the pickup warehouse" };
     const selectedWarehouseId = typeof payload.warehouse_id === "string" && payload.warehouse_id.trim() ? payload.warehouse_id.trim() : null;
