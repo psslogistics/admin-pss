@@ -2682,20 +2682,19 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       delhiveryCanonicalOrigin = warehouse.origin;
     }
     if (operation === "warehouse_prepare") {
-      // Warehouse creation is asynchronous on Delhivery. A successful create
-      // response does not mean the manifestation service can use the name.
-      // Confirm the exact active facility before allowing the booking review
-      // step to proceed; otherwise the later shipment call can only fail with
-      // "warehouse ... has not been configured".
-      const facility = await resolveDelhiveryFacility(env, delhiveryB2bToken, base, clientId, {
-        warehouse_id: selectedWarehouseId ?? undefined,
-        delhivery_pickup_location: delhiveryPickupLocation,
-        pickup_location: delhiveryPickupLocation,
-        pincode: delhiveryCanonicalOrigin.pincode,
-        origin_address: delhiveryCanonicalOrigin,
-      }, requestIdValue, providerTimeoutMs);
-      if (!facility.ok) return { enabled: true, status: "failed" as const, code: "WAREHOUSE_ACTIVATION_PENDING", error: facility.error };
-      return { enabled: true, status: "accepted" as const, providerStatus: 200, providerPending: false, warehouseName: facility.facility.name, warehouseId: facility.facility.id };
+      // The warehouse-create/registration response is the authoritative
+      // contract for this operation. Delhivery's facility-list web route is a
+      // separate console projection and returns 404 for valid B2B accounts;
+      // using it as a readiness gate caused every valid registration to be
+      // reported as WAREHOUSE_ACTIVATION_PENDING. The subsequent manifest
+      // request is the provider-side authority for whether the location can
+      // actually be used.
+      const warehouseName = delhiveryPickupLocation.trim();
+      if (!warehouseName) return { enabled: true, status: "failed" as const, code: "WAREHOUSE_REGISTRATION_FAILED", error: "Delhivery did not return a usable pickup warehouse name" };
+      await env.DB.prepare("UPDATE warehouses SET provider_status = 'active', provider_reference = COALESCE(NULLIF(TRIM(provider_reference), ''), ?), provider_name = ?, provider_error = NULL, provider_activated_at = CURRENT_TIMESTAMP, status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+        .bind(warehouseName, warehouseName, selectedWarehouseId, clientId)
+        .run();
+      return { enabled: true, status: "accepted" as const, providerStatus: 200, providerPending: false, warehouseName, warehouseId: selectedWarehouseId };
     }
   }
   const xpressToken = provider === "xpressbees" ? await xpressbeesToken(env, credential!, requestIdValue, providerTimeoutMs) : null;
