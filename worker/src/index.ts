@@ -4943,7 +4943,6 @@ const worker = {
           profile?.gst_number?.trim() ? null : "GST",
           profile?.pan_number?.trim() ? null : "PAN",
           profile?.aadhaar_last4 ? null : "Aadhaar",
-          profile?.phone_verified_at ? null : "mobile verification",
         ].filter((value): value is string => Boolean(value));
         const kycTestAccount = await isKycTestAccount(env, auth);
         // Keep the existing exception account-specific: this test client is
@@ -5227,7 +5226,7 @@ const worker = {
           : [];
         const kyc = kycRows[0];
         const kycTestAccount = await isKycTestAccount(env, auth);
-        if ((!kyc || kyc.status !== "approved" || !kyc.gst_number?.trim() || !kyc.pan_number?.trim() || !kyc.aadhaar_last4 || !kyc.phone_verified_at) && !kycTestAccount) return error("KYC_REQUIRED", "Approved Aadhaar, GST, PAN, and OTP-verified mobile number are required before booking shipments", 403, id, headers);
+        if ((!kyc || kyc.status !== "approved" || !kyc.gst_number?.trim() || !kyc.pan_number?.trim() || !kyc.aadhaar_last4) && !kycTestAccount) return error("KYC_REQUIRED", "Approved Aadhaar, GST, and PAN KYC are required before booking shipments", 403, id, headers);
         // Approved KYC remains authoritative for normal clients. The exact
         // allow-listed test account may fall back to request identity fields.
         if (kyc?.gst_number?.trim() && kyc.pan_number?.trim()) {
