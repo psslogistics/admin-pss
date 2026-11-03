@@ -4,11 +4,13 @@ import { readFile } from "node:fs/promises";
 
 const source = await readFile(new URL("../src/index.ts", import.meta.url), "utf8");
 
-test("preflight is gated by the client-selected verified warehouse", () => {
+test("preflight is gated by the client-selected warehouse identity", () => {
   const preflight = source.slice(source.indexOf('route === \"/shipments/preflight\"'), source.indexOf('route === \"/shipments\" && request.method === \"POST\"'));
   assert.match(preflight, /warehouse_id/);
   assert.match(preflight, /PROVIDER_WAREHOUSE_REQUIRED/);
-  assert.match(preflight, /PROVIDER_WAREHOUSE_NOT_VERIFIED/);
+  assert.match(preflight, /PROVIDER_WAREHOUSE_NOT_FOUND/);
+  assert.match(preflight, /PROVIDER_WAREHOUSE_MISMATCH/);
+  assert.match(preflight, /PROVIDER_ACCOUNT_MISMATCH/);
   assert.match(preflight, /selectedWarehouse\.provider_name/);
   assert.doesNotMatch(preflight, /DELHIVERY_DEFAULT_PICKUP_LOCATION/);
 });
