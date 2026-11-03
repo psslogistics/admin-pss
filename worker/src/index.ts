@@ -5747,6 +5747,31 @@ const worker = {
             }
             if (isProviderPdfArtifact(providerResult.artifact)) break;
           }
+          // Delhivery's asynchronous PDF callback is not emitted consistently
+          // for the 3x2 physical option on every account. The legacy get_urls
+          // endpoint is read-only and returns the same provider sticker asset;
+          // use it only as a bounded fallback for that size. The Client still
+          // converts the returned raster asset to the required PDF container,
+          // preserving the source pixels and keeping the download PDF-only.
+          if (requestedSize === "3x2" && !isProviderPdfArtifact(providerResult.artifact)) {
+            try {
+              const legacyResult = await safeProviderRequest(env, "delhivery", operation, {
+                shipment_id: shipment.id,
+                tracking_number: providerReference,
+                provider_reference: providerReference,
+                provider_account_id: shipment.provider_account_id,
+                label_size: requestedSize,
+                label_api_variant: "legacy",
+                boxes: Math.max(1, Number(shipment.pieces ?? 1)),
+              }, id, shipment.client_id);
+              const legacyArtifact = legacyResult.artifact;
+              const legacyHasArtifact = legacyArtifact !== null && legacyArtifact !== undefined;
+              if (legacyHasArtifact) providerResult = legacyResult;
+            } catch {
+              // Preserve the original provider result so the Client receives
+              // the truthful pending/failed state if the fallback is absent.
+            }
+          }
         }
         if (operation === "labels" && !isProviderPdfArtifact(providerResult.artifact) && providerResult.status === "failed") {
           const providerCode = (providerResult as { code?: string }).code;
