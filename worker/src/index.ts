@@ -7097,12 +7097,18 @@ const worker = {
         }
          const oda = Boolean(originPin?.oda || destinationPin?.oda || providerOrigin.oda === true || providerDestination.oda === true);
          const result = calculatePssRate({ account, originCity, destinationCity, originState, destinationState, actualWeightKg, volumetricWeightKg, invoiceValue, rto, forwardRatePerKg, forwardOriginZoneOverride: rtoSource?.origin_zone, forwardDestinationZoneOverride: rtoSource?.destination_zone, minimumWeightKg: Number(activeVersion.minimum_weight_kg ?? 20), gstPercent: Number(activeVersion.gst_percent ?? 18), versionId: activeVersion.id, oda, opa: false, rateMatrix, riskCharges: [], chargeRules: rules.results.map((rule) => ({ code: rule.code, label: rule.label, kind: rule.calculation_type, value: Number(rule.value), basis: rule.basis, minimum: rule.minimum_value === null ? undefined : Number(rule.minimum_value), maximum: rule.maximum_value === null ? undefined : Number(rule.maximum_value), enabled: Boolean(rule.enabled), marker: rule.marker ?? undefined, condition: rule.condition ?? undefined, displayOrder: Number(rule.display_order ?? 0) })) });
-        const carrierRisk = payload.risk_type === "carrier";
-        const riskFee = carrierRisk
-          ? Math.max(80, Math.round(invoiceValue * 0.003 * 100) / 100)
-          : Math.max(50, Math.round(invoiceValue * 0.001 * 100) / 100);
-        result.lines.push({ code: carrierRisk ? "carrier_risk" : "owner_risk", label: carrierRisk ? "Carrier risk fee" : "Owner risk fee", amount: riskFee });
-        result.total = Number(result.total) + riskFee;
+        // Existing booking callers omit this field and retain the historical
+        // risk-charge behavior. The client rate calculator sends it
+        // explicitly so insurance can be included or excluded by the user.
+        const includeInsurance = payload.include_insurance === undefined || payload.include_insurance === true;
+        if (includeInsurance) {
+          const carrierRisk = payload.risk_type === "carrier";
+          const riskFee = carrierRisk
+            ? Math.max(80, Math.round(invoiceValue * 0.003 * 100) / 100)
+            : Math.max(50, Math.round(invoiceValue * 0.001 * 100) / 100);
+          result.lines.push({ code: carrierRisk ? "carrier_risk" : "owner_risk", label: carrierRisk ? "Carrier risk fee" : "Owner risk fee", amount: riskFee });
+          result.total = Number(result.total) + riskFee;
+        }
         if (previewOnly) return json({ ok: true, data: { quote_id: null, provider: "delhivery", service_level: "b2b", client_id: clientId, provider_account_id: liveProviderAccountId, provider_account_name: selectedProviderAccountName || null, serviceability_provenance: liveServiceability.provenance, account_code: account, ...result } }, 200, headers);
         const quoteId = crypto.randomUUID();
         await env.DB.prepare("INSERT INTO pricing_quotes (id, client_id, version_id, account_scope, origin_zone, destination_zone, chargeable_weight_kg, client_breakdown_json, expires_at, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+15 minutes'), ?)").bind(quoteId, clientId, activeVersion.id, account, result.originZone, result.destinationZone, result.chargeableWeightKg, JSON.stringify(result), auth.userId ?? `api:${clientId}`).run();
