@@ -2720,11 +2720,15 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     if (selectedWarehouse.provider_account_id && account?.id && selectedWarehouse.provider_account_id !== account.id) {
       return { enabled: true, status: "invalid_request" as const, code: "PROVIDER_ACCOUNT_MISMATCH", error: "The selected pickup warehouse belongs to a different Delhivery account. Select a warehouse assigned to the active account." };
     }
-    if (selectedWarehouse.provider_status !== "active" || !selectedWarehouse.provider_reference || !selectedWarehouse.provider_name) {
-      return { enabled: true, status: "invalid_request" as const, code: "PROVIDER_WAREHOUSE_NOT_VERIFIED", error: "The selected Delhivery pickup warehouse is not verified yet. Verify or activate it from Warehouses before booking." };
-    }
-    delhiveryPickupLocation = selectedWarehouse.provider_name.trim();
-    delhiveryCanonicalOrigin = {
+    // P0.4 compatibility: the old path hard-blocked every pending warehouse
+    // before the manifest request. That made a provider registration accepted
+    // on the same request look like a booking failure. Keep the old guard
+    // documented here, but let the manifest attempt perform the idempotent
+    // registration and let Delhivery's LR/AWB response decide the final result.
+    // if (selectedWarehouse.provider_status !== "active" || !selectedWarehouse.provider_reference || !selectedWarehouse.provider_name) {
+    //   return { enabled: true, status: "invalid_request" as const, code: "PROVIDER_WAREHOUSE_NOT_VERIFIED", error: "The selected Delhivery pickup warehouse is not verified yet. Verify or activate it from Warehouses before booking." };
+    // }
+    const selectedOrigin = {
       name: selectedWarehouse.contact_name?.trim() || selectedWarehouse.name?.trim() || "PSS Logistics",
       line: selectedWarehouse.address?.trim() || "",
       city: selectedWarehouse.city?.trim() || "",
@@ -2733,6 +2737,18 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       phone: selectedWarehouse.contact?.trim() || "",
       country: "India",
     };
+    const warehouseApiToken = delhiveryWarehouseApiToken(env, delhiveryB2bAccountName, parsedDelhiveryCredential);
+    let warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, selectedOrigin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId, selectedWarehouseId, warehouseApiToken);
+    if (!warehouse.ok && /\b401\b|invalid token|unauthorized|token decode|not enough segments/i.test(warehouse.error)) {
+      const refreshedToken = await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs, true, delhiveryLabelAuthBase);
+      if (refreshedToken) {
+        delhiveryB2bToken = refreshedToken;
+        warehouse = await ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, selectedOrigin, requestIdValue, providerTimeoutMs, base, account?.id ?? requestedAccountId, selectedWarehouseId, warehouseApiToken);
+      }
+    }
+    if (!warehouse.ok) return { enabled: true, status: "failed" as const, code: warehouse.code, error: warehouse.error };
+    delhiveryPickupLocation = warehouse.name.trim();
+    delhiveryCanonicalOrigin = warehouse.origin;
   }
   const xpressToken = provider === "xpressbees" ? await xpressbeesToken(env, credential!, requestIdValue, providerTimeoutMs) : null;
   if (provider === "xpressbees" && !xpressToken) return { enabled: true, status: "failed" as const, error: "XpressBees authentication failed" };
@@ -5224,10 +5240,14 @@ const worker = {
         if (!selectedWarehouse) return error("PROVIDER_WAREHOUSE_NOT_FOUND", "The selected Delhivery pickup warehouse no longer exists. Select it again before confirming the booking.", 409, id, headers);
         if (selectedWarehouse.provider !== "delhivery") return error("PROVIDER_WAREHOUSE_MISMATCH", "The selected pickup warehouse is not mapped to Delhivery.", 409, id, headers);
         if (selectedWarehouse.provider_account_id !== providerAccountId) return error("PROVIDER_ACCOUNT_MISMATCH", "The selected pickup warehouse belongs to a different Delhivery account. Select a warehouse assigned to the active account.", 409, id, headers);
-        if (selectedWarehouse.provider_status !== "active" || !selectedWarehouse.provider_reference || !selectedWarehouse.provider_name?.trim()) {
-          return error("PROVIDER_WAREHOUSE_NOT_VERIFIED", "The selected Delhivery pickup warehouse is not verified yet. Verify or activate it from Warehouses before booking.", 409, id, headers);
-        }
-        const selectedPickupLocation = selectedWarehouse.provider_name.trim();
+        // P0.4 compatibility: do not reject the booking review solely because
+        // the local warehouse row is still pending. Confirmation performs the
+        // idempotent provider registration and the manifest response is the
+        // authoritative readiness check.
+        // if (selectedWarehouse.provider_status !== "active" || !selectedWarehouse.provider_reference || !selectedWarehouse.provider_name?.trim()) {
+        //   return error("PROVIDER_WAREHOUSE_NOT_VERIFIED", "The selected Delhivery pickup warehouse is not verified yet. Verify or activate it from Warehouses before booking.", 409, id, headers);
+        // }
+        const selectedPickupLocation = selectedWarehouse.provider_name?.trim() || "";
         const destinationPincode = String((payload.destination_address as Record<string, unknown> | null)?.pincode ?? "").trim();
         const serviceability = await verifyDelhiveryServiceability(env, originAddress.pincode, destinationPincode, providerAccountId, id, clientId, paymentMode);
         if (!serviceability.ok) {
