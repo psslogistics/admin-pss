@@ -5051,7 +5051,7 @@ const worker = {
         // fetched lazily by their dedicated endpoints when the client opens
         // a shipment. The old correlated subqueries made this list request
         // time out as production history grew.
-        const trackingShipmentColumns = "s.id, s.pss_reference, s.order_id, s.client_id, s.tracking_number, s.lr_number, s.master_awb, s.box_awbs_json, s.provider_reference, s.provider_booking_id, s.provider_pickup_id, s.provider_sync_status, s.status, s.provider, s.origin, s.destination, s.origin_address_json, s.destination_address_json, s.consignee, s.total_weight_kg, s.weight_override_kg, s.weight_source, s.weight_updated_at, s.pieces, s.edd, s.delivered_at, s.created_at, s.updated_at, s.dimensions_json";
+         const trackingShipmentColumns = "s.id, s.pss_reference, s.order_id, s.order_id AS invoice_number, s.client_id, s.tracking_number, s.lr_number, s.master_awb, s.box_awbs_json, s.provider_reference, s.provider_booking_id, s.provider_pickup_id, s.provider_sync_status, s.status, s.provider, s.origin, s.destination, s.origin_address_json, s.destination_address_json, s.consignee, s.total_weight_kg, s.weight_override_kg, s.weight_source, s.weight_updated_at, s.pieces, s.edd, s.delivered_at, s.created_at, s.updated_at, s.dimensions_json";
         const selectedShipmentColumns = shipmentView === "tracking" || !internalShipmentView ? trackingShipmentColumns : shipmentColumns;
         const queryLimit = pageSize + 1;
         const shipmentVisibility = testDataVisibilityClause(auth, "s");
