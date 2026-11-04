@@ -11,7 +11,7 @@ const checks = [
   ["internal roles retain classified records", /auth\.roles\.has\("client"\) && !hasRole\(auth, \["employee", "admin", "super_admin"\]\)/],
   ["shipment rows use the visibility predicate", /const shipmentVisibility = testDataVisibilityClause\(auth, "s"\)[\s\S]*const clientWhere = \[[\s\S]*shipmentVisibility/],
   ["shipment status counts use the visibility predicate", /const shipmentVisibilityNoAlias = testDataVisibilityClause\(auth\)[\s\S]*const statusRows =/],
-  ["shipment tab and delayed counts share one lightweight status read", /statusAggregateSql = "SELECT status, edd FROM shipments"[\s\S]*let delayed = 0[\s\S]*counts\.delayed = delayed/],
+  ["shipment tab and delayed counts use an aggregated status read", /statusAggregateSql = `SELECT status, COUNT\(\*\) AS count,[\s\S]*GROUP BY status[\s\S]*counts\.delayed = statusRows\.results\.reduce/],
   ["tracking aggregate indexes cover status, EDD, test visibility, and client scope", /idx_shipments_test_status_edd_created[\s\S]*ON shipments\(is_test, status, edd, created_at DESC\)[\s\S]*idx_shipments_client_test_status_edd_created[\s\S]*ON shipments\(client_id, is_test, status, edd, created_at DESC\)/],
   ["shipment pagination totals use the visibility predicate", /const totalWhere = \[statusPredicate, shipmentVisibility\]\.filter\(Boolean\)\.join\(" AND "\)/],
   ["status-count cache separates client and internal views", /hidesClientTestData\(auth\) \? "client-visible" : "internal"/],

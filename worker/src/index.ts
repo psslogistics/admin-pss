@@ -5108,28 +5108,23 @@ const worker = {
         if (cachedStatusCounts && cachedStatusCounts.expiresAt > Date.now()) {
           statusCountsPromise = Promise.resolve(cachedStatusCounts.counts);
         } else {
-          // Return every tab count and the derived delayed count from one
-          // lightweight D1 read. The previous grouped/window aggregate plus
-          // a second total-count query could exceed the production read
-          // budget as shipment history grew, even after inline tracking was
-          // removed from the client list request.
+          // Aggregate inside D1 and return one row per status. Never select
+          // the full shipment history just to calculate tab counts: D1 bills
+          // rows read, and materializing every shipment here can exhaust the
+          // account allowance when this endpoint is refreshed repeatedly.
           statusCountsPromise = (async () => {
-            const statusAggregateSql = "SELECT status, edd FROM shipments";
+            const statusAggregateSql = `SELECT status, COUNT(*) AS count,
+              SUM(CASE WHEN edd IS NOT NULL AND date(edd) < date('now')
+                AND lower(COALESCE(status, '')) NOT IN ('delivered', 'cancelled', 'canceled', 'returned', 'rto')
+                THEN 1 ELSE 0 END) AS delayed_count
+              FROM shipments`;
             const statusRows = auth.system
-              ? await env.DB.prepare(`${statusAggregateSql}${shipmentVisibilityNoAlias ? ` WHERE ${shipmentVisibilityNoAlias}` : ""}`).all<{ status: string | null; edd: string | null }>()
+              ? await env.DB.prepare(`${statusAggregateSql}${shipmentVisibilityNoAlias ? ` WHERE ${shipmentVisibilityNoAlias}` : ""} GROUP BY status`).all<{ status: string | null; count: number; delayed_count: number }>()
               : auth.clientIds.size
-                ? await env.DB.prepare(`${statusAggregateSql} WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")})${shipmentVisibilityNoAlias ? ` AND ${shipmentVisibilityNoAlias}` : ""}`).bind(...[...auth.clientIds]).all<{ status: string | null; edd: string | null }>()
-                : { results: [] as Array<{ status: string | null; edd: string | null }> };
-            const counts: Record<string, number> = {};
-            const today = new Date().toISOString().slice(0, 10);
-            let delayed = 0;
-            for (const item of statusRows.results) {
-              const status = String(item.status ?? "unknown");
-              counts[status] = (counts[status] ?? 0) + 1;
-              const terminal = new Set(["delivered", "cancelled", "canceled", "returned", "rto"]);
-              if (item.edd && String(item.edd).slice(0, 10) < today && !terminal.has(status.toLowerCase())) delayed += 1;
-            }
-            counts.delayed = delayed;
+                ? await env.DB.prepare(`${statusAggregateSql} WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")})${shipmentVisibilityNoAlias ? ` AND ${shipmentVisibilityNoAlias}` : ""} GROUP BY status`).bind(...[...auth.clientIds]).all<{ status: string | null; count: number; delayed_count: number }>()
+                : { results: [] as Array<{ status: string | null; count: number; delayed_count: number }> };
+            const counts = Object.fromEntries(statusRows.results.map((item) => [String(item.status ?? "unknown"), Number(item.count ?? 0)]));
+            counts.delayed = statusRows.results.reduce((total, item) => total + Number(item.delayed_count ?? 0), 0);
             shipmentStatusCountsCache.set(scopeKey, { expiresAt: Date.now() + SHIPMENT_STATUS_COUNTS_CACHE_TTL_MS, counts });
             return counts;
           })();
