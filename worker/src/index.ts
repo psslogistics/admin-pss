@@ -2643,12 +2643,21 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       // warehouse. A selected saved warehouse is only valid when its identity
       // matches the editable consignor fields.
       if (selectedWarehouseId) {
-        const selected = await env.DB.prepare("SELECT address, city, state, pincode, contact, contact_name, provider, provider_account_id FROM warehouses WHERE id = ? AND client_id = ? LIMIT 1")
+        const selected = await env.DB.prepare("SELECT address, city, state, pincode, contact, contact_name, provider, provider_account_id, provider_status, provider_reference, provider_name FROM warehouses WHERE id = ? AND client_id = ? LIMIT 1")
           .bind(selectedWarehouseId, clientId)
-          .first<{ address: string | null; city: string | null; state: string | null; pincode: string | null; contact: string | null; contact_name: string | null; provider: string | null; provider_account_id: string | null }>();
+          .first<{ address: string | null; city: string | null; state: string | null; pincode: string | null; contact: string | null; contact_name: string | null; provider: string | null; provider_account_id: string | null; provider_status: string | null; provider_reference: string | null; provider_name: string | null }>();
         if (!selected) return { enabled: true, status: "invalid_request" as const, code: "WAREHOUSE_NOT_FOUND", error: "The selected pickup warehouse no longer exists. Select it again from Warehouses." };
         if (selected.provider !== "delhivery") return { enabled: true, status: "invalid_request" as const, code: "PROVIDER_WAREHOUSE_MISMATCH", error: "The selected pickup warehouse is not mapped to Delhivery." };
         if (selected.provider_account_id && account?.id && selected.provider_account_id !== account.id) return { enabled: true, status: "invalid_request" as const, code: "PROVIDER_ACCOUNT_MISMATCH", error: "The selected pickup warehouse belongs to a different Delhivery account. Select a warehouse assigned to the active account." };
+        // A successful local save or asynchronous registration is not proof
+        // that Delhivery's manifest service can use the facility. Sending a
+        // pending warehouse here produces a provider-side HTTP 400 such as
+        // "warehouse ... has not been configured" and leaves a misleading
+        // exception shipment. Require the explicit verification contract
+        // (active status + provider identity) before the manifest call.
+        if (String(selected.provider_status ?? "").toLowerCase() !== "active" || !String(selected.provider_reference ?? "").trim() || !String(selected.provider_name ?? "").trim()) {
+          return { enabled: true, status: "failed" as const, code: "WAREHOUSE_ACTIVATION_PENDING", error: "The selected pickup warehouse is not verified with Delhivery yet. Verify it in Warehouses before booking." };
+        }
         const same = (left: unknown, right: unknown) => String(left ?? "").trim().toLowerCase() === String(right ?? "").trim().toLowerCase();
         const samePhone = (left: unknown, right: unknown) => String(left ?? "").replace(/\D/g, "").slice(-10) === String(right ?? "").replace(/\D/g, "").slice(-10);
         if (!same(selected.address, origin.line) || !same(selected.city, origin.city) || !same(selected.state, origin.state) || !same(selected.pincode, origin.pincode) || !samePhone(selected.contact, origin.phone) || !same(selected.contact_name, origin.name)) {
