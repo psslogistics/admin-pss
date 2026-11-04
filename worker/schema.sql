@@ -1,6 +1,7 @@
 CREATE TABLE IF NOT EXISTS shipments (
   id TEXT PRIMARY KEY,
   order_id TEXT,
+  invoice_reference TEXT,
   client_id TEXT NOT NULL,
   created_by_user_id TEXT,
   provider TEXT,
