@@ -7162,10 +7162,17 @@ const worker = {
         const previewOnly = payload.preview_only === true;
         if (!Number.isFinite(actualWeightKg) || actualWeightKg <= 0 || !Number.isFinite(volumetricWeightKg) || volumetricWeightKg < 0 || !Number.isFinite(invoiceValue) || invoiceValue < 0) return error("VALIDATION_ERROR", "Valid weight and invoice values are required", 400, id, headers);
         const liveProviderAccountId = await resolveDelhiveryProviderAccountId(env, clientId, typeof payload.provider_account_id === "string" ? payload.provider_account_id : null);
-        if (!liveProviderAccountId) return error("PROVIDER_ACCOUNT_REQUIRED", "An active Delhivery account is required for live serviceability verification", 409, id, headers);
         const paymentMode = String(payload.payment_mode ?? "prepaid").trim().toLowerCase() === "cod" ? "cod" : "prepaid";
-        const liveServiceability = await verifyDelhiveryServiceability(env, originPincode, destinationPincode, liveProviderAccountId, id, clientId, paymentMode, actualWeightKg);
-        if (!liveServiceability.ok) return error("PROVIDER_SERVICEABILITY_FAILED", liveServiceability.reason ?? "Delhivery could not verify this route", 409, id, headers, JSON.stringify({ provenance: liveServiceability.provenance, origin: liveServiceability.origin, destination: liveServiceability.destination }));
+        // A rate-card preview is an internal PSS calculation and must remain
+        // usable when Delhivery capability health or account serviceability is
+        // temporarily unavailable. Booking still requires this live gate.
+        let liveServiceability: DelhiveryServiceabilityResult | null = null;
+        if (liveProviderAccountId) {
+          liveServiceability = await verifyDelhiveryServiceability(env, originPincode, destinationPincode, liveProviderAccountId, id, clientId, paymentMode, actualWeightKg);
+          if (!liveServiceability.ok && !previewOnly) return error("PROVIDER_SERVICEABILITY_FAILED", liveServiceability.reason ?? "Delhivery could not verify this route", 409, id, headers, JSON.stringify({ provenance: liveServiceability.provenance, origin: liveServiceability.origin, destination: liveServiceability.destination }));
+        } else if (!previewOnly) {
+          return error("PROVIDER_ACCOUNT_REQUIRED", "An active Delhivery account is required for live serviceability verification", 409, id, headers);
+        }
         const version = await env.DB.prepare("SELECT id, minimum_weight_kg, gst_percent FROM pricing_versions WHERE client_id = ? AND provider = 'delhivery' AND service_level = 'b2b' AND status = 'active' AND datetime(effective_at) <= CURRENT_TIMESTAMP ORDER BY datetime(effective_at) DESC LIMIT 1").bind(clientId).first<{ id: string; minimum_weight_kg: number; gst_percent: number }>();
         const activeVersion = version ?? await ensureDefaultClientPricing(env, clientId, auth.userId ?? `api:${clientId}`);
         if (!activeVersion) return error("PRICING_NOT_CONFIGURED", "A published Delhivery B2B PSS rate card is not configured for this client", 409, id, headers);
@@ -7175,8 +7182,8 @@ const worker = {
         // The pincode dataset remains pricing metadata only (zones/ODA/rates).
         // Live Delhivery serviceability above is the booking authority.
         const [originPin, destinationPin] = await Promise.all([pricingPincode(env, originPincode), pricingPincode(env, destinationPincode)]);
-        const providerOrigin = liveServiceability.origin as Record<string, unknown>;
-        const providerDestination = liveServiceability.destination as Record<string, unknown>;
+        const providerOrigin = (liveServiceability?.origin ?? {}) as Record<string, unknown>;
+        const providerDestination = (liveServiceability?.destination ?? {}) as Record<string, unknown>;
         const originCity = originPin?.facility_city ?? String(providerOrigin.facility_city ?? providerOrigin.city ?? payload.origin_city ?? "").trim();
         const destinationCity = destinationPin?.facility_city ?? String(providerDestination.facility_city ?? providerDestination.city ?? payload.destination_city ?? "").trim();
         const originState = originPin?.facility_state ?? String(providerOrigin.facility_state ?? providerOrigin.state ?? payload.origin_state ?? "").trim();
@@ -7205,10 +7212,10 @@ const worker = {
           result.lines.push({ code: carrierRisk ? "carrier_risk" : "owner_risk", label: carrierRisk ? "Carrier risk fee" : "Owner risk fee", amount: riskFee });
           result.total = Number(result.total) + riskFee;
         }
-        if (previewOnly) return json({ ok: true, data: { quote_id: null, provider: "delhivery", service_level: "b2b", client_id: clientId, provider_account_id: liveProviderAccountId, provider_account_name: selectedProviderAccountName || null, serviceability_provenance: liveServiceability.provenance, account_code: account, ...result } }, 200, headers);
+        if (previewOnly) return json({ ok: true, data: { quote_id: null, provider: "delhivery", service_level: "b2b", client_id: clientId, provider_account_id: liveProviderAccountId, provider_account_name: selectedProviderAccountName || null, serviceability_provenance: liveServiceability?.ok ? liveServiceability.provenance : "provider_unavailable", serviceability_warning: liveServiceability?.ok ? null : liveServiceability?.reason ?? "Delhivery serviceability could not be checked; this is a PSS rate-card preview.", account_code: account, ...result } }, 200, headers);
         const quoteId = crypto.randomUUID();
         await env.DB.prepare("INSERT INTO pricing_quotes (id, client_id, version_id, account_scope, origin_zone, destination_zone, chargeable_weight_kg, client_breakdown_json, expires_at, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+15 minutes'), ?)").bind(quoteId, clientId, activeVersion.id, account, result.originZone, result.destinationZone, result.chargeableWeightKg, JSON.stringify(result), auth.userId ?? `api:${clientId}`).run();
-        return json({ ok: true, data: { quote_id: quoteId, provider: "delhivery", service_level: "b2b", client_id: clientId, provider_account_id: liveProviderAccountId, serviceability_provenance: liveServiceability.provenance, ...result } }, 200, headers);
+        return json({ ok: true, data: { quote_id: quoteId, provider: "delhivery", service_level: "b2b", client_id: clientId, provider_account_id: liveProviderAccountId, serviceability_provenance: liveServiceability?.provenance, ...result } }, 200, headers);
       }
       if (route === "/pricing/assigned" && request.method === "GET") {
         if (!hasScope(auth, "quotes.create")) return error("FORBIDDEN", "Pricing view permission required", 403, id, headers);
