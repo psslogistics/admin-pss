@@ -443,6 +443,28 @@ function walletShipmentLinkStatement(env: Env, walletTransactionId: string, clie
 
 let walletShipmentLinkSchemaPromise: Promise<void> | null = null;
 
+let shipmentInvoiceReferenceSchemaPromise: Promise<void> | null = null;
+
+function ensureShipmentInvoiceReferenceSchema(env: Env): Promise<void> {
+  if (shipmentInvoiceReferenceSchemaPromise) return shipmentInvoiceReferenceSchemaPromise;
+  shipmentInvoiceReferenceSchemaPromise = (async () => {
+    const column = await env.DB.prepare("SELECT name FROM pragma_table_info('shipments') WHERE name = 'invoice_reference'").first<{ name: string }>();
+    if (!column) {
+      try {
+        await env.DB.prepare("ALTER TABLE shipments ADD COLUMN invoice_reference TEXT").run();
+      } catch (cause) {
+        const message = cause instanceof Error ? cause.message : String(cause);
+        if (!/duplicate column name|already exists/i.test(message)) throw cause;
+      }
+    }
+    await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_shipments_invoice_reference ON shipments(invoice_reference)").run();
+  })().catch((cause) => {
+    shipmentInvoiceReferenceSchemaPromise = null;
+    throw cause;
+  });
+  return shipmentInvoiceReferenceSchemaPromise;
+}
+
 function ensureWalletShipmentLinkSchema(env: Env): Promise<void> {
   if (walletShipmentLinkSchemaPromise) return walletShipmentLinkSchemaPromise;
   walletShipmentLinkSchemaPromise = env.DB.batch([
@@ -4648,6 +4670,7 @@ const worker = {
     // Strip only the `/v1` prefix and preserve the leading slash expected by route matchers.
     let route = url.pathname.slice(3);
     try {
+      await ensureShipmentInvoiceReferenceSchema(env);
       await ensureWalletShipmentLinkSchema(env);
       const limited = route === "/pricing/quotes" && request.method === "POST" ? pricingPreviewRateLimited(request, auth) : await rateLimited(env, request, auth, route);
       if (limited) return new Response(JSON.stringify({ ok: false, error: { code: "RATE_LIMITED", message: "Too many requests" }, request_id: id }), { status: 429, headers: { ...headers, "content-type": "application/json", "retry-after": "60" } });
@@ -7847,6 +7870,7 @@ const worker = {
   },
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
     ctx.waitUntil((async () => {
+      await ensureShipmentInvoiceReferenceSchema(env);
       await ensureWalletShipmentLinkSchema(env);
       await retryPendingDelhiveryBookings(env, controller.cron);
       await reconcilePendingDelhiveryReferences(env, controller.cron);
