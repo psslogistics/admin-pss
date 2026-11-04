@@ -57,10 +57,10 @@ function stateFor(readPercent: number, writePercent: number): { state: Cloudflar
   return { state: "healthy", threshold: percent >= 50 ? 50 : 0 };
 }
 
-function notConfigured(message: string): CloudflareUsageSnapshot {
+function notConfigured(message: string, databaseId = ""): CloudflareUsageSnapshot {
   const dates = period();
   return {
-    provider: "cloudflare", database_id: "", billing_period_start: dates.start, billing_period_end: dates.end,
+    provider: "cloudflare", database_id: databaseId, billing_period_start: dates.start, billing_period_end: dates.end,
     rows_read: 0, rows_written: 0, included_rows_read: READ_ALLOWANCE, included_rows_written: WRITE_ALLOWANCE,
     read_percent: 0, write_percent: 0, read_excess: 0, write_excess: 0, estimated_cost_usd: 0,
     projected_rows_read: 0, projected_cost_usd: 0, state: "not_configured", threshold_percent: 0,
@@ -72,7 +72,7 @@ export async function readCloudflareD1Usage(env: Env, now = new Date()): Promise
   const accountTag = env.CLOUDFLARE_ACCOUNT_ID?.trim();
   const token = env.CLOUDFLARE_API_TOKEN?.trim();
   const databaseId = env.CLOUDFLARE_D1_DATABASE_ID?.trim();
-  if (!accountTag || !token || !databaseId) return notConfigured("Cloudflare Analytics credentials are not configured on the API Worker.");
+  if (!accountTag || !token || !databaseId) return notConfigured("Cloudflare Analytics credentials are not configured on the API Worker.", databaseId ?? "");
   if (cached && cached.expiresAt > Date.now()) return cached.snapshot;
 
   const dates = period(now);
@@ -117,7 +117,7 @@ export async function readCloudflareD1Usage(env: Env, now = new Date()): Promise
     return snapshot;
   } catch (caught) {
     const message = caught instanceof Error ? caught.message : "Cloudflare Analytics request failed";
-    const snapshot = notConfigured(`Cloudflare usage could not be refreshed: ${message}`);
+    const snapshot = notConfigured(`Cloudflare usage could not be refreshed: ${message}`, databaseId);
     snapshot.state = "error";
     snapshot.source = "error";
     return snapshot;
