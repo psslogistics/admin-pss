@@ -274,9 +274,14 @@ function hasScope(auth: Auth, scope: string) {
     "weight_dispute.resolve": ["weight_dispute.resolve", "admin.weight_dispute.resolve", "admin.weight.resolve"],
   };
   if (permissionMap[scope]?.some((permission) => auth.permissions.has(permission))) return true;
-  if (auth.roles.has("employee")) return false;
   const roles = auth.roles;
+  // Employee navigation is permission-gated at the application boundary, but
+  // the auth-context RPC may omit the corresponding permission row for an
+  // active employee. Read endpoints still apply auth.clientIds to every query,
+  // so this fallback restores the intended employee read path without
+  // widening assignment visibility.
   if (["shipments.read", "tracking.read", "pickups.read", "documents.read", "reports.read", "departments.read"].includes(scope)) return roles.has("client") || roles.has("employee") || roles.has("admin");
+  if (auth.roles.has("employee")) return false;
   if (["shipments.create", "pickups.create", "documents.manage", "tickets.create", "tickets.read", "notifications.read", "cases.read", "cases.manage", "addresses.manage", "quotes.create", "billing.read", "wallet.read", "cod.read", "weight.read", "tasks.read", "activity.read"].includes(scope)) return roles.has("client") || roles.has("employee") || roles.has("admin");
   if (scope === "pickups.manage") return roles.has("client") || roles.has("employee") || roles.has("admin");
   if (scope === "tasks.manage") return roles.has("employee") || roles.has("admin");
