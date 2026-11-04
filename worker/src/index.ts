@@ -280,7 +280,7 @@ function hasScope(auth: Auth, scope: string) {
   // active employee. Read endpoints still apply auth.clientIds to every query,
   // so this fallback restores the intended employee read path without
   // widening assignment visibility.
-  if (["shipments.read", "tracking.read", "pickups.read", "documents.read", "reports.read", "departments.read"].includes(scope)) return roles.has("client") || roles.has("employee") || roles.has("admin");
+  if (["shipments.read", "tracking.read", "pickups.read", "documents.read", "reports.read", "departments.read"].includes(scope)) return auth.audience === "employee" || roles.has("client") || roles.has("employee") || roles.has("admin");
   if (auth.roles.has("employee")) return false;
   if (["shipments.create", "pickups.create", "documents.manage", "tickets.create", "tickets.read", "notifications.read", "cases.read", "cases.manage", "addresses.manage", "quotes.create", "billing.read", "wallet.read", "cod.read", "weight.read", "tasks.read", "activity.read"].includes(scope)) return roles.has("client") || roles.has("employee") || roles.has("admin");
   if (scope === "pickups.manage") return roles.has("client") || roles.has("employee") || roles.has("admin");
