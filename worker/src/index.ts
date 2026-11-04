@@ -2792,15 +2792,17 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   let delhiveryFacility: DelhiveryFacility | null = null;
   if (provider === "delhivery" && useDelhiveryB2b && clientId && delhiveryB2bToken && operation === "pickup_slots") {
     let facility = await resolveDelhiveryFacility(env, delhiveryB2bToken, base, clientId, providerPayload, requestIdValue, providerTimeoutMs);
-    if (!facility.ok && /\b401\b|invalid token|unauthorized|token decode|not enough segments/i.test(facility.error)) {
+    const facilityError = "error" in facility ? facility.error : "";
+    if (!facility.ok && /\b401\b|invalid token|unauthorized|token decode|not enough segments/i.test(facilityError)) {
       const refreshedToken = await delhiveryB2bBearer(env, credential, delhiveryB2bAccountName, requestIdValue, providerTimeoutMs, true);
       if (refreshedToken) {
         delhiveryB2bToken = refreshedToken;
         facility = await resolveDelhiveryFacility(env, delhiveryB2bToken, base, clientId, providerPayload, requestIdValue, providerTimeoutMs);
       }
     }
-    if (!facility.ok) return { enabled: true, status: "failed" as const, error: facility.error };
-    delhiveryFacility = facility.facility;
+    const facilityResult = facility;
+    if (!facilityResult.ok) return { enabled: true, status: "failed" as const, error: "error" in facilityResult ? facilityResult.error : "Facility resolution failed" };
+    delhiveryFacility = facilityResult.facility;
     providerPayload = { ...providerPayload, provider_facility_id: delhiveryFacility.id, provider_facility_code: delhiveryFacility.code };
   }
   const delhiveryCreate = provider === "delhivery" && operation === "shipments" ? useDelhiveryB2b ? delhiveryB2bManifestPayload(env, providerPayload) : delhiveryCreatePayload(env, providerPayload) : null;
