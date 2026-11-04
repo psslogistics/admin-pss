@@ -5106,18 +5106,28 @@ const worker = {
         if (cachedStatusCounts && cachedStatusCounts.expiresAt > Date.now()) {
           statusCountsPromise = Promise.resolve(cachedStatusCounts.counts);
         } else {
-          // Return every tab count and the derived delayed count from a single
-          // D1 scan. Previously status and delayed totals were separate,
-          // sequential full-history reads on every cache miss.
-          const statusAggregateSql = `SELECT status, COUNT(*) AS count, SUM(SUM(CASE WHEN edd IS NOT NULL AND date(edd) < date('now') AND lower(COALESCE(status, '')) NOT IN ('delivered', 'cancelled', 'canceled', 'returned', 'rto') THEN 1 ELSE 0 END)) OVER () AS delayed_count FROM shipments`;
+          // Return every tab count and the derived delayed count from one
+          // lightweight D1 read. The previous grouped/window aggregate plus
+          // a second total-count query could exceed the production read
+          // budget as shipment history grew, even after inline tracking was
+          // removed from the client list request.
           statusCountsPromise = (async () => {
+            const statusAggregateSql = "SELECT status, edd FROM shipments";
             const statusRows = auth.system
-              ? await env.DB.prepare(`${statusAggregateSql}${shipmentVisibilityNoAlias ? ` WHERE ${shipmentVisibilityNoAlias}` : ""} GROUP BY status`).all<{ status: string | null; count: number; delayed_count: number }>()
+              ? await env.DB.prepare(`${statusAggregateSql}${shipmentVisibilityNoAlias ? ` WHERE ${shipmentVisibilityNoAlias}` : ""}`).all<{ status: string | null; edd: string | null }>()
               : auth.clientIds.size
-                ? await env.DB.prepare(`${statusAggregateSql} WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")})${shipmentVisibilityNoAlias ? ` AND ${shipmentVisibilityNoAlias}` : ""} GROUP BY status`).bind(...[...auth.clientIds]).all<{ status: string | null; count: number; delayed_count: number }>()
-                : { results: [] as Array<{ status: string | null; count: number; delayed_count: number }> };
-            const counts = Object.fromEntries(statusRows.results.map((item) => [String(item.status ?? "unknown"), Number(item.count ?? 0)]));
-            counts.delayed = Number(statusRows.results[0]?.delayed_count ?? 0);
+                ? await env.DB.prepare(`${statusAggregateSql} WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")})${shipmentVisibilityNoAlias ? ` AND ${shipmentVisibilityNoAlias}` : ""}`).bind(...[...auth.clientIds]).all<{ status: string | null; edd: string | null }>()
+                : { results: [] as Array<{ status: string | null; edd: string | null }> };
+            const counts: Record<string, number> = {};
+            const today = new Date().toISOString().slice(0, 10);
+            let delayed = 0;
+            for (const item of statusRows.results) {
+              const status = String(item.status ?? "unknown");
+              counts[status] = (counts[status] ?? 0) + 1;
+              const terminal = new Set(["delivered", "cancelled", "canceled", "returned", "rto"]);
+              if (item.edd && String(item.edd).slice(0, 10) < today && !terminal.has(status.toLowerCase())) delayed += 1;
+            }
+            counts.delayed = delayed;
             shipmentStatusCountsCache.set(scopeKey, { expiresAt: Date.now() + SHIPMENT_STATUS_COUNTS_CACHE_TTL_MS, counts });
             return counts;
           })();
@@ -5126,11 +5136,15 @@ const worker = {
         // such as booked. Never derive the pagination total by summing the
         // tabs, otherwise a delayed shipment is counted twice.
         const totalWhere = [statusPredicate, shipmentVisibility].filter(Boolean).join(" AND ");
-        const totalRowPromise = auth.system
-          ? env.DB.prepare(`SELECT COUNT(*) AS count FROM shipments s${totalWhere ? ` WHERE ${totalWhere}` : ""}`).first<{ count: number }>()
-          : auth.clientIds.size
-            ? env.DB.prepare(`SELECT COUNT(*) AS count FROM shipments s WHERE s.client_id IN (${[...auth.clientIds].map(() => "?").join(",")})${totalWhere ? ` AND ${totalWhere}` : ""}`).bind(...auth.clientIds).first<{ count: number }>()
-            : Promise.resolve({ count: 0 });
+        const totalRowPromise = requestedStatus
+          ? auth.system
+            ? env.DB.prepare(`SELECT COUNT(*) AS count FROM shipments s${totalWhere ? ` WHERE ${totalWhere}` : ""}`).first<{ count: number }>()
+            : auth.clientIds.size
+              ? env.DB.prepare(`SELECT COUNT(*) AS count FROM shipments s WHERE s.client_id IN (${[...auth.clientIds].map(() => "?").join(",")})${totalWhere ? ` AND ${totalWhere}` : ""}`).bind(...auth.clientIds).first<{ count: number }>()
+              : Promise.resolve({ count: 0 })
+          : statusCountsPromise.then((counts) => ({
+            count: Object.entries(counts).reduce((total, [status, count]) => status === "delayed" ? total : total + Number(count ?? 0), 0),
+          }));
         // The page, status totals, and pagination total are independent reads.
         // Run them together so table size does not add their latencies in series.
         const [rows, statusCounts, totalRow] = await Promise.all([rowsPromise, statusCountsPromise, totalRowPromise]);
