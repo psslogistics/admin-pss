@@ -12,6 +12,7 @@ import { providerAmountForBookingResult } from "./provider-cost-amount";
 import { activitySnapshotPair } from "./activity-snapshots";
 import { effectiveShipmentWeightKg, findProviderWeight, type ProviderWeightSnapshot } from "./provider-weight";
 import { providerTestDouble } from "./provider-test-double";
+import { readCloudflareD1Usage } from "./cloudflare-usage";
 
 type DelhiveryTokenCache = {
   get<T>(key: string, type: "json"): Promise<T | null>;
@@ -19,7 +20,7 @@ type DelhiveryTokenCache = {
   delete(key: string): Promise<void>;
 };
 
-export interface Env extends Omit<Cloudflare.Env, "SUPABASE_PUBLISHABLE_KEY" | "API_KEY_PEPPER" | "DELHIVERY_API_TOKEN" | "DELHIVERY_B2B_API_BASE_URL" | "DELHIVERY_WEBHOOK_SECRET" | "DELHIVERY_TOKEN_CACHE" | "EKART_API_KEY" | "EKART_API_SECRET" | "EKART_WEBHOOK_SECRET" | "EKART_ENABLE_PROVIDER_CALLS" | "TRACKON_API_BASE_URL" | "TRACKON_CREDENTIALS_JSON" | "TRACKON_WEBHOOK_SECRET" | "TRACKON_BOOKING_URL" | "TRACKON_TRACKING_URL" | "TRACKON_LABEL_URL" | "TRACKON_ENABLE_SHIPMENT_CREATION" | "TRACKON_ENABLE_PICKUP_CREATION" | "XPRESSBEES_API_BASE_URL" | "XPRESSBEES_CREDENTIALS_JSON" | "XPRESSBEES_ENABLE_SHIPMENT_CREATION" | "XPRESSBEES_ENABLE_PICKUP_CREATION" | "RIVIGO_API_BASE_URL" | "RIVIGO_AUTH_URL" | "RIVIGO_TRACKING_URL" | "RIVIGO_CREDENTIALS_JSON" | "RIVIGO_ENABLE_PROVIDER_CALLS"> {
+export interface Env extends Omit<Cloudflare.Env, "SUPABASE_PUBLISHABLE_KEY" | "API_KEY_PEPPER" | "DELHIVERY_API_TOKEN" | "DELHIVERY_B2B_API_BASE_URL" | "DELHIVERY_WEBHOOK_SECRET" | "DELHIVERY_TOKEN_CACHE" | "EKART_API_KEY" | "EKART_API_SECRET" | "EKART_WEBHOOK_SECRET" | "EKART_ENABLE_PROVIDER_CALLS" | "TRACKON_API_BASE_URL" | "TRACKON_CREDENTIALS_JSON" | "TRACKON_WEBHOOK_SECRET" | "TRACKON_BOOKING_URL" | "TRACKON_TRACKING_URL" | "TRACKON_LABEL_URL" | "TRACKON_ENABLE_SHIPMENT_CREATION" | "TRACKON_ENABLE_PICKUP_CREATION" | "XPRESSBEES_API_BASE_URL" | "XPRESSBEES_CREDENTIALS_JSON" | "XPRESSBEES_ENABLE_SHIPMENT_CREATION" | "XPRESSBEES_ENABLE_PICKUP_CREATION" | "RIVIGO_API_BASE_URL" | "RIVIGO_AUTH_URL" | "RIVIGO_TRACKING_URL" | "RIVIGO_CREDENTIALS_JSON" | "RIVIGO_ENABLE_PROVIDER_CALLS" | "CLOUDFLARE_ACCOUNT_ID" | "CLOUDFLARE_API_TOKEN" | "CLOUDFLARE_D1_DATABASE_ID"> {
   SUPABASE_PUBLISHABLE_KEY: string;
   API_KEY_PEPPER?: string;
   DELHIVERY_API_TOKEN?: string;
@@ -49,6 +50,9 @@ export interface Env extends Omit<Cloudflare.Env, "SUPABASE_PUBLISHABLE_KEY" | "
   RIVIGO_CREDENTIALS_JSON?: string;
   RIVIGO_WEBHOOK_SECRET?: string;
   KYC_TEST_MODE?: string;
+  CLOUDFLARE_ACCOUNT_ID?: string;
+  CLOUDFLARE_API_TOKEN?: string;
+  CLOUDFLARE_D1_DATABASE_ID?: string;
 }
 
 type CourierProvider = "delhivery" | "ekart" | "trackon" | "xpressbees" | "rivigo";
@@ -4673,6 +4677,14 @@ const worker = {
         env.DB.prepare("UPDATE api_keys SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?").bind(auth.apiKeyId).run(),
         env.DB.prepare("INSERT INTO api_key_usage (id, api_key_id, client_id, endpoint, method, status_code, bytes_in, bytes_out, request_id) VALUES (?, ?, ?, ?, ?, NULL, ?, 0, ?)").bind(crypto.randomUUID(), auth.apiKeyId, auth.clientId, url.pathname, request.method, Number(request.headers.get("content-length") ?? 0), id).run(),
       ]).then(() => undefined).catch(() => undefined));
+    }
+    // Keep the development-billing monitor isolated from the normal D1
+    // schema bootstrap path. Opening this page must not itself add quota
+    // reads or trigger operational work.
+    if (url.pathname === "/v1/platform/cloudflare-usage" && request.method === "GET") {
+      if (!hasRole(auth, ["super_admin"])) return error("FORBIDDEN", "Only Super Admin may view development billing usage", 403, id, headers);
+      const data = await readCloudflareD1Usage(env);
+      return json({ ok: true, data, request_id: id }, 200, withCors(request, env, { "cache-control": "private, max-age=60" }));
     }
     // Strip only the `/v1` prefix and preserve the leading slash expected by route matchers.
     let route = url.pathname.slice(3);
