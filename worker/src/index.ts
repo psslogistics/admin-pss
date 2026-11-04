@@ -5819,12 +5819,13 @@ const worker = {
             if (isProviderPdfArtifact(providerResult.artifact)) break;
           }
           // Delhivery's asynchronous PDF callback is not emitted consistently
-          // for the 3x2 physical option on every account. The legacy get_urls
-          // endpoint is read-only and returns the same provider sticker asset;
-          // use it only as a bounded fallback for that size. The Client still
+          // for the compact physical options on every account. The legacy
+          // get_urls endpoint is read-only and returns the same provider
+          // sticker asset; use it only as a bounded fallback for those sizes.
+          // The Client still
           // converts the returned raster asset to the required PDF container,
           // preserving the source pixels and keeping the download PDF-only.
-          if (requestedSize === "3x2" && !isProviderPdfArtifact(providerResult.artifact)) {
+          if (["4x2", "3x2"].includes(requestedSize) && !isProviderPdfArtifact(providerResult.artifact)) {
             // The original working label-link call used the LTL client host.
             // Keep that route first; only then try the alternate B2B host and
             // finally the documented host. All three calls are read-only and
