@@ -247,3 +247,14 @@ tbody tr:last-child td { border-bottom: 0; }
   header > button[aria-label^="Search"] span { display: none; }
   header > button[aria-label^="Search"] { flex: 0 0 2rem; justify-content: center; padding-inline: 0.5rem; }
 }
+
+@media (max-width: 640px) {
+  /* Support ticket list/detail must shrink around long ticket IDs on narrow screens. */
+  main > div > div.grid.gap-4 { min-width: 0; }
+  main > div > div.grid.gap-4 > section,
+  main > div > div.grid.gap-4 > aside,
+  main > div > div.grid.gap-4 > section button,
+  main > div > div.grid.gap-4 > section button > div:first-child { min-width: 0; }
+  main > div > div.grid.gap-4 > aside,
+  main > div > div.grid.gap-4 > aside p { overflow-wrap: anywhere; }
+}
