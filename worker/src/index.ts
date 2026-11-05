@@ -7781,18 +7781,25 @@ const worker = {
           const values = delhiveryRouteResults.map((result) => {
             const destinationValue = (result.destination as { prepaid?: boolean | null; cod?: boolean | null })[mode];
             const routeValue = (result.route as { prepaid?: boolean | null; cod?: boolean | null })[mode];
+            if (destinationValue === false || routeValue === false) return false;
             // The route/TAT response is authoritative for the live lane. A
             // pincode payload can carry account-specific or legacy negatives
             // even when it does not actually publish a payment capability.
-            // Never turn that ambiguous pincode value into a hard client
-            // rejection; only an explicit route capability can do that.
-            return routeValue === true || destinationValue === true ? true : null;
+            // Never turn an omitted capability into a client rejection. For a
+            // serviceable Delhivery B2B lane, the provider's authenticated
+            // manifest form exposes Collect on Delivery even though the
+            // pincode endpoint omits the positive COD flag. Treat that
+            // provider-confirmed account capability as available; explicit
+            // provider negatives above still win.
+            if (routeValue === true || destinationValue === true) return true;
+            if (mode === "cod" && delhiveryAccountIsB2b(result.accountName)) return true;
+            return null;
           });
           if (values.some((value) => value === true)) return true;
-          // Delhivery frequently omits payment capability fields for valid B2B
-          // lanes. Absence (and legacy false defaults) is not a provider
-          // rejection; keep it unknown until the provider explicitly confirms
-          // support for the selected mode.
+          if (values.some((value) => value === false)) return false;
+          // Delhivery can omit payment capability fields for valid lanes. Keep
+          // those lanes unknown unless the account-level B2B capability above
+          // or an explicit provider response confirms the mode.
           return null;
         };
         const paymentModes = { prepaid: modeAvailability("prepaid"), cod: modeAvailability("cod") };
