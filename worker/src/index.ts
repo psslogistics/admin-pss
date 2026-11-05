@@ -7781,6 +7781,12 @@ const worker = {
           const values = delhiveryRouteResults.map((result) => {
             const destinationValue = (result.destination as { prepaid?: boolean | null; cod?: boolean | null })[mode];
             const routeValue = (result.route as { prepaid?: boolean | null; cod?: boolean | null })[mode];
+            // The Delhivery B2B pincode endpoint currently returns a legacy
+            // `cash: N`/`cod: false` value even though the authenticated B2B
+            // manifest form offers Collect on delivery for this account. The
+            // account-level B2B capability therefore wins for COD; retain
+            // explicit provider negatives for other modes/providers.
+            if (mode === "cod" && delhiveryAccountIsB2b(result.accountName)) return true;
             if (destinationValue === false || routeValue === false) return false;
             // The route/TAT response is authoritative for the live lane. A
             // pincode payload can carry account-specific or legacy negatives
@@ -7792,7 +7798,6 @@ const worker = {
             // provider-confirmed account capability as available; explicit
             // provider negatives above still win.
             if (routeValue === true || destinationValue === true) return true;
-            if (mode === "cod" && delhiveryAccountIsB2b(result.accountName)) return true;
             return null;
           });
           if (values.some((value) => value === true)) return true;
