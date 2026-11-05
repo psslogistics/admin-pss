@@ -2602,7 +2602,7 @@ function providerPaymentFlags(value: Record<string, unknown> | null | undefined)
           if (parsed || !positive.prepaid) flags.prepaid = parsed;
           if (parsed) positive.prepaid = true;
         }
-        if (["cod", "cash", "cashondelivery", "codallowed", "codserviceable", "codavailable", "codenabled", "codflag"].includes(normalizedKey)) {
+        if (["cod", "cash", "cashondelivery", "cashondeliveryavailable", "codallowed", "codserviceable", "codavailability", "codavailable", "codenabled", "codflag", "iscod", "iscodavailable"].includes(normalizedKey)) {
           if (parsed || !positive.cod) flags.cod = parsed;
           if (parsed) positive.cod = true;
         }
@@ -3553,7 +3553,8 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       return null;
     };
     const tatDays = parseTat(parsedProviderBody) ?? findTat(body);
-    if (tatDays !== null && tatDays > 0) return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable: true, pickup: true, prepaid: true, cod: null, oda: null, tat_days: tatDays };
+    const routePaymentFlags = providerPaymentFlags(body);
+    if (tatDays !== null && tatDays > 0) return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable: true, pickup: true, prepaid: routePaymentFlags.prepaid, cod: routePaymentFlags.cod, oda: null, tat_days: tatDays };
     return { enabled: true, status: "failed" as const, providerStatus: response.status, error: "Delhivery returned an incomplete route serviceability response" };
   }
   if (response.ok && provider === "delhivery" && operation === "serviceability") {
@@ -7795,6 +7796,10 @@ const worker = {
           return null;
         };
         const paymentModes = { prepaid: modeAvailability("prepaid"), cod: modeAvailability("cod") };
+        const routeTatDays = delhiveryRouteResults
+          .map((result) => Number((result.route as { tat_days?: unknown }).tat_days))
+          .filter((value) => Number.isFinite(value) && value > 0);
+        const etaDays = routeTatDays.length ? Math.min(...routeTatDays) : null;
         const acceptedResult = routeResults.some((result) => result.origin.status === "accepted" && result.destination.status === "accepted");
         const failedResult = serviceabilityRows.some((row) => row.status === "Provider error" || row.status === "Not configured");
         const providerStatus = routeServiceable || acceptedResult ? "verified" : failedResult ? "provider_error" : configuredProviders.length ? "provider_contract_not_verified" : "provider_unavailable";
@@ -7814,6 +7819,7 @@ const worker = {
           availability_status: availabilityStatus,
           serviceability_provenance: serviceabilityProvenance ?? (failedResult ? "provider_unavailable" : undefined),
           payment_modes: paymentModes,
+          eta_days: etaDays,
           serviceability_rows: serviceabilityRows,
           provider_results: routeResults,
         } }, 200, headers);
