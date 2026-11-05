@@ -2,7 +2,6 @@ import { redirect } from 'next/navigation'
 import { cache } from 'react'
 import { createClient } from '@/lib/supabase/server'
 
-
 const getEmployeeAccess = cache(async () => {
   const supabase = await createClient(); const claimsResult = await supabase.auth.getClaims(); const userId = claimsResult.data?.claims?.sub;
   if (!userId) redirect('/sign-in');
@@ -30,7 +29,8 @@ const getEmployeeAccess = cache(async () => {
     : { data: [], error: null };
   if (directRolePermissionsError) redirect('/access-denied?reason=database');
   const context = (authContext && typeof authContext === 'object' ? authContext : {}) as {
-    permissions?: Array<{ permission_key?: string }>; permission_overrides?: Array<{ permission_key?: string; mode?: string }>; active_client_ids?: string[];
+    permissions?: Array<{ permission_key?: string }>; permission_overrides?: Array<{ permission_key?: string; mode?: string }>;
+    active_client_ids?: string[];
   };
   const directPermissions = (directRolePermissions ?? []).map((item) => item.permission_key).filter((item): item is string => Boolean(item));
   // Keep the server-rendered navigation on the same permission snapshot as
@@ -39,3 +39,29 @@ const getEmployeeAccess = cache(async () => {
   const contextPermissions = (context.permissions ?? []).map((item) => item.permission_key).filter((item): item is string => Boolean(item));
   const permissions = new Set((contextPermissions.length ? contextPermissions : directPermissions).filter((item): item is string => Boolean(item)));
   for (const override of context.permission_overrides ?? []) {
+    if (!override.permission_key) continue;
+    if (override.mode === 'grant') permissions.add(override.permission_key);
+    if (override.mode === 'revoke') permissions.delete(override.permission_key);
+  }
+  const assignedClientIds = [...new Set([
+    ...(context.active_client_ids ?? []),
+    ...(employeeAssignments ?? []).map((item) => item.client_id),
+  ])].filter((id): id is string => typeof id === 'string' && Boolean(id));
+  const resolvedAssignedClients = (employeeAssignments ?? []).flatMap((item) => {
+    const client = Array.isArray(item.client_accounts) ? item.client_accounts[0] : item.client_accounts;
+    return client ? [{ id: client.id, name: client.legal_name, contact: '', location: '', shipments: 0, status: client.status === 'active' ? 'Active' : client.status, lastActivity: 'Live assignment activity' }] : [];
+  });
+  const assignedClients = resolvedAssignedClients.length ? resolvedAssignedClients : assignedClientIds.map((id) => ({ id, name: 'Assigned client', contact: '', location: '', shipments: 0, status: 'Active', lastActivity: 'Live assignment scope' }));
+  return { userId, profile: data, employee: employeeProfile, roles, permissions: [...permissions], assignedClientIds, assignedClients };
+});
+
+export async function requireEmployeeAccess() { return getEmployeeAccess(); }
+
+export async function requireEmployeePermission(permission: string) {
+  const actor = await requireEmployeeAccess();
+  const supabase = await createClient();
+  const { data, error } = await supabase.rpc('has_permission', { required_permission: permission });
+  if (error) redirect('/access-denied?reason=database');
+  if (!data) redirect('/access-denied?reason=permission');
+  return actor;
+}
