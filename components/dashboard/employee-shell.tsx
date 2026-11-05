@@ -34,6 +34,20 @@ export default function EmployeeShell({ children }: { children: React.ReactNode 
   const searchResults = useMemo(() => searchEmployeeMaster(searchQuery, profile, clients, tasks, activity, notifications), [searchQuery, profile, clients, tasks, activity, notifications]);
   const unreadCount = notifications.filter((item) => !item.read).length;
 
+  useEffect(() => {
+    const labelTicketReply = () => {
+      document.querySelectorAll<HTMLTextAreaElement>('textarea[placeholder="Write a reply..."]').forEach((field) => {
+        if (!field.getAttribute("aria-label")) field.setAttribute("aria-label", "Ticket reply");
+      });
+    };
+    labelTicketReply();
+    const main = document.querySelector("main");
+    if (!main) return;
+    const observer = new MutationObserver(labelTicketReply);
+    observer.observe(main, { childList: true, subtree: true });
+    return () => observer.disconnect();
+  }, [pathname]);
+
   const signOut = async () => {
     setProfileOpen(false);
     await createClient().auth.signOut({ scope: "global" });
