@@ -7785,12 +7785,13 @@ const worker = {
             // even when it does not actually publish a payment capability.
             // Never turn that ambiguous pincode value into a hard client
             // rejection; only an explicit route capability can do that.
-            return routeValue !== null && routeValue !== undefined
-              ? routeValue
-              : destinationValue === true ? true : null;
+            return routeValue === true || destinationValue === true ? true : null;
           });
           if (values.some((value) => value === true)) return true;
-          if (values.some((value) => value === false)) return false;
+          // Delhivery frequently omits payment capability fields for valid B2B
+          // lanes. Absence (and legacy false defaults) is not a provider
+          // rejection; keep it unknown until the provider explicitly confirms
+          // support for the selected mode.
           return null;
         };
         const paymentModes = { prepaid: modeAvailability("prepaid"), cod: modeAvailability("cod") };
