@@ -35,6 +35,7 @@ export const navigationGroups: NavigationGroup[] = [
       { title: "Tracking", href: "/dashboard/tracking", icon: "shipment", permission: "admin.tracking.view" },
       { title: "Pickup", href: "/dashboard/pickup", icon: "pickups", permission: "admin.pickup.view" },
       { title: "Reports", href: "/dashboard/reports", icon: "reports", permission: "admin.reports.view" },
+      { title: "Wallet activity", href: "/dashboard/wallet", icon: "reports", permission: "admin.wallet.view" },
       { title: "Rate Cards", href: "/dashboard/rate-cards", icon: "reports", permission: "admin.rate_cards.view" },
       { title: "Weight Reconciliation", href: "/dashboard/weight-reconciliation", icon: "reports", permission: "admin.weight.view" },
     ],
