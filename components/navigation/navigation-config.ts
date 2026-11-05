@@ -22,6 +22,7 @@ export const navigationGroups: NavigationGroup[] = [
     label: "My work",
     items: [
       { title: "My Clients", href: "/dashboard/myClients", icon: "clients", permission: "admin.clients.view" },
+      { title: "Addresses", href: "/dashboard/addresses", icon: "clients", permission: "admin.addresses.view" },
       { title: "My Tasks", href: "/dashboard/myTasks", icon: "tasks", permission: "admin.tasks.view" },
       { title: "My Activity", href: "/dashboard/myActivity", icon: "employeeActivity", permission: "admin.activity.view" },
     ],

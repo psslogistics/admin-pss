@@ -10,8 +10,8 @@
     "qs": ">=6.16.0"
   },
   "scripts": {
-    "dev": "next dev",
     "build": "next build",
+    "dev": "next dev",
     "start": "next start",
     "lint": "eslint",
     "test:pricing": "node --experimental-strip-types worker/tools/pricing-engine-acceptance.mjs",
@@ -24,10 +24,34 @@
     "test:warehouse": "node worker/tools/exact-warehouse-contract-acceptance.mjs && node --experimental-strip-types worker/tools/exact-warehouse-flow-matrix.mjs",
     "test:provider-weight": "node --experimental-strip-types --test worker/tools/provider-weight.test.mjs",
     "test:test-data": "node worker/tools/test-data-visibility-acceptance.mjs",
-    "test:notifications": "node worker/tools/notification-preference-acceptance.mjs"
+    "test:staging-flow": "node --experimental-strip-types --test worker/tools/staging-flow-contract.test.mjs",
+    "test:permission-parity": "node --experimental-strip-types worker/tools/employee-permission-parity-contract.mjs",
+    "test:task-permissions": "node --experimental-strip-types worker/tools/employee-task-permission-contract.mjs",
+    "test:tracking-refresh": "node --experimental-strip-types worker/tools/employee-tracking-refresh-contract.mjs",
+    "test:shipment-cancel": "node --experimental-strip-types worker/tools/employee-shipment-cancel-contract.mjs",
+    "test:pickup-status": "node --experimental-strip-types worker/tools/employee-pickup-status-contract.mjs",
+    "test:exception-permissions": "node --experimental-strip-types worker/tools/employee-exception-permission-contract.mjs",
+    "test:returns-permissions": "node --experimental-strip-types worker/tools/employee-returns-permission-contract.mjs",
+    "test:rate-card-parity": "node --experimental-strip-types worker/tools/employee-rate-card-parity-contract.mjs",
+    "test:report-export": "node --experimental-strip-types worker/tools/employee-report-export-contract.mjs",
+    "test:address-read": "node --experimental-strip-types worker/tools/employee-address-read-contract.mjs",
+    "test:label-permissions": "node --experimental-strip-types worker/tools/employee-label-permission-contract.mjs",
+    "test:booking-document-permissions": "node --experimental-strip-types worker/tools/employee-booking-document-permission-contract.mjs",
+    "test:audit-export": "node --experimental-strip-types worker/tools/employee-audit-export-contract.mjs",
+    "test:finance-export": "node --experimental-strip-types worker/tools/employee-finance-export-contract.mjs",
+    "test:shipment-intervention": "node --experimental-strip-types worker/tools/employee-shipment-intervention-contract.mjs",
+    "test:security-session": "node --experimental-strip-types worker/tools/employee-security-session-contract.mjs",
+    "test:rate-card-publish": "node --experimental-strip-types worker/tools/employee-rate-card-publish-contract.mjs",
+    "test:returns-view": "node --experimental-strip-types worker/tools/employee-returns-view-contract.mjs",
+    "test:notifications": "node worker/tools/notification-preference-acceptance.mjs",
+    "preview": "opennextjs-cloudflare build && opennextjs-cloudflare preview",
+    "deploy": "opennextjs-cloudflare build && opennextjs-cloudflare deploy",
+    "upload": "opennextjs-cloudflare build && opennextjs-cloudflare upload",
+    "cf-typegen": "wrangler types --env-interface CloudflareEnv cloudflare-env.d.ts"
   },
   "dependencies": {
     "@base-ui/react": "^1.7.0",
+    "@opennextjs/cloudflare": "^1.20.15",
     "@supabase/ssr": "^0.12.5",
     "@supabase/supabase-js": "^2.112.4",
     "class-variance-authority": "^0.7.1",
@@ -48,6 +72,7 @@
     "eslint-config-next": "^16.3.5",
     "shadcn": "^4.21.0",
     "tailwindcss": "^4",
-    "typescript": "^5"
+    "typescript": "^5",
+    "wrangler": "^4.156.1"
   }
 }

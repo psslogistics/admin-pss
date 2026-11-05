@@ -74,14 +74,16 @@ export function EmployeeProvider({ children, initialIdentity, initialPermissions
       const summaryPermissions = summaryResult.data?.permissions;
       const apiPermissions = Array.isArray(summaryPermissions) ? summaryPermissions : null;
       const roleBasedPermissions = permissionSet((rolePermissions ?? []) as Array<{ permission_key?: string }>, allowed);
-      // The direct role-permission query is the freshest authenticated source
-      // after a role change. Prefer it when it returns rows so a previous
-      // server-layout snapshot cannot leave stale navigation visible after a
-      // user signs in with a different employee role.
+      // The server layout and protected routes use get_auth_context() plus
+      // has_permission(). Keep the browser shell on that same snapshot so a
+      // direct role query cannot expose a navigation item whose route/API is
+      // denied by the authoritative RBAC function.
       const effectivePermissions = new Set<PermissionKey>(
-        roleIds.length > 0 && !rolePermissionsError
-          ? roleBasedPermissions
-          : initialPermissions.filter((permission): permission is PermissionKey => isAdminPermission(permission)),
+        initialPermissions.length
+          ? initialPermissions.filter((permission): permission is PermissionKey => isAdminPermission(permission))
+          : roleIds.length > 0 && !rolePermissionsError
+            ? roleBasedPermissions
+            : [],
       );
       // Keep the Worker response as a fallback for deployments where both the
       // role query and the server snapshot are unavailable.
@@ -96,8 +98,14 @@ export function EmployeeProvider({ children, initialIdentity, initialPermissions
         if (override.mode === "revoke") effectivePermissions.delete(override.permission_key);
       }
       const queriedAssignedClientIds = (assignments ?? []).map((item) => item.client_id).filter(Boolean);
+      // The server layout has already resolved the same authenticated scope
+      // through get_auth_context. Keep that authoritative snapshot when a
+      // browser-side RLS read is briefly empty during session restoration.
       const assignedClientIds = initialIdentity?.assignedClientIds?.length ? initialIdentity.assignedClientIds : queriedAssignedClientIds;
       const queriedClients: AssignedClient[] = (assignments ?? []).flatMap((item) => { const client = Array.isArray(item.client_accounts) ? item.client_accounts[0] : item.client_accounts; return client ? [{ id: client.id, name: client.legal_name, contact: "", location: "", shipments: 0, status: client.status === "active" ? "Active" : client.status, lastActivity: "Live assignment activity" }] : []; });
+      // A transient browser-side RLS read can return no assignment rows while
+      // the trusted server layout has already resolved the employee scope.
+      // Keep the client cards/count aligned with that server snapshot too.
       const loadedClients = queriedClients.length ? queriedClients : (initialIdentity?.assignedClients ?? []);
       let liveTickets: DemoTicket[] = []; let liveNotifications: DemoNotification[] = []; let liveShipments: DemoShipment[] = []; let liveTasks: EmployeeTask[] = []; let liveActivity: EmployeeActivity[] = [];
       let liveSettings: EmployeeSettings = initialSettings;

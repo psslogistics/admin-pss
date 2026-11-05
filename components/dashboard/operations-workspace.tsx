@@ -43,9 +43,11 @@ const handleBookingSubmit = async (booking: ShipmentBooking) => { const dimensio
 }
 
 function ReportCards() {
+  const { can } = useEmployee();
   const [rows, setRows] = useState<Array<{ status?: string; shipments?: number; delayed?: number }>>([]);
   const [error, setError] = useState<PssErrorDetails | null>(null);
   const [loading, setLoading] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const load = () => {
     setLoading(true);
     setError(null);
@@ -58,6 +60,15 @@ function ReportCards() {
   useEffect(() => { load(); }, []);
   const total = rows.reduce((sum, row) => sum + Number(row.shipments ?? 0), 0);
   const delayed = rows.reduce((sum, row) => sum + Number(row.delayed ?? 0), 0);
+  const exportReport = async () => {
+    setExporting(true);
+    try {
+      const result = await pssApi<{ csv?: string; filename?: string }>("/v1/reports/shipments?format=csv");
+      const blob = new Blob([result.csv ?? ""], { type: "text/csv;charset=utf-8" });
+      const url = URL.createObjectURL(blob); const anchor = document.createElement("a"); anchor.href = url; anchor.download = result.filename ?? "shipment-report.csv"; anchor.click(); URL.revokeObjectURL(url);
+    } catch (caught) { setError(getPssErrorDetails(caught, "The report export is temporarily unavailable.")); }
+    finally { setExporting(false); }
+  };
   return <div className="space-y-4 md:col-span-2 xl:col-span-3">
     <div className="grid gap-3 sm:grid-cols-3">
       <Metric label="Shipments" value={loading || error ? "—" : String(total)} detail={loading ? "Loading production report…" : "Production records"} icon={ClipboardList} />
@@ -67,7 +78,7 @@ function ReportCards() {
     <section className="overflow-hidden rounded-xl border border-border/70 bg-card">
       <div className="flex items-center justify-between border-b border-border/70 p-4">
         <div><h2 className="text-sm font-semibold">Shipment report</h2><p className="mt-1 text-xs text-muted-foreground">Grouped from the production Worker report endpoint.</p></div>
-        <button type="button" onClick={load} disabled={loading} className="rounded-lg border border-border px-3 py-2 text-xs font-semibold disabled:opacity-50">{loading ? "Refreshing…" : "Refresh"}</button>
+        <div className="flex items-center gap-2"><button type="button" onClick={load} disabled={loading} className="rounded-lg border border-border px-3 py-2 text-xs font-semibold disabled:opacity-50">{loading ? "Refreshing…" : "Refresh"}</button>{can("admin.reports.export") && <button type="button" onClick={() => void exportReport()} disabled={exporting} className="rounded-lg border border-border px-3 py-2 text-xs font-semibold disabled:opacity-50">{exporting ? "Exporting…" : "Export CSV"}</button>}</div>
       </div>
       {error ? <div role="alert" className="flex flex-wrap items-start justify-between gap-3 p-4 text-xs text-destructive">
         <div><p>Shipment report is unavailable; no empty totals are being shown as valid data. {error.message}</p><details className="mt-2"><summary className="cursor-pointer font-semibold">Technical details</summary><p className="mt-1 break-words">{error.technicalMessage}{error.providerCode ? ` · Provider code: ${error.providerCode}` : ""}{error.requestId ? ` · Request ID: ${error.requestId}` : ""}</p></details></div>

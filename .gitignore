@@ -52,3 +52,13 @@ next-env.d.ts
 /worker/.wrangler-dry-run/
 /worker/tmp/
 /worker/worker/.wrangler-fujiyama-verify/
+
+# OpenNext
+.open-next
+
+# wrangler files
+.wrangler
+.dev.vars*
+!.dev.vars.example
+
+!.env.example

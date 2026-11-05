@@ -12,7 +12,7 @@ const checks = [
   ["API-key tenant binding", source.includes("clientIds: new Set([row.client_id])")],
   ["canonical booking delegation", source.includes('route = "/shipments"')],
   ["persisted booking reference", source.includes("provider_reference FROM shipments WHERE id = ? AND client_id = ?")],
-  ["tracking uses database lookup", source.includes("FROM shipments WHERE client_id = ? AND (tracking_number = ? OR provider_reference = ?)")],
+  ["tracking uses client-scoped database lookup", /FROM shipments WHERE client_id = \? AND \(tracking_number = \? OR lr_number = \? OR provider_reference = \?\)/.test(source)],
   ["tracking refreshes Delhivery", (() => { const start = source.indexOf('route === "/fujiyama/tracking"'); const end = source.indexOf('route === "/fujiyama/bookings"', start); return start >= 0 && end > start && source.slice(start, end).includes('safeProviderRequest(env, "delhivery", "tracking"'); })()],
   ["tracking falls back to assigned Delhivery accounts", source.includes("No shipment found in PSS or the client’s active Delhivery accounts") && source.includes("FROM provider_accounts pa")],
   ["tracking returns provider status", source.includes("provider_status: providerResult.status")],
