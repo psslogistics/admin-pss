@@ -267,8 +267,8 @@ function hasScope(auth: Auth, scope: string) {
     "tasks.create": ["tasks.create", "admin.tasks.create"], "tasks.edit": ["tasks.edit", "admin.tasks.edit"], "tasks.complete": ["tasks.complete", "admin.tasks.complete"], "tasks.assign": ["tasks.assign", "admin.tasks.assign"],
     "departments.read": ["departments.read", "departments.view", "admin.departments.view"], "departments.manage": ["departments.manage", "admin.departments.manage"],
     "activity.read": ["activity.read", "employee_activity.view", "admin.activity.view", "admin.audit.view", "audit.view"], "security.view": ["security.view", "admin.security.view"], "security.session_revoke": ["security.session_revoke", "admin.security.session_revoke"],
-    "integrations.read": ["integrations.view", "admin.integrations.view"], "webhooks.read": ["api_keys.view", "integrations.view", "admin.api_keys.view"],
-    "provider_accounts.read": ["integrations.view", "admin.integrations.view"], "provider_accounts.manage": ["integrations.manage", "admin.integrations.manage"],
+    "integrations.read": ["integrations.view", "admin.integrations.view", "admin.couriers.view"], "webhooks.read": ["api_keys.view", "integrations.view", "admin.api_keys.view"],
+    "provider_accounts.read": ["integrations.view", "admin.integrations.view", "admin.couriers.view"], "provider_accounts.manage": ["integrations.manage", "admin.integrations.manage"],
     "pricing.read": ["pricing.view", "admin.pricing.view", "rate_cards.manage", "admin.rate_cards.view", "admin.rate_cards.manage"],
     "pricing.manage": ["pricing.manage", "admin.pricing.manage", "rate_cards.manage", "admin.rate_cards.manage"],
     "pricing.publish": ["pricing.publish", "admin.pricing.publish", "admin.rate_cards.publish", "rate_cards.manage", "admin.rate_cards.manage"],
@@ -4955,6 +4955,7 @@ const worker = {
         return json({ ok: true, data }, 200, headers);
       }
       if (route === "/provider-capabilities" && request.method === "GET") {
+        if (!hasScope(auth, "integrations.read")) return error("FORBIDDEN", "Integration visibility permission required", 403, id, headers);
         const callsEnabled = String(env.ENABLE_PROVIDER_CALLS) === "true";
         const delhiveryConfigured = Boolean(env.DELHIVERY_API_BASE_URL && env.DELHIVERY_API_TOKEN);
         const ekartConfigured = Boolean(env.EKART_API_BASE_URL && env.EKART_API_KEY);

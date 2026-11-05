@@ -18,7 +18,7 @@ const config: Record<Mode, { title: string; eyebrow: string; description: string
 };
 
 export default function OperationsWorkspace({ mode }: { mode: Mode }) {
-  const { profile, getVisibleClients, addActivity } = useEmployee();
+  const { profile, getVisibleClients, addActivity, can } = useEmployee();
   const copy = config[mode];
   const Icon = copy.icon;
   const [query, setQuery] = useState("");
