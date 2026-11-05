@@ -3598,7 +3598,13 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     const code = Array.isArray(body.delivery_codes) ? (body as { delivery_codes: Array<Record<string, unknown>> }).delivery_codes[0] : null;
     const postal = code?.postal_code && typeof code.postal_code === "object" ? code.postal_code as Record<string, unknown> : null;
     if (!postal) return { enabled: true, status: "failed" as const, providerStatus: response.status, error: "Delhivery returned an incomplete pincode serviceability response" };
-    return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable: Boolean(postal && (String(postal.pre_paid ?? "N").toUpperCase() === "Y" || String(postal.cash ?? "N").toUpperCase() === "Y")), prepaid: String(postal?.pre_paid ?? "N").toUpperCase() === "Y", cod: String(postal?.cash ?? "N").toUpperCase() === "Y", pickup: String(postal?.pickup ?? "N").toUpperCase() === "Y", oda: providerOdaFlag(postal), facility_city: String(postal?.city ?? postal?.district ?? "").trim() || undefined, facility_state: String(postal?.state ?? "").trim() || undefined };
+    const hasPrepaidFlag = postal ? Object.prototype.hasOwnProperty.call(postal, "pre_paid") : false;
+    const hasCodFlag = postal ? Object.prototype.hasOwnProperty.call(postal, "cash") : false;
+    const hasPickupFlag = postal ? Object.prototype.hasOwnProperty.call(postal, "pickup") : false;
+    const prepaid = hasPrepaidFlag ? String(postal?.pre_paid ?? "").toUpperCase() === "Y" : null;
+    const cod = hasCodFlag ? String(postal?.cash ?? "").toUpperCase() === "Y" : null;
+    const pickup = hasPickupFlag ? String(postal?.pickup ?? "").toUpperCase() === "Y" : null;
+    return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable: postal !== null && (prepaid === true || cod === true || pickup === true), prepaid, cod, pickup, oda: providerOdaFlag(postal), facility_city: String(postal?.city ?? postal?.district ?? "").trim() || undefined, facility_state: String(postal?.state ?? "").trim() || undefined };
   }
   if (response.ok && provider === "rivigo" && operation === "serviceability") {
     const payloadBody = parsedProviderBody && typeof parsedProviderBody === "object" ? (parsedProviderBody as Record<string, unknown>).payload : null;
