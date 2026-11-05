@@ -38,11 +38,15 @@ const getEmployeeAccess = cache(async () => {
     if (override.mode === 'grant') permissions.add(override.permission_key);
     if (override.mode === 'revoke') permissions.delete(override.permission_key);
   }
-  const assignedClientIds = (context.active_client_ids ?? []).filter((id): id is string => typeof id === 'string' && Boolean(id));
-  const assignedClients = (employeeAssignments ?? []).flatMap((item) => {
+  const assignedClientIds = [...new Set([
+    ...(context.active_client_ids ?? []),
+    ...(employeeAssignments ?? []).map((item) => item.client_id),
+  ])].filter((id): id is string => typeof id === 'string' && Boolean(id));
+  const resolvedAssignedClients = (employeeAssignments ?? []).flatMap((item) => {
     const client = Array.isArray(item.client_accounts) ? item.client_accounts[0] : item.client_accounts;
     return client ? [{ id: client.id, name: client.legal_name, contact: '', location: '', shipments: 0, status: client.status === 'active' ? 'Active' : client.status, lastActivity: 'Live assignment activity' }] : [];
   });
+  const assignedClients = resolvedAssignedClients.length ? resolvedAssignedClients : assignedClientIds.map((id) => ({ id, name: 'Assigned client', contact: '', location: '', shipments: 0, status: 'Active', lastActivity: 'Live assignment scope' }));
   return { userId, profile: data, employee: employeeProfile, roles, permissions: [...permissions], assignedClientIds, assignedClients };
 });
 
