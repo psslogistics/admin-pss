@@ -74,20 +74,17 @@ export function EmployeeProvider({ children, initialIdentity, initialPermissions
       const summaryPermissions = summaryResult.data?.permissions;
       const apiPermissions = Array.isArray(summaryPermissions) ? summaryPermissions : null;
       const roleBasedPermissions = permissionSet((rolePermissions ?? []) as Array<{ permission_key?: string }>, allowed);
-      // The Worker is an additional production cross-check, not a reason to
-      // erase permissions when a stale deployment or transient API response
-      // returns an empty list. Supabase is the same authenticated source used
-      // by the server-side permission gate, so retain it as the safe fallback.
-      // The server layout already passed the same auth-context snapshot used
-      // by the route guard. Keep it as the authoritative base so RLS on the
-      // permission catalogue cannot make a permitted screen render as denied.
-      const effectivePermissions = new Set(initialPermissions.filter((permission): permission is PermissionKey => isAdminPermission(permission)));
-      // Keep the Worker response as a fallback for deployments where the
-      // Supabase permission query is unavailable. Do not replace the complete
-      // role catalogue with a partial Worker response.
-      if (!effectivePermissions.size && roleBasedPermissions.length) {
-        for (const permission of roleBasedPermissions) effectivePermissions.add(permission);
-      }
+      // The direct role-permission query is the freshest authenticated source
+      // after a role change. Prefer it when it returns rows so a previous
+      // server-layout snapshot cannot leave stale navigation visible after a
+      // user signs in with a different employee role.
+      const effectivePermissions = new Set<PermissionKey>(
+        roleBasedPermissions.length
+          ? roleBasedPermissions
+          : initialPermissions.filter((permission): permission is PermissionKey => isAdminPermission(permission)),
+      );
+      // Keep the Worker response as a fallback for deployments where both the
+      // role query and the server snapshot are unavailable.
       if (!effectivePermissions.size && apiPermissions?.length) {
         for (const permission of apiPermissions) {
           if (allowed.has(permission) && isAdminPermission(permission)) effectivePermissions.add(permission);
