@@ -249,27 +249,29 @@ function hasScope(auth: Auth, scope: string) {
   // applies to authenticated first-party system users.
   if (auth.system) return true;
   const permissionMap: Record<string, string[]> = {
-    "shipments.read": ["shipments.read", "shipments.view", "admin.shipments.view", "admin.shipments.assigned.view", "admin.tracking.view"], "tracking.read": ["tracking.read", "tracking.view", "admin.tracking.view"],
+    "shipments.read": ["shipments.read", "shipments.view", "admin.shipments.view", "admin.shipments.assigned.view", "admin.tracking.view"], "shipments.edit": ["shipments.edit", "admin.shipments.edit"], "tracking.read": ["tracking.read", "tracking.view", "admin.tracking.view"], "tracking.refresh": ["tracking.refresh", "admin.tracking.refresh"], "tracking.intervene": ["tracking.intervene", "admin.tracking.intervene"],
     "shipments.sensitive.read": ["shipments.sensitive.read", "admin.shipments.sensitive.view"],
     "provider_data.correct": ["shipments.provider_data.correct"],
-    "shipments.create": ["shipments.create", "admin.booking.create"], "pickups.read": ["pickups.read", "pickup.view", "admin.pickup.view"],
-    "pickups.create": ["pickups.create", "pickup.create", "admin.pickup.create"], "pickups.manage": ["pickups.manage", "pickup.assign", "admin.pickup.assign"],
+    "shipments.create": ["shipments.create", "admin.booking.create"], "bookings.documents.manage": ["bookings.documents.manage", "admin.bookings.documents.manage", "documents.manage"], "shipments.cancel": ["shipments.cancel", "admin.shipments.cancel"], "pickups.read": ["pickups.read", "pickup.view", "admin.pickup.view"],
+    "pickups.create": ["pickups.create", "pickup.create", "admin.pickup.create"], "pickups.manage": ["pickups.manage", "pickup.assign", "admin.pickup.assign"], "pickups.cancel": ["pickups.cancel", "admin.pickup.cancel"], "pickups.update_status": ["pickups.update_status", "admin.pickup.update_status"],
     "documents.read": ["documents.read", "admin.documents.pod.view", "admin.documents.pod.download"], "documents.manage": ["documents.manage", "admin.booking.create"],
-    "reports.read": ["reports.read", "reports.view", "admin.reports.view"], "tickets.read": ["tickets.read", "tickets.view", "admin.support.view", "admin.tickets.view"],
+    "documents.label.view": ["documents.label.view", "admin.documents.label.view", "admin.documents.label.download"], "documents.label.download": ["documents.label.download", "admin.documents.label.download"],
+    "reports.read": ["reports.read", "reports.view", "admin.reports.view"], "reports.export": ["reports.export", "admin.reports.export"], "audit.export": ["audit.export", "admin.audit.export"], "billing.export": ["billing.export", "admin.billing.export"], "transactions.export": ["transactions.export", "admin.transactions.export"], "tickets.read": ["tickets.read", "tickets.view", "admin.support.view", "admin.tickets.view"],
     "tickets.create": ["tickets.create", "tickets.reply", "admin.tickets.create"], "notifications.read": ["notifications.read", "notifications.view", "admin.notifications.view"],
-    "cases.read": ["cases.read", "exceptions.view", "admin.exceptions.view"], "cases.manage": ["cases.manage", "exceptions.manage", "admin.exceptions.manage", "admin.tracking.update"],
-    "addresses.manage": ["addresses.manage", "admin.booking.create"], "quotes.create": ["quotes.create", "admin.booking.create"],
+    "cases.read": ["cases.read", "exceptions.view", "admin.exceptions.view"], "returns.read": ["returns.read", "admin.returns.view", "admin.returns.manage"], "cases.manage": ["cases.manage", "exceptions.manage", "admin.exceptions.manage", "admin.tracking.update"], "exceptions.assign": ["exceptions.assign", "admin.exceptions.assign"], "exceptions.resolve": ["exceptions.resolve", "admin.exceptions.resolve"], "returns.manage": ["returns.manage", "admin.returns.manage"],
+    "addresses.read": ["addresses.read", "admin.addresses.view", "addresses.manage", "admin.booking.create"], "addresses.manage": ["addresses.manage", "admin.booking.create"], "quotes.create": ["quotes.create", "admin.booking.create"],
     "billing.read": ["billing.read", "billing.view"], "wallet.read": ["wallet.read", "transactions.view"],
     "billing.manage": ["billing.manage", "billing.create", "billing.approve"], "wallet.manage": ["wallet.manage", "transactions.manage"],
     "cod.read": ["cod.read", "transactions.view"], "cod.manage": ["cod.manage", "billing.approve"], "weight.read": ["weight.read", "billing.view", "admin.weight.view"], "weight.manage": ["weight.manage", "billing.approve", "admin.weight.manage"],
     "tasks.read": ["tasks.read", "tasks.view", "admin.tasks.view"], "tasks.manage": ["tasks.manage", "admin.tasks.manage"],
+    "tasks.create": ["tasks.create", "admin.tasks.create"], "tasks.edit": ["tasks.edit", "admin.tasks.edit"], "tasks.complete": ["tasks.complete", "admin.tasks.complete"], "tasks.assign": ["tasks.assign", "admin.tasks.assign"],
     "departments.read": ["departments.read", "departments.view", "admin.departments.view"], "departments.manage": ["departments.manage", "admin.departments.manage"],
-    "activity.read": ["activity.read", "employee_activity.view", "admin.activity.view", "admin.audit.view", "audit.view"],
+    "activity.read": ["activity.read", "employee_activity.view", "admin.activity.view", "admin.audit.view", "audit.view"], "security.view": ["security.view", "admin.security.view"], "security.session_revoke": ["security.session_revoke", "admin.security.session_revoke"],
     "integrations.read": ["integrations.view", "admin.integrations.view"], "webhooks.read": ["api_keys.view", "integrations.view", "admin.api_keys.view"],
     "provider_accounts.read": ["integrations.view", "admin.integrations.view"], "provider_accounts.manage": ["integrations.manage", "admin.integrations.manage"],
     "pricing.read": ["pricing.view", "admin.pricing.view", "rate_cards.manage", "admin.rate_cards.view", "admin.rate_cards.manage"],
     "pricing.manage": ["pricing.manage", "admin.pricing.manage", "rate_cards.manage", "admin.rate_cards.manage"],
-    "pricing.publish": ["pricing.publish", "admin.pricing.publish", "rate_cards.manage", "admin.rate_cards.manage"],
+    "pricing.publish": ["pricing.publish", "admin.pricing.publish", "admin.rate_cards.publish", "rate_cards.manage", "admin.rate_cards.manage"],
     "pricing.override": ["pricing.override", "admin.pricing.override", "rate_cards.manage", "admin.rate_cards.manage"],
     "provider_cost.view": ["provider_cost.view", "admin.provider_cost.view"],
     "documents.pod.download": ["documents.pod.download", "admin.documents.pod.download"],
@@ -286,7 +288,7 @@ function hasScope(auth: Auth, scope: string) {
   // widening assignment visibility.
   if (["shipments.read", "tracking.read", "pickups.read", "documents.read", "reports.read", "departments.read"].includes(scope)) return auth.audience === "employee" || roles.has("client") || roles.has("employee") || roles.has("admin");
   if (auth.roles.has("employee")) return false;
-  if (["shipments.create", "pickups.create", "documents.manage", "tickets.create", "tickets.read", "notifications.read", "cases.read", "cases.manage", "addresses.manage", "quotes.create", "billing.read", "wallet.read", "cod.read", "weight.read", "tasks.read", "activity.read"].includes(scope)) return roles.has("client") || roles.has("employee") || roles.has("admin");
+  if (["shipments.create", "pickups.create", "documents.manage", "bookings.documents.manage", "tickets.create", "tickets.read", "notifications.read", "cases.read", "cases.manage", "addresses.manage", "quotes.create", "billing.read", "wallet.read", "cod.read", "weight.read", "tasks.read", "activity.read"].includes(scope)) return roles.has("client") || roles.has("employee") || roles.has("admin");
   if (scope === "pickups.manage") return roles.has("client") || roles.has("employee") || roles.has("admin");
   if (scope === "tasks.manage") return roles.has("employee") || roles.has("admin");
   if (scope === "departments.manage") return roles.has("admin") || roles.has("super_admin");
@@ -297,6 +299,7 @@ function hasScope(auth: Auth, scope: string) {
   if (["api_keys.read", "api_keys.manage", "integrations.read", "webhooks.read"].includes(scope)) return roles.has("admin");
   return false;
 }
+function hasAnyScope(auth: Auth, scopes: string[]) { return scopes.some((scope) => hasScope(auth, scope)); }
 const API_KEY_SCOPES = new Set(["shipments.read", "tracking.read", "shipments.create", "pickups.read", "pickups.create", "pickups.manage", "documents.read", "documents.manage", "reports.read", "tickets.read", "tickets.create", "notifications.read", "cases.read", "cases.manage", "addresses.manage", "quotes.create", "billing.read", "billing.manage", "wallet.read", "wallet.manage", "cod.read", "cod.manage", "weight.read", "weight.manage", "tasks.read", "tasks.manage", "activity.read"]);
 const shipmentTransitions: Record<string, Set<string>> = {
   booked: new Set(["booked", "picked_up", "cancelled", "exception"]),
@@ -773,12 +776,75 @@ async function ensureDefaultClientPricing(env: Env, clientId: string, actor = "s
   await env.DB.batch(statements);
   return env.DB.prepare("SELECT id, status, effective_at, minimum_weight_kg, volumetric_divisor, gst_percent FROM pricing_versions WHERE client_id = ? AND provider = 'delhivery' AND service_level = 'b2b' AND status = 'active' AND datetime(effective_at) <= CURRENT_TIMESTAMP ORDER BY datetime(effective_at) DESC LIMIT 1").bind(clientId).first<{ id: string; status: string; effective_at: string; minimum_weight_kg: number; volumetric_divisor: number; gst_percent: number }>();
 }
-async function ensureDefaultClientProviderPolicies(env: Env, clientId: string, actor = "system") {
-  const accounts = await env.DB.prepare("SELECT id, credential_secret_name FROM provider_accounts WHERE provider = 'delhivery' AND status = 'active' AND account_name IN ('PSSLOGISTICS04 B2BC', 'PSSLOGISTICS08 B2BC', 'PSSLOGISTICS10 B2BC', 'PSSCHANDIGARHCARGO6 B2BC')").all<{ id: string; credential_secret_name: string }>();
-  const secretBag = env as unknown as Record<string, unknown>;
-  const configured = accounts.results.filter((account) => typeof secretBag[account.credential_secret_name] === "string" && String(secretBag[account.credential_secret_name]).trim());
-  if (!configured.length) return;
-  await env.DB.batch(configured.map((account) => env.DB.prepare("INSERT OR IGNORE INTO provider_account_client_policies (provider_account_id, client_id, enabled, priority, confidence_score, rate_card_id, notes, updated_by_user_id, updated_at) VALUES (?, ?, 1, 100, 0, NULL, 'Default Delhivery B2B account assignment', ?, CURRENT_TIMESTAMP)").bind(account.id, clientId, actor)));
+type ProviderAccountEligibility = {
+  id: string;
+  provider: string;
+  account_name: string;
+  account_type: string;
+  client_id: string | null;
+  status: string;
+  activation_status: string;
+  available_for_clients: number;
+  booking_enabled: number;
+  tracking_enabled: number;
+  quotes_enabled: number;
+  health_status: string;
+  policy_exists: boolean;
+  policy_enabled: boolean;
+  configured: boolean;
+  blockers: string[];
+};
+
+function providerAccountConfigured(env: Env, secretName: string) {
+  const value = (env as unknown as Record<string, unknown>)[secretName];
+  return Boolean(secretName && typeof value === "string" && value.trim());
+}
+
+function providerAccountEligibility(env: Env, row: Record<string, unknown>): ProviderAccountEligibility {
+  const configured = providerAccountConfigured(env, String(row.credential_secret_name ?? ""));
+  const policyExists = row.policy_exists === true || Number(row.policy_exists ?? 0) === 1;
+  const policyEnabled = Number(row.policy_enabled ?? 0) === 1;
+  const blockers: string[] = [];
+  if (String(row.status ?? "") !== "active") blockers.push("account_disabled");
+  if (String(row.activation_status ?? "pending_verification") !== "ready") blockers.push("account_not_verified");
+  if (!configured) blockers.push("credential_not_configured");
+  if (Number(row.available_for_clients ?? 0) !== 1) blockers.push("not_available_for_clients");
+  if (!policyExists || !policyEnabled) blockers.push("client_policy_not_enabled");
+  if (Number(row.booking_enabled ?? 0) !== 1) blockers.push("booking_not_enabled");
+  if (String(row.health_status ?? "unknown") === "error") blockers.push("provider_health_error");
+  return {
+    id: String(row.id ?? ""), provider: String(row.provider ?? ""), account_name: String(row.account_name ?? ""),
+    account_type: String(row.account_type ?? ""), client_id: row.client_id ? String(row.client_id) : null,
+    status: String(row.status ?? ""), activation_status: String(row.activation_status ?? "pending_verification"),
+    available_for_clients: Number(row.available_for_clients ?? 0), booking_enabled: Number(row.booking_enabled ?? 0),
+    tracking_enabled: Number(row.tracking_enabled ?? 0), quotes_enabled: Number(row.quotes_enabled ?? 0),
+    health_status: String(row.health_status ?? "unknown"), policy_exists: policyExists, policy_enabled: policyEnabled,
+    configured, blockers,
+  };
+}
+
+async function loadClientProviderAccountEligibility(env: Env, clientId: string, provider = "delhivery", accountId?: string | null) {
+  const filter = accountId ? " AND pa.id = ?" : "";
+  const binds = accountId ? [clientId, provider, accountId] : [clientId, provider];
+  const rows = await env.DB.prepare(`
+    SELECT pa.id, pa.provider, pa.account_name, pa.account_type, pa.client_id,
+      pa.credential_secret_name, pa.status, pa.activation_status,
+      pa.available_for_clients, pa.booking_enabled, pa.tracking_enabled,
+      pa.quotes_enabled, pa.health_status,
+      CASE WHEN p.provider_account_id IS NULL THEN 0 ELSE 1 END AS policy_exists,
+      COALESCE(p.enabled, 0) AS policy_enabled
+    FROM provider_accounts pa
+    LEFT JOIN provider_account_client_policies p
+      ON p.provider_account_id = pa.id AND p.client_id = ?
+    WHERE pa.provider = ?${filter}
+    ORDER BY COALESCE(p.priority, 100) ASC, COALESCE(p.confidence_score, 0) DESC, pa.account_name ASC
+  `).bind(...binds).all<Record<string, unknown>>();
+  return rows.results.map((row) => providerAccountEligibility(env, row));
+}
+
+async function bookingProviderAccountDiagnostics(env: Env, clientId: string, requestedAccountId?: string | null) {
+  const accounts = await loadClientProviderAccountEligibility(env, clientId, "delhivery", requestedAccountId);
+  return { accounts, eligible: accounts.filter((account) => account.blockers.length === 0) };
 }
 const FUJIYAMA_CLIENT_ID = "bb308dde-aae8-4503-ac7b-f91cd80ada78";
 const FUJIYAMA_FORWARD_RATES: Record<string, number> = { N1: 5.5, N2: 6.2, N3: 6.5, N4: 6.9, C1: 7.9, C2: 8.6, E1: 10.5, E2: 11.2, NE1: 15.9, NE2: 18.8, S1: 8.8, S2: 9.4, S3: 9.8, S4: 10.5, W1: 7.9, W2: 8.7 };
@@ -2601,6 +2667,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   const account = clientId
     ? await env.DB.prepare(`
         SELECT pa.id, pa.provider, pa.account_name, pa.credential_secret_name,
+               pa.activation_status, pa.available_for_clients, pa.booking_enabled, pa.tracking_enabled, pa.quotes_enabled,
                COALESCE(p.enabled, 1) AS client_enabled,
                COALESCE(p.priority, 100) AS priority,
                COALESCE(p.confidence_score, 0) AS confidence_score,
@@ -2617,11 +2684,12 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
                  COALESCE(p.confidence_score, 0) DESC,
                  pa.created_at ASC
          LIMIT 1`).bind(clientId, provider, clientId, ...accountConstraintBinds).first<{
-          id: string; provider: CourierProvider; account_name: string; credential_secret_name: string;
+          id: string; provider: CourierProvider; account_name: string; credential_secret_name: string; activation_status: string; available_for_clients: number; booking_enabled: number; tracking_enabled: number; quotes_enabled: number;
           client_enabled: number; priority: number; confidence_score: number; rate_card_id: string | null;
         }>()
     : await env.DB.prepare(`
         SELECT pa.id, pa.provider, pa.account_name, pa.credential_secret_name,
+               pa.activation_status, pa.available_for_clients, pa.booking_enabled, pa.tracking_enabled, pa.quotes_enabled,
                1 AS client_enabled,
                100 AS priority,
                0 AS confidence_score,
@@ -2631,7 +2699,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
           ${accountConstraint}
         ORDER BY pa.created_at ASC
         LIMIT 1`).bind(provider, ...accountConstraintBinds).first<{
-          id: string; provider: CourierProvider; account_name: string; credential_secret_name: string;
+          id: string; provider: CourierProvider; account_name: string; credential_secret_name: string; activation_status: string; available_for_clients: number; booking_enabled: number; tracking_enabled: number; quotes_enabled: number;
           client_enabled: number; priority: number; confidence_score: number; rate_card_id: string | null;
         }>();
   const resolvedDelhiveryB2b = provider === "delhivery" && Boolean(account && delhiveryAccountIsB2b(account.account_name));
@@ -2641,6 +2709,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     ? useDelhiveryB2b ? String(env.DELHIVERY_B2B_API_BASE_URL ?? "https://ltl-clients-api.delhivery.com") : env.DELHIVERY_API_BASE_URL
     : provider === "ekart" ? env.EKART_API_BASE_URL : provider === "trackon" ? env.TRACKON_API_BASE_URL : provider === "xpressbees" ? env.XPRESSBEES_API_BASE_URL : env.RIVIGO_API_BASE_URL;
   if (clientId && requestedAccountId && !account) return { enabled: false, status: "disabled" as const, reason: "The selected courier account is not enabled for this client" };
+  if (account && (account.activation_status !== "ready" || Number(account.available_for_clients) !== 1 || (operation === "shipments" && Number(account.booking_enabled) !== 1) || (operation === "tracking" && Number(account.tracking_enabled) !== 1) || (operation === "quotes" && Number(account.quotes_enabled) !== 1))) return { enabled: false, status: "not_configured" as const, reason: `Provider account '${account.account_name}' is not ready for ${operation}` };
   if (provider === "delhivery" && !account) return { enabled: false, status: "not_configured" as const, reason: defaultDelhiveryAccountName ? `The configured Delhivery account '${defaultDelhiveryAccountName}' is not active` : "A Delhivery account must be selected before booking" };
   const secretBag = env as unknown as Record<string, unknown>;
   const configuredCredential = provider === "delhivery" ? env.DELHIVERY_API_TOKEN : provider === "ekart" ? env.EKART_API_KEY : provider === "xpressbees" ? env.XPRESSBEES_CREDENTIALS_JSON : provider === "rivigo" ? env.RIVIGO_CREDENTIALS_JSON : undefined;
@@ -3753,11 +3822,8 @@ async function verifyDelhiveryServiceability(env: Env, originPincode: string, de
 }
 
 async function resolveDelhiveryProviderAccountId(env: Env, clientId: string, requestedAccountId?: string | null) {
-  const requested = String(requestedAccountId ?? "").trim();
-  const row = requested
-    ? await env.DB.prepare("SELECT pa.id FROM provider_accounts pa LEFT JOIN provider_account_client_policies p ON p.provider_account_id = pa.id AND p.client_id = ? WHERE pa.id = ? AND pa.provider = 'delhivery' AND pa.status = 'active' AND (pa.client_id = ? OR (p.client_id = ? AND p.enabled = 1)) LIMIT 1").bind(clientId, requested, clientId, clientId).first<{ id: string }>()
-    : await env.DB.prepare("SELECT pa.id FROM provider_accounts pa LEFT JOIN provider_account_client_policies p ON p.provider_account_id = pa.id AND p.client_id = ? WHERE pa.provider = 'delhivery' AND pa.status = 'active' AND (pa.client_id = ? OR (p.client_id = ? AND p.enabled = 1)) ORDER BY CASE WHEN pa.client_id = ? THEN 0 ELSE 1 END, COALESCE(p.priority, 100) ASC, COALESCE(p.confidence_score, 0) DESC, pa.account_name ASC LIMIT 1").bind(clientId, clientId, clientId, clientId).first<{ id: string }>();
-  return row?.id ?? null;
+  const result = await bookingProviderAccountDiagnostics(env, clientId, requestedAccountId);
+  return result.eligible[0]?.id ?? null;
 }
 
 async function loadShipmentInvoiceDocumentsForRetry(env: Env, clientId: string, shipmentId: string, payload: Record<string, unknown>) {
@@ -4784,7 +4850,7 @@ const worker = {
         }, request_id: id }, 200, headers);
       }
       if (route === "/fujiyama/bookings" && request.method === "POST") {
-        if (!hasScope(auth, "shipments.create")) return error("FORBIDDEN", "Shipment creation scope required", 403, id, headers);
+        if (!hasScope(auth, "shipments.create") || !hasScope(auth, "bookings.documents.manage")) return error("FORBIDDEN", "Booking document permission required", 403, id, headers);
         route = "/shipments";
       }
       if (route === "/preferences" && (request.method === "GET" || request.method === "PUT")) {
@@ -4825,7 +4891,6 @@ const worker = {
         const requestedClient = url.searchParams.get("client_id");
         const clientId = requireClient(auth, requestedClient);
         if (!clientId || !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
-        await ensureDefaultClientProviderPolicies(env, clientId, auth.userId ?? `client:${clientId}`);
         const rows = await env.DB.prepare(`
           SELECT pa.provider, pa.capabilities_json, pa.credential_secret_name
             FROM provider_accounts pa
@@ -4833,7 +4898,10 @@ const worker = {
               ON p.provider_account_id = pa.id AND p.client_id = ?
            WHERE pa.status = 'active'
              AND (pa.client_id = ? OR (pa.client_id IS NULL AND p.client_id = ?))
-             AND COALESCE(p.enabled, 1) = 1
+             AND COALESCE(p.enabled, 0) = 1
+             AND pa.activation_status = 'ready'
+             AND pa.available_for_clients = 1
+             AND pa.quotes_enabled = 1
            ORDER BY pa.provider`).bind(clientId, clientId, clientId).all<{ provider: string; capabilities_json: string | null; credential_secret_name: string | null }>();
         const recentRequests = await env.DB.prepare("SELECT provider, status, error_code, updated_at FROM integration_requests WHERE provider IN ('delhivery', 'ekart', 'trackon', 'xpressbees', 'rivigo') ORDER BY updated_at DESC, id DESC").all<{ provider: CourierProvider; status: string; error_code: string | null; updated_at: string | null }>();
         const secretBag = env as unknown as Record<string, unknown>;
@@ -4937,19 +5005,22 @@ const worker = {
         const requestedClient = new URL(request.url).searchParams.get("client_id");
         const clientId = requireClient(auth, requestedClient);
         if (!clientId || !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
-        await ensureDefaultClientProviderPolicies(env, clientId, auth.userId ?? `client:${clientId}`);
          const internalProviderView = hasRole(auth, ["employee", "admin", "super_admin"]) || auth.system;
          const providerAccountVisibility = internalProviderView
-           ? "pa.status = 'active' AND (pa.client_id = ? OR pa.client_id IS NULL)"
+           ? "pa.status IN ('active', 'disabled') AND (pa.client_id = ? OR pa.client_id IS NULL)"
            : "pa.status = 'active' AND (pa.client_id = ? OR (pa.client_id IS NULL AND p.client_id = ? AND p.enabled = 1))";
          const rows = await env.DB.prepare(`
           SELECT pa.id, pa.provider, pa.account_name, pa.account_type, pa.client_id,
                   pa.capabilities_json, pa.credential_secret_name, pa.status,
-                 CASE WHEN p.provider_account_id IS NULL THEN CASE WHEN pa.status = 'active' THEN 1 ELSE 0 END ELSE p.enabled END AS enabled,
+                  pa.activation_status, pa.available_for_clients, pa.booking_enabled,
+                  pa.tracking_enabled, pa.quotes_enabled, pa.health_status,
+                 COALESCE(p.enabled, 0) AS enabled,
                  CASE WHEN p.provider_account_id IS NULL THEN 100 ELSE p.priority END AS priority,
                  CASE WHEN p.provider_account_id IS NULL THEN 0 ELSE p.confidence_score END AS confidence_score,
                  p.rate_card_id, p.notes, p.updated_at AS policy_updated_at,
-                 CASE WHEN p.provider_account_id IS NULL THEN 0 ELSE 1 END AS explicitly_configured
+                 CASE WHEN p.provider_account_id IS NULL THEN 0 ELSE 1 END AS explicitly_configured,
+                 CASE WHEN p.provider_account_id IS NULL THEN 0 ELSE 1 END AS policy_exists,
+                 COALESCE(p.enabled, 0) AS policy_enabled
           FROM provider_accounts pa
           LEFT JOIN provider_account_client_policies p
             ON p.provider_account_id = pa.id AND p.client_id = ?
@@ -4966,9 +5037,30 @@ const worker = {
           const isConfigured = configured(record);
           const safeRow = { ...record };
           delete safeRow.credential_secret_name;
-          return { ...safeRow, capabilities: (() => { try { return JSON.parse(String(record.capabilities_json ?? "[]")); } catch { return []; } })(), configured: isConfigured, enabled: Boolean(Number(record.enabled)) && isConfigured, explicitly_configured: Boolean(Number(record.explicitly_configured)) };
+          const eligibility = providerAccountEligibility(env, record);
+          return { ...safeRow, capabilities: (() => { try { return JSON.parse(String(record.capabilities_json ?? "[]")); } catch { return []; } })(), configured: isConfigured, enabled: internalProviderView ? Boolean(Number(record.enabled)) : eligibility.blockers.length === 0, explicitly_configured: Boolean(Number(record.explicitly_configured)), policy_exists: eligibility.policy_exists, eligible_for_booking: eligibility.blockers.length === 0, eligible_for_tracking: eligibility.tracking_enabled === 1 && eligibility.blockers.every((blocker) => blocker !== "account_disabled" && blocker !== "account_not_verified" && blocker !== "credential_not_configured" && blocker !== "not_available_for_clients" && blocker !== "client_policy_not_enabled" && blocker !== "provider_health_error"), eligible_for_quotes: eligibility.quotes_enabled === 1 && eligibility.blockers.every((blocker) => blocker !== "account_disabled" && blocker !== "account_not_verified" && blocker !== "credential_not_configured" && blocker !== "not_available_for_clients" && blocker !== "client_policy_not_enabled" && blocker !== "provider_health_error"), blockers: eligibility.blockers };
         });
         return json({ ok: true, data: shapeProviderAccountsForPickup(providerAccounts, pickupOnly) }, 200, headers);
+      }
+      if (route === "/provider-account-health" && request.method === "GET") {
+        if (!hasRole(auth, ["admin", "super_admin"]) || !hasScope(auth, "provider_accounts.read")) return error("FORBIDDEN", "Provider account health permission required", 403, id, headers);
+        const rows = await env.DB.prepare(`
+          SELECT pa.id, pa.provider, pa.account_name, pa.account_type, pa.status,
+            pa.activation_status, pa.available_for_clients, pa.booking_enabled,
+            pa.tracking_enabled, pa.quotes_enabled, pa.health_status,
+            pa.health_error_code, pa.health_error_message, pa.last_health_checked_at,
+            pa.credential_secret_name, COUNT(p.client_id) AS policy_count,
+            SUM(CASE WHEN p.enabled = 1 THEN 1 ELSE 0 END) AS enabled_policy_count
+          FROM provider_accounts pa
+          LEFT JOIN provider_account_client_policies p ON p.provider_account_id = pa.id
+          GROUP BY pa.id
+          ORDER BY pa.provider, pa.account_name`).all<Record<string, unknown>>();
+        const data = rows.results.map((row) => {
+          const eligibility = providerAccountEligibility(env, { ...row, policy_exists: Number(row.policy_count ?? 0) > 0, policy_enabled: Number(row.enabled_policy_count ?? 0) > 0 });
+          const safe = { ...row }; delete safe.credential_secret_name;
+          return { ...safe, configured: eligibility.configured, blockers: eligibility.blockers, eligible_for_booking: eligibility.blockers.length === 0, policy_count: Number(row.policy_count ?? 0), enabled_policy_count: Number(row.enabled_policy_count ?? 0) };
+        });
+        return json({ ok: true, data }, 200, headers);
       }
       const providerPolicyMatch = route.match(/^\/provider-account-policies\/([^/]+)$/);
       if (providerPolicyMatch && request.method === "PUT") {
@@ -5014,13 +5106,13 @@ const worker = {
         return json({ ok: true, data: { status: kycTestAccount ? "approved" : (profile?.status ?? "not_started"), approved: kycTestAccount || missingFields.length === 0, missing_fields: kycTestAccount ? [] : missingFields } }, 200, headers);
       }
       if (route === "/security/sessions" && request.method === "GET") {
-        if (!auth.userId || !hasRole(auth, ["admin", "super_admin"])) return error("FORBIDDEN", "Security session visibility permission required", 403, id, headers);
+        if (!auth.userId || !hasRole(auth, ["admin", "super_admin"]) || !hasScope(auth, "security.view")) return error("FORBIDDEN", "Security session visibility permission required", 403, id, headers);
         const sessionId = `current-${(await sha256(auth.accessToken ?? "")).slice(0, 24)}`;
         return json({ ok: true, data: [{ id: sessionId, user_id: auth.userId, current: true, status: "active", last_seen_at: new Date().toISOString() }] }, 200, headers);
       }
       const securitySessionRevoke = route.match(/^\/security\/sessions\/([^/]+)\/revoke$/);
       if (securitySessionRevoke && request.method === "POST") {
-        if (!auth.userId || !auth.accessToken || !hasRole(auth, ["admin", "super_admin"])) return error("FORBIDDEN", "Security session revocation permission required", 403, id, headers);
+        if (!auth.userId || !auth.accessToken || !hasRole(auth, ["admin", "super_admin"]) || !hasScope(auth, "security.session_revoke")) return error("FORBIDDEN", "Security session revocation permission required", 403, id, headers);
         const expectedSessionId = `current-${(await sha256(auth.accessToken)).slice(0, 24)}`;
         if (securitySessionRevoke[1] !== expectedSessionId) return error("NOT_FOUND", "Security session not found", 404, id, headers);
         const logout = await fetch(`${env.SUPABASE_URL}/auth/v1/logout`, { method: "POST", headers: { apikey: env.SUPABASE_PUBLISHABLE_KEY, Authorization: `Bearer ${auth.accessToken}` } });
@@ -5031,9 +5123,9 @@ const worker = {
       if (route === "/provider-accounts" && request.method === "GET") {
         if (!hasScope(auth, "provider_accounts.read")) return error("FORBIDDEN", "Provider account visibility permission required", 403, id, headers);
         const rows = auth.system
-          ? await env.DB.prepare("SELECT id, provider, account_name, account_type, client_id, capabilities_json, status, created_by_user_id, created_at, updated_at FROM provider_accounts ORDER BY provider, account_name LIMIT 100").all()
+          ? await env.DB.prepare("SELECT id, provider, account_name, account_type, client_id, capabilities_json, status, activation_status, available_for_clients, booking_enabled, tracking_enabled, quotes_enabled, health_status, health_error_code, health_error_message, last_health_checked_at, created_by_user_id, created_at, updated_at FROM provider_accounts ORDER BY provider, account_name LIMIT 100").all()
           : auth.clientIds.size
-            ? await env.DB.prepare(`SELECT id, provider, account_name, account_type, client_id, capabilities_json, status, created_by_user_id, created_at, updated_at FROM provider_accounts WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY provider, account_name LIMIT 100`).bind(...auth.clientIds).all()
+            ? await env.DB.prepare(`SELECT id, provider, account_name, account_type, client_id, capabilities_json, status, activation_status, available_for_clients, booking_enabled, tracking_enabled, quotes_enabled, health_status, health_error_code, health_error_message, last_health_checked_at, created_by_user_id, created_at, updated_at FROM provider_accounts WHERE client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY provider, account_name LIMIT 100`).bind(...auth.clientIds).all()
             : { results: [] };
         return json({ ok: true, data: rows.results.map((row) => { const value = row as Record<string, unknown>; let capabilities: unknown[] = []; try { capabilities = JSON.parse(String(value.capabilities_json ?? "[]")); } catch { capabilities = []; } const safe = { ...value }; delete safe.capabilities_json; return { ...safe, capabilities }; }) }, 200, headers);
       }
@@ -5045,9 +5137,30 @@ const worker = {
         if (clientId) { const client = await supabaseGet<{ id: string; status: string }>(env, `client_accounts?id=eq.${encodeURIComponent(clientId)}&status=eq.active&select=id,status`, auth.accessToken ?? ""); if (!client.length) return error("NOT_FOUND", "Client account not found", 404, id, headers); }
         const duplicate = await env.DB.prepare("SELECT id FROM provider_accounts WHERE provider = ? AND account_name = ? LIMIT 1").bind(provider, accountName).first<{ id: string }>(); if (duplicate) return error("CONFLICT", "Provider account name already exists", 409, id, headers);
         const idempotencyKey = request.headers.get("Idempotency-Key"); if (!idempotencyKey) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers); const requestHash = await payloadFingerprint(payload); const endpoint = "POST /v1/provider-accounts"; const existing = await idempotentResponse(env, idempotencyKey, auth.userId ?? "system", endpoint, requestHash); if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
-        const accountId = crypto.randomUUID(); const capabilities = Array.isArray(payload.capabilities) ? payload.capabilities.filter((value): value is string => typeof value === "string").slice(0, 20) : []; await env.DB.prepare("INSERT INTO provider_accounts (id, provider, account_name, account_type, credential_secret_name, client_id, capabilities_json, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").bind(accountId, provider, accountName, accountType, secretName, clientId, JSON.stringify(capabilities), auth.userId ?? "system").run(); await audit(env, ctx, auth, id, "provider_account.created", "provider_account", accountId, { provider, account_name: accountName, client_id: clientId, credential_secret_name: secretName }); const serialized = JSON.stringify({ ok: true, data: { id: accountId, provider, account_name: accountName, account_type: accountType, client_id: clientId, capabilities, status: "active" }, request_id: id }); await saveIdempotent(env, idempotencyKey, auth.userId ?? "system", endpoint, 201, serialized, requestHash); return new Response(serialized, { status: 201, headers: { ...headers, "content-type": "application/json" } });
+        const accountId = crypto.randomUUID(); const capabilities = Array.isArray(payload.capabilities) ? payload.capabilities.filter((value): value is string => typeof value === "string").slice(0, 20) : []; await env.DB.prepare("INSERT INTO provider_accounts (id, provider, account_name, account_type, credential_secret_name, client_id, capabilities_json, status, activation_status, available_for_clients, booking_enabled, tracking_enabled, quotes_enabled, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 'pending_verification', 0, 0, 0, 0, ?)").bind(accountId, provider, accountName, accountType, secretName, clientId, JSON.stringify(capabilities), auth.userId ?? "system").run(); await audit(env, ctx, auth, id, "provider_account.created", "provider_account", accountId, { provider, account_name: accountName, client_id: clientId, credential_secret_name: secretName, activation_status: "pending_verification" }); const serialized = JSON.stringify({ ok: true, data: { id: accountId, provider, account_name: accountName, account_type: accountType, client_id: clientId, capabilities, status: "active", activation_status: "pending_verification", eligible_for_booking: false }, request_id: id }); await saveIdempotent(env, idempotencyKey, auth.userId ?? "system", endpoint, 201, serialized, requestHash); return new Response(serialized, { status: 201, headers: { ...headers, "content-type": "application/json" } });
       }
       const providerAccountMatch = route.match(/^\/provider-accounts\/([^/]+)$/);
+      if (providerAccountMatch && request.method === "PATCH") {
+        if (!hasScope(auth, "provider_accounts.manage") || !hasRole(auth, ["admin", "super_admin"])) return error("FORBIDDEN", "Provider account management permission required", 403, id, headers);
+        const account = await env.DB.prepare("SELECT id, client_id, credential_secret_name, provider FROM provider_accounts WHERE id = ? LIMIT 1").bind(providerAccountMatch[1]).first<{ id: string; client_id: string | null; credential_secret_name: string; provider: CourierProvider }>();
+        if (!account) return error("NOT_FOUND", "Provider account not found", 404, id, headers);
+        const payload = await bodyJson(request);
+        const activationStatus = payload.activation_status === undefined ? undefined : String(payload.activation_status);
+        const status = payload.status === undefined ? undefined : String(payload.status);
+        const flag = (name: string) => payload[name] === undefined ? undefined : (payload[name] === true || payload[name] === 1 ? 1 : payload[name] === false || payload[name] === 0 ? 0 : null);
+        const available = flag("available_for_clients"); const booking = flag("booking_enabled"); const tracking = flag("tracking_enabled"); const quotes = flag("quotes_enabled");
+        if (status !== undefined && !new Set(["active", "disabled"]).has(status)) return error("VALIDATION_ERROR", "Invalid provider account status", 400, id, headers);
+        if (activationStatus !== undefined && !new Set(["pending_verification", "ready", "error", "disabled"]).has(activationStatus)) return error("VALIDATION_ERROR", "Invalid provider account activation status", 400, id, headers);
+        if ([available, booking, tracking, quotes].some((value) => value === null)) return error("VALIDATION_ERROR", "Readiness flags must be booleans", 400, id, headers);
+        if (activationStatus === "ready" && !providerAccountConfigured(env, account.credential_secret_name)) return error("PROVIDER_CREDENTIAL_MISSING", "Add the matching Worker secret before marking this provider account ready", 409, id, headers);
+        if (activationStatus === "ready" && account.provider === "delhivery" && booking === 1 && available !== 1) return error("VALIDATION_ERROR", "A booking-ready account must be available to clients", 400, id, headers);
+        const key = request.headers.get("Idempotency-Key"); if (!key) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
+        const requestHash = await payloadFingerprint(payload); const endpoint = `PATCH /v1/provider-accounts/${account.id}`; const existing = await idempotentResponse(env, key, auth.userId ?? "system", endpoint, requestHash); if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
+        const updates: Array<[string, string | number]> = []; if (status !== undefined) updates.push(["status", status]); if (activationStatus !== undefined) updates.push(["activation_status", activationStatus]); if (available !== undefined && available !== null) updates.push(["available_for_clients", available]); if (booking !== undefined && booking !== null) updates.push(["booking_enabled", booking]); if (tracking !== undefined && tracking !== null) updates.push(["tracking_enabled", tracking]); if (quotes !== undefined && quotes !== null) updates.push(["quotes_enabled", quotes]);
+        if (updates.length) await env.DB.prepare(`UPDATE provider_accounts SET ${updates.map(([field]) => `${field} = ?`).join(", ")}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(...updates.map(([, value]) => value), account.id).run();
+        await audit(env, ctx, auth, id, "provider_account.updated", "provider_account", account.id, Object.fromEntries(updates));
+        const serialized = JSON.stringify({ ok: true, data: { id: account.id, ...Object.fromEntries(updates) }, request_id: id }); await saveIdempotent(env, key, auth.userId ?? "system", endpoint, 200, serialized, requestHash); return new Response(serialized, { status: 200, headers: { ...headers, "content-type": "application/json" } });
+      }
       if (providerAccountMatch && request.method === "PATCH") {
         if (!hasScope(auth, "provider_accounts.manage") || !hasRole(auth, ["admin", "super_admin"])) return error("FORBIDDEN", "Provider account management permission required", 403, id, headers);
         const account = await env.DB.prepare("SELECT id, client_id, credential_secret_name FROM provider_accounts WHERE id = ? LIMIT 1").bind(providerAccountMatch[1]).first<{ id: string; client_id: string | null; credential_secret_name: string }>(); if (!account) return error("NOT_FOUND", "Provider account not found", 404, id, headers); if (!auth.system && (!account.client_id || !canAccessClient(auth, account.client_id))) return error("NOT_FOUND", "Provider account not found", 404, id, headers); const payload = await bodyJson(request); const status = payload.status === undefined ? undefined : String(payload.status); if (status !== undefined && !new Set(["active", "disabled"]).has(status)) return error("VALIDATION_ERROR", "Invalid provider account status", 400, id, headers); if (status === "active") { const secretValue = (env as unknown as Record<string, unknown>)[account.credential_secret_name]; if (typeof secretValue !== "string" || !secretValue.trim()) return error("PROVIDER_CREDENTIAL_MISSING", "Add the matching Worker secret before activating this provider account", 409, id, headers); } const idempotencyKey = request.headers.get("Idempotency-Key"); if (!idempotencyKey) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers); const requestHash = await payloadFingerprint(payload); const endpoint = `PATCH /v1/provider-accounts/${account.id}`; const existing = await idempotentResponse(env, idempotencyKey, auth.userId ?? "system", endpoint, requestHash); if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } }); if (status !== undefined) await env.DB.prepare("UPDATE provider_accounts SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(status, account.id).run(); await audit(env, ctx, auth, id, "provider_account.updated", "provider_account", account.id, { status }); const serialized = JSON.stringify({ ok: true, data: { id: account.id, ...(status ? { status } : {}) }, request_id: id }); await saveIdempotent(env, idempotencyKey, auth.userId ?? "system", endpoint, 200, serialized, requestHash); return new Response(serialized, { status: 200, headers: { ...headers, "content-type": "application/json" } });
@@ -5334,8 +5447,9 @@ const worker = {
         let liveServiceabilityProvenance: DelhiveryServiceabilityResult["provenance"] | null = null;
         if (provider === "delhivery") {
           const requestedProviderAccountId = typeof payload.provider_account_id === "string" && payload.provider_account_id.trim() ? payload.provider_account_id.trim() : null;
-          const liveProviderAccountId = await resolveDelhiveryProviderAccountId(env, clientId, requestedProviderAccountId);
-          if (!liveProviderAccountId) return error("PROVIDER_ACCOUNT_REQUIRED", "An active Delhivery account is required for live serviceability verification", 409, id, headers);
+          const diagnostics = await bookingProviderAccountDiagnostics(env, clientId, requestedProviderAccountId);
+          const liveProviderAccountId = diagnostics.eligible[0]?.id ?? null;
+          if (!liveProviderAccountId) return error("PROVIDER_ACCOUNT_REQUIRED", "No booking-ready Delhivery account is assigned to this client. An administrator must explicitly assign a verified account with a configured credential and booking capability.", 409, id, headers, JSON.stringify({ accounts: diagnostics.accounts.map((account) => ({ id: account.id, account_name: account.account_name, policy_enabled: account.policy_enabled, activation_status: account.activation_status, health_status: account.health_status, blockers: account.blockers })) }));
           payload.provider_account_id = liveProviderAccountId;
           const liveServiceability = await verifyDelhiveryServiceability(env, originAddress.pincode, destinationAddress.pincode, liveProviderAccountId, id, clientId, String(payload.payment_mode ?? "prepaid").trim().toLowerCase() === "cod" ? "cod" : "prepaid", weight);
           if (!liveServiceability.ok) return error("PROVIDER_SERVICEABILITY_FAILED", liveServiceability.reason ?? "Delhivery could not verify this route", 409, id, headers, JSON.stringify({ provenance: liveServiceability.provenance, origin: liveServiceability.origin, destination: liveServiceability.destination, route: liveServiceability.route }));
@@ -5654,6 +5768,7 @@ const worker = {
         if (!current || !canAccessClient(auth, current.client_id)) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
         const payload = await bodyJson(request);
         const clientActor = hasRole(auth, ["client"]) && !hasRole(auth, ["employee", "admin", "super_admin"]);
+        if (!clientActor && !hasRole(auth, ["admin", "super_admin"]) && !hasAnyScope(auth, ["shipments.edit", "shipments.create"])) return error("FORBIDDEN", "Shipment edit permission required", 403, id, headers);
         if (clientActor && Object.keys(payload).some((field) => field !== "status")) return error("FORBIDDEN", "Clients may only cancel their own shipment", 403, id, headers);
         if (!clientActor && providerManagedShipmentFields(payload).length) return error("PROVIDER_DATA_PROTECTED", "Provider references, shipment status, reconciled weight, ETA, and delivery timestamps can only be changed by provider reconciliation.", 409, id, headers);
         if (payload.is_test !== undefined && !hasRole(auth, ["admin", "super_admin"])) return error("FORBIDDEN", "Only administrators may classify test shipments", 403, id, headers);
@@ -5665,6 +5780,7 @@ const worker = {
         if (!updates.length) return error("VALIDATION_ERROR", "A supported shipment update is required", 400, id, headers);
         if (payload.provider !== undefined && payload.provider !== null && !new Set(["delhivery", "ekart", "trackon", "xpressbees", "rivigo"]).has(String(payload.provider))) return error("VALIDATION_ERROR", "Unsupported shipment provider", 400, id, headers);
         const status = payload.status === undefined ? null : String(payload.status).toLowerCase();
+        if (status === "cancelled" && !clientActor && !hasAnyScope(auth, ["shipments.cancel", "shipments.create"])) return error("FORBIDDEN", "Shipment cancellation permission required", 403, id, headers);
         if (status && !["booked", "picked_up", "in_transit", "out_for_delivery", "delivered", "cancelled", "exception", "rto"].includes(status)) return error("VALIDATION_ERROR", "Unsupported shipment status", 400, id, headers);
         if (status && !validShipmentTransition(String(current.status).toLowerCase(), status)) return error("CONFLICT", `Shipment cannot transition from ${current.status} to ${status}`, 409, id, headers);
         const key = request.headers.get("Idempotency-Key"); if (!key) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
@@ -5737,8 +5853,10 @@ const worker = {
       const trackingPost = route.match(/^\/shipments\/([^/]+)\/tracking$/);
       if (trackingPost && request.method === "POST") {
         if (!hasRole(auth, ["employee", "admin", "super_admin"])) return error("FORBIDDEN", "Employee or administrator role required", 403, id, headers);
+        if (!hasAnyScope(auth, ["tracking.intervene", "tracking.update", "cases.manage"]) && !hasRole(auth, ["admin", "super_admin"])) return error("FORBIDDEN", "Tracking intervention permission required", 403, id, headers);
         const shipment = await env.DB.prepare("SELECT client_id, status FROM shipments WHERE id = ? LIMIT 1").bind(trackingPost[1]).first<{ client_id: string; status: string }>();
         if (!shipment || !canAccessClient(auth, shipment.client_id)) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
+        if (route.endsWith("/tracking") && url.searchParams.get("refresh") === "1" && !hasScope(auth, "tracking.refresh")) return error("FORBIDDEN", "Tracking refresh permission required", 403, id, headers);
         const payload = await bodyJson(request);
         const requestHash = await payloadFingerprint(payload);
         const nextStatus = typeof payload.status === "string" ? payload.status.trim().toLowerCase().replaceAll(" ", "_") : "";
@@ -5773,6 +5891,10 @@ const worker = {
         const url = new URL(request.url);
         const kind = shipmentArtifact[2];
         const operation = kind === "lr-copy" ? "lr_copy" : kind === "document" ? "document" : "labels";
+        // Authorize before shipment refresh/provider work. Label viewing and
+        // explicit downloading are separate employee permissions.
+        const artifactPermission = url.searchParams.get("download") === "1" ? "documents.label.download" : "documents.label.view";
+        if (operation === "labels" && !hasScope(auth, artifactPermission)) return error("FORBIDDEN", "Label permission required", 403, id, headers);
         const requestedSize = url.searchParams.get("size") ?? (kind === "sticker" ? "3x2" : "a4");
         if (operation === "labels" && !["a4", "4x2", "4x2.5", "3x2"].includes(requestedSize)) return error("INVALID_REQUEST", "Delhivery label size must be a4, 4x2, 4x2.5, or 3x2", 400, id, headers);
         if (!shipment.lr_number && !shipment.master_awb && shipment.provider_booking_id) {
@@ -6142,6 +6264,8 @@ const worker = {
         if (payload.status !== undefined && (typeof payload.status !== "string" || !allowedStatuses.has(payload.status))) return error("VALIDATION_ERROR", "Unsupported pickup status", 400, id, headers);
         const clientCancel = !staffUpdate && payload.status === "cancelled" && Object.keys(payload).every((key) => key === "status") && hasScope(auth, "pickups.read");
         const clientReschedule = !staffUpdate && (payload.retry === true || payload.requested_date !== undefined || payload.requested_time_slot !== undefined) && hasScope(auth, "pickups.manage");
+        if (staffUpdate && payload.status === "cancelled" && !hasAnyScope(auth, ["pickups.cancel", "pickups.manage"]) && !hasRole(auth, ["admin", "super_admin"])) return error("FORBIDDEN", "Pickup cancellation permission required", 403, id, headers);
+        if (staffUpdate && payload.status !== undefined && payload.status !== "cancelled" && !hasAnyScope(auth, ["pickups.update_status", "pickups.manage"]) && !hasRole(auth, ["admin", "super_admin"])) return error("FORBIDDEN", "Pickup status permission required", 403, id, headers);
         if (!staffUpdate && !hasScope(auth, "pickups.manage") && !clientCancel) return error("FORBIDDEN", "Pickup update permission required", 403, id, headers);
         if (!staffUpdate && !clientCancel && !clientReschedule) return error("FORBIDDEN", "Client users may only cancel or reschedule their own pickup", 403, id, headers);
         const idempotencyKey = request.headers.get("Idempotency-Key"); if (!idempotencyKey) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
@@ -6193,7 +6317,7 @@ const worker = {
       }
 
       if (route === "/documents" && request.method === "POST") {
-        if (!hasScope(auth, "documents.manage")) return error("FORBIDDEN", "Document upload scope required", 403, id, headers);
+        if (!hasScope(auth, "documents.manage") || !hasScope(auth, "bookings.documents.manage")) return error("FORBIDDEN", "Booking document permission required", 403, id, headers);
         const payload = await bodyJson(request, 12 * 1024 * 1024); const requestHash = await payloadFingerprint(payload); const clientId = requireClient(auth, payload.client_id);
         const shipmentId = typeof payload.shipment_id === "string" ? payload.shipment_id.trim() : null; const name = String(payload.name ?? "").trim(); const contentType = String(payload.content_type ?? "application/octet-stream").split(";", 1)[0].trim().toLowerCase(); const encoded = typeof payload.body_base64 === "string" ? payload.body_base64 : "";
         const allowedContentTypes = new Set(["application/pdf", "image/jpeg", "image/png", "image/webp", "text/csv", "application/csv", "application/vnd.ms-excel", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"]);
@@ -6437,6 +6561,8 @@ const worker = {
 
       if (route === "/reports/shipments" && request.method === "GET") {
         if (!hasScope(auth, "reports.read")) return error("FORBIDDEN", "Report read scope required", 403, id, headers);
+        const exportRequested = url.searchParams.get("format") === "csv";
+        if (exportRequested && !hasScope(auth, "reports.export")) return error("FORBIDDEN", "Report export permission required", 403, id, headers);
         const reportShipmentVisibility = testDataVisibilityClause(auth);
         const summarySql = `SELECT status, COUNT(*) AS shipments, SUM(CASE WHEN edd IS NOT NULL AND date(COALESCE(delivered_at, CURRENT_TIMESTAMP)) > date(edd) THEN 1 ELSE 0 END) AS delayed FROM shipments${reportShipmentVisibility ? ` WHERE ${reportShipmentVisibility}` : ""}`;
         const detailSql = `SELECT id, client_id, pss_reference, lr_number, master_awb, provider_reference, tracking_number, provider, origin, destination, status, total_weight_kg, pieces, declared_value, created_at, edd, delivered_at, CASE WHEN edd IS NULL THEN 0 ELSE MAX(0, CAST(julianday(date(COALESCE(delivered_at, CURRENT_TIMESTAMP))) - julianday(date(edd)) AS INTEGER)) END AS delay_days FROM shipments${reportShipmentVisibility ? ` WHERE ${reportShipmentVisibility}` : ""}`;
@@ -6450,6 +6576,12 @@ const worker = {
           : auth.clientIds.size
             ? await env.DB.prepare(`${detailSql}${reportShipmentVisibility ? " AND" : " WHERE"} client_id IN (${[...auth.clientIds].map(() => "?").join(",")}) ORDER BY created_at DESC`).bind(...auth.clientIds).all()
             : { results: [] };
+        if (exportRequested) {
+          const columns = ["id", "client_id", "pss_reference", "lr_number", "master_awb", "provider_reference", "tracking_number", "provider", "origin", "destination", "status", "total_weight_kg", "pieces", "declared_value", "created_at", "edd", "delivered_at", "delay_days"];
+          const escapeCsv = (value: unknown) => `"${String(value ?? "").replaceAll('"', '""')}"`;
+          const csv = [columns.join(","), ...details.results.map((row) => columns.map((column) => escapeCsv((row as Record<string, unknown>)[column])).join(","))].join("\n");
+          return json({ ok: true, data: summary.results, details: details.results, csv, filename: `shipment-report-${new Date().toISOString().slice(0, 10)}.csv` }, 200, headers);
+        }
         return json({ ok: true, data: summary.results, details: details.results }, 200, headers);
       }
 
@@ -6544,9 +6676,9 @@ const worker = {
         "/notifications": { table: "notifications", scope: "notifications.read", order: "created_at DESC" },
         "/ndr": { table: "ndr_cases", scope: "cases.read", order: "updated_at DESC" },
         "/exceptions": { table: "exception_cases", scope: "cases.read", order: "updated_at DESC" },
-        "/returns": { table: "return_shipments", scope: "cases.read", order: "updated_at DESC" },
+        "/returns": { table: "return_shipments", scope: "returns.read", order: "updated_at DESC" },
         "/warehouses": { table: "warehouses", scope: "addresses.manage", order: "updated_at DESC" },
-        "/addresses": { table: "client_addresses", scope: "addresses.manage", order: "updated_at DESC" },
+        "/addresses": { table: "client_addresses", scope: "addresses.read", order: "updated_at DESC" },
         "/billing": { table: "billing_records", scope: "billing.read", order: "created_at DESC" },
         "/wallet": { table: "wallet_transactions", scope: "wallet.read", order: "created_at DESC" },
         "/cod-remittances": { table: "cod_remittances", scope: "cod.read", order: "created_at DESC" },
@@ -6622,7 +6754,7 @@ const worker = {
         return new Response(responseBody, { status: accepted ? 200 : 409, headers: { ...headers, "content-type": "application/json" } });
       }
       if (route === "/addresses" && request.method === "GET") {
-        if (!hasScope(auth, "addresses.manage")) return error("FORBIDDEN", "Permission required", 403, id, headers);
+        if (!hasScope(auth, "addresses.read")) return error("FORBIDDEN", "Address read permission required", 403, id, headers);
         const search = String(url.searchParams.get("search") ?? "").trim().slice(0, 120);
         const addressKind = String(url.searchParams.get("address_kind") ?? "").trim().toLowerCase();
         const activeOnly = url.searchParams.get("active_only") !== "false";
@@ -6781,6 +6913,17 @@ const worker = {
         const scopedWhere = auth.system ? "" : auth.clientIds.size ? ` WHERE ${scopeColumn} IN (${[...auth.clientIds].map(() => "?").join(",")})` : " WHERE 1 = 0";
         const scopeBinds = auth.system ? [] : [...auth.clientIds];
         const rows = await env.DB.prepare(`SELECT ${select} FROM ${source}${scopedWhere} ORDER BY ${orderColumn}${collectionLimit}`).bind(...scopeBinds).all();
+        const exportRequested = url.searchParams.get("format") === "csv";
+        if (exportRequested && route === "/billing" && !hasScope(auth, "billing.export")) return error("FORBIDDEN", "Billing export permission required", 403, id, headers);
+        if (exportRequested && route === "/wallet" && !hasScope(auth, "transactions.export")) return error("FORBIDDEN", "Transaction export permission required", 403, id, headers);
+        if (exportRequested && (route === "/billing" || route === "/wallet")) {
+          const columns = route === "/billing"
+            ? ["id", "client_id", "shipment_id", "invoice_number", "amount", "currency", "status", "due_date", "created_at"]
+            : ["id", "client_id", "type", "amount", "balance_after", "reference", "status", "created_at"];
+          const escapeCsv = (value: unknown) => `"${String(value ?? "").replaceAll('"', '""')}"`;
+          const csv = [columns.join(","), ...rows.results.map((row) => columns.map((column) => escapeCsv((row as Record<string, unknown>)[column])).join(","))].join("\n");
+          return json({ ok: true, data: rows.results, csv, filename: `${route === "/billing" ? "billing" : "transactions"}-export-${new Date().toISOString().slice(0, 10)}.csv` }, 200, headers);
+        }
         if (pageLimit === null) return json({ ok: true, data: rows.results }, 200, headers);
         const data = rows.results.slice(0, pageLimit);
         const count = auth.system
@@ -6879,7 +7022,7 @@ const worker = {
         return new Response(serialized, { status: 201, headers: { ...headers, "content-type": "application/json" } });
       }
       if (route === "/returns" && request.method === "POST") {
-        if (!hasScope(auth, "cases.manage")) return error("FORBIDDEN", "Returns management permission required", 403, id, headers);
+        if (!hasAnyScope(auth, ["returns.manage", "cases.manage"])) return error("FORBIDDEN", "Returns management permission required", 403, id, headers);
         const payload = await bodyJson(request); const requestHash = await payloadFingerprint(payload); const clientId = requireClient(auth, payload.client_id);
         if (!clientId || !canAccessClient(auth, clientId) || typeof payload.shipment_id !== "string" || typeof payload.reason !== "string") return error("VALIDATION_ERROR", "Shipment and return reason are required", 400, id, headers);
         if (!(await shipmentBelongsToClient(env, payload.shipment_id, clientId))) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
@@ -7109,8 +7252,31 @@ const worker = {
         if ((entityUpdate[1] === "billing" || entityUpdate[1] === "wallet") && !hasRole(auth, ["admin", "super_admin"])) return error("FORBIDDEN", "Administrator finance permission required", 403, id, headers);
         const table = map[entityUpdate[1]]; const current = await env.DB.prepare(`SELECT client_id FROM ${table} WHERE id = ? LIMIT 1`).bind(entityUpdate[2]).first<{ client_id: string }>();
         const scopeByEntity: Record<string, string> = { billing: "billing.manage", wallet: "wallet.manage", "cod-remittances": "cod.manage", "weight-reconciliation": "weight.manage" };
-        if (!current || !canAccessClient(auth, current.client_id) || (scopeByEntity[entityUpdate[1]] && !hasScope(auth, scopeByEntity[entityUpdate[1]])) || (!scopeByEntity[entityUpdate[1]] && entityUpdate[1] !== "warehouses" && entityUpdate[1] !== "addresses" && !hasRole(auth, ["employee", "admin", "super_admin"]))) return error("NOT_FOUND", "Record not found", 404, id, headers);
-        const payload = await bodyJson(request); if (entityUpdate[1] === "tickets") { const status = typeof payload.status === "string" ? payload.status.trim().toLowerCase() : undefined; if (status && !["open", "in_progress", "waiting_for_client", "resolved", "closed", "escalated"].includes(status)) return error("VALIDATION_ERROR", "Unsupported ticket status", 400, id, headers); const isAdmin = hasRole(auth, ["admin", "super_admin"]); const requiredPermission = ticketUpdatePermissions(payload).find((permission) => !isAdmin && (permission === "admin" || !hasScope(auth, permission))); if (requiredPermission) { const messages = { "tickets.reassign": "Ticket reassignment permission required", "tickets.close": "Ticket resolution permission required", "tickets.escalate": "Ticket escalation permission required", admin: "Only administrators may change ticket priority" }; return error("FORBIDDEN", messages[requiredPermission], 403, id, headers); } } const financeStatuses: Record<string, string[]> = { billing: ["pending", "approved", "paid", "void", "cancelled"], wallet: ["pending", "approved", "posted", "rejected", "void"] }; const requestedStatus = payload.status === undefined ? undefined : String(payload.status); if (requestedStatus !== undefined && financeStatuses[entityUpdate[1]] && !financeStatuses[entityUpdate[1]].includes(requestedStatus)) return error("VALIDATION_ERROR", "Invalid finance record status", 400, id, headers); if (entityUpdate[1] === "billing" && requestedStatus === "paid") return error("FINANCE_RECONCILIATION_REQUIRED", "Billing cannot be marked paid by changing status alone. Reconcile it against its shipment and posted wallet transaction.", 409, id, headers); if (entityUpdate[1] === "weight-reconciliation" && (typeof payload.reason !== "string" || !payload.reason.trim())) return error("VALIDATION_ERROR", "A reason is required for weight-record changes", 400, id, headers); if (payload.is_test !== undefined && !hasRole(auth, ["admin", "super_admin"])) return error("FORBIDDEN", "Only administrators may classify test data", 403, id, headers); if (payload.is_test !== undefined && !isTestFlag(payload.is_test)) return error("VALIDATION_ERROR", "is_test must be a boolean", 400, id, headers); const requestHash = await payloadFingerprint(payload); const allowedFields = entityUpdate[1] === "warehouses" ? ["name", "address", "city", "state", "pincode", "contact", "contact_name", "is_test"] : entityUpdate[1] === "addresses" ? ["label", "address_kind", "contact_name", "phone", "address", "city", "state", "country", "pincode", "is_test"] : entityUpdate[1] === "weight-reconciliation" ? ["status", "measured_weight_kg", "billable_weight_kg"] : entityUpdate[1] === "wallet" ? ["status"] : entityUpdate[1] === "cod-remittances" ? ["status", "settled_at"] : entityUpdate[1] === "ndr" ? ["status", "assigned_to_user_id", "deadline", "notes", "attempt"] : entityUpdate[1] === "exceptions" ? ["status", "assigned_to_user_id", "severity", "details"] : entityUpdate[1] === "returns" ? ["status", "provider_reference"] : ["status", "assigned_to_user_id", "priority"]; if ((entityUpdate[1] === "ndr" || entityUpdate[1] === "exceptions" || entityUpdate[1] === "tickets") && payload.assigned_to_user_id !== undefined && !(await employeeCanBeAssigned(env, auth, payload.assigned_to_user_id, current.client_id))) return error("FORBIDDEN", "Assigned employee is inactive, classified as a test identity, or outside the client scope", 403, id, headers); let updates = allowedFields.filter((field) => typeof payload[field] === "string" || typeof payload[field] === "number" || (field === "is_test" && isTestFlag(payload[field]))).map((field) => ({ field, value: field === "address_kind" && payload[field] !== "consignee" ? "consignor" : field === "is_test" ? testFlagNumber(payload[field]) : payload[field] })); if (entityUpdate[1] === "tickets" && payload.status === "escalated") updates = [...updates, { field: "escalation_state", value: "escalated" }];
+        if (!current || !canAccessClient(auth, current.client_id) || (scopeByEntity[entityUpdate[1]] && !hasScope(auth, scopeByEntity[entityUpdate[1]])) || (!scopeByEntity[entityUpdate[1]] && entityUpdate[1] !== "warehouses" && entityUpdate[1] !== "addresses" && entityUpdate[1] !== "returns" && !hasRole(auth, ["employee", "admin", "super_admin"]))) return error("NOT_FOUND", "Record not found", 404, id, headers);
+        if (entityUpdate[1] === "returns" && !hasAnyScope(auth, ["returns.manage", "cases.manage"]) && !hasRole(auth, ["admin", "super_admin"])) return error("FORBIDDEN", "Returns management permission required", 403, id, headers);
+        const payload = await bodyJson(request);
+        if (entityUpdate[1] === "tickets") {
+          const status = typeof payload.status === "string" ? payload.status.trim().toLowerCase() : undefined;
+          if (status && !["open", "in_progress", "waiting_for_client", "resolved", "closed", "escalated"].includes(status)) return error("VALIDATION_ERROR", "Unsupported ticket status", 400, id, headers);
+          const isAdmin = hasRole(auth, ["admin", "super_admin"]);
+          const requiredPermission = ticketUpdatePermissions(payload).find((permission) => !isAdmin && (permission === "admin" || !hasScope(auth, permission)));
+          if (requiredPermission) {
+            const messages = { "tickets.reassign": "Ticket reassignment permission required", "tickets.close": "Ticket resolution permission required", "tickets.escalate": "Ticket escalation permission required", admin: "Only administrators may change ticket priority" };
+            return error("FORBIDDEN", messages[requiredPermission], 403, id, headers);
+          }
+        }
+        const financeStatuses: Record<string, string[]> = { billing: ["pending", "approved", "paid", "void", "cancelled"], wallet: ["pending", "approved", "posted", "rejected", "void"] };
+        const requestedStatus = payload.status === undefined ? undefined : String(payload.status);
+        if (requestedStatus !== undefined && financeStatuses[entityUpdate[1]] && !financeStatuses[entityUpdate[1]].includes(requestedStatus)) return error("VALIDATION_ERROR", "Invalid finance record status", 400, id, headers);
+        if (entityUpdate[1] === "billing" && requestedStatus === "paid") return error("FINANCE_RECONCILIATION_REQUIRED", "Billing cannot be marked paid by changing status alone. Reconcile it against its shipment and posted wallet transaction.", 409, id, headers);
+        if (entityUpdate[1] === "weight-reconciliation" && (typeof payload.reason !== "string" || !payload.reason.trim())) return error("VALIDATION_ERROR", "A reason is required for weight-record changes", 400, id, headers);
+        if (payload.is_test !== undefined && !hasRole(auth, ["admin", "super_admin"])) return error("FORBIDDEN", "Only administrators may classify test data", 403, id, headers);
+        if (payload.is_test !== undefined && !isTestFlag(payload.is_test)) return error("VALIDATION_ERROR", "is_test must be a boolean", 400, id, headers);
+        const caseEntity = entityUpdate[1] === "ndr" || entityUpdate[1] === "exceptions";
+        const requestedCaseStatus = typeof payload.status === "string" ? payload.status.trim().toLowerCase() : undefined;
+        if (caseEntity && payload.assigned_to_user_id !== undefined && !hasAnyScope(auth, ["exceptions.assign", "cases.manage"]) && !hasRole(auth, ["admin", "super_admin"])) return error("FORBIDDEN", "Exception assignment permission required", 403, id, headers);
+        if (caseEntity && ["resolved", "closed"].includes(requestedCaseStatus ?? "") && !hasAnyScope(auth, ["exceptions.resolve", "cases.manage"]) && !hasRole(auth, ["admin", "super_admin"])) return error("FORBIDDEN", "Exception resolution permission required", 403, id, headers);
+        const requestHash = await payloadFingerprint(payload); const allowedFields = entityUpdate[1] === "warehouses" ? ["name", "address", "city", "state", "pincode", "contact", "contact_name", "is_test"] : entityUpdate[1] === "addresses" ? ["label", "address_kind", "contact_name", "phone", "address", "city", "state", "country", "pincode", "is_test"] : entityUpdate[1] === "weight-reconciliation" ? ["status", "measured_weight_kg", "billable_weight_kg"] : entityUpdate[1] === "wallet" ? ["status"] : entityUpdate[1] === "cod-remittances" ? ["status", "settled_at"] : entityUpdate[1] === "ndr" ? ["status", "assigned_to_user_id", "deadline", "notes", "attempt"] : entityUpdate[1] === "exceptions" ? ["status", "assigned_to_user_id", "severity", "details"] : entityUpdate[1] === "returns" ? ["status", "provider_reference"] : ["status", "assigned_to_user_id", "priority"]; if ((entityUpdate[1] === "ndr" || entityUpdate[1] === "exceptions" || entityUpdate[1] === "tickets") && payload.assigned_to_user_id !== undefined && !(await employeeCanBeAssigned(env, auth, payload.assigned_to_user_id, current.client_id))) return error("FORBIDDEN", "Assigned employee is inactive, classified as a test identity, or outside the client scope", 403, id, headers); let updates = allowedFields.filter((field) => typeof payload[field] === "string" || typeof payload[field] === "number" || (field === "is_test" && isTestFlag(payload[field]))).map((field) => ({ field, value: field === "address_kind" && payload[field] !== "consignee" ? "consignor" : field === "is_test" ? testFlagNumber(payload[field]) : payload[field] })); if (entityUpdate[1] === "tickets" && payload.status === "escalated") updates = [...updates, { field: "escalation_state", value: "escalated" }];
         if (!updates.length) return error("VALIDATION_ERROR", "A supported update is required", 400, id, headers);
         const safeAuditFields = updates.map((update) => update.field).filter((field) => ["status", "escalation_state", "priority", "assigned_to_user_id", "deadline", "attempt", "severity", "settled_at", "measured_weight_kg", "billable_weight_kg"].includes(field));
         const auditBefore = safeAuditFields.length ? await env.DB.prepare(`SELECT ${safeAuditFields.join(", ")} FROM ${table} WHERE id = ? LIMIT 1`).bind(entityUpdate[2]).first<Record<string, unknown>>() : {};
@@ -7153,10 +7319,10 @@ const worker = {
         let selectedProviderAccountName = "";
         let accountValue = internalPricingRequest ? String(payload.account_code ?? "").trim().toLowerCase() : "other";
         if (typeof payload.provider_account_id === "string" && payload.provider_account_id.trim()) {
-          await ensureDefaultClientProviderPolicies(env, clientId, auth.userId ?? `client:${clientId}`);
-           const providerAccount = await env.DB.prepare(`SELECT pa.account_name FROM provider_accounts pa JOIN provider_account_client_policies p ON p.provider_account_id = pa.id AND p.client_id = ? AND p.enabled = 1 WHERE pa.id = ? AND pa.provider = 'delhivery' AND pa.status = 'active' AND (pa.client_id = ? OR p.client_id = ?) LIMIT 1`).bind(clientId, payload.provider_account_id.trim(), clientId, clientId).first<{ account_name: string }>();
+          const diagnostics = await bookingProviderAccountDiagnostics(env, clientId, payload.provider_account_id.trim());
+          const providerAccount = diagnostics.eligible[0];
           if (!providerAccount) return error("PROVIDER_ACCOUNT_NOT_ASSIGNED", "This Delhivery account is not assigned to the client", 403, id, headers);
-          selectedProviderAccountName = String(providerAccount.account_name ?? "");
+          selectedProviderAccountName = providerAccount.account_name;
           accountValue = delhiveryPricingAccountFromName(selectedProviderAccountName);
         }
         if (!accountValue) accountValue = "other";
@@ -7353,6 +7519,9 @@ const worker = {
         if (!hasRole(auth, ["super_admin"]) || !hasScope(auth, "pricing.manage")) return error("FORBIDDEN", "Pricing management permission required", 403, id, headers);
         const payload = await bodyJson(request, 2 * 1024 * 1024); const clientId = requireClient(auth, payload.client_id);
         if (!clientId) return error("VALIDATION_ERROR", "A client is required", 400, id, headers);
+        const idempotencyKey = request.headers.get("Idempotency-Key"); if (!idempotencyKey) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
+        const requestHash = await payloadFingerprint(payload); const endpoint = "POST /v1/pricing/versions"; const existing = await idempotentResponse(env, idempotencyKey, auth.userId ?? "system", endpoint, requestHash);
+        if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
         const legacySourceRateCardId = typeof payload.source_rate_card_id === "string" ? payload.source_rate_card_id.trim() : "";
         const suppliedSourceIds = payload.source_rate_card_ids && typeof payload.source_rate_card_ids === "object" ? payload.source_rate_card_ids as Record<string, unknown> : {};
         const sourceRateCardIds = Object.fromEntries(["04", "08", "other"].map((account) => [account, String(suppliedSourceIds[account] ?? (account === "other" ? legacySourceRateCardId : "")).trim()]).filter(([, value]) => Boolean(value)));
@@ -7406,12 +7575,17 @@ const worker = {
         }
         await env.DB.batch(statements);
         await audit(env, ctx, auth, id, requestedStatus === "active" ? "pricing.version_published" : "pricing.version_drafted", "pricing_version", versionId, { client_id: clientId, account_scopes: validAccounts, charge_rule_count: chargeRules.length });
-        return json({ ok: true, data: { id: versionId, client_id: clientId, provider: "delhivery", service_level: "b2b", status: requestedStatus, effective_at: now } }, 201, headers);
+        const serialized = JSON.stringify({ ok: true, data: { id: versionId, client_id: clientId, provider: "delhivery", service_level: "b2b", status: requestedStatus, effective_at: now }, request_id: id });
+        await saveIdempotent(env, idempotencyKey, auth.userId ?? "system", endpoint, 201, serialized, requestHash);
+        return new Response(serialized, { status: 201, headers: { ...headers, "content-type": "application/json" } });
       }
       if (route === "/pricing/overrides" && request.method === "POST") {
         if (!hasRole(auth, ["admin", "super_admin"]) || !hasScope(auth, "pricing.override")) return error("FORBIDDEN", "Pricing override permission required", 403, id, headers);
         const payload = await bodyJson(request); const shipmentId = typeof payload.shipment_id === "string" ? payload.shipment_id.trim() : ""; const component = typeof payload.component_code === "string" ? payload.component_code.trim() : ""; const reason = typeof payload.reason === "string" ? payload.reason.trim() : ""; const nextAmount = Number(payload.new_amount);
         if (!shipmentId || !component || !reason || !Number.isFinite(nextAmount) || nextAmount < 0) return error("VALIDATION_ERROR", "Shipment, component, non-negative amount, and reason are required", 400, id, headers);
+        const idempotencyKey = request.headers.get("Idempotency-Key"); if (!idempotencyKey) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
+        const requestHash = await payloadFingerprint(payload); const endpoint = "POST /v1/pricing/overrides"; const existing = await idempotentResponse(env, idempotencyKey, auth.userId ?? "system", endpoint, requestHash);
+        if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
         const snapshot = await env.DB.prepare("SELECT id, client_id, client_breakdown_json FROM pricing_shipment_snapshots WHERE shipment_id = ? LIMIT 1").bind(shipmentId).first<{ id: string; client_id: string; client_breakdown_json: string }>();
         if (!snapshot || !canAccessClient(auth, snapshot.client_id)) return error("NOT_FOUND", "Pricing snapshot not found", 404, id, headers);
         const billing = await env.DB.prepare("SELECT id, amount FROM billing_records WHERE shipment_id = ? AND client_id = ? ORDER BY created_at ASC LIMIT 1").bind(shipmentId, snapshot.client_id).first<{ id: string; amount: number }>();
@@ -7457,7 +7631,9 @@ const worker = {
         ]);
         if (walletAdjustment) await recalculateWalletBalances(env, snapshot.client_id);
         await audit(env, ctx, auth, id, "pricing.override_applied", "pricing_snapshot", snapshot.id, { client_id: snapshot.client_id, shipment_id: shipmentId, component_code: component, previous_amount: previous, new_amount: line.amount, reason });
-        return json({ ok: true, data: { id: overrideId, shipment_id: shipmentId, component_code: component, amount: line.amount, total: breakdown.total, reason } }, 200, headers);
+        const serialized = JSON.stringify({ ok: true, data: { id: overrideId, shipment_id: shipmentId, component_code: component, amount: line.amount, total: breakdown.total, reason }, request_id: id });
+        await saveIdempotent(env, idempotencyKey, auth.userId ?? "system", endpoint, 200, serialized, requestHash);
+        return new Response(serialized, { status: 200, headers: { ...headers, "content-type": "application/json" } });
       }
       if (route === "/pricing/internal/margins" && request.method === "GET") {
         if (!hasRole(auth, ["super_admin"]) || !hasScope(auth, "provider_cost.view")) return error("FORBIDDEN", "Internal pricing access required", 403, id, headers);
@@ -7681,7 +7857,7 @@ const worker = {
         return json({ ok: true, data: rows.results }, 200, headers);
       }
       if (route === "/tasks" && request.method === "POST") {
-        if (!hasScope(auth, "tasks.manage")) return error("FORBIDDEN", "Task management scope required", 403, id, headers);
+        if (!hasAnyScope(auth, ["tasks.create", "tasks.manage"])) return error("FORBIDDEN", "Task creation permission required", 403, id, headers);
         const payload = await bodyJson(request); const requestHash = await payloadFingerprint(payload); const clientId = typeof payload.client_id === "string" ? payload.client_id : null;
         if (!auth.system && !clientId) return error("FORBIDDEN", "Client scope is required", 403, id, headers);
         if (clientId && !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
@@ -7703,7 +7879,6 @@ const worker = {
       }
       const taskMatch = route.match(/^\/tasks\/([^/]+)$/);
       if (taskMatch && request.method === "PATCH") {
-        if (!hasScope(auth, "tasks.manage")) return error("FORBIDDEN", "Task management scope required", 403, id, headers);
         const task = await env.DB.prepare("SELECT client_id, status, priority, due_at, assigned_to_user_id, title FROM tasks WHERE id = ? LIMIT 1").bind(taskMatch[1]).first<{ client_id: string | null; status: string; priority: string; due_at: string | null; assigned_to_user_id: string | null; title: string }>(); if (!task || (task.client_id && !canAccessClient(auth, task.client_id))) return error("NOT_FOUND", "Task not found", 404, id, headers);
         const payload = await bodyJson(request);
         const requestHash = await payloadFingerprint(payload);
@@ -7739,6 +7914,13 @@ const worker = {
           taskUpdates.push({ field: "assigned_to_user_id", value: assignedToUserId === null ? "" : String(assignedToUserId) });
         }
         if (!taskUpdates.length) return error("VALIDATION_ERROR", "A supported task update is required", 400, id, headers);
+        const editFields = new Set(["client_id", "title", "description", "priority", "due_at"]);
+        const needsEdit = taskUpdates.some((update) => editFields.has(update.field));
+        const needsCompletion = taskUpdates.some((update) => update.field === "status");
+        const needsAssignment = taskUpdates.some((update) => update.field === "assigned_to_user_id");
+        if (needsEdit && !hasAnyScope(auth, ["tasks.edit", "tasks.manage"])) return error("FORBIDDEN", "Task edit permission required", 403, id, headers);
+        if (needsCompletion && !hasAnyScope(auth, ["tasks.complete", "tasks.manage"])) return error("FORBIDDEN", "Task completion permission required", 403, id, headers);
+        if (needsAssignment && !hasAnyScope(auth, ["tasks.assign", "tasks.manage"])) return error("FORBIDDEN", "Task assignment permission required", 403, id, headers);
         const idempotencyKey = request.headers.get("Idempotency-Key"); if (!idempotencyKey) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
         const scopeKey = task.client_id ?? auth.clientId ?? auth.userId ?? "system"; const endpoint = `PATCH /v1/tasks/${taskMatch[1]}`; const existing = await idempotentResponse(env, idempotencyKey, scopeKey, endpoint, requestHash); if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
         await env.DB.prepare(`UPDATE tasks SET ${taskUpdates.map((update) => `${update.field} = ?`).join(", ")}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(...taskUpdates.map((update) => update.value), taskMatch[1]).run();
@@ -7773,6 +7955,8 @@ const worker = {
       }
       if (route === "/activity" && request.method === "GET") {
         if (!hasScope(auth, "activity.read")) return error("FORBIDDEN", "Activity read scope required", 403, id, headers);
+        const exportRequested = url.searchParams.get("format") === "csv";
+        if (exportRequested && !hasScope(auth, "audit.export")) return error("FORBIDDEN", "Audit export permission required", 403, id, headers);
         const limit = Math.min(Math.max(Number.parseInt(url.searchParams.get("limit") ?? "100", 10) || 100, 1), 200);
         const offset = Math.max(Number.parseInt(url.searchParams.get("offset") ?? "0", 10) || 0, 0);
         const scopedSql = auth.system
@@ -7796,6 +7980,12 @@ const worker = {
           : await env.DB.prepare(countQuery).bind(...auth.clientIds, auth.userId ?? "").first<{ total: number }>();
         const results = rows.results ?? [];
         const data = results.slice(0, limit);
+        if (exportRequested) {
+          const columns = ["id", "actor_user_id", "client_id", "shipment_id", "action", "entity_type", "entity_id", "created_at"];
+          const escapeCsv = (value: unknown) => `"${String(value ?? "").replaceAll('"', '""')}"`;
+          const csv = [columns.join(","), ...data.map((row) => columns.map((column) => escapeCsv((row as Record<string, unknown>)[column])).join(","))].join("\n");
+          return json({ ok: true, data, csv, filename: `audit-log-${new Date().toISOString().slice(0, 10)}.csv` }, 200, headers);
+        }
         return json({ ok: true, data, pagination: { limit, offset, total: Number(count?.total ?? 0), next_offset: offset + data.length, has_more: results.length > limit } }, 200, headers);
       }
       const notificationMatch = route.match(/^\/notifications\/([^/]+)$/);
