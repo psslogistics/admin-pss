@@ -19,7 +19,9 @@ export type ServiceabilityDecision = {
 export function serviceabilityCacheKey(providerAccountId: string, originPincode: string, destinationPincode: string, paymentMode?: string, weightKg?: number) {
   const mode = String(paymentMode ?? "any").trim().toLowerCase() === "cod" ? "cod" : String(paymentMode ?? "any").trim().toLowerCase() === "prepaid" ? "prepaid" : "any";
   const weight = Number.isFinite(Number(weightKg)) && Number(weightKg) > 0 ? Math.round(Number(weightKg) * 1000) : 20000;
-  return `${providerAccountId}|${originPincode}|${destinationPincode}|${mode}|${weight}`;
+  // Bump when provider capability normalization changes so an older cached
+  // response cannot preserve fabricated payment-mode negatives after release.
+  return `capabilities-v2|${providerAccountId}|${originPincode}|${destinationPincode}|${mode}|${weight}`;
 }
 
 export function evaluateDelhiveryServiceability(origin: ServiceabilityObservation, destination: ServiceabilityObservation, paymentMode?: string): ServiceabilityDecision {
