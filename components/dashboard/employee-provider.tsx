@@ -7,7 +7,7 @@ import { getSlaState, initialSettings, type AssignedClient, type DemoEmployee, t
 import { getPssErrorDetails, pssApi } from "@/lib/pss-api";
 
 type EmployeeState = { employeeId: string; profile: DemoEmployee; tasks: EmployeeTask[]; tickets: DemoTicket[]; notifications: DemoNotification[]; activity: EmployeeActivity[]; settings: EmployeeSettings; shipments: DemoShipment[] };
-type InitialIdentity = { id: string; name: string; email: string; employeeId: string; workspace: string; role: string };
+type InitialIdentity = { id: string; name: string; email: string; employeeId: string; workspace: string; role: string; assignedClientIds?: string[]; assignedClients?: AssignedClient[] };
 type EmployeeContextValue = EmployeeState & { hydrated: boolean; bootstrapError: string; ticketMessagesError: string; employees: DemoEmployee[]; clients: AssignedClient[]; can: (permission: PermissionKey) => boolean; saveTask: (task: EmployeeTask) => Promise<{ error?: string }>; updateTask: (id: string, patch: Partial<EmployeeTask>) => Promise<{ error?: string }>; saveTicket: (ticket: DemoTicket) => Promise<{ error?: string }>; updateTicket: (id: string, patch: Partial<DemoTicket>) => Promise<{ error?: string }>; replyToTicket: (id: string, body: string) => Promise<{ error?: string }>; markNotificationRead: (id: string) => Promise<{ error?: string }>; markAllNotificationsRead: () => Promise<{ error?: string }>; addActivity: (title: string, detail: string, tone?: EmployeeActivity["tone"]) => Promise<{ error?: string }>; updateSettings: (patch: Partial<EmployeeSettings>) => Promise<{ error?: string }>; updateProfile: (patch: Partial<Pick<DemoEmployee, "name" | "phone">>) => Promise<{ error?: string }>; getVisibleClients: () => AssignedClient[]; getVisibleTickets: () => DemoTicket[] };
 const emptyProfile: DemoEmployee = { id: "authenticated", name: "Authenticated employee", initials: "AE", role: "Employee", email: "", employeeId: "", workspace: "", assignedClientIds: [], permissions: [], panelRole: "admin" };
 const actionError = (error: unknown, fallback: string) => getPssErrorDetails(error, fallback).message;
@@ -22,7 +22,7 @@ function permissionSet(rows: Array<{ permission_key?: string }>, allowed: Set<st
 export function EmployeeProvider({ children, initialIdentity, initialPermissions = [] }: { children: React.ReactNode; initialIdentity?: InitialIdentity; initialPermissions?: string[] }) {
   const initialState = useMemo<EmployeeState>(() => {
     if (!initialIdentity) return defaultState();
-    return { ...defaultState(), employeeId: initialIdentity.id, profile: { ...emptyProfile, id: initialIdentity.id, name: initialIdentity.name, initials: initials(initialIdentity.name), role: initialIdentity.role, email: initialIdentity.email, employeeId: initialIdentity.employeeId, workspace: initialIdentity.workspace, permissions: initialPermissions.filter((permission): permission is PermissionKey => isAdminPermission(permission)) } };
+    return { ...defaultState(), employeeId: initialIdentity.id, profile: { ...emptyProfile, id: initialIdentity.id, name: initialIdentity.name, initials: initials(initialIdentity.name), role: initialIdentity.role, email: initialIdentity.email, employeeId: initialIdentity.employeeId, workspace: initialIdentity.workspace, assignedClientIds: initialIdentity.assignedClientIds ?? [], permissions: initialPermissions.filter((permission): permission is PermissionKey => isAdminPermission(permission)) } };
   }, [initialIdentity, initialPermissions]);
   const [state, setState] = useState<EmployeeState>(initialState);
   const [clients, setClients] = useState<AssignedClient[]>([]);
@@ -95,8 +95,10 @@ export function EmployeeProvider({ children, initialIdentity, initialPermissions
         if (override.mode === "grant") effectivePermissions.add(override.permission_key);
         if (override.mode === "revoke") effectivePermissions.delete(override.permission_key);
       }
-      const assignedClientIds = (assignments ?? []).map((item) => item.client_id).filter(Boolean);
-      const loadedClients: AssignedClient[] = (assignments ?? []).flatMap((item) => { const client = Array.isArray(item.client_accounts) ? item.client_accounts[0] : item.client_accounts; return client ? [{ id: client.id, name: client.legal_name, contact: "", location: "", shipments: 0, status: client.status === "active" ? "Active" : client.status, lastActivity: "Live assignment activity" }] : []; });
+      const queriedAssignedClientIds = (assignments ?? []).map((item) => item.client_id).filter(Boolean);
+      const assignedClientIds = initialIdentity?.assignedClientIds?.length ? initialIdentity.assignedClientIds : queriedAssignedClientIds;
+      const queriedClients: AssignedClient[] = (assignments ?? []).flatMap((item) => { const client = Array.isArray(item.client_accounts) ? item.client_accounts[0] : item.client_accounts; return client ? [{ id: client.id, name: client.legal_name, contact: "", location: "", shipments: 0, status: client.status === "active" ? "Active" : client.status, lastActivity: "Live assignment activity" }] : []; });
+      const loadedClients = queriedClients.length ? queriedClients : (initialIdentity?.assignedClients ?? []);
       let liveTickets: DemoTicket[] = []; let liveNotifications: DemoNotification[] = []; let liveShipments: DemoShipment[] = []; let liveTasks: EmployeeTask[] = []; let liveActivity: EmployeeActivity[] = [];
       let liveSettings: EmployeeSettings = initialSettings;
       try {
