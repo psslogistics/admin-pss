@@ -6,7 +6,10 @@ const allowed = new Set(["application/pdf", "application/vnd.openxmlformats-offi
 const rateCardError = (status: number, code: string, userMessage: string, technicalMessage = userMessage) => { const requestId = crypto.randomUUID(); return NextResponse.json({ error: { category: status === 403 ? "permission" : status >= 500 ? "server" : "request", code, user_safe_message: userMessage, technical_message: technicalMessage, retryable: status >= 500 || [408, 409, 429].includes(status), stale_data: false, request_id: requestId } }, { status, headers: { "x-request-id": requestId } }); };
 
 async function access(clientId?: string, requiredPermission = "admin.rate_cards.manage") {
-  const actor = await requireEmployeeAccess(); const supabase = await createClient();
+  const supabase = await createClient();
+  const claimsResult = await supabase.auth.getClaims();
+  if (!claimsResult.data?.claims?.sub) return { error: rateCardError(401, "AUTHENTICATION_REQUIRED", "Your session is missing or expired.") };
+  const actor = await requireEmployeeAccess();
   const { data: permission } = await supabase.rpc("has_permission", { required_permission: requiredPermission });
   if (!permission) return { error: rateCardError(403, "RATE_CARD_PERMISSION_DENIED", "You do not have permission to view or manage rate cards.") };
   if (clientId) { const { data: assigned } = await supabase.from("employee_client_assignments").select("client_id").eq("employee_user_id", actor.userId).eq("client_id", clientId).maybeSingle(); if (!assigned) return { error: rateCardError(403, "RATE_CARD_CLIENT_SCOPE_DENIED", "This client is outside your assigned scope.") }; }
