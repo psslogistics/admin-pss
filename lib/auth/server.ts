@@ -5,13 +5,14 @@ import { createClient } from '@/lib/supabase/server'
 const getEmployeeAccess = cache(async () => {
   const supabase = await createClient(); const claimsResult = await supabase.auth.getClaims(); const userId = claimsResult.data?.claims?.sub;
   if (!userId) redirect('/sign-in');
-  const [{ data, error: profileError }, { data: employeeProfile, error: employeeProfileError }, { data: assignments, error: assignmentsError }, { data: authContext, error: authContextError }] = await Promise.all([
+  const [{ data, error: profileError }, { data: employeeProfile, error: employeeProfileError }, { data: assignments, error: assignmentsError }, { data: authContext, error: authContextError }, { data: employeeAssignments, error: employeeAssignmentsError }] = await Promise.all([
     supabase.from('profiles').select('id,email,display_name,status,must_change_password').eq('id', userId).maybeSingle(),
     supabase.from('employee_profiles').select('employee_code,workspace_slug,employment_status').eq('user_id', userId).maybeSingle(),
     supabase.from('user_roles').select('is_active,role_id').eq('user_id', userId),
     supabase.rpc('get_auth_context'),
+    supabase.from('employee_client_assignments').select('client_id,client_accounts(id,legal_name,status)').eq('employee_user_id', userId).eq('is_active', true),
   ]);
-  if (profileError || employeeProfileError || assignmentsError || authContextError) redirect('/access-denied?reason=database');
+  if (profileError || employeeProfileError || assignmentsError || authContextError || employeeAssignmentsError) redirect('/access-denied?reason=database');
   const roleIds = (assignments ?? []).map((item) => item.role_id);
   const { data: roleRows, error: rolesError } = roleIds.length ? await supabase.from('roles').select('id,role_code,scope').in('id', roleIds) : { data: [], error: null };
   if (rolesError) redirect('/access-denied?reason=database');
@@ -28,7 +29,7 @@ const getEmployeeAccess = cache(async () => {
     : { data: [], error: null };
   if (directRolePermissionsError) redirect('/access-denied?reason=database');
   const context = (authContext && typeof authContext === 'object' ? authContext : {}) as {
-    permissions?: Array<{ permission_key?: string }>; permission_overrides?: Array<{ permission_key?: string; mode?: string }>;
+    permissions?: Array<{ permission_key?: string }>; permission_overrides?: Array<{ permission_key?: string; mode?: string }>; active_client_ids?: string[];
   };
   const directPermissions = (directRolePermissions ?? []).map((item) => item.permission_key).filter((item): item is string => Boolean(item));
   const permissions = new Set((directPermissions.length ? directPermissions : (context.permissions ?? []).map((item) => item.permission_key)).filter((item): item is string => Boolean(item)));
@@ -37,7 +38,12 @@ const getEmployeeAccess = cache(async () => {
     if (override.mode === 'grant') permissions.add(override.permission_key);
     if (override.mode === 'revoke') permissions.delete(override.permission_key);
   }
-  return { userId, profile: data, employee: employeeProfile, roles, permissions: [...permissions] };
+  const assignedClientIds = (context.active_client_ids ?? []).filter((id): id is string => typeof id === 'string' && Boolean(id));
+  const assignedClients = (employeeAssignments ?? []).flatMap((item) => {
+    const client = Array.isArray(item.client_accounts) ? item.client_accounts[0] : item.client_accounts;
+    return client ? [{ id: client.id, name: client.legal_name, contact: '', location: '', shipments: 0, status: client.status === 'active' ? 'Active' : client.status, lastActivity: 'Live assignment activity' }] : [];
+  });
+  return { userId, profile: data, employee: employeeProfile, roles, permissions: [...permissions], assignedClientIds, assignedClients };
 });
 
 export async function requireEmployeeAccess() { return getEmployeeAccess(); }
