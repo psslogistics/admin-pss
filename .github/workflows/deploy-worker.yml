@@ -5,6 +5,7 @@ on:
     branches: [master]
     paths:
       - 'worker/**'
+      - 'package-lock.json'
       - '.github/workflows/deploy-worker.yml'
 
 jobs:
