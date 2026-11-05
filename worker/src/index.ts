@@ -3553,7 +3553,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       return null;
     };
     const tatDays = parseTat(parsedProviderBody) ?? findTat(body);
-    if (tatDays !== null && tatDays > 0) return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable: true, pickup: true, prepaid: true, cod: false, oda: null, tat_days: tatDays };
+    if (tatDays !== null && tatDays > 0) return { enabled: true, status: "accepted" as const, providerStatus: response.status, serviceable: true, pickup: true, prepaid: true, cod: null, oda: null, tat_days: tatDays };
     return { enabled: true, status: "failed" as const, providerStatus: response.status, error: "Delhivery returned an incomplete route serviceability response" };
   }
   if (response.ok && provider === "delhivery" && operation === "serviceability") {
@@ -7716,7 +7716,7 @@ const worker = {
         const providerLabel = (provider: CourierProvider) => provider === "delhivery" ? "Delhivery" : provider === "xpressbees" ? "XpressBees" : provider[0].toUpperCase() + provider.slice(1);
         const supportedProviders = new Set<CourierProvider>(["delhivery", "rivigo", "xpressbees"]);
         const serviceabilityRows: Array<{ pincode: string; provider: string; status: string; oda: boolean | null; prepaid?: boolean; cod?: boolean; account_id: string; account_name: string; confidence_score: number; priority: number; source?: string; reason?: string }> = [];
-        const routeResults: Array<{ provider: CourierProvider; accountId: string; accountName: string; confidenceScore: number; priority: number; origin: Record<string, unknown>; destination: Record<string, unknown>; routeServiceable: boolean }> = [];
+        const routeResults: Array<{ provider: CourierProvider; accountId: string; accountName: string; confidenceScore: number; priority: number; origin: Record<string, unknown>; destination: Record<string, unknown>; route: Record<string, unknown>; routeServiceable: boolean }> = [];
         for (const account of accountRows) {
           const label = `${providerLabel(account.provider)} · ${account.account_name}`;
           if (!supportedProviders.has(account.provider)) {
@@ -7758,7 +7758,7 @@ const worker = {
               { pincode: origin, provider: label, status: accountStatus, oda: originOda, prepaid: (originResult as { prepaid?: boolean }).prepaid, cod: (originResult as { cod?: boolean }).cod, account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), source: liveVerification?.provenance, reason: accountReason },
               { pincode: destination, provider: label, status: accountStatus, oda: destinationOda, prepaid: (destinationRecord as { prepaid?: boolean }).prepaid, cod: (destinationRecord as { cod?: boolean }).cod, account_id: account.id, account_name: account.account_name, confidence_score: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), source: liveVerification?.provenance, reason: accountReason },
             );
-            routeResults.push({ provider: account.provider, accountId: account.id, accountName: account.account_name, confidenceScore: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), origin: originRecord, destination: destinationRecord, routeServiceable: routeServiceableForAccount ?? (originServiceable && destinationServiceable) });
+            routeResults.push({ provider: account.provider, accountId: account.id, accountName: account.account_name, confidenceScore: Number(account.confidence_score ?? 0), priority: Number(account.priority ?? 100), origin: originRecord, destination: destinationRecord, route: (liveVerification?.route ?? {}) as Record<string, unknown>, routeServiceable: routeServiceableForAccount ?? (originServiceable && destinationServiceable) });
           } catch (caught) {
             const providerError = caught instanceof Error ? caught.message : "provider_request_failed";
             console.error(JSON.stringify({ request_id: id, route: "/v1/serviceability", provider: account.provider, account_id: account.id, error: providerError }));
@@ -7771,10 +7771,14 @@ const worker = {
         const routeServiceable = routeResults.some((result) => result.routeServiceable);
         const delhiveryRouteResults = routeResults.filter((result) => result.provider === "delhivery" && result.routeServiceable);
         const modeAvailability = (mode: "prepaid" | "cod") => {
-          const values = delhiveryRouteResults.map((result) => (result.destination as { prepaid?: boolean; cod?: boolean })[mode]);
+          const values = delhiveryRouteResults.map((result) => {
+            const destinationValue = (result.destination as { prepaid?: boolean | null; cod?: boolean | null })[mode];
+            const routeValue = (result.route as { prepaid?: boolean | null; cod?: boolean | null })[mode];
+            return destinationValue ?? routeValue ?? null;
+          });
           if (values.some((value) => value === true)) return true;
           if (values.some((value) => value === false)) return false;
-          return undefined;
+          return null;
         };
         const paymentModes = { prepaid: modeAvailability("prepaid"), cod: modeAvailability("cod") };
         const acceptedResult = routeResults.some((result) => result.origin.status === "accepted" && result.destination.status === "accepted");
