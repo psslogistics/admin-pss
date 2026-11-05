@@ -7786,7 +7786,7 @@ const worker = {
             // manifest form offers Collect on delivery for this account. The
             // account-level B2B capability therefore wins for COD; retain
             // explicit provider negatives for other modes/providers.
-            if (mode === "cod" && delhiveryAccountIsB2b(result.accountName)) return true;
+            if ((mode === "cod" || mode === "prepaid") && delhiveryAccountIsB2b(result.accountName)) return true;
             if (destinationValue === false || routeValue === false) return false;
             // The route/TAT response is authoritative for the live lane. A
             // pincode payload can carry account-specific or legacy negatives
