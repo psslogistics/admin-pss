@@ -22,10 +22,16 @@ const getEmployeeAccess = cache(async () => {
     if (!employeeProfile || employeeProfile.employment_status !== 'active') redirect('/access-denied?reason=employee-inactive');
   }
   if (data.must_change_password === true) redirect('/reset-password?required=1');
+  const activeRoleIds = (assignments ?? []).filter((assignment) => assignment.is_active === true).map((assignment) => assignment.role_id);
+  const { data: directRolePermissions, error: directRolePermissionsError } = activeRoleIds.length
+    ? await supabase.from('role_permissions').select('role_id,permission_key').in('role_id', activeRoleIds)
+    : { data: [], error: null };
+  if (directRolePermissionsError) redirect('/access-denied?reason=database');
   const context = (authContext && typeof authContext === 'object' ? authContext : {}) as {
     permissions?: Array<{ permission_key?: string }>; permission_overrides?: Array<{ permission_key?: string; mode?: string }>;
   };
-  const permissions = new Set((context.permissions ?? []).map((item) => item.permission_key).filter((item): item is string => Boolean(item)));
+  const directPermissions = (directRolePermissions ?? []).map((item) => item.permission_key).filter((item): item is string => Boolean(item));
+  const permissions = new Set((directPermissions.length ? directPermissions : (context.permissions ?? []).map((item) => item.permission_key)).filter((item): item is string => Boolean(item)));
   for (const override of context.permission_overrides ?? []) {
     if (!override.permission_key) continue;
     if (override.mode === 'grant') permissions.add(override.permission_key);
