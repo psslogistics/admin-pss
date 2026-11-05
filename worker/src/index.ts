@@ -7780,7 +7780,14 @@ const worker = {
           const values = delhiveryRouteResults.map((result) => {
             const destinationValue = (result.destination as { prepaid?: boolean | null; cod?: boolean | null })[mode];
             const routeValue = (result.route as { prepaid?: boolean | null; cod?: boolean | null })[mode];
-            return destinationValue ?? routeValue ?? null;
+            // The route/TAT response is authoritative for the live lane. A
+            // pincode payload can carry account-specific or legacy negatives
+            // even when it does not actually publish a payment capability.
+            // Never turn that ambiguous pincode value into a hard client
+            // rejection; only an explicit route capability can do that.
+            return routeValue !== null && routeValue !== undefined
+              ? routeValue
+              : destinationValue === true ? true : null;
           });
           if (values.some((value) => value === true)) return true;
           if (values.some((value) => value === false)) return false;
