@@ -65,8 +65,8 @@ export function EmployeeProvider({ children, initialIdentity, initialPermissions
       const roles = (userRoles ?? []) as Array<{ role_id?: string; roles?: { name?: string } | { name?: string }[] }>;
       const roleNames = roles.flatMap((item) => Array.isArray(item.roles) ? item.roles.map((role) => role.name) : [item.roles?.name]).filter((name): name is string => Boolean(name));
       const roleIds = roles.map((item) => item.role_id).filter((id): id is string => Boolean(id));
-      const [{ data: rolePermissions }, { data: overrides }, summaryResult] = await Promise.all([
-        roleIds.length ? supabase.from("role_permissions").select("role_id,permission_key").in("role_id", roleIds) : Promise.resolve({ data: [] }),
+      const [{ data: rolePermissions, error: rolePermissionsError }, { data: overrides }, summaryResult] = await Promise.all([
+        roleIds.length ? supabase.from("role_permissions").select("role_id,permission_key").in("role_id", roleIds) : Promise.resolve({ data: [], error: null }),
         supabase.from("employee_permission_overrides").select("permission_key,mode").eq("employee_user_id", user.id),
         summaryPromise,
       ]);
@@ -79,7 +79,7 @@ export function EmployeeProvider({ children, initialIdentity, initialPermissions
       // server-layout snapshot cannot leave stale navigation visible after a
       // user signs in with a different employee role.
       const effectivePermissions = new Set<PermissionKey>(
-        roleBasedPermissions.length
+        roleIds.length > 0 && !rolePermissionsError
           ? roleBasedPermissions
           : initialPermissions.filter((permission): permission is PermissionKey => isAdminPermission(permission)),
       );
