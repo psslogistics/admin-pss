@@ -259,7 +259,7 @@ function hasScope(auth: Auth, scope: string) {
     "reports.read": ["reports.read", "reports.view", "admin.reports.view"], "reports.export": ["reports.export", "admin.reports.export"], "audit.export": ["audit.export", "admin.audit.export"], "billing.export": ["billing.export", "admin.billing.export"], "transactions.export": ["transactions.export", "admin.transactions.export"], "tickets.read": ["tickets.read", "tickets.view", "admin.support.view", "admin.tickets.view"],
     "tickets.create": ["tickets.create", "tickets.reply", "admin.tickets.create"], "notifications.read": ["notifications.read", "notifications.view", "admin.notifications.view"],
     "cases.read": ["cases.read", "exceptions.view", "admin.exceptions.view"], "returns.read": ["returns.read", "admin.returns.view", "admin.returns.manage"], "cases.manage": ["cases.manage", "exceptions.manage", "admin.exceptions.manage", "admin.tracking.update"], "exceptions.assign": ["exceptions.assign", "admin.exceptions.assign"], "exceptions.resolve": ["exceptions.resolve", "admin.exceptions.resolve"], "returns.manage": ["returns.manage", "admin.returns.manage"],
-    "addresses.read": ["addresses.read", "admin.addresses.view", "addresses.manage", "admin.booking.create"], "addresses.manage": ["addresses.manage", "admin.booking.create"], "quotes.create": ["quotes.create", "admin.booking.create"],
+    "addresses.read": ["addresses.read", "admin.addresses.view", "addresses.manage", "admin.booking.create"], "addresses.manage": ["addresses.manage", "admin.booking.create"], "kyc.read": ["kyc.read", "admin.clients.kyc.view"], "quotes.create": ["quotes.create", "admin.booking.create"],
     "billing.read": ["billing.read", "billing.view", "admin.billing.view"], "wallet.read": ["wallet.read", "transactions.view", "admin.wallet.view"],
     "billing.manage": ["billing.manage", "billing.create", "billing.approve"], "wallet.manage": ["wallet.manage", "transactions.manage", "admin.wallet.adjust", "admin.wallet.approve", "admin.transactions.reconcile"],
     "cod.read": ["cod.read", "transactions.view"], "cod.manage": ["cod.manage", "billing.approve"], "weight.read": ["weight.read", "billing.view", "admin.weight.view"], "weight.manage": ["weight.manage", "billing.approve", "admin.weight.manage"],
@@ -5089,7 +5089,7 @@ const worker = {
         return new Response(serialized, { status: 200, headers: { ...headers, "content-type": "application/json" } });
       }
       if (route === "/kyc-status" && request.method === "GET") {
-        if (!auth.accessToken) return error("FORBIDDEN", "An authenticated client session is required", 403, id, headers);
+        if (!auth.accessToken || (auth.audience !== "client" && !hasScope(auth, "kyc.read"))) return error("FORBIDDEN", "KYC status permission required", 403, id, headers);
         const clientId = requireClient(auth, url.searchParams.get("client_id"));
         if (!clientId || !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
         const rows = await supabaseGet<{ status: string | null; gst_number: string | null; pan_number: string | null; aadhaar_last4: string | null; phone_verified_at: string | null }>(env, `client_kyc_profiles?client_id=eq.${encodeURIComponent(clientId)}&select=status,gst_number,pan_number,aadhaar_last4,phone_verified_at&limit=1`, auth.accessToken);
