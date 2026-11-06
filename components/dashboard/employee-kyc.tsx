@@ -14,7 +14,7 @@ export default function EmployeeKyc() {
   const [result, setResult] = useState<KycStatus | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
-  const [actionStatus, setActionStatus] = useState("");
+  const [actionStatus, setActionStatus] = useState(""); useEffect(() => { if (!selectedClient && clients[0]?.id) setSelectedClient(clients[0].id); }, [clients, selectedClient]);
   const load = () => {
     if (!selectedClient) return;
     setLoading(true); setError("");
