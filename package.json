@@ -34,6 +34,7 @@
     "test:returns-permissions": "node --experimental-strip-types worker/tools/employee-returns-permission-contract.mjs",
     "test:rate-card-parity": "node --experimental-strip-types worker/tools/employee-rate-card-parity-contract.mjs",
     "test:report-export": "node --experimental-strip-types worker/tools/employee-report-export-contract.mjs",
+    "test:report-schedule-preview": "node --experimental-strip-types worker/tools/employee-report-schedule-preview-contract.mjs",
     "test:address-read": "node --experimental-strip-types worker/tools/employee-address-read-contract.mjs",
     "test:label-permissions": "node --experimental-strip-types worker/tools/employee-label-permission-contract.mjs",
     "test:booking-document-permissions": "node --experimental-strip-types worker/tools/employee-booking-document-permission-contract.mjs",
