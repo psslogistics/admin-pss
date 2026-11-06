@@ -1,13 +1,13 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useEmployee } from "@/components/dashboard/employee-provider";
 import ProviderHealth from "@/components/dashboard/provider-health";
 
 export default function EmployeeCouriers() {
   const { getVisibleClients } = useEmployee();
   const clients = getVisibleClients();
-  const [selectedClient, setSelectedClient] = useState(clients[0]?.id ?? "");
+  const [selectedClient, setSelectedClient] = useState(clients[0]?.id ?? ""); useEffect(() => { if (!selectedClient && clients[0]?.id) setSelectedClient(clients[0].id); }, [clients, selectedClient]);
 
   return <div className="space-y-6">
     <header>
