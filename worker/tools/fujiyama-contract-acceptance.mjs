@@ -16,6 +16,8 @@ const checks = [
   ["warehouse registration resolves an account-scoped token", source.includes("DELHIVERY_WAREHOUSE_TOKEN_PSSLOGISTICS10_B2BC") && source.includes("DELHIVERY_TOKEN_PSSLOGISTICS10_B2BC")],
   ["warehouse registration prefers the B2B JWT contract", source.includes('contract: "b2b"') && source.includes('address_details') && source.includes('authorization: `Bearer ${token}`')],
   ["warehouse registration retains legacy compatibility fallback", source.includes('contract: "legacy"') && source.includes('authorization: `Token ${registrationToken}`')],
+  ["manifest polling allows provider propagation", source.includes("for (let poll = 0; poll < 12; poll += 1)")],
+  ["confirmed booking clears retry metadata", source.includes("provider_retry_at = NULL, provider_booking_payload_json = NULL, provider_last_error = NULL")],
   ["legacy Fujiyama ID removed", !source.includes("bb308dde-aae8-4503-ac7b-f91cd80ada78")],
   ["system API-key administration", source.includes("if (auth.system) return true;")],
   ["API-key tenant binding", source.includes("clientIds: new Set([row.client_id])")],

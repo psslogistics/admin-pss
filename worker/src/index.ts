@@ -3370,7 +3370,10 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       // is the synchronous 21-Oct behaviour: bounded, in-request lookup only.
       // It never sends a second manifest and never turns a late background
       // retry into a client-visible booking success.
-      for (let poll = 0; poll < 6; poll += 1) {
+      // Delhivery can publish the LR/AWB after the initial manifest
+      // acknowledgement. Keep this bounded, but allow a normal provider
+      // propagation window before returning 202 to the client.
+      for (let poll = 0; poll < 12; poll += 1) {
         await new Promise((resolve) => setTimeout(resolve, poll === 0 ? 0 : 1500));
         try {
           const statusUrl = `${base.replace(/\/$/, "")}/manifest?job_id=${encodeURIComponent(jobId)}`;
@@ -4035,6 +4038,10 @@ async function reconcilePendingDelhiveryReferences(env: Env, cron: string) {
   for (const shipment of pending.results) {
     try {
       await safeProviderRequest(env, "delhivery", "shipment_status", { shipment_id: shipment.id, provider_booking_id: shipment.provider_booking_id, provider_account_id: shipment.provider_account_id }, `cron:${cron}:delhivery-reference:${shipment.id}`, shipment.client_id, undefined, 10000);
+      // The status poll persists the provider reference inside
+      // safeProviderRequest. Once it exists, remove the original booking
+      // retry payload and timer so a confirmed shipment cannot be replayed.
+      await env.DB.prepare("UPDATE shipments SET provider_retry_at = NULL, provider_booking_payload_json = NULL, provider_last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ? AND provider_sync_status = 'confirmed' AND COALESCE(lr_number, master_awb, provider_reference, '') <> ''").bind(shipment.id, shipment.client_id).run();
     } catch (caught) {
       console.error(JSON.stringify({ job: "delhivery_reference_reconciliation", shipment_id: shipment.id, error: caught instanceof Error ? caught.message : "unknown_error" }));
     }
@@ -5667,7 +5674,7 @@ const worker = {
           return new Response(pendingResponse, { status: 202, headers: { ...headers, "content-type": "application/json" } });
         }
         if (reconciledProviderLr || reconciledProviderAwb || reconciledProviderReference) {
-          await env.DB.prepare("UPDATE shipments SET lr_number = COALESCE(?, lr_number), master_awb = COALESCE(?, master_awb), tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(?, provider_reference), provider_booking_id = COALESCE(?, provider_booking_id), provider_sync_status = 'confirmed', provider_last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+          await env.DB.prepare("UPDATE shipments SET lr_number = COALESCE(?, lr_number), master_awb = COALESCE(?, master_awb), tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(?, provider_reference), provider_booking_id = COALESCE(?, provider_booking_id), provider_sync_status = 'confirmed', provider_retry_at = NULL, provider_booking_payload_json = NULL, provider_last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
             .bind(reconciledProviderLr || null, reconciledProviderAwb || null, reconciledProviderLr || reconciledProviderAwb || null, reconciledProviderReference || reconciledProviderAwb || reconciledProviderLr || null, providerBookingId, shipmentId, clientId)
             .run();
         }
