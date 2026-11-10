@@ -1320,18 +1320,39 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
     return_country: "India",
   };
   const registrationToken = warehouseApiToken && !delhiveryLooksLikeJwt(warehouseApiToken) ? warehouseApiToken : null;
-  if (!registrationToken) return { ok: false as const, code: "DELHIVERY_WAREHOUSE_CREDENTIAL_REQUIRED" as const, error: "The Delhivery account has no valid Client Warehouse API token configured. Configure the account-scoped warehouse token before using dynamic pickup addresses." };
-  // The manifest service is backed by Delhivery's legacy client-warehouse
-  // registry. Prefer the account-scoped production API token for that
-  // registry; the B2B JWT endpoint can show an Active facility in the console
-  // while the manifest service still reports it as unconfigured. Keep the B2B
-  // endpoint as a fallback for accounts that do not expose the legacy token.
-  const registrationAttempts = [{
-    contract: "legacy",
-    endpoint: "https://track.delhivery.com/api/backend/clientwarehouse/create/",
-    authorization: `Token ${registrationToken}`,
-    payload: warehousePayload,
-  }];
+  // The active B2B clients use Delhivery's LTL warehouse contract with the
+  // authenticated B2B JWT and nested address_details payload. Keep the
+  // legacy Client Warehouse API as a compatibility fallback for older
+  // account credentials; do not require that separate token when the B2B
+  // warehouse contract is available.
+  const b2bWarehousePayload = {
+    name: providerName,
+    pin_code: resolvedOrigin.pincode,
+    city: resolvedOrigin.city,
+    state: resolvedOrigin.state,
+    country: "India",
+    address_details: {
+      address: resolvedOrigin.line,
+      contact_person: resolvedOrigin.name || providerName,
+      phone_number: resolvedOrigin.phone,
+    },
+    same_as_fwd_add: true,
+    ret_address: { pin: resolvedOrigin.pincode, address: resolvedOrigin.line },
+  };
+  const registrationAttempts = [
+    {
+      contract: "b2b",
+      endpoint: `${String(b2bBaseUrl).replace(/\/$/, "")}/client-warehouse/create/`,
+      authorization: `Bearer ${token}`,
+      payload: b2bWarehousePayload,
+    },
+    ...(registrationToken ? [{
+      contract: "legacy",
+      endpoint: "https://track.delhivery.com/api/backend/clientwarehouse/create/",
+      authorization: `Token ${registrationToken}`,
+      payload: warehousePayload,
+    }] : []),
+  ];
   let response: Response | null = null;
   let responseText = "";
   let registrationContract = "";
