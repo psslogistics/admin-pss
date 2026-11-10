@@ -20,8 +20,9 @@ type DelhiveryTokenCache = {
   delete(key: string): Promise<void>;
 };
 
-export interface Env extends Omit<Cloudflare.Env, "SUPABASE_PUBLISHABLE_KEY" | "API_KEY_PEPPER" | "DELHIVERY_API_TOKEN" | "DELHIVERY_B2B_API_BASE_URL" | "DELHIVERY_WEBHOOK_SECRET" | "DELHIVERY_TOKEN_CACHE" | "EKART_API_KEY" | "EKART_API_SECRET" | "EKART_WEBHOOK_SECRET" | "EKART_ENABLE_PROVIDER_CALLS" | "TRACKON_API_BASE_URL" | "TRACKON_CREDENTIALS_JSON" | "TRACKON_WEBHOOK_SECRET" | "TRACKON_BOOKING_URL" | "TRACKON_TRACKING_URL" | "TRACKON_LABEL_URL" | "TRACKON_ENABLE_SHIPMENT_CREATION" | "TRACKON_ENABLE_PICKUP_CREATION" | "XPRESSBEES_API_BASE_URL" | "XPRESSBEES_CREDENTIALS_JSON" | "XPRESSBEES_ENABLE_SHIPMENT_CREATION" | "XPRESSBEES_ENABLE_PICKUP_CREATION" | "RIVIGO_API_BASE_URL" | "RIVIGO_AUTH_URL" | "RIVIGO_TRACKING_URL" | "RIVIGO_CREDENTIALS_JSON" | "RIVIGO_ENABLE_PROVIDER_CALLS" | "CLOUDFLARE_ACCOUNT_ID" | "CLOUDFLARE_API_TOKEN" | "CLOUDFLARE_D1_DATABASE_ID"> {
+export interface Env extends Omit<Cloudflare.Env, "SUPABASE_PUBLISHABLE_KEY" | "SUPABASE_SERVICE_ROLE_KEY" | "API_KEY_PEPPER" | "DELHIVERY_API_TOKEN" | "DELHIVERY_B2B_API_BASE_URL" | "DELHIVERY_WEBHOOK_SECRET" | "DELHIVERY_TOKEN_CACHE" | "EKART_API_KEY" | "EKART_API_SECRET" | "EKART_WEBHOOK_SECRET" | "EKART_ENABLE_PROVIDER_CALLS" | "TRACKON_API_BASE_URL" | "TRACKON_CREDENTIALS_JSON" | "TRACKON_WEBHOOK_SECRET" | "TRACKON_BOOKING_URL" | "TRACKON_TRACKING_URL" | "TRACKON_LABEL_URL" | "TRACKON_ENABLE_SHIPMENT_CREATION" | "TRACKON_ENABLE_PICKUP_CREATION" | "XPRESSBEES_API_BASE_URL" | "XPRESSBEES_CREDENTIALS_JSON" | "XPRESSBEES_ENABLE_SHIPMENT_CREATION" | "XPRESSBEES_ENABLE_PICKUP_CREATION" | "RIVIGO_API_BASE_URL" | "RIVIGO_AUTH_URL" | "RIVIGO_TRACKING_URL" | "RIVIGO_CREDENTIALS_JSON" | "RIVIGO_ENABLE_PROVIDER_CALLS" | "CLOUDFLARE_ACCOUNT_ID" | "CLOUDFLARE_API_TOKEN" | "CLOUDFLARE_D1_DATABASE_ID"> {
   SUPABASE_PUBLISHABLE_KEY: string;
+  SUPABASE_SERVICE_ROLE_KEY?: string;
   API_KEY_PEPPER?: string;
   DELHIVERY_API_TOKEN?: string;
   DELHIVERY_B2B_API_BASE_URL?: string;
@@ -50,6 +51,7 @@ export interface Env extends Omit<Cloudflare.Env, "SUPABASE_PUBLISHABLE_KEY" | "
   RIVIGO_CREDENTIALS_JSON?: string;
   RIVIGO_WEBHOOK_SECRET?: string;
   KYC_TEST_MODE?: string;
+  KYC_TEST_CLIENT_IDS?: string;
   CLOUDFLARE_ACCOUNT_ID?: string;
   CLOUDFLARE_API_TOKEN?: string;
   CLOUDFLARE_D1_DATABASE_ID?: string;
@@ -147,6 +149,42 @@ async function supabaseGet<T>(env: Env, path: string, token: string): Promise<T[
   return Array.isArray(value) ? value as T[] : [];
 }
 
+type BookingKycProfile = {
+  status: string | null;
+  gst_number: string | null;
+  pan_number: string | null;
+  aadhaar_last4: string | null;
+  kyc_version: number | null;
+};
+
+type BookingKycLookup = {
+  available: boolean;
+  profile: BookingKycProfile | null;
+};
+
+async function loadBookingKyc(env: Env, auth: Auth, clientId: string): Promise<BookingKycLookup> {
+  // User sessions are constrained by Supabase RLS. API keys do not carry a
+  // Supabase session token, so use the Worker-only credential for the same
+  // tenant-scoped lookup. This credential must never be returned to clients.
+  const credential = auth.accessToken ?? env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!credential) return { available: false, profile: null };
+  const serviceLookup = !auth.accessToken;
+  const response = await fetch(`${env.SUPABASE_URL}/rest/v1/client_kyc_profiles?client_id=eq.${encodeURIComponent(clientId)}&select=status,gst_number,pan_number,aadhaar_last4,kyc_version&limit=1`, {
+    headers: {
+      apikey: serviceLookup ? credential : env.SUPABASE_PUBLISHABLE_KEY,
+      Authorization: `Bearer ${credential}`,
+    },
+  });
+  if (!response.ok) return { available: false, profile: null };
+  const value = await response.json();
+  const rows = Array.isArray(value) ? value as BookingKycProfile[] : [];
+  return { available: true, profile: rows[0] ?? null };
+}
+
+function bookingKycApproved(profile: BookingKycProfile | null) {
+  return Boolean(profile && profile.status === "approved" && profile.gst_number?.trim() && profile.pan_number?.trim() && profile.aadhaar_last4?.trim());
+}
+
 async function supabaseRpc<T>(env: Env, functionName: string, token: string): Promise<T | null> {
   const response = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/${functionName}`, {
     method: "POST",
@@ -162,7 +200,10 @@ async function isKycTestAccount(env: Env, auth: Auth): Promise<boolean> {
   // Worker. An identity_environment marker alone must never unlock booking
   // on the production Worker.
   if (!isKycTestModeEnabled(env.ENVIRONMENT, env.KYC_TEST_MODE)) return false;
-  if (auth.audience !== "client" || !auth.clientIds.size || !auth.accessToken) return false;
+  if (auth.audience !== "client" || !auth.clientIds.size) return false;
+  const configuredTestClients = new Set(String(env.KYC_TEST_CLIENT_IDS ?? "").split(",").map((value) => value.trim()).filter(Boolean));
+  if (auth.kind === "api" && configuredTestClients.size) return [...auth.clientIds].every((clientId) => configuredTestClients.has(clientId));
+  if (!auth.accessToken) return false;
   const clientIds = [...auth.clientIds];
   const organizations = await supabaseGet<{ id: string; identity_environment: string | null }>(env, `client_accounts?id=in.(${clientIds.join(",")})&select=id,identity_environment`, auth.accessToken);
   return isExplicitKycTestOrganization(organizations, clientIds);
@@ -170,6 +211,8 @@ async function isKycTestAccount(env: Env, auth: Auth): Promise<boolean> {
 
 async function isProviderTestDoubleEnabled(env: Env, clientId?: string) {
   if (!clientId || !isKycTestModeEnabled(env.ENVIRONMENT, env.KYC_TEST_MODE)) return false;
+  const configuredTestClients = new Set(String(env.KYC_TEST_CLIENT_IDS ?? "").split(",").map((value) => value.trim()).filter(Boolean));
+  if (configuredTestClients.has(clientId)) return true;
   const account = await env.DB.prepare("SELECT identity_environment FROM client_accounts WHERE id = ? LIMIT 1")
     .bind(clientId)
     .first<{ identity_environment: string | null }>();
@@ -281,16 +324,14 @@ function hasScope(auth: Auth, scope: string) {
   };
   if (permissionMap[scope]?.some((permission) => auth.permissions.has(permission))) return true;
   const roles = auth.roles;
-  // Employee navigation is permission-gated at the application boundary, but
-  // the auth-context RPC may omit the corresponding permission row for an
-  // active employee. Read endpoints still apply auth.clientIds to every query,
-  // so this fallback restores the intended employee read path without
-  // widening assignment visibility.
-  if (["shipments.read", "tracking.read", "pickups.read", "documents.read", "reports.read", "departments.read"].includes(scope)) return auth.audience === "employee" || roles.has("client") || roles.has("employee") || roles.has("admin");
+  // Employee access must remain permission-driven. A missing permission row
+  // in the auth context is a deny, not a reason to grant a broad role-based
+  // fallback that could disagree with the employee UI and protected routes.
+  if (["shipments.read", "tracking.read", "pickups.read", "documents.read", "reports.read", "departments.read"].includes(scope)) return auth.audience !== "employee" && (roles.has("client") || roles.has("admin"));
   if (auth.roles.has("employee")) return false;
-  if (["shipments.create", "pickups.create", "documents.manage", "bookings.documents.manage", "tickets.create", "tickets.read", "notifications.read", "cases.read", "cases.manage", "addresses.manage", "quotes.create", "billing.read", "wallet.read", "cod.read", "weight.read", "tasks.read", "activity.read"].includes(scope)) return roles.has("client") || roles.has("employee") || roles.has("admin");
-  if (scope === "pickups.manage") return roles.has("client") || roles.has("employee") || roles.has("admin");
-  if (scope === "tasks.manage") return roles.has("employee") || roles.has("admin");
+  if (["shipments.create", "pickups.create", "documents.manage", "bookings.documents.manage", "tickets.create", "tickets.read", "notifications.read", "cases.read", "cases.manage", "addresses.manage", "quotes.create", "billing.read", "wallet.read", "cod.read", "weight.read", "tasks.read", "activity.read"].includes(scope)) return roles.has("client") || roles.has("admin");
+  if (scope === "pickups.manage") return roles.has("client") || roles.has("admin");
+  if (scope === "tasks.manage") return roles.has("admin");
   if (scope === "departments.manage") return roles.has("admin") || roles.has("super_admin");
   if (scope === "provider_accounts.read") return roles.has("admin") || roles.has("super_admin");
   if (scope === "provider_accounts.manage") return roles.has("admin") || roles.has("super_admin");
@@ -846,7 +887,8 @@ async function bookingProviderAccountDiagnostics(env: Env, clientId: string, req
   const accounts = await loadClientProviderAccountEligibility(env, clientId, "delhivery", requestedAccountId);
   return { accounts, eligible: accounts.filter((account) => account.blockers.length === 0) };
 }
-const FUJIYAMA_CLIENT_ID = "bb308dde-aae8-4503-ac7b-f91cd80ada78";
+const FUJIYAMA_FORWARD_CLIENT_ID = "b8bd8184-1b90-4a33-b6bd-9e5dbbd88b10";
+const FUJIYAMA_REVERSE_CLIENT_ID = "9c0fd0b5-8b5a-4a66-a2cb-4c0f4b6a9c31";
 const FUJIYAMA_FORWARD_RATES: Record<string, number> = { N1: 5.5, N2: 6.2, N3: 6.5, N4: 6.9, C1: 7.9, C2: 8.6, E1: 10.5, E2: 11.2, NE1: 15.9, NE2: 18.8, S1: 8.8, S2: 9.4, S3: 9.8, S4: 10.5, W1: 7.9, W2: 8.7 };
 const FUJIYAMA_REVERSE_RATES: Record<string, number> = { North: 7.5, West: 11, South: 14.5, East: 14.5, Northeast: 18.5 };
 const fujiyamaKey = (value: string | undefined) => String(value ?? "").toLowerCase().replace(/[^a-z]/g, "");
@@ -858,8 +900,9 @@ function fujiyamaReverseZone(city: string, state: string) { return FUJIYAMA_REVE
 async function createShipmentPricingQuote(env: Env, clientId: string, payload: Record<string, unknown>, createdByUserId: string, versionIdOverride?: string): Promise<PricingQuoteRecord> {
   const origin = shipmentAddress(payload.origin_address); const destination = shipmentAddress(payload.destination_address);
   if (!origin || !destination) throw new Error("PRICING_ADDRESS_REQUIRED");
-  const fujiyamaLane = clientId === FUJIYAMA_CLIENT_ID ? String(payload.lane ?? "").trim().toLowerCase() : "";
-  if (clientId === FUJIYAMA_CLIENT_ID && fujiyamaLane !== "forward" && fujiyamaLane !== "reverse") throw new Error("FUJIYAMA_LANE_REQUIRED");
+  const isFujiyamaClient = clientId === FUJIYAMA_FORWARD_CLIENT_ID || clientId === FUJIYAMA_REVERSE_CLIENT_ID;
+  const fujiyamaLane = isFujiyamaClient ? String(payload.lane ?? "").trim().toLowerCase() : "";
+  if (isFujiyamaClient && fujiyamaLane !== "forward" && fujiyamaLane !== "reverse") throw new Error("FUJIYAMA_LANE_REQUIRED");
   let accountValue = String(payload.account_code ?? "").trim().toLowerCase();
   if (!accountValue && typeof payload.provider_account_id === "string") {
     const providerAccount = await env.DB.prepare("SELECT account_name FROM provider_accounts WHERE id = ? AND provider = 'delhivery' LIMIT 1").bind(payload.provider_account_id).first<{ account_name: string }>();
@@ -3793,6 +3836,9 @@ async function verifyDelhiveryServiceability(env: Env, originPincode: string, de
   const cacheKey = serviceabilityCacheKey(providerAccountId, originPincode, destinationPincode, paymentMode, normalizedWeightKg);
   const cached = delhiveryServiceabilityCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return { ...cached.result, provenance: "cached_provider" };
+  const providerAccount = await env.DB.prepare("SELECT account_name FROM provider_accounts WHERE id = ? AND provider = 'delhivery' AND status = 'active' LIMIT 1")
+    .bind(providerAccountId).first<{ account_name: string | null }>();
+  const allowRoutePaymentFallback = delhiveryAccountIsB2b(String(providerAccount?.account_name ?? ""));
   const [originResult, destinationResult, routeResult] = await Promise.all([
     safeProviderRequest(env, "delhivery", "serviceability", { destination_pincode: originPincode, weight_kg: normalizedWeightKg, provider_account_id: providerAccountId }, `${requestIdValue}:origin-serviceability`, clientId, undefined, 10000),
     safeProviderRequest(env, "delhivery", "serviceability", { destination_pincode: destinationPincode, weight_kg: normalizedWeightKg, provider_account_id: providerAccountId }, `${requestIdValue}:destination-serviceability`, clientId, undefined, 10000),
@@ -3814,7 +3860,7 @@ async function verifyDelhiveryServiceability(env: Env, originPincode: string, de
     ? { ...destination, serviceable: true, prepaid: route.prepaid === true ? true : destination.prepaid, cod: route.cod === true ? true : destination.cod }
     : destination;
   const decision = routeAccepted
-    ? evaluateDelhiveryServiceability(routeDecisionOrigin, routeDecisionDestination, paymentMode)
+    ? evaluateDelhiveryServiceability(routeDecisionOrigin, routeDecisionDestination, paymentMode, allowRoutePaymentFallback)
     : { ok: false, providerUnavailable: route.status !== "accepted" && route.status !== "failed", reason: String(route.error ?? route.reason ?? "Delhivery could not verify the origin-to-destination route") };
   const result: DelhiveryServiceabilityResult = {
     ok: decision.ok,
@@ -4793,6 +4839,7 @@ const worker = {
           ? await env.DB.prepare("SELECT id, tracking_number, lr_number, provider_reference, provider_account_id, status, provider, destination, edd, delivered_at FROM shipments WHERE client_id = ? AND (tracking_number = ? OR lr_number = ? OR provider_reference = ?) ORDER BY updated_at DESC LIMIT 1").bind(auth.clientId, awb, awb, awb).first<{ id: string; tracking_number: string | null; lr_number: string | null; provider_reference: string | null; provider_account_id: string | null; status: string | null; provider: string | null; destination: string | null; edd: string | null; delivered_at: string | null }>()
           : null;
         if (!shipment) {
+          if (auth.kind === "api") return json({ ok: true, data: { tracking_type: trackingType, awb, found: false, source: "pss", status: "not_found", location: "", description: "No shipment found for this client", event_time: null, provider: "delhivery", events: [] }, request_id: id }, 200, headers);
           const assignedAccounts = await env.DB.prepare(`
             SELECT pa.id
             FROM provider_accounts pa
@@ -4857,7 +4904,7 @@ const worker = {
         }, request_id: id }, 200, headers);
       }
       if (route === "/fujiyama/bookings" && request.method === "POST") {
-        if (!hasScope(auth, "shipments.create") || !hasScope(auth, "bookings.documents.manage")) return error("FORBIDDEN", "Booking document permission required", 403, id, headers);
+        if (!hasScope(auth, "shipments.create")) return error("FORBIDDEN", "Shipment creation scope required", 403, id, headers);
         route = "/shipments";
       }
       if (route === "/preferences" && (request.method === "GET" || request.method === "PUT")) {
@@ -5424,12 +5471,11 @@ const worker = {
         if (!Number.isFinite(declaredValue) || declaredValue < 0) return error("VALIDATION_ERROR", "Declared value must be a non-negative number", 400, id, headers);
         const clientId = requireClient(auth, payload.client_id);
         if (!clientId || !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
-        const kycRows = auth.accessToken
-          ? await supabaseGet<{ status: string; gst_number: string | null; pan_number: string | null; aadhaar_last4: string | null; phone_verified_at: string | null; kyc_version: number | null }>(env, `client_kyc_profiles?client_id=eq.${encodeURIComponent(clientId)}&select=status,gst_number,pan_number,aadhaar_last4,phone_verified_at,kyc_version&limit=1`, auth.accessToken)
-          : [];
-        const kyc = kycRows[0];
         const kycTestAccount = await isKycTestAccount(env, auth);
-        if ((!kyc || kyc.status !== "approved" || !kyc.gst_number?.trim() || !kyc.pan_number?.trim() || !kyc.aadhaar_last4) && !kycTestAccount) return error("KYC_REQUIRED", "Approved Aadhaar, GST, and PAN KYC are required before booking shipments", 403, id, headers);
+        const kycLookup = kycTestAccount ? { available: true, profile: null } : await loadBookingKyc(env, auth, clientId);
+        if (!kycLookup.available) return error("KYC_LOOKUP_UNAVAILABLE", "KYC verification is temporarily unavailable. Please retry the booking.", 503, id, headers, "Supabase KYC lookup failed or the Worker server credential is not configured");
+        const kyc = kycLookup.profile;
+        if (!bookingKycApproved(kyc) && !kycTestAccount) return error("KYC_REQUIRED", "Approved Aadhaar, GST, and PAN KYC are required before booking shipments", 403, id, headers);
         // Approved KYC remains authoritative for normal clients. The exact
         // allow-listed test account may fall back to request identity fields.
         if (kyc?.gst_number?.trim() && kyc.pan_number?.trim()) {
@@ -5504,7 +5550,7 @@ const worker = {
         }
         const shipmentId = crypto.randomUUID();
         const requestedProviderAccountId = typeof payload.provider_account_id === "string" && payload.provider_account_id.trim() ? payload.provider_account_id.trim() : null;
-        await env.DB.prepare("INSERT INTO shipments (id, order_id, invoice_reference, client_id, created_by_user_id, provider, provider_account_id, client_gst_number, client_pan_number, kyc_version, status, description, origin, destination, origin_address_json, destination_address_json, consignee, total_weight_kg, declared_value, pieces, edd, dimensions_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'booked', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(shipmentId, resolvedOrderId, invoiceReference || null, clientId, auth.userId ?? `api:${clientId}`, provider, requestedProviderAccountId, shipmentGst, shipmentPan, kyc?.kyc_version ?? null, description, origin, destination, JSON.stringify(originAddress), JSON.stringify(destinationAddress), String(destinationAddress.name), weight, declaredValue, pieces, typeof payload.edd === "string" ? payload.edd : null, dimensionsJson).run();
+        await env.DB.prepare("INSERT INTO shipments (id, order_id, invoice_reference, client_id, created_by_user_id, provider, provider_account_id, client_gst_number, client_pan_number, kyc_version, status, description, origin, destination, origin_address_json, destination_address_json, consignee, total_weight_kg, declared_value, pieces, edd, dimensions_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'booked', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(shipmentId, resolvedOrderId, invoiceReference || null, clientId, auth.userId ?? `api:${clientId}`, provider, requestedProviderAccountId, shipmentGst, shipmentPan, kyc?.kyc_version ?? null, description, origin, destination, JSON.stringify(originAddress), JSON.stringify(destinationAddress), String(destinationAddress.name), weight, declaredValue, pieces, typeof payload.edd === "string" ? payload.edd : null, dimensionsJson).run();
         await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'booked', 'Shipment created', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipmentId, auth.userId ?? `api:${clientId}`).run();
         const storedDocuments = await persistShipmentDocuments(env, clientId, shipmentId, payload.invoice_documents, auth.userId ?? `api:${clientId}`);
         if (!storedDocuments.ok) {

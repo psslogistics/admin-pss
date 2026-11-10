@@ -24,7 +24,7 @@ export function serviceabilityCacheKey(providerAccountId: string, originPincode:
   return `capabilities-v2|${providerAccountId}|${originPincode}|${destinationPincode}|${mode}|${weight}`;
 }
 
-export function evaluateDelhiveryServiceability(origin: ServiceabilityObservation, destination: ServiceabilityObservation, paymentMode?: string): ServiceabilityDecision {
+export function evaluateDelhiveryServiceability(origin: ServiceabilityObservation, destination: ServiceabilityObservation, paymentMode?: string, allowRoutePaymentFallback = false): ServiceabilityDecision {
   const originAccepted = origin.status === "accepted" && origin.serviceable === true && origin.pickup === true;
   const destinationAccepted = destination.status === "accepted" && destination.serviceable === true;
   const providerUnavailable = [origin, destination].some((result) => result.status === "failed" || result.status === "provider_unavailable" || result.status === "not_configured" || Number(result.providerStatus ?? 0) === 0);
@@ -36,7 +36,11 @@ export function evaluateDelhiveryServiceability(origin: ServiceabilityObservatio
   // Delhivery's B2B route response can omit payment capabilities even when
   // the lane is valid. Reject only an explicit provider-negative flag; an
   // omitted flag must continue to manifest so Delhivery remains authoritative.
-  if (mode === "cod" && destination.cod === false) return { ok: false, providerUnavailable, reason: "The delivery pincode does not support COD with Delhivery" };
-  if (mode === "prepaid" && destination.prepaid === false) return { ok: false, providerUnavailable, reason: "The delivery pincode does not support prepaid delivery with Delhivery" };
+  // Delhivery B2B can return a serviceable route while its legacy pincode
+  // endpoint reports both payment modes as false. When the authenticated
+  // route is confirmed and the account is B2B, the manifest endpoint remains
+  // authoritative; do not reject the booking on that stale capability flag.
+  if (!allowRoutePaymentFallback && mode === "cod" && destination.cod === false) return { ok: false, providerUnavailable, reason: "The delivery pincode does not support COD with Delhivery" };
+  if (!allowRoutePaymentFallback && mode === "prepaid" && destination.prepaid === false) return { ok: false, providerUnavailable, reason: "The delivery pincode does not support prepaid delivery with Delhivery" };
   return { ok: true, providerUnavailable };
 }

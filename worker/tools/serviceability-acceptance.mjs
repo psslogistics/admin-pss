@@ -10,6 +10,8 @@ const oda = evaluateDelhiveryServiceability(accepted({ oda: true }), accepted({ 
 assert.equal(oda.ok, true, "ODA must remain a pricing surcharge signal, not a serviceability rejection");
 assert.match(evaluateDelhiveryServiceability(accepted(), accepted({ cod: false }), "cod").reason, /does not support COD/);
 assert.equal(evaluateDelhiveryServiceability(accepted(), accepted({ prepaid: undefined, cod: undefined }), "prepaid").ok, true, "missing provider payment flags must not create a false negative");
+assert.equal(evaluateDelhiveryServiceability(accepted(), accepted({ prepaid: false, cod: false }), "prepaid", true).ok, true, "confirmed B2B route must not be blocked by legacy payment flags");
+assert.equal(evaluateDelhiveryServiceability(accepted(), accepted({ prepaid: false, cod: false }), "cod", true).ok, true, "confirmed B2B route must not be blocked by legacy COD flags");
 const timeout = evaluateDelhiveryServiceability({ status: "failed", providerStatus: 0, error: "timeout" }, accepted(), "prepaid");
 assert.equal(timeout.providerUnavailable, true, "provider timeout must be unavailable, not dataset-positive");
 assert.notEqual(serviceabilityCacheKey("account-a", "110001", "201301", "cod"), serviceabilityCacheKey("account-a", "110001", "201301", "prepaid"), "payment mode must partition the cache");

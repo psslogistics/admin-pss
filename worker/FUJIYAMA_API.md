@@ -23,6 +23,13 @@ The tracking key contains only `tracking.read`; the booking key contains only
 The key is tenant-scoped to Fujiyama's client record. It cannot read or create
 records for another client.
 
+Before enabling live API-key bookings, the Worker must have the
+`SUPABASE_SERVICE_ROLE_KEY` configured as a Cloudflare secret. It is used only
+server-side to verify the API key's own client's approved KYC profile; it is
+never returned to or accepted from Fujiyama. If the secret or Supabase lookup
+is unavailable, booking fails closed with `KYC_LOOKUP_UNAVAILABLE` and no
+shipment or wallet charge is created.
+
 ## Tracking
 
 Tracking is read-only. PSS resolves the shipment within Fujiyama's tenant,
