@@ -13,6 +13,8 @@ const checks = [
   ["booking route has no document-scope gate", source.includes('if (route === "/fujiyama/bookings" && request.method === "POST")') && source.includes('if (!hasScope(auth, "shipments.create")) return error("FORBIDDEN", "Shipment creation scope required"')],
   ["API booking can auto-register a pickup address", source.includes('if (!selectedWarehouseId && operation === "warehouse_prepare")') && source.includes('ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin')],
   ["booking can derive provider invoice reference from order id", source.includes('payload.invoice_reference ?? payload.invoice_number ?? orderId')],
+  ["warehouse registration has a dedicated account token", source.includes("DELHIVERY_WAREHOUSE_TOKEN_PSSLOGISTICS10_B2BC") && source.includes("DELHIVERY_WAREHOUSE_CREDENTIAL_REQUIRED")],
+  ["warehouse registration does not use the B2B JWT fallback", source.includes('const registrationAttempts = [{') && !source.includes('contract: "b2b"')],
   ["legacy Fujiyama ID removed", !source.includes("bb308dde-aae8-4503-ac7b-f91cd80ada78")],
   ["system API-key administration", source.includes("if (auth.system) return true;")],
   ["API-key tenant binding", source.includes("clientIds: new Set([row.client_id])")],

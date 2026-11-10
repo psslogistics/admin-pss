@@ -1033,6 +1033,14 @@ function delhiveryWarehouseApiToken(env: Env, accountName: string, primaryCreden
   const normalizedAccount = accountName.trim().replace(/\s+/g, " ").toUpperCase();
   if (normalizedAccount !== "PSSLOGISTICS10 B2BC") return null;
   const secretBag = env as unknown as Record<string, unknown>;
+  // Warehouse registration uses Delhivery's legacy Client Warehouse API
+  // contract. Keep that credential separate from the B2B login/JWT secret so
+  // a valid B2B booking credential cannot be sent to the wrong endpoint.
+  const dedicatedWarehouseToken = typeof secretBag.DELHIVERY_WAREHOUSE_TOKEN_PSSLOGISTICS10_B2BC === "string"
+    ? String(secretBag.DELHIVERY_WAREHOUSE_TOKEN_PSSLOGISTICS10_B2BC)
+    : undefined;
+  const dedicatedToken = delhiveryB2bCredential(dedicatedWarehouseToken)?.token;
+  if (dedicatedToken && !delhiveryLooksLikeJwt(dedicatedToken)) return dedicatedToken;
   // Keep the account boundary explicit while accepting both the legacy alias
   // and the current account-token secret name used in production.
   const accountSecret = typeof secretBag.DELHIVERY_TOKEN_PSSLOGISTICS10_B2BC === "string"
@@ -1312,39 +1320,18 @@ async function ensureDelhiveryWarehouse(env: Env, clientId: string, token: strin
     return_country: "India",
   };
   const registrationToken = warehouseApiToken && !delhiveryLooksLikeJwt(warehouseApiToken) ? warehouseApiToken : null;
-  const b2bWarehousePayload = {
-    name: providerName,
-    pin_code: resolvedOrigin.pincode,
-    city: resolvedOrigin.city,
-    state: resolvedOrigin.state,
-    country: "India",
-    address_details: {
-      address: resolvedOrigin.line,
-      contact_person: resolvedOrigin.name || providerName,
-      phone_number: resolvedOrigin.phone,
-    },
-    same_as_fwd_add: true,
-    ret_address: { pin: resolvedOrigin.pincode, address: resolvedOrigin.line },
-  };
+  if (!registrationToken) return { ok: false as const, code: "DELHIVERY_WAREHOUSE_CREDENTIAL_REQUIRED" as const, error: "The Delhivery account has no valid Client Warehouse API token configured. Configure the account-scoped warehouse token before using dynamic pickup addresses." };
   // The manifest service is backed by Delhivery's legacy client-warehouse
   // registry. Prefer the account-scoped production API token for that
   // registry; the B2B JWT endpoint can show an Active facility in the console
   // while the manifest service still reports it as unconfigured. Keep the B2B
   // endpoint as a fallback for accounts that do not expose the legacy token.
-  const registrationAttempts = [
-    ...(registrationToken ? [{
-      contract: "legacy",
-      endpoint: "https://track.delhivery.com/api/backend/clientwarehouse/create/",
-      authorization: `Token ${registrationToken}`,
-      payload: warehousePayload,
-    }] : []),
-    {
-      contract: "b2b",
-      endpoint: `${String(b2bBaseUrl).replace(/\/$/, "")}/client-warehouse/create/`,
-      authorization: `Bearer ${token}`,
-      payload: b2bWarehousePayload,
-    },
-  ];
+  const registrationAttempts = [{
+    contract: "legacy",
+    endpoint: "https://track.delhivery.com/api/backend/clientwarehouse/create/",
+    authorization: `Token ${registrationToken}`,
+    payload: warehousePayload,
+  }];
   let response: Response | null = null;
   let responseText = "";
   let registrationContract = "";

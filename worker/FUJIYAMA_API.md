@@ -66,6 +66,10 @@ must still accept the facility registration before the manifest can be
 created. A `warehouse_id` may be sent when a previously verified PSS warehouse
 should be used explicitly.
 
+Dynamic pickup registration requires the account-scoped Cloudflare secret
+`DELHIVERY_WAREHOUSE_TOKEN_PSSLOGISTICS10_B2BC`. This is the legacy Delhivery
+Client Warehouse API token and is separate from the B2B login credential.
+
 ```bash
 curl --fail-with-body --request POST \
   'https://pss-api.psslogisticsadmin.workers.dev/v1/fujiyama/bookings' \
