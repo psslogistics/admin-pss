@@ -57,7 +57,9 @@ and Delhivery B2B flow as the client panel. Send a unique
 `Idempotency-Key` for every booking attempt.
 
 `order_id` is required and is used as the provider invoice reference when a
-separate `invoice_number` is not supplied.
+separate `invoice_number` is not supplied. For Fujiyama API keys, the Worker
+infers the forward/reverse lane and Delhivery provider from the tenant-scoped
+key. City and state are resolved from each six-digit pincode.
 
 The pickup address is used as the shipment's consignor address. Fujiyama does
 not need to send `warehouse_id`; for API bookings PSS automatically registers
@@ -66,10 +68,6 @@ must still accept the facility registration before the manifest can be
 created. A `warehouse_id` may be sent when a previously verified PSS warehouse
 should be used explicitly.
 
-Dynamic pickup registration requires the account-scoped Cloudflare secret
-`DELHIVERY_WAREHOUSE_TOKEN_PSSLOGISTICS10_B2BC`. This is the legacy Delhivery
-Client Warehouse API token and is separate from the B2B login credential.
-
 ```bash
 curl --fail-with-body --request POST \
   'https://pss-api.psslogisticsadmin.workers.dev/v1/fujiyama/bookings' \
@@ -77,39 +75,35 @@ curl --fail-with-body --request POST \
   --header 'Content-Type: application/json' \
   --header 'Idempotency-Key: fujiyama-order-<YOUR_UNIQUE_ID>' \
   --data '{
-    "lane": "forward",
-    "description": "Solar inverter",
-    "origin": "New Delhi",
-    "destination": "Mumbai",
-    "origin_address": {
+    "order_id": "FJM-2026-000001",
+    "origin": {
       "name": "Fujiyama Power Systems",
-      "line": "53A/6 Rama Road Industrial Area",
-      "city": "New Delhi",
-      "state": "Delhi",
+      "address": "Complete pickup address",
       "pincode": "110015",
       "phone": "<10_DIGIT_PHONE>"
     },
-    "destination_address": {
+    "destination": {
       "name": "Consignee",
-      "line": "Complete destination address",
-      "city": "Mumbai",
-      "state": "Maharashtra",
+      "address": "Complete destination address",
       "pincode": "400001",
       "phone": "<10_DIGIT_PHONE>"
     },
-    "consignee": "Consignee",
-    "total_weight_kg": 20,
-    "pieces": 1,
+    "package": {
+      "weight_kg": 20,
+      "pieces": 1,
+      "dimensions_cm": {"length": 10, "width": 10, "height": 10}
+    },
     "declared_value": 1000,
-    "provider": "delhivery",
-    "invoice_documents": [{"name":"invoice.pdf","content_type":"application/pdf","body_base64":"<BASE64_INVOICE>"}]
+    "invoice_document": {"name":"invoice.pdf","content_type":"application/pdf","base64":"<BASE64_INVOICE>"}
   }'
 ```
 
-Use `lane: "reverse"` for a return shipment to Noida. The Worker applies the
-corresponding Fujiyama rate card, recalculates pricing, checks the wallet, and
-then submits the Delhivery B2B booking. The Delhivery/provider amount is never
-returned as the client billing amount.
+For declared values of ₹50,000 or more, include an `eway_bill` object with a
+12-digit `number` and a valid `document`. If it is omitted for a high-value
+shipment, the API rejects the request before contacting Delhivery. The Worker
+applies the corresponding Fujiyama rate card, recalculates pricing, checks the
+wallet, and then submits the Delhivery B2B booking. The Delhivery/provider
+amount is never returned as the client billing amount.
 
 ## Key lifecycle
 

@@ -783,6 +783,64 @@ async function pricingPincode(env: Env, pincode: string) {
   if (!/^\d{6}$/.test(pincode)) return null;
   return env.DB.prepare("SELECT pincode, facility_city, facility_state, oda FROM delhivery_b2b_pincode_zones WHERE pincode = ? LIMIT 1").bind(pincode).first<{ pincode: string; facility_city: string; facility_state: string; oda: number }>();
 }
+
+function compactDocument(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const document = value as Record<string, unknown>;
+  return {
+    name: String(document.name ?? document.filename ?? "").trim(),
+    content_type: String(document.content_type ?? document.mime_type ?? "").split(";", 1)[0].trim().toLowerCase(),
+    body_base64: String(document.body_base64 ?? document.base64 ?? "").replace(/^data:[^,]+,/, ""),
+  };
+}
+
+async function normalizeFujiyamaBookingPayload(env: Env, clientId: string, payload: Record<string, unknown>) {
+  const isFujiyamaClient = clientId === FUJIYAMA_FORWARD_CLIENT_ID || clientId === FUJIYAMA_REVERSE_CLIENT_ID;
+  if (!isFujiyamaClient) return;
+
+  const originInput = payload.origin && typeof payload.origin === "object" && !Array.isArray(payload.origin) ? payload.origin as Record<string, unknown> : payload.origin_address as Record<string, unknown> | undefined;
+  const destinationInput = payload.destination && typeof payload.destination === "object" && !Array.isArray(payload.destination) ? payload.destination as Record<string, unknown> : payload.destination_address as Record<string, unknown> | undefined;
+  const originPincode = String(originInput?.pincode ?? originInput?.pin ?? "").trim();
+  const destinationPincode = String(destinationInput?.pincode ?? destinationInput?.pin ?? "").trim();
+  const [originPin, destinationPin] = await Promise.all([pricingPincode(env, originPincode), pricingPincode(env, destinationPincode)]);
+  if (!originPin || !destinationPin) throw new Error("PINCODE_LOOKUP_FAILED");
+
+  const normalizeAddress = (input: Record<string, unknown> | undefined, pin: { pincode: string; facility_city: string; facility_state: string }, fallbackName: string) => ({
+    name: String(input?.name ?? fallbackName).trim(),
+    line: String(input?.address ?? input?.line ?? input?.address_line1 ?? "").trim(),
+    city: pin.facility_city,
+    state: pin.facility_state,
+    pincode: pin.pincode,
+    phone: String(input?.phone ?? input?.primary_contact_number ?? "").replace(/\D/g, "").slice(-10),
+  });
+
+  payload.origin_address = normalizeAddress(originInput, originPin, "Fujiyama Consignor");
+  payload.destination_address = normalizeAddress(destinationInput, destinationPin, "Consignee");
+  payload.origin = originPin.facility_city;
+  payload.destination = destinationPin.facility_city;
+  payload.description = String(payload.description ?? "Shipment").trim() || "Shipment";
+  payload.provider = String(payload.provider ?? "delhivery").trim().toLowerCase();
+  payload.lane = String(payload.lane ?? (clientId === FUJIYAMA_FORWARD_CLIENT_ID ? "forward" : "reverse")).trim().toLowerCase();
+
+  const packageValue = payload.package && typeof payload.package === "object" && !Array.isArray(payload.package) ? payload.package as Record<string, unknown> : null;
+  if (payload.total_weight_kg === undefined && packageValue?.weight_kg !== undefined) payload.total_weight_kg = packageValue.weight_kg;
+  if (payload.pieces === undefined && packageValue?.pieces !== undefined) payload.pieces = packageValue.pieces;
+  if (payload.dimensions === undefined && packageValue?.dimensions_cm && typeof packageValue.dimensions_cm === "object" && !Array.isArray(packageValue.dimensions_cm)) {
+    const dimensions = packageValue.dimensions_cm as Record<string, unknown>;
+    payload.dimensions = [{ length: dimensions.length, width: dimensions.width, height: dimensions.height, quantity: packageValue.pieces ?? 1 }];
+  }
+
+  const invoice = compactDocument(payload.invoice_document ?? payload.invoice);
+  if (invoice) payload.invoice_documents = [invoice];
+  const invoiceReference = payload.invoice_document_ref ?? payload.invoice_document_reference;
+  if (!payload.invoice_documents && invoiceReference) payload.invoice_document_refs = [{ object_key: String(invoiceReference).trim() }];
+
+  const eway = payload.eway_bill && typeof payload.eway_bill === "object" && !Array.isArray(payload.eway_bill) ? payload.eway_bill as Record<string, unknown> : null;
+  if (eway) {
+    payload.e_waybill_no = String(eway.number ?? eway.e_waybill_no ?? "").trim();
+    payload.eway_document = compactDocument(eway.document ?? eway);
+  }
+}
 /**
  * Provision the built-in PSS B2B card when a client has no published version.
  *
@@ -5467,6 +5525,15 @@ const worker = {
       if (route === "/shipments" && request.method === "POST") {
         if (!hasScope(auth, "shipments.create")) return error("FORBIDDEN", "Shipment creation scope required", 403, id, headers);
         const payload = await bodyJson(request, 32 * 1024 * 1024);
+        const clientId = requireClient(auth, payload.client_id);
+        if (!clientId || !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
+        try {
+          await normalizeFujiyamaBookingPayload(env, clientId, payload);
+        } catch (caught) {
+          const reason = caught instanceof Error ? caught.message : "PINCODE_LOOKUP_FAILED";
+          if (reason === "PINCODE_LOOKUP_FAILED") return error("PINCODE_LOOKUP_FAILED", "One or more booking pincodes could not be resolved to a city and state", 400, id, headers);
+          throw caught;
+        }
         const bookingStartedAt = Date.now();
         const requestHash = await payloadFingerprint(payload);
         const description = typeof payload.description === "string" ? payload.description.trim() : "";
@@ -5489,8 +5556,6 @@ const worker = {
         if (!Number.isFinite(weight) || weight <= 0 || weight > 100000) return error("VALIDATION_ERROR", "Weight must be greater than 0 and within the supported limit", 400, id, headers);
         if (!Number.isInteger(pieces) || pieces < 1 || pieces > 10000) return error("VALIDATION_ERROR", "Pieces must be a whole number between 1 and 10,000", 400, id, headers);
         if (!Number.isFinite(declaredValue) || declaredValue < 0) return error("VALIDATION_ERROR", "Declared value must be a non-negative number", 400, id, headers);
-        const clientId = requireClient(auth, payload.client_id);
-        if (!clientId || !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
         const kycTestAccount = await isKycTestAccount(env, auth);
         const kycLookup = kycTestAccount ? { available: true, profile: null } : await loadBookingKyc(env, auth, clientId);
         if (!kycLookup.available) return error("KYC_LOOKUP_UNAVAILABLE", "KYC verification is temporarily unavailable. Please retry the booking.", 503, id, headers, "Supabase KYC lookup failed or the Worker server credential is not configured");
