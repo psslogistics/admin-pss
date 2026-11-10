@@ -2770,15 +2770,17 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (provider === "delhivery" && operation === "shipments") removeRetiredDelhiveryPickupLocation(payload);
   let delhiveryPickupLocation = "";
   let delhiveryCanonicalOrigin: Record<string, unknown> | null = null;
-  // Booking addresses come from the selected local warehouse. Prepare that
-  // exact warehouse in the same request before manifesting; never fall back to
-  // an account-wide/default pickup facility and never schedule a pickup here.
+  // Booking addresses come from the supplied consignor. If the caller sends a
+  // warehouse_id, validate that exact saved warehouse; otherwise register or
+  // reuse a provider warehouse for this address in the same request. Never
+  // fall back to an account-wide/default pickup facility and never schedule a
+  // pickup here.
   // The provider's manifest response remains the source of truth for LR/AWB.
   if (provider === "delhivery" && ["shipments", "warehouse_prepare"].includes(operation) && useDelhiveryB2b && clientId && delhiveryB2bToken) {
     const origin = delhiveryAddress(payload.origin_address, String(payload.origin ?? "PSS Logistics"));
     if (!origin) return { enabled: true, status: "invalid_request" as const, reason: "A complete consignor address is required to create or select the pickup warehouse" };
     const selectedWarehouseId = typeof payload.warehouse_id === "string" && payload.warehouse_id.trim() ? payload.warehouse_id.trim() : null;
-    if (!selectedWarehouseId) return { enabled: true, status: "invalid_request" as const, code: "PROVIDER_WAREHOUSE_REQUIRED", error: "Select a pickup warehouse before booking this shipment." };
+    if (!selectedWarehouseId && operation === "warehouse_prepare") return { enabled: true, status: "invalid_request" as const, code: "PROVIDER_WAREHOUSE_REQUIRED", error: "Select a pickup warehouse before preparing this warehouse." };
     if (operation === "shipments") {
       // The provider pickup facility must represent this shipment's actual
       // consignor. Falling back to the account-wide facility silently sends a

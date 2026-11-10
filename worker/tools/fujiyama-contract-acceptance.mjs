@@ -11,6 +11,7 @@ const checks = [
   ["both Fujiyama client IDs", source.includes('FUJIYAMA_FORWARD_CLIENT_ID = "b8bd8184-1b90-4a33-b6bd-9e5dbbd88b10"') && source.includes('FUJIYAMA_REVERSE_CLIENT_ID = "9c0fd0b5-8b5a-4a66-a2cb-4c0f4b6a9c31"')],
   ["lane-neutral account handling", source.includes("clientId === FUJIYAMA_FORWARD_CLIENT_ID || clientId === FUJIYAMA_REVERSE_CLIENT_ID") && source.includes('fujiyamaLane !== "forward" && fujiyamaLane !== "reverse"')],
   ["booking route has no document-scope gate", source.includes('if (route === "/fujiyama/bookings" && request.method === "POST")') && source.includes('if (!hasScope(auth, "shipments.create")) return error("FORBIDDEN", "Shipment creation scope required"')],
+  ["API booking can auto-register a pickup address", source.includes('if (!selectedWarehouseId && operation === "warehouse_prepare")') && source.includes('ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin')],
   ["legacy Fujiyama ID removed", !source.includes("bb308dde-aae8-4503-ac7b-f91cd80ada78")],
   ["system API-key administration", source.includes("if (auth.system) return true;")],
   ["API-key tenant binding", source.includes("clientIds: new Set([row.client_id])")],

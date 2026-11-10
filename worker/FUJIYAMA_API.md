@@ -56,6 +56,13 @@ Booking uses the same server-side PSS rate-card, wallet, audit, idempotency,
 and Delhivery B2B flow as the client panel. Send a unique
 `Idempotency-Key` for every booking attempt.
 
+The pickup address is used as the shipment's consignor address. Fujiyama does
+not need to send `warehouse_id`; for API bookings PSS automatically registers
+or reuses the matching Delhivery pickup facility for that address. Delhivery
+must still accept the facility registration before the manifest can be
+created. A `warehouse_id` may be sent when a previously verified PSS warehouse
+should be used explicitly.
+
 ```bash
 curl --fail-with-body --request POST \
   'https://pss-api.psslogisticsadmin.workers.dev/v1/fujiyama/bookings' \
