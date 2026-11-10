@@ -56,6 +56,9 @@ Booking uses the same server-side PSS rate-card, wallet, audit, idempotency,
 and Delhivery B2B flow as the client panel. Send a unique
 `Idempotency-Key` for every booking attempt.
 
+`order_id` is required and is used as the provider invoice reference when a
+separate `invoice_number` is not supplied.
+
 The pickup address is used as the shipment's consignor address. Fujiyama does
 not need to send `warehouse_id`; for API bookings PSS automatically registers
 or reuses the matching Delhivery pickup facility for that address. Delhivery

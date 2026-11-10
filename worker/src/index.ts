@@ -1622,7 +1622,10 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
   // separate provider values. Never use the account label as the warehouse.
   const pickupLocation = String(payload.delhivery_pickup_location ?? payload.pickup_location ?? "").trim();
   const orderId = String(payload.order_id ?? payload.invoice_reference ?? payload.invoice_number ?? "").trim().slice(0, 80);
-  const invoiceNumber = String(payload.invoice_reference ?? payload.invoice_number ?? "").trim();
+  // The API contract already requires a unique order_id. Use it as the
+  // provider invoice reference when callers supply the invoice document but
+  // omit a separate invoice_number.
+  const invoiceNumber = String(payload.invoice_reference ?? payload.invoice_number ?? orderId).trim();
   const providerInvoiceNumber = invoiceNumber.replace(/[^A-Za-z0-9\/-]/g, "-").replace(/-{2,}/g, "-").replace(/^-|-$/g, "").slice(0, 25);
   const declaredValue = Number(payload.declared_value ?? payload.invoice_value ?? payload.inv_amt ?? 0);
   const weightKg = Number(payload.total_weight_kg ?? 0);

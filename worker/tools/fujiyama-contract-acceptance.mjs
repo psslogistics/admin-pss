@@ -12,6 +12,7 @@ const checks = [
   ["lane-neutral account handling", source.includes("clientId === FUJIYAMA_FORWARD_CLIENT_ID || clientId === FUJIYAMA_REVERSE_CLIENT_ID") && source.includes('fujiyamaLane !== "forward" && fujiyamaLane !== "reverse"')],
   ["booking route has no document-scope gate", source.includes('if (route === "/fujiyama/bookings" && request.method === "POST")') && source.includes('if (!hasScope(auth, "shipments.create")) return error("FORBIDDEN", "Shipment creation scope required"')],
   ["API booking can auto-register a pickup address", source.includes('if (!selectedWarehouseId && operation === "warehouse_prepare")') && source.includes('ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin')],
+  ["booking can derive provider invoice reference from order id", source.includes('payload.invoice_reference ?? payload.invoice_number ?? orderId')],
   ["legacy Fujiyama ID removed", !source.includes("bb308dde-aae8-4503-ac7b-f91cd80ada78")],
   ["system API-key administration", source.includes("if (auth.system) return true;")],
   ["API-key tenant binding", source.includes("clientIds: new Set([row.client_id])")],
