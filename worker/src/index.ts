@@ -955,6 +955,32 @@ const FUJIYAMA_STATE_ZONES: Record<string, string> = { chhattisgarh: "C2", madhy
 const FUJIYAMA_REVERSE_ZONE_BY_STATE: Record<string, string> = { punjab: "North", delhi: "North", haryana: "North", himachalpradesh: "North", jammuandkashmir: "North", rajasthan: "North", uttarpradesh: "North", uttarakhand: "North", chhattisgarh: "West", goa: "West", gujarat: "West", madhyapradesh: "West", maharashtra: "West", andhrapradesh: "South", karnataka: "South", puducherry: "South", tamilnadu: "South", telangana: "South", kerala: "South", bihar: "East", jharkhand: "East", odisha: "East", westbengal: "East", arunachalpradesh: "Northeast", assam: "Northeast", manipur: "Northeast", meghalaya: "Northeast", sikkim: "Northeast", nagaland: "Northeast" };
 function fujiyamaForwardZone(city: string, state: string) { return FUJIYAMA_CITY_ZONES[fujiyamaKey(city)] ?? FUJIYAMA_STATE_ZONES[fujiyamaKey(state)] ?? null; }
 function fujiyamaReverseZone(city: string, state: string) { return FUJIYAMA_REVERSE_ZONE_BY_STATE[fujiyamaKey(state)] ?? (fujiyamaKey(city) === "guwahati" ? "Northeast" : null); }
+function fujiyamaLaneForClient(clientId: string): "forward" | "reverse" | null {
+  if (clientId === FUJIYAMA_FORWARD_CLIENT_ID) return "forward";
+  if (clientId === FUJIYAMA_REVERSE_CLIENT_ID) return "reverse";
+  return null;
+}
+function fujiyamaContractMatrix(lane: "forward" | "reverse") {
+  return lane === "forward"
+    ? Object.entries(FUJIYAMA_FORWARD_RATES).map(([destination_zone, rate_per_kg]) => ({ origin_zone: "N1", destination_zone, rate_per_kg }))
+    : Object.entries(FUJIYAMA_REVERSE_RATES).map(([origin_zone, rate_per_kg]) => ({ origin_zone, destination_zone: "North", rate_per_kg }));
+}
+function fujiyamaContractRules(lane: "forward" | "reverse"): ChargeRule[] {
+  return lane === "forward"
+    ? [
+        { code: "docket", label: "Docket / LR charge", kind: "fixed", value: 50, basis: "freight", displayOrder: 10 },
+        { code: "fuel", label: "Fuel surcharge", kind: "percent", value: 15, basis: "freight", displayOrder: 20 },
+        { code: "fm", label: "FM charge", kind: "per_kg", value: 1, basis: "chargeable_weight", displayOrder: 30 },
+        { code: "oda", label: "ODA surcharge", kind: "per_kg", value: 2, basis: "chargeable_weight", minimum: 450, condition: "oda_or_opa", marker: "*", displayOrder: 40 },
+        { code: "minimum_freight", label: "Minimum waybill freight", kind: "minimum", value: 500, basis: "subtotal", displayOrder: 60 },
+      ]
+    : [
+        { code: "docket", label: "Docket / LR charge", kind: "fixed", value: 50, basis: "freight", displayOrder: 10 },
+        { code: "fuel", label: "Fuel surcharge", kind: "percent", value: 10, basis: "freight", displayOrder: 20 },
+        { code: "oda", label: "ODA surcharge", kind: "per_kg", value: 3, basis: "chargeable_weight", minimum: 550, condition: "oda_or_opa", marker: "*", displayOrder: 40 },
+        { code: "minimum_freight", label: "Minimum waybill freight", kind: "minimum", value: 450, basis: "subtotal", displayOrder: 60 },
+      ];
+}
 async function createShipmentPricingQuote(env: Env, clientId: string, payload: Record<string, unknown>, createdByUserId: string, versionIdOverride?: string): Promise<PricingQuoteRecord> {
   const origin = shipmentAddress(payload.origin_address); const destination = shipmentAddress(payload.destination_address);
   if (!origin || !destination) throw new Error("PRICING_ADDRESS_REQUIRED");
@@ -7450,13 +7476,14 @@ const worker = {
         const payload = await bodyJson(request);
         const clientId = requireClient(auth, payload.client_id);
         if (!clientId || !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
+        const fujiyamaLane = fujiyamaLaneForClient(clientId);
         // Client users never choose a courier account. The account is an
         // internal routing concern; all non-04/non-08 Delhivery accounts use
         // the shared Namo/other client matrix. Internal pricing previews may
         // still select 04 or 08 for verification.
         const internalPricingRequest = auth.system || hasRole(auth, ["employee", "admin", "super_admin"]);
         let selectedProviderAccountName = "";
-        let accountValue = internalPricingRequest ? String(payload.account_code ?? "").trim().toLowerCase() : "other";
+        let accountValue = fujiyamaLane ? "other" : internalPricingRequest ? String(payload.account_code ?? "").trim().toLowerCase() : "other";
         if (typeof payload.provider_account_id === "string" && payload.provider_account_id.trim()) {
           const diagnostics = await bookingProviderAccountDiagnostics(env, clientId, payload.provider_account_id.trim());
           const providerAccount = diagnostics.eligible[0];
@@ -7497,7 +7524,8 @@ const worker = {
         if (!activeVersion) return error("PRICING_NOT_CONFIGURED", "A published Delhivery B2B PSS rate card is not configured for this client", 409, id, headers);
         const rules = await env.DB.prepare("SELECT code, label, calculation_type, value, basis, minimum_value, maximum_value, enabled, marker, condition, display_order FROM pricing_charge_rules WHERE version_id = ? ORDER BY display_order ASC, code ASC").bind(activeVersion.id).all<{ code: string; label: string; calculation_type: ChargeRule["kind"]; value: number; basis: ChargeRule["basis"]; minimum_value: number | null; maximum_value: number | null; enabled: number; marker: "*" | null; condition: "oda_or_opa" | null; display_order: number }>();
         const matrixRows = await env.DB.prepare("SELECT origin_zone, destination_zone, rate_per_kg FROM pricing_rate_matrix WHERE version_id = ? AND account_scope = ?").bind(activeVersion.id, account).all<{ origin_zone: string; destination_zone: string; rate_per_kg: number }>();
-        const rateMatrix = Object.fromEntries(matrixRows.results.map((row) => [`${row.origin_zone}->${row.destination_zone}`, Number(row.rate_per_kg)]));
+        const contractMatrix = fujiyamaLane ? fujiyamaContractMatrix(fujiyamaLane) : [];
+        const rateMatrix = Object.fromEntries((fujiyamaLane ? contractMatrix : matrixRows.results).map((row) => [`${row.origin_zone}->${row.destination_zone}`, Number(row.rate_per_kg)]));
         // The pincode dataset remains pricing metadata only (zones/ODA/rates).
         // Live Delhivery serviceability above is the booking authority.
         const [originPin, destinationPin] = await Promise.all([pricingPincode(env, originPincode), pricingPincode(env, destinationPincode)]);
@@ -7508,6 +7536,9 @@ const worker = {
         const originState = originPin?.facility_state ?? String(providerOrigin.facility_state ?? providerOrigin.state ?? payload.origin_state ?? "").trim();
         const destinationState = destinationPin?.facility_state ?? String(providerDestination.facility_state ?? providerDestination.state ?? payload.destination_state ?? "").trim();
         if (!originCity || !originState || !destinationCity || !destinationState) return error("LOCATION_METADATA_REQUIRED", "Delhivery verified the route, but city/state metadata is unavailable for PSS pricing. Enter the city and state and retry.", 409, id, headers);
+        const fujiyamaOriginZone = fujiyamaLane === "forward" ? "N1" : fujiyamaLane === "reverse" ? fujiyamaReverseZone(originCity, originState) : null;
+        const fujiyamaDestinationZone = fujiyamaLane === "forward" ? fujiyamaForwardZone(destinationCity, destinationState) : fujiyamaLane === "reverse" ? "North" : null;
+        if (fujiyamaLane && (!fujiyamaOriginZone || !fujiyamaDestinationZone)) return error("FUJIYAMA_ZONE_NOT_CONFIGURED", "The pincode location is not mapped to the Fujiyama contract zones", 409, id, headers);
         let forwardRatePerKg: number | undefined;
         if (rtoSource) {
           try {
@@ -7518,7 +7549,8 @@ const worker = {
           if (forwardRatePerKg === undefined) return error("RTO_SOURCE_INVALID", "The original shipment pricing snapshot is invalid", 409, id, headers);
         }
          const oda = Boolean(originPin?.oda || destinationPin?.oda || providerOrigin.oda === true || providerDestination.oda === true);
-         const result = calculatePssRate({ account, originCity, destinationCity, originState, destinationState, actualWeightKg, volumetricWeightKg, invoiceValue, rto, forwardRatePerKg, forwardOriginZoneOverride: rtoSource?.origin_zone, forwardDestinationZoneOverride: rtoSource?.destination_zone, minimumWeightKg: Number(activeVersion.minimum_weight_kg ?? 20), gstPercent: Number(activeVersion.gst_percent ?? 18), versionId: activeVersion.id, oda, opa: false, rateMatrix, riskCharges: [], chargeRules: rules.results.map((rule) => ({ code: rule.code, label: rule.label, kind: rule.calculation_type, value: Number(rule.value), basis: rule.basis, minimum: rule.minimum_value === null ? undefined : Number(rule.minimum_value), maximum: rule.maximum_value === null ? undefined : Number(rule.maximum_value), enabled: Boolean(rule.enabled), marker: rule.marker ?? undefined, condition: rule.condition ?? undefined, displayOrder: Number(rule.display_order ?? 0) })) });
+         const chargeRules = fujiyamaLane ? fujiyamaContractRules(fujiyamaLane) : rules.results.map((rule) => ({ code: rule.code, label: rule.label, kind: rule.calculation_type, value: Number(rule.value), basis: rule.basis, minimum: rule.minimum_value === null ? undefined : Number(rule.minimum_value), maximum: rule.maximum_value === null ? undefined : Number(rule.maximum_value), enabled: Boolean(rule.enabled), marker: rule.marker ?? undefined, condition: rule.condition ?? undefined, displayOrder: Number(rule.display_order ?? 0) }));
+         const result = calculatePssRate({ account, originCity, destinationCity, originState, destinationState, actualWeightKg, volumetricWeightKg, invoiceValue, rto: fujiyamaLane ? false : rto, forwardRatePerKg, forwardOriginZoneOverride: rtoSource?.origin_zone, forwardDestinationZoneOverride: rtoSource?.destination_zone, originZoneOverride: fujiyamaOriginZone ?? undefined, destinationZoneOverride: fujiyamaDestinationZone ?? undefined, minimumWeightKg: Number(fujiyamaLane ? 20 : activeVersion.minimum_weight_kg ?? 20), gstPercent: Number(activeVersion.gst_percent ?? 18), versionId: activeVersion.id, oda, opa: false, rateMatrix, riskCharges: fujiyamaLane === "forward" ? [{ code: "rov", label: "ROV", percent: 0.3, minimum: 80 }] : fujiyamaLane === "reverse" ? [{ code: "rov", label: "ROV", percent: 0.2, minimum: 65 }, { code: "owner_risk", label: "Owner risk", percent: 0.1, minimum: 100 }] : [], chargeRules });
         // Existing booking callers omit this field and retain the historical
         // risk-charge behavior. The client rate calculator sends it
         // explicitly so insurance can be included or excluded by the user.
@@ -7540,6 +7572,7 @@ const worker = {
         if (!hasScope(auth, "quotes.create")) return error("FORBIDDEN", "Pricing view permission required", 403, id, headers);
         const clientId = requireClient(auth, null);
         if (!clientId || !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
+        const fujiyamaLane = fujiyamaLaneForClient(clientId);
         const version = await env.DB.prepare("SELECT id, status, effective_at, minimum_weight_kg, volumetric_divisor, gst_percent FROM pricing_versions WHERE client_id = ? AND provider = 'delhivery' AND service_level = 'b2b' AND status = 'active' AND datetime(effective_at) <= CURRENT_TIMESTAMP ORDER BY datetime(effective_at) DESC LIMIT 1").bind(clientId).first();
         const activeVersion = version ?? await ensureDefaultClientPricing(env, clientId, auth.userId ?? `client:${clientId}`);
         if (!activeVersion) return error("PRICING_NOT_CONFIGURED", "A published PSS rate card is not configured for this client", 409, id, headers);
@@ -7547,7 +7580,10 @@ const worker = {
           env.DB.prepare("SELECT origin_zone, destination_zone, rate_per_kg FROM pricing_rate_matrix WHERE version_id = ? AND account_scope = 'other' ORDER BY origin_zone, destination_zone").bind((activeVersion as Record<string, unknown>).id).all(),
           env.DB.prepare("SELECT code, label, calculation_type, value, basis, minimum_value, maximum_value, enabled, marker FROM pricing_charge_rules WHERE version_id = ? ORDER BY display_order, code").bind((activeVersion as Record<string, unknown>).id).all(),
         ]);
-        return json({ ok: true, data: { version: activeVersion, rate_matrices: { other: matrixRows.results }, charge_rules: chargeRules.results } }, 200, headers);
+        const contractMatrix = fujiyamaLane ? fujiyamaContractMatrix(fujiyamaLane) : matrixRows.results;
+        const contractRules = fujiyamaLane ? fujiyamaContractRules(fujiyamaLane) : chargeRules.results;
+        const versionData = fujiyamaLane ? { ...(activeVersion as Record<string, unknown>), minimum_weight_kg: 20, volumetric_divisor: 2700, gst_percent: 18, contract_lane: fujiyamaLane } : activeVersion;
+        return json({ ok: true, data: { version: versionData, rate_matrices: { other: contractMatrix }, charge_rules: contractRules } }, 200, headers);
       }
       if (route === "/pricing/versions" && request.method === "GET") {
         if (!hasScope(auth, "pricing.read")) return error("FORBIDDEN", "Pricing view permission required", 403, id, headers);

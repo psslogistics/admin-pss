@@ -9,6 +9,8 @@ const checks = [
   ["tracking scope", source.includes('hasScope(auth, "tracking.read")')],
   ["booking scope", source.includes('hasScope(auth, "shipments.create")')],
   ["both Fujiyama client IDs", source.includes('FUJIYAMA_FORWARD_CLIENT_ID = "b8bd8184-1b90-4a33-b6bd-9e5dbbd88b10"') && source.includes('FUJIYAMA_REVERSE_CLIENT_ID = "9c0fd0b5-8b5a-4a66-a2cb-4c0f4b6a9c31"')],
+  ["assigned rate card uses contract lane", source.includes("fujiyamaLaneForClient(clientId)") && source.includes("fujiyamaContractMatrix(fujiyamaLane)") && source.includes('route === "/pricing/assigned"')],
+  ["quote preview uses contract rates", source.includes("const contractRules = fujiyamaLane ? fujiyamaContractRules(fujiyamaLane)") && source.includes("originZoneOverride: fujiyamaOriginZone")],
   ["lane-neutral account handling", source.includes("clientId === FUJIYAMA_FORWARD_CLIENT_ID || clientId === FUJIYAMA_REVERSE_CLIENT_ID") && source.includes('fujiyamaLane !== "forward" && fujiyamaLane !== "reverse"')],
   ["booking route has no document-scope gate", source.includes('if (route === "/fujiyama/bookings" && request.method === "POST")') && source.includes('if (!hasScope(auth, "shipments.create")) return error("FORBIDDEN", "Shipment creation scope required"')],
   ["compact Fujiyama payload normalization", source.includes("normalizeFujiyamaBookingPayload") && source.includes("payload.origin_address = normalizeAddress") && source.includes("payload.destination_address = normalizeAddress")],
