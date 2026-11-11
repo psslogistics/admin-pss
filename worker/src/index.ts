@@ -965,6 +965,32 @@ function fujiyamaContractMatrix(lane: "forward" | "reverse") {
     ? Object.entries(FUJIYAMA_FORWARD_RATES).map(([destination_zone, rate_per_kg]) => ({ origin_zone: "N1", destination_zone, rate_per_kg }))
     : Object.entries(FUJIYAMA_REVERSE_RATES).map(([origin_zone, rate_per_kg]) => ({ origin_zone, destination_zone: "North", rate_per_kg }));
 }
+const FUJIYAMA_FORWARD_ZONE_DEFINITIONS = [
+  { code: "N1", region: "North", coverage: "Delhi; Faridabad; Gurgaon; Ghaziabad; Noida; Chandigarh; Jaipur" },
+  { code: "N2", region: "North", coverage: "Dehradun; Ludhiana" },
+  { code: "N3", region: "North", coverage: "Haryana; Punjab; Rajasthan; Uttar Pradesh" },
+  { code: "N4", region: "North", coverage: "Himachal Pradesh; Jammu & Kashmir; Uttarakhand" },
+  { code: "C1", region: "Central", coverage: "Bhopal; Indore; Raipur" },
+  { code: "C2", region: "Central", coverage: "Chhattisgarh; Madhya Pradesh" },
+  { code: "E1", region: "East", coverage: "Kolkata; Patna; Ranchi; Bhubaneswar; Siliguri" },
+  { code: "E2", region: "East", coverage: "Bihar; Odisha; Jharkhand; West Bengal" },
+  { code: "NE1", region: "North East", coverage: "Guwahati" },
+  { code: "NE2", region: "North East", coverage: "Arunachal Pradesh; Assam; Manipur; Meghalaya; Mizoram; Nagaland; Sikkim; Tripura" },
+  { code: "S1", region: "South", coverage: "Hyderabad; Chennai" },
+  { code: "S2", region: "South", coverage: "Andhra Pradesh; Karnataka; Telangana" },
+  { code: "S3", region: "South", coverage: "Tamil Nadu; Pondicherry" },
+  { code: "S4", region: "South", coverage: "Kerala" },
+  { code: "W1", region: "West", coverage: "Mumbai; Pune; Thane; Ahmedabad; Surat" },
+  { code: "W2", region: "West", coverage: "Maharashtra; Gujarat; Goa" },
+];
+const FUJIYAMA_REVERSE_ZONE_DEFINITIONS = [
+  { code: "North", region: "North", coverage: "Punjab; Delhi; Haryana; Himachal Pradesh; Jammu & Kashmir; Rajasthan; Uttar Pradesh; Uttarakhand" },
+  { code: "West", region: "West", coverage: "Chhattisgarh; Goa; Gujarat; Madhya Pradesh; Maharashtra" },
+  { code: "South", region: "South", coverage: "Andhra Pradesh; Karnataka; Pondicherry; Tamil Nadu; Telangana; Kerala" },
+  { code: "East", region: "East", coverage: "Bihar; Jharkhand; Odisha; West Bengal" },
+  { code: "Northeast", region: "North East", coverage: "Arunachal Pradesh; Assam; Manipur; Meghalaya; Sikkim; Nagaland" },
+];
+function fujiyamaContractZoneDefinitions(lane: "forward" | "reverse") { return lane === "forward" ? FUJIYAMA_FORWARD_ZONE_DEFINITIONS : FUJIYAMA_REVERSE_ZONE_DEFINITIONS; }
 function fujiyamaContractRules(lane: "forward" | "reverse"): ChargeRule[] {
   return lane === "forward"
     ? [
@@ -7581,9 +7607,9 @@ const worker = {
           env.DB.prepare("SELECT code, label, calculation_type, value, basis, minimum_value, maximum_value, enabled, marker FROM pricing_charge_rules WHERE version_id = ? ORDER BY display_order, code").bind((activeVersion as Record<string, unknown>).id).all(),
         ]);
         const contractMatrix = fujiyamaLane ? fujiyamaContractMatrix(fujiyamaLane) : matrixRows.results;
-        const contractRules = fujiyamaLane ? fujiyamaContractRules(fujiyamaLane) : chargeRules.results;
+        const contractRules = fujiyamaLane ? fujiyamaContractRules(fujiyamaLane).map((rule) => ({ code: rule.code, label: rule.label, calculation_type: rule.kind, value: rule.value, basis: rule.basis, minimum_value: rule.minimum ?? null, maximum_value: rule.maximum ?? null, enabled: rule.enabled === false ? 0 : 1, marker: rule.marker ?? null })) : chargeRules.results;
         const versionData = fujiyamaLane ? { ...(activeVersion as Record<string, unknown>), minimum_weight_kg: 20, volumetric_divisor: 2700, gst_percent: 18, contract_lane: fujiyamaLane } : activeVersion;
-        return json({ ok: true, data: { version: versionData, rate_matrices: { other: contractMatrix }, charge_rules: contractRules } }, 200, headers);
+        return json({ ok: true, data: { version: versionData, rate_matrices: { other: contractMatrix }, charge_rules: contractRules, zone_definitions: fujiyamaLane ? fujiyamaContractZoneDefinitions(fujiyamaLane) : [], tat: fujiyamaLane ? (fujiyamaLane === "forward" ? { North: "4 days", West: "5 days", South: "6 days", East: "6 days", "North East": "9 days" } : { "North to North": "2-3 days", "West to North": "3-4 days", "South to North": "4-5 days", "East to North": "5-6 days", "North East to North": "6-7 days" }) : {} } }, 200, headers);
       }
       if (route === "/pricing/versions" && request.method === "GET") {
         if (!hasScope(auth, "pricing.read")) return error("FORBIDDEN", "Pricing view permission required", 403, id, headers);
