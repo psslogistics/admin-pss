@@ -248,8 +248,12 @@ aside.bg-sidebar nav a { color: var(--sidebar-foreground); }
 aside.bg-sidebar nav a:hover { color: var(--sidebar-foreground); }
 aside.bg-sidebar > div:last-child > div { background: var(--sidebar-accent); }
 aside.bg-sidebar > div:last-child p { color: var(--sidebar-foreground); }
-header > button[aria-label="Search tasks, clients, shipments"] { color: var(--foreground); }
-header > button[aria-label="Search tasks, clients, shipments"] span { color: inherit; }
+html body header button[aria-label="Search tasks, clients, shipments"] {
+  color: var(--foreground) !important;
+}
+html body header button[aria-label="Search tasks, clients, shipments"] span {
+  color: inherit !important;
+}
 header input::placeholder { color: var(--foreground); opacity: 0.72; }
 
 @media (max-width: 430px) {
