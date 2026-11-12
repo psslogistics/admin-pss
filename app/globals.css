@@ -256,6 +256,14 @@ html body header button[aria-label="Search tasks, clients, shipments"] span {
 }
 header input::placeholder { color: var(--foreground); opacity: 0.72; }
 
+/* Employee-panel touch targets: preserve readable mobile controls across scoped workflows. */
+@media (pointer: coarse) {
+  aside.bg-sidebar nav a { min-height: 2.75rem; }
+  main input[aria-label="Search shipments"],
+  main select[aria-label="Filter shipments by assigned client"] { min-height: 2.75rem; }
+  main [role="alert"] button { min-height: 2.75rem; }
+}
+
 @media (max-width: 430px) {
   header > button[aria-label^="Search"] span { display: none; }
   header > button[aria-label^="Search"] { flex: 0 0 2rem; justify-content: center; padding-inline: 0.5rem; }
