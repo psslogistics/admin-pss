@@ -17,7 +17,7 @@ export default function EmployeeCouriers() {
     </header>
     <section className="flex flex-col gap-2 rounded-xl border border-border/70 bg-card p-4 shadow-xs sm:flex-row sm:items-center sm:justify-between">
       <label htmlFor="courier-client" className="text-xs font-semibold">Assigned client</label>
-      <select id="courier-client" value={selectedClient} onChange={(event) => setSelectedClient(event.target.value)} disabled={!clients.length} className="h-10 min-w-0 rounded-lg border border-input bg-background px-3 text-sm sm:min-w-72">
+      <select id="courier-client" value={selectedClient} onChange={(event) => setSelectedClient(event.target.value)} disabled={!clients.length} className="min-h-11 min-w-0 rounded-lg border border-input bg-background px-3 text-sm sm:min-w-72">
         {!clients.length && <option value="">No assigned clients</option>}
         {clients.map((client) => <option key={client.id} value={client.id}>{client.name}</option>)}
       </select>
