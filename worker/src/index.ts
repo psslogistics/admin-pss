@@ -1990,19 +1990,29 @@ function delhiveryPickupPayload(env: Env, payload: Record<string, unknown>, useD
   const pickupLocation = String(payload.delhivery_pickup_location ?? payload.pickup_location ?? env.DELHIVERY_DEFAULT_PICKUP_LOCATION ?? "").trim();
   const pickupDate = String(payload.scheduled_date ?? payload.pickup_date ?? "").trim();
   const rawWindow = String(payload.window ?? payload.pickup_time ?? "").trim();
-  const startTime = normalizePickupStartTime(rawWindow);
+  const times = rawWindow.match(/\b\d{1,2}:\d{2}(?::\d{2})?\b/g) ?? [];
+  const normalizeTime = (value: string | undefined) => (value ?? "").split(":").map((part) => part.padStart(2, "0")).slice(0, 3).concat(["00", "00"]).slice(0, 3).join(":");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(pickupDate)) return null;
   if (useDelhiveryB2b) {
-    if (!pickupLocation || !startTime) return null;
+    const awbValue = payload.awb_number ?? payload.master_awb ?? payload.provider_reference ?? payload.tracking_number;
+    const awbNumbers = normalizePickupAwbNumbers(awbValue);
+    const facilityId = String(payload.provider_facility_id ?? payload.facility_id ?? "").trim();
+    const facilityCode = String(payload.provider_facility_code ?? payload.facility_code ?? "").trim();
+    const startTime = normalizeTime(times[0]);
+    if (!facilityId || !facilityCode || !awbNumbers.length || !startTime) return null;
     return {
-      client_warehouse: pickupLocation,
+      facility_id: facilityId,
+      facility_code: facilityCode,
       pickup_date: pickupDate,
       start_time: startTime,
-      expected_package_count: Math.max(1, Number(payload.expected_package_count ?? payload.package_count ?? payload.pieces ?? 1)),
+      end_time: normalizeTime(times[1] ?? times[0]),
+      awb_number: awbNumbers,
+      expected_package_count: Math.max(1, Number(payload.expected_package_count ?? payload.package_count ?? payload.pieces ?? awbNumbers.length ?? 1)),
+      pincode: String(payload.pincode ?? "").trim() || undefined,
     };
   }
   if (!pickupLocation) return null;
-  return { pickup_time: startTime ?? "00:00:00", pickup_date: pickupDate, pickup_location: pickupLocation, expected_package_count: Math.max(1, Number(payload.expected_package_count ?? payload.package_count ?? 1)) };
+  return { pickup_time: normalizeTime(times[0]), pickup_date: pickupDate, pickup_location: pickupLocation, expected_package_count: Math.max(1, Number(payload.expected_package_count ?? payload.package_count ?? 1)) };
 }
 
 function providerSafePickupDate(dateValue: string) {
@@ -3036,7 +3046,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     }
   }
   let delhiveryFacility: DelhiveryFacility | null = null;
-  if (provider === "delhivery" && useDelhiveryB2b && clientId && delhiveryB2bToken && operation === "pickup_slots") {
+  if (provider === "delhivery" && useDelhiveryB2b && clientId && delhiveryB2bToken && ["pickups", "pickup_slots"].includes(operation)) {
     let facility = await resolveDelhiveryFacility(env, delhiveryB2bToken, base, clientId, providerPayload, requestIdValue, providerTimeoutMs);
     const facilityError = "error" in facility ? facility.error : "";
     if (!facility.ok && /\b401\b|invalid token|unauthorized|token decode|not enough segments/i.test(facilityError)) {
@@ -3112,7 +3122,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       : provider === "delhivery" && operation === "shipments"
        ? useDelhiveryB2b ? `${base.replace(/\/$/, "")}/manifest` : `${delhiveryOrigin}/api/cmu/create.json`
        : provider === "delhivery" && operation === "pickups"
-         ? useDelhiveryB2b ? `${base.replace(/\/$/, "")}/pickup_requests/` : "https://track.delhivery.com/fm/request/new/"
+         ? useDelhiveryB2b ? `${base.replace(/\/$/, "")}/v2/web/api/orders/pickup_request` : "https://track.delhivery.com/fm/request/new/"
        : provider === "delhivery" && operation === "pickup_slots"
          ? `${base.replace(/\/$/, "")}/web/api/forward_orders/pickup_slots/${encodeURIComponent(String(delhiveryFacility?.code ?? ""))}?facility_id=${encodeURIComponent(String(delhiveryFacility?.id ?? ""))}`
         : provider === "delhivery" && operation === "serviceability_route"
