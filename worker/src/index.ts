@@ -6427,9 +6427,12 @@ const worker = {
         if (shipment?.provider && shipment.provider !== provider) return error("VALIDATION_ERROR", "The pickup courier must match the shipment courier", 409, id, headers);
         const pickupAwbNumbers = normalizePickupAwbNumbers(payload.awb_number ?? payload.master_awb);
         const isManifestSelection = payload.selection_mode === "manifested" || Array.isArray(payload.shipment_ids) === true;
-        // Standalone pickups may be location-only. Delhivery can accept the
-        // pickup location and package count without pre-booked shipments or
-        // AWBs; AWBs remain optional when the client has them available.
+        // Delhivery's B2B pickup_request contract requires at least one AWB
+        // for a blind/standalone pickup. Reject it before persistence so the
+        // client does not create a misleading failed pickup record. Other
+        // courier flows retain their existing standalone behavior.
+        const isDelhiveryStandalone = provider === "delhivery" && !isManifestSelection;
+        if (isDelhiveryStandalone && !pickupAwbNumbers.length) return error("PROVIDER_REFERENCE_REQUIRED", "Select at least one manifested shipment or enter a Delhivery AWB before scheduling this pickup", 409, id, headers);
         const providerAccountId = typeof payload.provider_account_id === "string" && payload.provider_account_id.trim() ? payload.provider_account_id.trim() : shipment?.provider_account_id ?? null;
         if (!providerAccountId) return error("VALIDATION_ERROR", "Select an active courier account before scheduling the pickup", 400, id, headers);
         const providerAccount = await env.DB.prepare(`SELECT pa.id FROM provider_accounts pa LEFT JOIN provider_account_client_policies p ON p.provider_account_id = pa.id AND p.client_id = ? WHERE pa.id = ? AND pa.provider = ? AND pa.status = 'active' AND (pa.client_id = ? OR (p.client_id = ? AND p.enabled = 1)) LIMIT 1`).bind(clientId, providerAccountId, provider, clientId, clientId).first<{ id: string }>();
