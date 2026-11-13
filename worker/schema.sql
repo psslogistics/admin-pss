@@ -219,6 +219,13 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
   PRIMARY KEY(idempotency_key, client_id, endpoint)
 );
 
+CREATE TABLE IF NOT EXISTS employee_session_revocations (
+  token_hash TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  revoked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  expires_at TEXT NOT NULL DEFAULT (datetime('now', '+24 hours'))
+);
+
 CREATE TABLE IF NOT EXISTS activity_events (
   id TEXT PRIMARY KEY,
   actor_user_id TEXT NOT NULL,
@@ -271,6 +278,7 @@ CREATE INDEX IF NOT EXISTS idx_api_keys_client_status ON api_keys(client_id, sta
 CREATE INDEX IF NOT EXISTS idx_api_key_events_key_time ON api_key_events(api_key_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_api_key_usage_key_time ON api_key_usage(api_key_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_idempotency_expiry ON idempotency_keys(expires_at);
+CREATE INDEX IF NOT EXISTS idx_employee_session_revocations_expiry ON employee_session_revocations(expires_at);
 CREATE INDEX IF NOT EXISTS idx_integration_provider_status ON integration_requests(provider, status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_webhook_provider_status ON webhook_events(provider, status, created_at);
 

@@ -50,7 +50,15 @@ export default function EmployeeShell({ children }: { children: React.ReactNode 
 
   const signOut = async () => {
     setProfileOpen(false);
-    await createClient().auth.signOut({ scope: "global" });
+    const supabase = createClient();
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      const apiBase = process.env.NEXT_PUBLIC_PSS_API_URL;
+      if (session?.access_token && apiBase) {
+        await fetch(`${apiBase.replace(/\/$/, "")}/v1/employee/session/revoke`, { method: "POST", headers: { Authorization: `Bearer ${session.access_token}` }, keepalive: true });
+      }
+    } catch { /* local sign-out must still complete if the revoke request is unavailable */ }
+    await supabase.auth.signOut({ scope: "global" });
     router.replace("/sign-in");
     router.refresh();
   };

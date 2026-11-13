@@ -269,6 +269,8 @@ async function authenticate(request: Request, env: Env): Promise<Auth | null> {
   const token = header.slice(7).trim();
   if (!token || token.length > 8192) return null;
   const tokenKey = await sha256(token);
+  const revoked = await env.DB.prepare("SELECT token_hash FROM employee_session_revocations WHERE token_hash = ? AND expires_at > CURRENT_TIMESTAMP LIMIT 1").bind(tokenKey).first<{ token_hash: string }>();
+  if (revoked) return null;
   const cached = userAuthCache.get(tokenKey);
   if (cached && cached.expiresAt > Date.now()) return cached.value;
   const pending = userAuthInFlight.get(tokenKey);
@@ -4943,6 +4945,13 @@ const worker = {
       const limited = route === "/pricing/quotes" && request.method === "POST" ? pricingPreviewRateLimited(request, auth) : await rateLimited(env, request, auth, route);
       if (limited) return new Response(JSON.stringify({ ok: false, error: { code: "RATE_LIMITED", message: "Too many requests" }, request_id: id }), { status: 429, headers: { ...headers, "content-type": "application/json", "retry-after": "60" } });
       if (route === "/me" && request.method === "GET") return json({ ok: true, authenticated: true, user_id: auth.userId, client_id: auth.clientId, client_ids: [...auth.clientIds], audience: auth.audience, roles: [...auth.roles], permissions: [...auth.permissions], system: auth.system }, 200, withCors(request, env));
+      if (route === "/employee/session/revoke" && request.method === "POST") {
+        if (auth.kind !== "user" || auth.audience !== "employee" || !auth.userId || !auth.accessToken) return error("FORBIDDEN", "Employee session revocation is not allowed", 403, id, headers);
+        const tokenHash = await sha256(auth.accessToken);
+        await env.DB.prepare("DELETE FROM employee_session_revocations WHERE expires_at <= CURRENT_TIMESTAMP").run();
+        await env.DB.prepare("INSERT OR REPLACE INTO employee_session_revocations (token_hash, user_id, revoked_at, expires_at) VALUES (?, ?, CURRENT_TIMESTAMP, datetime('now', '+24 hours'))").bind(tokenHash, auth.userId).run();
+        return json({ ok: true, data: { revoked: true }, request_id: id }, 200, withCors(request, env, { "cache-control": "no-store" }));
+      }
       const pincodeLookup = route.match(/^\/pincodes\/(\d{6})$/);
       if (pincodeLookup && request.method === "GET") {
         if (!hasScope(auth, "quotes.create") && !hasScope(auth, "serviceability.read")) return error("FORBIDDEN", "Pincode lookup permission required", 403, id, headers);
