@@ -55,10 +55,14 @@ export default function EmployeeShell({ children }: { children: React.ReactNode 
       const { data: { session } } = await supabase.auth.getSession();
       const apiBase = process.env.NEXT_PUBLIC_PSS_API_URL;
       if (session?.access_token && apiBase) {
-        await fetch(`${apiBase.replace(/\/$/, "")}/v1/employee/session/revoke`, { method: "POST", headers: { Authorization: `Bearer ${session.access_token}` }, keepalive: true });
+        // Do not let a slow/unavailable revocation endpoint strand the employee
+        // in the authenticated shell. The local Supabase session must be
+        // cleared immediately; the best-effort server revocation is still sent
+        // with keepalive so replay protection remains effective when available.
+        void fetch(`${apiBase.replace(/\/$/, "")}/v1/employee/session/revoke`, { method: "POST", headers: { Authorization: `Bearer ${session.access_token}` }, keepalive: true }).catch(() => undefined);
       }
     } catch { /* local sign-out must still complete if the revoke request is unavailable */ }
-    await supabase.auth.signOut({ scope: "global" });
+    await supabase.auth.signOut({ scope: "local" });
     router.replace("/sign-in");
     router.refresh();
   };
