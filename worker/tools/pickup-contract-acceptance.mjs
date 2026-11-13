@@ -10,6 +10,8 @@ const checks = [
   ["canonical pickup fields are selected", ["requested_date", "requested_time_slot", "pickup_address", "contact_name", "contact_phone"].every((field) => source.includes(field))],
   ["canonical lifecycle statuses are accepted", ["draft", "requested", "provider_pending", "scheduled", "driver_assigned", "en_route", "picked_up", "completed", "cancelled", "failed"].every((status) => source.includes(`\"${status}\"`))],
   ["provider account is required and scoped", source.includes("PROVIDER_ACCOUNT_UNAVAILABLE") && source.includes("pa.status = 'active'")],
+  ["pickup candidates are scoped to the selected warehouse or canonical location", source.includes("pickupLocationsMatch") && source.includes("warehouse_id") && source.includes("pickup_line") && source.includes("PICKUP_LOCATION_REQUIRED")],
+  ["pickup submission rejects a warehouse/location mismatch", source.includes("PICKUP_LOCATION_MISMATCH") && source.includes("savedWarehouse")],
   ["pickup idempotency is required", source.includes("IDEMPOTENCY_KEY_REQUIRED") && source.includes("POST /v1/pickups")],
   ["attempt history is recorded", source.includes("recordPickupAttempt") && schema.includes("CREATE TABLE IF NOT EXISTS pickup_request_attempts")],
   ["provider slot references are persisted", source.includes("providerSlotId") && source.includes("provider_slot_id = COALESCE")],

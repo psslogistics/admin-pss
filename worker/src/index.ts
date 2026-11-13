@@ -2042,6 +2042,34 @@ function normalizePickupPhone(value: unknown) {
   return digits.length === 10 ? digits : null;
 }
 
+function normalizePickupLocationText(value: unknown) {
+  return String(value ?? "")
+    .trim()
+    .replace(/^(?:\+?91[\s-]?)?\d{10}\s*[,:-]?\s*/i, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+}
+
+function pickupLocationIdentity(value: unknown) {
+  const record = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  return {
+    line: normalizePickupLocationText(record.line ?? record.address_line1 ?? record.address),
+    city: normalizePickupLocationText(record.city),
+    state: normalizePickupLocationText(record.state),
+    pincode: String(record.pincode ?? record.pin ?? record.pin_code ?? "").replace(/\D/g, ""),
+  };
+}
+
+function pickupLocationsMatch(left: unknown, right: unknown) {
+  const first = pickupLocationIdentity(left);
+  const second = pickupLocationIdentity(right);
+  return Boolean(first.line && first.city && first.state && /^\d{6}$/.test(first.pincode)
+    && first.line === second.line
+    && first.city === second.city
+    && first.state === second.state
+    && first.pincode === second.pincode);
+}
+
 function validPickupDate(value: string) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
   const parsed = new Date(`${value}T00:00:00Z`);
@@ -6344,12 +6372,32 @@ const worker = {
         const provider = String(url.searchParams.get("provider") ?? "").trim().toLowerCase();
         const providerAccountId = String(url.searchParams.get("provider_account_id") ?? "").trim();
         const pincode = String(url.searchParams.get("pincode") ?? "").trim();
+        const warehouseId = String(url.searchParams.get("warehouse_id") ?? "").trim();
+        const pickupLine = String(url.searchParams.get("pickup_line") ?? "").trim();
+        const pickupCity = String(url.searchParams.get("city") ?? "").trim();
+        const pickupState = String(url.searchParams.get("state") ?? "").trim();
         if (!provider || !providerAccountId) return error("VALIDATION_ERROR", "Provider and provider account are required", 400, id, headers);
+        const selectedWarehouse = warehouseId
+          ? await env.DB.prepare("SELECT id, address, city, state, pincode, provider, provider_account_id FROM warehouses WHERE id = ? AND client_id = ? LIMIT 1")
+            .bind(warehouseId, clientId)
+            .first<{ id: string; address: string | null; city: string | null; state: string | null; pincode: string | null; provider: string | null; provider_account_id: string | null }>()
+          : null;
+        if (warehouseId && !selectedWarehouse) return error("WAREHOUSE_NOT_FOUND", "The selected pickup warehouse is not saved for this client", 404, id, headers);
+        if (selectedWarehouse?.provider && selectedWarehouse.provider !== provider) return error("PROVIDER_WAREHOUSE_MISMATCH", "The selected pickup warehouse is not mapped to this courier", 409, id, headers);
+        if (selectedWarehouse?.provider_account_id && selectedWarehouse.provider_account_id !== providerAccountId) return error("PROVIDER_ACCOUNT_MISMATCH", "The selected pickup warehouse belongs to a different courier account", 409, id, headers);
+        const requestedLocation = selectedWarehouse ?? (pickupLine || pickupCity || pickupState || pincode ? { line: pickupLine, city: pickupCity, state: pickupState, pincode } : null);
+        if (!requestedLocation) return error("PICKUP_LOCATION_REQUIRED", "Select a pickup warehouse before choosing manifested shipments", 400, id, headers);
         const conditions = ["s.client_id = ?", "s.status = 'booked'", "s.provider = ?", "s.provider_account_id = ?", "NOT EXISTS (SELECT 1 FROM pickup_request_shipments prs JOIN pickup_requests pr ON pr.id = prs.pickup_id WHERE prs.shipment_id = s.id AND pr.status NOT IN ('cancelled', 'completed', 'failed'))"];
         const binds: unknown[] = [clientId, provider, providerAccountId];
         if (pincode) { conditions.push("json_extract(s.origin_address_json, '$.pincode') = ?"); binds.push(pincode); }
         const rows = await env.DB.prepare(`SELECT s.id, s.pss_reference, s.order_id, s.tracking_number, s.lr_number, s.master_awb, s.provider_reference, s.origin_address_json, s.origin, s.total_weight_kg, s.pieces, s.created_at FROM shipments s WHERE ${conditions.join(" AND ")} ORDER BY s.created_at ASC LIMIT 200`).bind(...binds).all<Record<string, unknown>>();
-        return json({ ok: true, data: rows.results.map((row) => { let origin: Record<string, unknown> = {}; try { origin = JSON.parse(String(row.origin_address_json ?? "{}")) as Record<string, unknown>; } catch { origin = {}; } return { ...row, origin_address: origin, awb: row.master_awb ?? row.tracking_number ?? row.provider_reference ?? row.lr_number ?? null }; }) }, 200, headers);
+        const candidates = rows.results.flatMap((row) => {
+          let origin: Record<string, unknown> = {};
+          try { origin = JSON.parse(String(row.origin_address_json ?? "{}")) as Record<string, unknown>; } catch { origin = {}; }
+          if (!pickupLocationsMatch(origin, requestedLocation)) return [];
+          return [{ ...row, origin_address: origin, awb: row.master_awb ?? row.tracking_number ?? row.provider_reference ?? row.lr_number ?? null }];
+        });
+        return json({ ok: true, data: candidates }, 200, headers);
       }
 
       if (route === "/pickups" && request.method === "POST") {
@@ -6396,10 +6444,15 @@ const worker = {
         const totalWeight = Number(payload.weight ?? payload.total_weight_kg);
         if (!isManifestSelection && (!Number.isFinite(totalWeight) || totalWeight <= 0)) return error("VALIDATION_ERROR", "Total pickup weight must be greater than zero", 400, id, headers);
         const warehouseId = typeof payload.warehouse_id === "string" && payload.warehouse_id.trim() ? payload.warehouse_id.trim() : null;
-        if (warehouseId) {
-          const savedWarehouse = await env.DB.prepare("SELECT id FROM warehouses WHERE id = ? AND client_id = ? LIMIT 1").bind(warehouseId, clientId).first<{ id: string }>();
-          if (!savedWarehouse) return error("WAREHOUSE_NOT_FOUND", "The selected pickup warehouse is not saved for this client", 404, id, headers);
-        }
+        const savedWarehouse = warehouseId
+          ? await env.DB.prepare("SELECT id, address, city, state, pincode, contact, contact_name, provider, provider_account_id FROM warehouses WHERE id = ? AND client_id = ? LIMIT 1")
+            .bind(warehouseId, clientId)
+            .first<{ id: string; address: string | null; city: string | null; state: string | null; pincode: string | null; contact: string | null; contact_name: string | null; provider: string | null; provider_account_id: string | null }>()
+          : null;
+        if (warehouseId && !savedWarehouse) return error("WAREHOUSE_NOT_FOUND", "The selected pickup warehouse is not saved for this client", 404, id, headers);
+        if (savedWarehouse?.provider && savedWarehouse.provider !== provider) return error("PROVIDER_WAREHOUSE_MISMATCH", "The selected pickup warehouse is not mapped to this courier", 409, id, headers);
+        if (savedWarehouse?.provider_account_id && savedWarehouse.provider_account_id !== providerAccountId) return error("PROVIDER_ACCOUNT_MISMATCH", "The selected pickup warehouse belongs to a different courier account", 409, id, headers);
+        if (savedWarehouse && !pickupLocationsMatch(savedWarehouse, { line: payload.pickup_line ?? payload.address ?? pickupAddressInput, city: payload.city, state: payload.state, pincode: payload.pincode })) return error("PICKUP_LOCATION_MISMATCH", "The pickup details do not match the selected warehouse. Select the warehouse again or correct the pickup details.", 409, id, headers);
          const providerPayload: Record<string, unknown> = { ...payload, provider, provider_account_id: providerAccountId, awb_number: pickupAwbNumbers, scheduled_date: normalizedScheduledDate, requested_date: normalizedScheduledDate, window: String(requestedWindowInput), requested_time_slot: String(requestedWindowInput), location: String(pickupAddressInput).trim(), pickup_address: String(pickupAddressInput).trim(), contact_phone: normalizedContactPhone, pieces, weight: totalWeight };
         if (payload.shipment_id !== undefined && !(await shipmentBelongsToClient(env, payload.shipment_id, clientId))) return error("NOT_FOUND", "Shipment not found", 404, id, headers);
          if (payload.provider_managed === true && !shipment) return error("VALIDATION_ERROR", "Provider-managed pickup requests must be linked to a shipment", 400, id, headers);
@@ -6416,8 +6469,13 @@ const worker = {
           if (selectedRows.results.length !== manifestShipmentIds.length) return error("NOT_FOUND", "One or more selected shipments do not belong to this client", 404, id, headers);
           if (selectedRows.results.some((row) => row.status !== "booked")) return error("SHIPMENT_NOT_READY", "Only booked shipments that are not already on an active pickup can be selected", 409, id, headers);
           if (selectedRows.results.some((row) => String(row.provider ?? "") !== provider || String(row.provider_account_id ?? "") !== providerAccountId)) return error("VALIDATION_ERROR", "All selected shipments must use the selected courier account", 409, id, headers);
-          const normalizedPickupAddress = String(pickupAddressInput).toLowerCase().replace(/[^a-z0-9]/g, "");
-          const mismatchedLocation = selectedRows.results.some((row) => { try { const origin = JSON.parse(String(row.origin_address_json ?? "{}")) as Record<string, unknown>; const originLine = String(origin.line ?? origin.address_line1 ?? origin.address ?? "").toLowerCase().replace(/[^a-z0-9]/g, ""); return !originLine || !normalizedPickupAddress.includes(originLine) || String(origin.pincode ?? "").trim() !== String(payload.pincode).trim() || String(origin.city ?? "").trim().toLowerCase() !== String(payload.city).trim().toLowerCase() || String(origin.state ?? "").trim().toLowerCase() !== String(payload.state).trim().toLowerCase(); } catch { return true; } });
+          const requestedLocation = savedWarehouse ?? { line: payload.pickup_line ?? payload.address ?? pickupAddressInput, city: payload.city, state: payload.state, pincode: payload.pincode };
+          const mismatchedLocation = selectedRows.results.some((row) => {
+            try {
+              const origin = JSON.parse(String(row.origin_address_json ?? "{}")) as Record<string, unknown>;
+              return !pickupLocationsMatch(origin, requestedLocation);
+            } catch { return true; }
+          });
           if (mismatchedLocation) return error("PICKUP_LOCATION_MISMATCH", "Selected shipments must come from the pickup location and PIN code shown in this request", 409, id, headers);
           const active = await env.DB.prepare(`SELECT prs.shipment_id FROM pickup_request_shipments prs JOIN pickup_requests pr ON pr.id = prs.pickup_id WHERE prs.client_id = ? AND prs.shipment_id IN (${placeholders}) AND pr.status NOT IN ('cancelled', 'completed', 'failed') LIMIT 1`).bind(clientId, ...manifestShipmentIds).first<{ shipment_id: string }>();
           if (active) return error("SHIPMENT_ALREADY_ASSIGNED", "One or more selected shipments already belong to an active pickup request", 409, id, headers);
