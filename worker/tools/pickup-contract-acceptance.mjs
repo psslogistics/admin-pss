@@ -22,6 +22,7 @@ const checks = [
   ["Delhivery pickup creation uses the verified B2B pickup endpoint and full provider payload", source.includes("/v2/web/api/orders/pickup_request") && source.includes("facility_id") && source.includes("facility_code") && source.includes("end_time") && source.includes("awb_number") && source.includes("pincode")],
   ["Delhivery pickup windows preserve AM/PM start times", source.includes("normalizePickupStartTime") && source.includes("AM|PM") && source.includes("start_time: startTime")],
   ["B2B pickup booking resolves the active facility before submission", source.includes('["pickups", "pickup_slots"].includes(operation)') && source.includes("provider_facility_id") && source.includes("provider_facility_code")],
+  ["verified pickup warehouses reuse the persisted provider identity without the console facility-list lookup", source.includes("persistedFacilityId") && source.includes("provider_status") && source.includes("facility list is not a")],
   ["provider warehouse reuse is tracked", source.includes("provider_status = 'active'") && source.includes("reused: true") && migration.includes("provider_status")],
   ["migration carries canonical fields", ["provider_account_id", "warehouse_id", "provider_slot_id", "idempotency_key"].every((field) => migration.includes(field))],
   ["admin does not post incomplete pickup payloads", !adminWorkspace.includes('scheduled_date: new Date().toISOString().slice(0, 10)') && adminWorkspace.includes("Open the full Pickup desk")],

@@ -1596,12 +1596,12 @@ async function resolveDelhiveryFacility(
   timeoutMs: number,
 ): Promise<{ ok: true; facility: DelhiveryFacility } | { ok: false; error: string }> {
   const warehouseId = typeof payload.warehouse_id === "string" ? payload.warehouse_id.trim() : "";
-  const warehouseSelect = "SELECT id, name, address, city, pincode, provider, provider_account_id, provider_reference, provider_status FROM warehouses WHERE client_id = ?";
+  const warehouseSelect = "SELECT id, name, address, city, pincode, provider, provider_account_id, provider_reference, provider_status, provider_name FROM warehouses WHERE client_id = ?";
   const localWarehouse = warehouseId
-    ? await env.DB.prepare(`${warehouseSelect} AND id = ? LIMIT 1`).bind(clientId, warehouseId).first<{ id: string; name: string; address: string; city: string; pincode: string; provider: string | null; provider_account_id: string | null; provider_reference: string | null; provider_status: string | null }>()
+    ? await env.DB.prepare(`${warehouseSelect} AND id = ? LIMIT 1`).bind(clientId, warehouseId).first<{ id: string; name: string; address: string; city: string; pincode: string; provider: string | null; provider_account_id: string | null; provider_reference: string | null; provider_status: string | null; provider_name: string | null }>()
     : await env.DB.prepare(`${warehouseSelect} AND provider = 'delhivery' AND lower(trim(COALESCE(address, ''))) = lower(trim(?)) AND lower(trim(COALESCE(city, ''))) = lower(trim(?)) AND lower(trim(COALESCE(pincode, ''))) = lower(trim(?)) ORDER BY updated_at DESC LIMIT 1`)
       .bind(clientId, String((payload.origin_address as Record<string, unknown> | null)?.line ?? ""), String((payload.origin_address as Record<string, unknown> | null)?.city ?? ""), String(payload.pincode ?? (payload.origin_address as Record<string, unknown> | null)?.pincode ?? ""))
-      .first<{ id: string; name: string; address: string; city: string; pincode: string; provider: string | null; provider_account_id: string | null; provider_reference: string | null; provider_status: string | null }>();
+      .first<{ id: string; name: string; address: string; city: string; pincode: string; provider: string | null; provider_account_id: string | null; provider_reference: string | null; provider_status: string | null; provider_name: string | null }>();
   const requestedAccountId = String(payload.provider_account_id ?? "").trim();
   if (localWarehouse && String(localWarehouse.provider ?? "").trim().toLowerCase() !== "delhivery") {
     return { ok: false, error: "The selected pickup warehouse is not mapped to Delhivery" };
@@ -1612,6 +1612,19 @@ async function resolveDelhiveryFacility(
   const name = String(payload.delhivery_pickup_location ?? payload.pickup_location ?? localWarehouse?.name ?? "").trim();
   const pincode = String(payload.pincode ?? localWarehouse?.pincode ?? "").trim();
   if (!name && !localWarehouse?.provider_reference) return { ok: false, error: "A Delhivery pickup facility is required before scheduling this pickup" };
+
+  // Pickup submission must use the provider identity captured when this
+  // warehouse was registered/verified. The web-console facility list is not a
+  // booking authority and can return 404 for valid B2B facilities; relying on
+  // it here made every otherwise-valid pickup fail before the pickup endpoint
+  // was reached. provider_reference is the facility identifier returned by
+  // Delhivery, while provider_name is the canonical facility code/name used by
+  // the existing provider payload contract.
+  const persistedFacilityId = String(localWarehouse?.provider_reference ?? "").trim();
+  const persistedFacilityCode = String(localWarehouse?.provider_name ?? localWarehouse?.name ?? name).trim();
+  if (localWarehouse && String(localWarehouse.provider_status ?? "").trim().toLowerCase() === "active" && persistedFacilityId && persistedFacilityCode) {
+    return { ok: true, facility: { id: persistedFacilityId, code: persistedFacilityCode, name: persistedFacilityCode, pincode } };
+  }
 
   // The B2B booking JWT is valid only on the configured B2B host. The
   // Delhivery web console uses a separate gateway/authentication contract, so
