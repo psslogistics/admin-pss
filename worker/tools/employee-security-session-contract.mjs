@@ -16,7 +16,7 @@ const checks = [
   ["revoke remains current-session-only", /expectedSessionId[\s\S]*securitySessionRevoke\[1\] !== expectedSessionId/],
   ["employee logout revocation table exists", /CREATE TABLE IF NOT EXISTS employee_session_revocations/],
   ["worker rejects revoked token hashes", /employee_session_revocations[\s\S]*if \(revoked\) return null/],
-  ["employee shell revokes before global sign-out", /employee\/session\/revoke[\s\S]*signOut\(\{ scope: "global" \}\)/],
+  ["employee shell sends revocation before local sign-out", /employee\/session\/revoke[\s\S]*signOut\(\{ scope: "local" \}\)/],
 ];
 
 for (const [label, pattern] of checks) assert.match(`${permissions}\n${worker}\n${migration}\n${shell}`, pattern, label);
