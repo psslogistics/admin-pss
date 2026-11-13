@@ -1596,12 +1596,19 @@ async function resolveDelhiveryFacility(
   timeoutMs: number,
 ): Promise<{ ok: true; facility: DelhiveryFacility } | { ok: false; error: string }> {
   const warehouseId = typeof payload.warehouse_id === "string" ? payload.warehouse_id.trim() : "";
-  const warehouseSelect = "SELECT id, name, address, city, pincode, provider_reference, provider_status FROM warehouses WHERE client_id = ?";
+  const warehouseSelect = "SELECT id, name, address, city, pincode, provider, provider_account_id, provider_reference, provider_status FROM warehouses WHERE client_id = ?";
   const localWarehouse = warehouseId
-    ? await env.DB.prepare(`${warehouseSelect} AND id = ? LIMIT 1`).bind(clientId, warehouseId).first<{ id: string; name: string; address: string; city: string; pincode: string; provider_reference: string | null; provider_status: string | null }>()
+    ? await env.DB.prepare(`${warehouseSelect} AND id = ? LIMIT 1`).bind(clientId, warehouseId).first<{ id: string; name: string; address: string; city: string; pincode: string; provider: string | null; provider_account_id: string | null; provider_reference: string | null; provider_status: string | null }>()
     : await env.DB.prepare(`${warehouseSelect} AND provider = 'delhivery' AND lower(trim(COALESCE(address, ''))) = lower(trim(?)) AND lower(trim(COALESCE(city, ''))) = lower(trim(?)) AND lower(trim(COALESCE(pincode, ''))) = lower(trim(?)) ORDER BY updated_at DESC LIMIT 1`)
       .bind(clientId, String((payload.origin_address as Record<string, unknown> | null)?.line ?? ""), String((payload.origin_address as Record<string, unknown> | null)?.city ?? ""), String(payload.pincode ?? (payload.origin_address as Record<string, unknown> | null)?.pincode ?? ""))
-      .first<{ id: string; name: string; address: string; city: string; pincode: string; provider_reference: string | null; provider_status: string | null }>();
+      .first<{ id: string; name: string; address: string; city: string; pincode: string; provider: string | null; provider_account_id: string | null; provider_reference: string | null; provider_status: string | null }>();
+  const requestedAccountId = String(payload.provider_account_id ?? "").trim();
+  if (localWarehouse && String(localWarehouse.provider ?? "").trim().toLowerCase() !== "delhivery") {
+    return { ok: false, error: "The selected pickup warehouse is not mapped to Delhivery" };
+  }
+  if (localWarehouse?.provider_account_id && requestedAccountId && localWarehouse.provider_account_id !== requestedAccountId) {
+    return { ok: false, error: "The selected pickup warehouse belongs to a different Delhivery account" };
+  }
   const name = String(payload.delhivery_pickup_location ?? payload.pickup_location ?? localWarehouse?.name ?? "").trim();
   const pincode = String(payload.pincode ?? localWarehouse?.pincode ?? "").trim();
   if (!name && !localWarehouse?.provider_reference) return { ok: false, error: "A Delhivery pickup facility is required before scheduling this pickup" };
@@ -3319,6 +3326,25 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   if (persistIntegration) await env.DB.prepare("UPDATE integration_requests SET status = ?, error_code = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(response.ok ? "succeeded" : "failed", response.ok ? null : `HTTP_${response.status}`, response.ok ? null : `${lastError}${providerFailureDetail ? `: ${providerFailureDetail}` : ""}`.slice(0, 500), integrationId).run();
   let parsedProviderBody: unknown = null;
   try { parsedProviderBody = JSON.parse(responseBody); } catch { parsedProviderBody = responseBody.trim() || null; }
+  const providerBodyRecord = parsedProviderBody && typeof parsedProviderBody === "object" && !Array.isArray(parsedProviderBody)
+    ? parsedProviderBody as Record<string, unknown>
+    : null;
+  const providerBodyError = providerBodyRecord?.error && typeof providerBodyRecord.error === "object"
+    ? providerBodyRecord.error as Record<string, unknown>
+    : null;
+  const providerBodyStatus = String(providerBodyRecord?.status ?? providerBodyRecord?.state ?? providerBodyRecord?.provider_status ?? "").trim().toLowerCase();
+  const providerBodyRejected = provider === "delhivery" && operation === "pickups" && (
+    providerBodyRecord?.success === false ||
+    providerBodyRecord?.ok === false ||
+    providerBodyRecord?.accepted === false ||
+    ["failed", "failure", "rejected", "declined", "error"].includes(providerBodyStatus) ||
+    Boolean(providerBodyError)
+  );
+  if (providerBodyRejected && persistIntegration) {
+    const bodyMessage = String(providerBodyError?.message ?? providerBodyError?.detail ?? providerBodyRecord?.message ?? providerBodyRecord?.reason ?? "Delhivery rejected the pickup request").replace(/\s+/g, " ").trim().slice(0, 500);
+    await env.DB.prepare("UPDATE integration_requests SET status = 'failed', error_code = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+      .bind(String(providerBodyError?.code ?? (providerBodyStatus || "PROVIDER_REJECTED")), bodyMessage, integrationId).run();
+  }
   if (provider === "delhivery" && operation === "tracking" && payload.weight_reconciliation === true) {
     // Keep weight debugging useful without logging provider values, addresses,
     // invoice data, or the raw response. Field names are enough to extend the
@@ -3814,22 +3840,26 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     const createdReference = findProviderReference(parsedProviderBody, new Set(["cnote", "bookingId", "booking_id"]));
     if (createdReference) await env.DB.prepare("UPDATE shipments SET tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(provider_reference, ?), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(createdReference, createdReference, payload.shipment_id, clientId).run();
   }
-  const providerError = response.ok
+  const providerAccepted = response.ok && !providerBodyRejected;
+  const providerError = providerAccepted
     ? undefined
     : findProviderReference(parsedProviderBody, new Set(["message", "error", "errors", "rmk", "remark", "remarks", "reason", "detail"]))
       ?? (responseBody.replace(/\s+/g, " ").trim().slice(0, 300) || lastError);
   const providerErrorText = String(providerError ?? "").replace(/\s+/g, " ").trim().slice(0, 500);
-  const normalizedError = response.ok
+  const normalizedError = providerAccepted
     ? undefined
     : /client[- ]warehouse.*not active|warehouse.*inactive|wrong\/inactive center/i.test(providerErrorText)
       ? "Delhivery rejected this booking because the selected pickup warehouse is inactive. Activate that exact saved warehouse for this Delhivery account, then retry."
       : `${lastError}: ${providerErrorText || "Delhivery rejected the booking"}`;
   const providerAmountValue = provider === "delhivery" ? findDelhiveryCost(parsedProviderBody) : provider === "xpressbees" && operation === "quotes" ? findProviderAmount(parsedProviderBody) : null;
-  if (response.ok && provider === "delhivery" && providerAmountValue !== null && clientId && typeof payload.shipment_id === "string") {
+  if (providerAccepted && provider === "delhivery" && providerAmountValue !== null && clientId && typeof payload.shipment_id === "string") {
     await env.DB.prepare("INSERT OR REPLACE INTO pricing_provider_costs (id, shipment_id, client_id, provider, provider_account_id, provider_amount, provider_status) VALUES (COALESCE((SELECT id FROM pricing_provider_costs WHERE shipment_id = ?), ?), ?, ?, ?, ?, ?, ?)")
       .bind(payload.shipment_id, crypto.randomUUID(), payload.shipment_id, clientId, provider, account?.id ?? null, providerAmountValue, "accepted").run();
   }
-  return { enabled: true, status: response.ok ? "accepted" as const : "failed" as const, providerStatus: response.status, normalized_status: normalizedTracking?.status, edd: providerEdd, tracking: normalizedTracking ? { status: normalizedTracking.status, location: normalizedTracking.location, description: normalizedTracking.description, event_time: normalizedTracking.eventTime } : undefined, tracking_events: operation === "tracking" ? normalizedTrackingEvents.map((event) => ({ status: event.status, location: event.location, description: event.description, event_time: event.eventTime, source: `provider:${provider}` })) : undefined, provider_weight_received: ["freight_charges", "tracking"].includes(operation) && payload.weight_reconciliation === true ? providerWeightReceived : undefined, amount: providerAmountValue, provider_account_id: account?.id, account_name: account?.account_name, confidence_score: account?.confidence_score, priority: account?.priority, rate_card_id: account?.rate_card_id ?? undefined, error: normalizedError };
+  const providerErrorCode = providerBodyError
+    ? String(providerBodyError.code ?? providerBodyError.error_code ?? (providerBodyStatus || "provider_rejected")).slice(0, 120)
+    : providerAccepted ? undefined : `HTTP_${response.status}`;
+  return { enabled: true, status: providerAccepted ? "accepted" as const : "failed" as const, providerStatus: providerBodyRejected ? (providerBodyStatus || response.status) : response.status, normalized_status: normalizedTracking?.status, edd: providerEdd, tracking: normalizedTracking ? { status: normalizedTracking.status, location: normalizedTracking.location, description: normalizedTracking.description, event_time: normalizedTracking.eventTime } : undefined, tracking_events: operation === "tracking" ? normalizedTrackingEvents.map((event) => ({ status: event.status, location: event.location, description: event.description, event_time: event.eventTime, source: `provider:${provider}` })) : undefined, provider_weight_received: ["freight_charges", "tracking"].includes(operation) && payload.weight_reconciliation === true ? providerWeightReceived : undefined, amount: providerAmountValue, provider_account_id: account?.id, account_name: account?.account_name, confidence_score: account?.confidence_score, priority: account?.priority, rate_card_id: account?.rate_card_id ?? undefined, error: normalizedError, error_code: providerErrorCode, provider_request_id: requestIdValue };
 }
 
 async function recordPickupAttempt(env: Env, details: { pickupId: string; clientId: string; provider: string; providerAccountId?: string | null; requestId?: string | null; idempotencyKey?: string | null; requestedDate?: string | null; requestedWindow?: string | null; status: string; providerStatus?: string | number | null; providerReference?: string | null; providerErrorCode?: string | null; errorMessage?: string | null }) {
@@ -6402,11 +6432,12 @@ const worker = {
           const providerReference = (providerResult as { providerReference?: string | null }).providerReference ?? null;
           const providerStatus = (providerResult as { providerStatus?: string | number | null }).providerStatus ?? providerResult.status;
           const providerErrorMessage = (providerResult as { error?: string; reason?: string }).error ?? (providerResult as { reason?: string }).reason ?? null;
-          await recordPickupAttempt(env, { pickupId, clientId, provider, providerAccountId, requestId: id, idempotencyKey: key, requestedDate: normalizedScheduledDate, requestedWindow: String(requestedWindowInput), status: providerResult.status, providerStatus, providerReference, providerErrorCode: providerResult.status === "accepted" ? null : providerResult.status, errorMessage: providerErrorMessage }).catch(() => undefined);
+          const providerErrorCode = (providerResult as { error_code?: string | null }).error_code ?? (providerResult.status === "accepted" ? null : providerResult.status);
+          await recordPickupAttempt(env, { pickupId, clientId, provider, providerAccountId, requestId: id, idempotencyKey: key, requestedDate: normalizedScheduledDate, requestedWindow: String(requestedWindowInput), status: providerResult.status, providerStatus, providerReference, providerErrorCode, errorMessage: providerErrorMessage }).catch(() => undefined);
           if (providerResult.status !== "accepted") {
             const failureReason = String(providerErrorMessage ?? `The ${provider} pickup was not accepted`).slice(0, 500);
-            await env.DB.prepare("UPDATE pickup_requests SET status = 'failed', provider_status = ?, provider_request_id = ?, provider_error_code = ?, failure_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(String(providerStatus), id, String(providerResult.status), failureReason, pickupId, clientId).run();
-            const failedResponse = JSON.stringify({ ok: false, error: { code: "PROVIDER_REQUEST_FAILED", category: "provider", message: failureReason, user_safe_message: `The ${provider} pickup was not accepted.`, technical_message: failureReason, request_id: id, retryable: true }, data: { id: pickupId, status: "failed" }, request_id: id });
+            await env.DB.prepare("UPDATE pickup_requests SET status = 'failed', provider_status = ?, provider_request_id = ?, provider_error_code = ?, failure_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(String(providerStatus), id, String(providerErrorCode ?? "provider_request_failed"), failureReason, pickupId, clientId).run();
+            const failedResponse = JSON.stringify({ ok: false, error: { code: "PROVIDER_REQUEST_FAILED", category: "provider", message: failureReason, user_safe_message: `The ${provider} pickup was not accepted. Check the pickup details and retry after correcting the provider issue.`, technical_message: failureReason, provider_code: providerErrorCode, request_id: id, retryable: true }, data: { id: pickupId, status: "failed" }, request_id: id });
             await saveIdempotent(env, key, clientId, "POST /v1/pickups", 502, failedResponse, requestHash);
             return new Response(failedResponse, { status: 502, headers: { ...headers, "content-type": "application/json" } });
           }
