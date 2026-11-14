@@ -32,6 +32,8 @@ const checks = [
   ["accepted manifest pickups are not silently appended", source.includes("GROUPABLE_MANIFEST_PICKUP_STATUSES = [\"requested\", \"provider_pending\"]") && !source.includes("GROUPABLE_MANIFEST_PICKUP_STATUSES = [\"requested\", \"provider_pending\", \"scheduled\"]")],
   ["standalone pickup path remains distinct", source.includes("provider_managed === true") && source.includes("Provider-managed pickup requests must be linked to a shipment")],
     ["Delhivery standalone pickups require an AWB before persistence", source.includes("isDelhiveryStandalone") && source.includes("PROVIDER_REFERENCE_REQUIRED") && source.includes("Select at least one manifested shipment or enter a Delhivery AWB before scheduling this pickup")],
+  ["HTTP-success provider rejection envelopes fail the pickup", source.includes("providerBodyRejected && provider === \"delhivery\" && operation === \"pickups\"") && source.includes("error_code: providerBodyCode")],
+  ["HTTP-success pickup responses without a provider reference remain pending", source.includes("const providerPending = !pickupReference ||")],
   ["pickup list orders newest requests first", source.includes("ORDER BY created_at DESC, id DESC")],
   ["pickup reference only accepts PUR fields", source.includes("pickup_request_number") && source.includes("pickupRequestNumber") && !source.includes('"request_id", "request_no"]')],
   ["Delhivery pickup reference must be numeric PUR", source.includes("validDelhiveryPickupReference(rawPickupReference)") && source.includes("pickupRequestNumber") && source.includes("responseBody.match")],

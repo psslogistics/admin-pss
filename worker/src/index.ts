@@ -3381,10 +3381,18 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     ["failed", "failure", "rejected", "declined", "error"].includes(providerBodyStatus) ||
     Boolean(providerBodyError)
   );
+  const providerBodyMessage = String(providerBodyError?.message ?? providerBodyError?.detail ?? providerBodyRecord?.message ?? providerBodyRecord?.reason ?? "Delhivery rejected the pickup request").replace(/\s+/g, " ").trim().slice(0, 500);
+  const providerBodyCode = String(providerBodyError?.code ?? (providerBodyStatus || "PROVIDER_REJECTED")).trim().slice(0, 120);
   if (providerBodyRejected && persistIntegration) {
-    const bodyMessage = String(providerBodyError?.message ?? providerBodyError?.detail ?? providerBodyRecord?.message ?? providerBodyRecord?.reason ?? "Delhivery rejected the pickup request").replace(/\s+/g, " ").trim().slice(0, 500);
     await env.DB.prepare("UPDATE integration_requests SET status = 'failed', error_code = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-      .bind(String(providerBodyError?.code ?? (providerBodyStatus || "PROVIDER_REJECTED")), bodyMessage, integrationId).run();
+      .bind(providerBodyCode, providerBodyMessage, integrationId).run();
+  }
+  // A 2xx response is not acceptance by itself. Delhivery's private pickup
+  // surface can return an HTTP-success envelope containing success=false or a
+  // rejection object. Stop here so the generic success branch cannot turn a
+  // provider rejection into a scheduled pickup.
+  if (providerBodyRejected && provider === "delhivery" && operation === "pickups") {
+    return { enabled: true, status: "failed" as const, providerStatus: response.status, error: providerBodyMessage, error_code: providerBodyCode };
   }
   if (provider === "delhivery" && operation === "tracking" && payload.weight_reconciliation === true) {
     // Keep weight debugging useful without logging provider values, addresses,
@@ -3766,7 +3774,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     const providerSlotId = findProviderReference(parsedProviderBody, new Set(["slot_id", "pickup_slot_id", "provider_slot_id", "slot", "time_slot_id"]));
     const acceptedDate = findProviderReference(parsedProviderBody, new Set(["pickup_date", "pickupDate", "scheduled_date", "scheduledDate", "pickup_scheduled_date"]));
     const acceptedWindow = findProviderReference(parsedProviderBody, new Set(["pickup_time", "pickupTime", "time_slot", "timeSlot", "pickup_window", "pickupWindow", "requested_time_slot"]));
-    const providerPending = Boolean(providerState && /pending|queued|processing|created|in_progress/i.test(providerState));
+    const providerPending = !pickupReference || Boolean(providerState && /pending|queued|processing|created|in_progress/i.test(providerState));
     return { enabled: true, status: "accepted" as const, providerStatus: providerState ?? response.status, providerPending, providerReference: pickupReference, providerSlotId, acceptedDate: acceptedDate && validPickupDate(acceptedDate) ? acceptedDate : null, acceptedWindow };
   }
   if (response.ok && provider === "delhivery" && operation === "serviceability_route") {
