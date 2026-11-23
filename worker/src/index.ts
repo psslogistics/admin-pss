@@ -153,7 +153,7 @@ type BookingKycProfile = {
   status: string | null;
   gst_number: string | null;
   pan_number: string | null;
-  aadhaar_last4: string | null;
+  aadhaar_number: string | null;
   kyc_version: number | null;
 };
 
@@ -169,7 +169,7 @@ async function loadBookingKyc(env: Env, auth: Auth, clientId: string): Promise<B
   const credential = auth.accessToken ?? env.SUPABASE_SERVICE_ROLE_KEY;
   if (!credential) return { available: false, profile: null };
   const serviceLookup = !auth.accessToken;
-  const response = await fetch(`${env.SUPABASE_URL}/rest/v1/client_kyc_profiles?client_id=eq.${encodeURIComponent(clientId)}&select=status,gst_number,pan_number,aadhaar_last4,kyc_version&limit=1`, {
+  const response = await fetch(`${env.SUPABASE_URL}/rest/v1/client_kyc_profiles?client_id=eq.${encodeURIComponent(clientId)}&select=status,gst_number,pan_number,aadhaar_number,kyc_version&limit=1`, {
     headers: {
       apikey: serviceLookup ? credential : env.SUPABASE_PUBLISHABLE_KEY,
       Authorization: `Bearer ${credential}`,
@@ -182,7 +182,7 @@ async function loadBookingKyc(env: Env, auth: Auth, clientId: string): Promise<B
 }
 
 function bookingKycApproved(profile: BookingKycProfile | null) {
-  return Boolean(profile && profile.status === "approved" && profile.gst_number?.trim() && profile.pan_number?.trim() && profile.aadhaar_last4?.trim());
+  return Boolean(profile && profile.status === "approved" && profile.gst_number?.trim() && profile.pan_number?.trim() && profile.aadhaar_number?.trim());
 }
 
 async function supabaseRpc<T>(env: Env, functionName: string, token: string): Promise<T | null> {
@@ -5364,13 +5364,13 @@ const worker = {
         if (!auth.accessToken || (auth.audience !== "client" && !hasScope(auth, "kyc.read"))) return error("FORBIDDEN", "KYC status permission required", 403, id, headers);
         const clientId = requireClient(auth, url.searchParams.get("client_id"));
         if (!clientId || !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
-        const rows = await supabaseGet<{ status: string | null; gst_number: string | null; pan_number: string | null; aadhaar_last4: string | null; phone_verified_at: string | null }>(env, `client_kyc_profiles?client_id=eq.${encodeURIComponent(clientId)}&select=status,gst_number,pan_number,aadhaar_last4,phone_verified_at&limit=1`, auth.accessToken);
+        const rows = await supabaseGet<{ status: string | null; gst_number: string | null; pan_number: string | null; aadhaar_number: string | null; phone_verified_at: string | null }>(env, `client_kyc_profiles?client_id=eq.${encodeURIComponent(clientId)}&select=status,gst_number,pan_number,aadhaar_number,phone_verified_at&limit=1`, auth.accessToken);
         const profile = rows[0];
         const missingFields = [
           profile?.status === "approved" ? null : "approval",
           profile?.gst_number?.trim() ? null : "GST",
           profile?.pan_number?.trim() ? null : "PAN",
-          profile?.aadhaar_last4 ? null : "Aadhaar",
+          profile?.aadhaar_number ? null : "Aadhaar",
         ].filter((value): value is string => Boolean(value));
         const kycTestAccount = await isKycTestAccount(env, auth);
         // Keep the existing exception account-specific: this test client is

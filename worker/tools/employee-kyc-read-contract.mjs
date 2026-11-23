@@ -16,7 +16,7 @@ const checks = [
   ["employee page has a server permission guard", /requireEmployeePermission\("admin\.clients\.kyc\.view"\)/.test(page)],
   ["KYC UI uses the scoped GET endpoint", /pssApi<[^>]+>\([\s\S]*?["']\/v1\/kyc-status\?client_id=["']\s*\+/.test(component)],
   ["KYC UI exposes no real KYC mutation endpoint", !/fetch\(\s*["']\/api\/clients\/kyc\/(approve|reject|review|update)["']/.test(component)],
-  ["KYC UI does not render identity values", !/pan_number|gst_number|aadhaar_last4/.test(component)],
+  ["KYC UI does not render identity values", !/pan_number|gst_number|aadhaar_number/.test(component)],
   ["KYC navigation is permission-gated", /href: "\/dashboard\/kyc"[^\n]+permission: "admin\.clients\.kyc\.view"/.test(navigation)],
 ];
 
