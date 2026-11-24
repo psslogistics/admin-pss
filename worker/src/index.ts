@@ -424,7 +424,8 @@ function providerAccountId(payload: Record<string, unknown>) {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 function delhiveryPricingAccountFromName(accountName: string): PricingAccount {
-  return /(^|\D)04(\D|$)/.test(accountName) ? "04" : /(^|\D)08(\D|$)/.test(accountName) ? "08" : "other";
+  const normalized = String(accountName ?? "").trim().toUpperCase().replace(/\s+/g, " ");
+  return /(^|\D)04(\D|$)/.test(normalized) ? "04" : /(^|\D)08(\D|$)/.test(normalized) ? "08" : normalized || "other";
 }
 function canonicalDelhiveryAccountName(accountName: string) {
   return String(accountName ?? "").trim().toUpperCase().replace(/\s+/g, " ") === "PSSBOOKCFT10 B2BC" ? "PSSBOOKSCFT10 B2BC" : String(accountName ?? "").trim();
@@ -7626,9 +7627,9 @@ const worker = {
         if (!clientId || !canAccessClient(auth, clientId)) return error("FORBIDDEN", "Client scope is not allowed", 403, id, headers);
         const fujiyamaLane = fujiyamaLaneForClient(clientId);
         // Client users never choose a courier account. The account is an
-        // internal routing concern; all non-04/non-08 Delhivery accounts use
-        // the shared Namo/other client matrix. Internal pricing previews may
-        // still select 04 or 08 for verification.
+        // internal routing concern, but pricing remains account-specific when
+        // a matrix exists. Missing exact-account matrices fall back to the
+        // client Standard B2B matrix below.
         const internalPricingRequest = auth.system || hasRole(auth, ["employee", "admin", "super_admin"]);
         let selectedProviderAccountName = "";
         let accountValue = fujiyamaLane ? "other" : internalPricingRequest ? String(payload.account_code ?? "").trim().toLowerCase() : "other";
@@ -7640,7 +7641,8 @@ const worker = {
           accountValue = delhiveryPricingAccountFromName(selectedProviderAccountName);
         }
         if (!accountValue) accountValue = "other";
-        if (!["04", "08", "other"].includes(accountValue)) return error("VALIDATION_ERROR", "Delhivery B2B account must be 04, 08, or other", 400, id, headers);
+        if (accountValue !== "04" && accountValue !== "08" && accountValue !== "other" && !/^[A-Z0-9][A-Z0-9 ._-]{1,99}$/.test(accountValue.toUpperCase())) return error("VALIDATION_ERROR", "Delhivery B2B account scope is invalid", 400, id, headers);
+        accountValue = accountValue === "04" || accountValue === "08" || accountValue === "other" ? accountValue : accountValue.toUpperCase().replace(/\s+/g, " ");
         const rto = payload.rto === true;
         const rtoSourceId = typeof payload.rto_of_shipment_id === "string" ? payload.rto_of_shipment_id.trim() : typeof payload.original_shipment_id === "string" ? payload.original_shipment_id.trim() : "";
         const rtoSource = rto ? await env.DB.prepare("SELECT account_scope, origin_zone, destination_zone, chargeable_weight_kg, client_breakdown_json FROM pricing_shipment_snapshots WHERE shipment_id = ? AND client_id = ? LIMIT 1").bind(rtoSourceId, clientId).first<{ account_scope: PricingAccount; origin_zone: string; destination_zone: string; chargeable_weight_kg: number; client_breakdown_json: string }>() : null;
@@ -7671,7 +7673,8 @@ const worker = {
         const activeVersion = version ?? await ensureDefaultClientPricing(env, clientId, auth.userId ?? `api:${clientId}`);
         if (!activeVersion) return error("PRICING_NOT_CONFIGURED", "A published Delhivery B2B PSS rate card is not configured for this client", 409, id, headers);
         const rules = await env.DB.prepare("SELECT code, label, calculation_type, value, basis, minimum_value, maximum_value, enabled, marker, condition, display_order FROM pricing_charge_rules WHERE version_id = ? ORDER BY display_order ASC, code ASC").bind(activeVersion.id).all<{ code: string; label: string; calculation_type: ChargeRule["kind"]; value: number; basis: ChargeRule["basis"]; minimum_value: number | null; maximum_value: number | null; enabled: number; marker: "*" | null; condition: "oda_or_opa" | null; display_order: number }>();
-        const matrixRows = await env.DB.prepare("SELECT origin_zone, destination_zone, rate_per_kg FROM pricing_rate_matrix WHERE version_id = ? AND account_scope = ?").bind(activeVersion.id, account).all<{ origin_zone: string; destination_zone: string; rate_per_kg: number }>();
+        const exactMatrixRows = account !== "other" ? await env.DB.prepare("SELECT origin_zone, destination_zone, rate_per_kg FROM pricing_rate_matrix WHERE version_id = ? AND account_scope = ?").bind(activeVersion.id, account).all<{ origin_zone: string; destination_zone: string; rate_per_kg: number }>() : { results: [] };
+        const matrixRows = exactMatrixRows.results.length ? exactMatrixRows : await env.DB.prepare("SELECT origin_zone, destination_zone, rate_per_kg FROM pricing_rate_matrix WHERE version_id = ? AND account_scope = 'other'").bind(activeVersion.id).all<{ origin_zone: string; destination_zone: string; rate_per_kg: number }>();
         const contractMatrix = fujiyamaLane ? fujiyamaContractMatrix(fujiyamaLane) : [];
         const rateMatrix = Object.fromEntries((fujiyamaLane ? contractMatrix : matrixRows.results).map((row) => [`${row.origin_zone}->${row.destination_zone}`, Number(row.rate_per_kg)]));
         // The pincode dataset remains pricing metadata only (zones/ODA/rates).
@@ -7847,17 +7850,17 @@ const worker = {
         if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
         const legacySourceRateCardId = typeof payload.source_rate_card_id === "string" ? payload.source_rate_card_id.trim() : "";
         const suppliedSourceIds = payload.source_rate_card_ids && typeof payload.source_rate_card_ids === "object" ? payload.source_rate_card_ids as Record<string, unknown> : {};
-        const sourceRateCardIds = Object.fromEntries(["04", "08", "other"].map((account) => [account, String(suppliedSourceIds[account] ?? (account === "other" ? legacySourceRateCardId : "")).trim()]).filter(([, value]) => Boolean(value)));
-        if (["04", "08", "other"].some((account) => !sourceRateCardIds[account])) return error("VALIDATION_ERROR", "A source rate card is required for Delhivery accounts 04, 08, and other/Namo before publishing pricing", 400, id, headers);
+        const sourceRateCardIds: Record<string, string> = Object.fromEntries(Object.entries(suppliedSourceIds).map(([account, value]) => [account === "04" || account === "08" || account === "other" ? account : account.trim().toUpperCase().replace(/\s+/g, " "), String(value ?? "").trim()]).filter(([account, value]) => Boolean(value) && /^(04|08|other|[A-Z0-9][A-Z0-9 ._-]{1,99})$/.test(account)));
+        if (!Object.keys(sourceRateCardIds).length && legacySourceRateCardId) sourceRateCardIds.other = legacySourceRateCardId;
+        if (!Object.keys(sourceRateCardIds).length) return error("VALIDATION_ERROR", "At least one source rate card is required before publishing", 400, id, headers);
         if (!auth.accessToken) return error("FORBIDDEN", "An authenticated Super Admin session is required to validate the source rate card", 403, id, headers);
-        const sourceCardEntries = await Promise.all(["04", "08", "other"].map(async (account) => {
-          const sourceId = sourceRateCardIds[account];
+        const sourceCardEntries = await Promise.all(Object.entries(sourceRateCardIds).map(async ([account, sourceId]) => {
           const rows = await supabaseGet<{ id: string; account_code: string; object_path: string; original_filename: string; updated_at: string }>(env, `rate_cards?id=eq.${encodeURIComponent(sourceId)}&client_id=eq.${encodeURIComponent(clientId)}&account_code=eq.${encodeURIComponent(account)}&select=id,account_code,object_path,original_filename,updated_at`, auth.accessToken!);
           return [account, rows[0] ?? null] as const;
         }));
-        if (sourceCardEntries.some(([, card]) => !card)) return error("NOT_FOUND", "Each selected source rate card must belong to this client and its mapped Delhivery account", 404, id, headers);
+        if (sourceCardEntries.some(([, card]) => !card)) return error("NOT_FOUND", "Each selected source rate card must belong to this client and its mapped provider account", 404, id, headers);
         const sourceCards = Object.fromEntries(sourceCardEntries) as Record<string, { id: string; account_code: string; object_path: string; original_filename: string; updated_at: string }>;
-        const sourceRateCard = sourceCards.other;
+        const sourceRateCard = sourceCards.other ?? Object.values(sourceCards)[0];
         const rateMatrices = payload.rate_matrices && typeof payload.rate_matrices === "object" ? payload.rate_matrices as Record<string, unknown> : {};
         const chargeRules = Array.isArray(payload.charge_rules) ? payload.charge_rules : [];
         if (!chargeRules.length) return error("VALIDATION_ERROR", "At least one client pricing charge rule is required", 400, id, headers);
@@ -7872,8 +7875,8 @@ const worker = {
         if (!Number.isFinite(minimumWeight) || minimumWeight <= 0 || !Number.isFinite(volumetricDivisor) || volumetricDivisor <= 0 || !Number.isFinite(gstPercent) || gstPercent < 0 || gstPercent > 100) return error("VALIDATION_ERROR", "Minimum weight, volumetric divisor, and GST must be valid positive values", 400, id, headers);
         const requestedStatus = payload.status === "draft" ? "draft" : payload.status === undefined || payload.status === "active" ? "active" : "invalid";
         if (requestedStatus === "invalid") return error("VALIDATION_ERROR", "Pricing version status must be draft or active", 400, id, headers);
-        const validAccounts = ["04", "08", "other"]; const versionId = crypto.randomUUID(); const now = new Date().toISOString();
-        const statements = [ ...(requestedStatus === "active" ? [env.DB.prepare("UPDATE pricing_versions SET status = 'retired', updated_at = CURRENT_TIMESTAMP WHERE client_id = ? AND provider = 'delhivery' AND service_level = 'b2b' AND status = 'active'").bind(clientId)] : []), env.DB.prepare("INSERT INTO pricing_versions (id, client_id, provider, service_level, status, effective_at, source_rate_card_id, source_rate_card_ids_json, source_rate_card_object_path, source_rate_card_filename, source_rate_card_uploaded_at, minimum_weight_kg, volumetric_divisor, gst_percent, created_by_user_id, published_by_user_id) VALUES (?, ?, 'delhivery', 'b2b', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(versionId, clientId, requestedStatus, now, sourceRateCardIds.other, JSON.stringify(sourceCards), sourceRateCard.object_path, sourceRateCard.original_filename, sourceRateCard.updated_at, minimumWeight, volumetricDivisor, gstPercent, auth.userId ?? "system", requestedStatus === "active" ? auth.userId ?? "system" : null)];
+        const validAccounts = [...new Set(["other", ...Object.keys(sourceRateCardIds), ...Object.keys(rateMatrices)])]; const versionId = crypto.randomUUID(); const now = new Date().toISOString();
+        const statements = [ ...(requestedStatus === "active" ? [env.DB.prepare("UPDATE pricing_versions SET status = 'retired', updated_at = CURRENT_TIMESTAMP WHERE client_id = ? AND provider = 'delhivery' AND service_level = 'b2b' AND status = 'active'").bind(clientId)] : []), env.DB.prepare("INSERT INTO pricing_versions (id, client_id, provider, service_level, status, effective_at, source_rate_card_id, source_rate_card_ids_json, source_rate_card_object_path, source_rate_card_filename, source_rate_card_uploaded_at, minimum_weight_kg, volumetric_divisor, gst_percent, created_by_user_id, published_by_user_id) VALUES (?, ?, 'delhivery', 'b2b', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(versionId, clientId, requestedStatus, now, sourceRateCardIds.other ?? sourceRateCard.id, JSON.stringify(sourceCards), sourceRateCard.object_path, sourceRateCard.original_filename, sourceRateCard.updated_at, minimumWeight, volumetricDivisor, gstPercent, auth.userId ?? "system", requestedStatus === "active" ? auth.userId ?? "system" : null)];
         for (const account of validAccounts) {
           const suppliedRows = Array.isArray(rateMatrices[account]) ? rateMatrices[account] as Array<Record<string, unknown>> : [];
           const rows = suppliedRows.length ? suppliedRows : defaultRateRows(account as PricingAccount).map((row) => ({ origin_zone: row.origin_zone, destination_zone: row.destination_zone, rate_per_kg: row.rate_per_kg }));

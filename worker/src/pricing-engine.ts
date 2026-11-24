@@ -1,4 +1,6 @@
-export type PricingAccount = "04" | "08" | "other";
+// 04/08 are legacy account scopes. Any other non-empty value is an exact
+// provider-account scope and uses the Standard B2B zone model.
+export type PricingAccount = string;
 export type PricingZone = "N1" | "N2" | "E" | "NE" | "W1" | "W2" | "S1" | "S2" | "Central";
 
 export type ChargeRule = {
@@ -137,7 +139,7 @@ function resolveNamoZone(city?: string, state?: string): typeof NAMO_ZONES[numbe
 
 function roundMoney(value: number) { return Math.round((value + Number.EPSILON) * 100) / 100; }
 function rateFor(account: PricingAccount, origin: string, destination: string) {
-  if (account === "other") {
+  if (account !== "04" && account !== "08") {
     const row = NAMO_ZONES.indexOf(origin as typeof NAMO_ZONES[number]); const column = NAMO_ZONES.indexOf(destination as typeof NAMO_ZONES[number]);
     if (row >= 0 && column >= 0) return NAMO_MATRIX[row][column];
     throw new Error("NAMO_ZONE_NOT_CONFIGURED");
@@ -148,8 +150,9 @@ function rateFor(account: PricingAccount, origin: string, destination: string) {
 }
 
 export function calculatePssRate(input: PricingInput): PricingResult {
-  const originZone = input.originZoneOverride ?? (input.account === "other" ? resolveNamoZone(input.originCity, input.originState) : resolveZone(input.originCity, input.originState));
-  const destinationZone = input.destinationZoneOverride ?? (input.account === "other" ? resolveNamoZone(input.destinationCity, input.destinationState) : resolveZone(input.destinationCity, input.destinationState));
+  const standardZoneModel = input.account !== "04" && input.account !== "08";
+  const originZone = input.originZoneOverride ?? (standardZoneModel ? resolveNamoZone(input.originCity, input.originState) : resolveZone(input.originCity, input.originState));
+  const destinationZone = input.destinationZoneOverride ?? (standardZoneModel ? resolveNamoZone(input.destinationCity, input.destinationState) : resolveZone(input.destinationCity, input.destinationState));
   const laneOrigin = input.rto ? input.forwardOriginZoneOverride ?? originZone : originZone;
   const laneDestination = input.rto ? input.forwardDestinationZoneOverride ?? destinationZone : destinationZone;
   const chargeableWeightKg = Math.max(input.actualWeightKg, input.volumetricWeightKg ?? 0, input.minimumWeightKg ?? 20);
@@ -190,7 +193,7 @@ export function calculatePssRate(input: PricingInput): PricingResult {
 }
 
 export function defaultRateRows(account: PricingAccount): Array<{ origin_zone: string; destination_zone: string; rate_per_kg: number }> {
-  if (account === "other") return NAMO_ZONES.flatMap((origin, row) => NAMO_ZONES.map((destination, column) => ({ origin_zone: origin, destination_zone: destination, rate_per_kg: NAMO_MATRIX[row][column] })));
+  if (account !== "04" && account !== "08") return NAMO_ZONES.flatMap((origin, row) => NAMO_ZONES.map((destination, column) => ({ origin_zone: origin, destination_zone: destination, rate_per_kg: NAMO_MATRIX[row][column] })));
   const matrix = account === "04" ? MATRIX_04 : MATRIX_08;
   return ZONES.flatMap((origin) => ZONES.map((destination, column) => ({ origin_zone: origin, destination_zone: destination, rate_per_kg: matrix[origin][column] })));
 }
