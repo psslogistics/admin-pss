@@ -92,6 +92,8 @@ Delhivery as a `DELIVERY_CHALLAN` document. This mode is Fujiyama-only and is
 not available for high-value shipments. Delhivery remains authoritative; if
 the assigned account does not accept this document type, the provider error
 is returned and the shipment is not treated as successfully booked.
+The production feature flag is currently disabled until Delhivery confirms
+acceptance of this document type.
 
 `order_id` is required and is used as the provider invoice reference when a
 separate `invoice_number` is not supplied. For Fujiyama API keys, the Worker

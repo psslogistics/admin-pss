@@ -21,6 +21,7 @@ type DelhiveryTokenCache = {
 };
 
 export interface Env extends Omit<Cloudflare.Env, "SUPABASE_PUBLISHABLE_KEY" | "SUPABASE_SERVICE_ROLE_KEY" | "API_KEY_PEPPER" | "DELHIVERY_API_TOKEN" | "DELHIVERY_B2B_API_BASE_URL" | "DELHIVERY_WEBHOOK_SECRET" | "DELHIVERY_TOKEN_CACHE" | "EKART_API_KEY" | "EKART_API_SECRET" | "EKART_WEBHOOK_SECRET" | "EKART_ENABLE_PROVIDER_CALLS" | "TRACKON_API_BASE_URL" | "TRACKON_CREDENTIALS_JSON" | "TRACKON_WEBHOOK_SECRET" | "TRACKON_BOOKING_URL" | "TRACKON_TRACKING_URL" | "TRACKON_LABEL_URL" | "TRACKON_ENABLE_SHIPMENT_CREATION" | "TRACKON_ENABLE_PICKUP_CREATION" | "XPRESSBEES_API_BASE_URL" | "XPRESSBEES_CREDENTIALS_JSON" | "XPRESSBEES_ENABLE_SHIPMENT_CREATION" | "XPRESSBEES_ENABLE_PICKUP_CREATION" | "RIVIGO_API_BASE_URL" | "RIVIGO_AUTH_URL" | "RIVIGO_TRACKING_URL" | "RIVIGO_CREDENTIALS_JSON" | "RIVIGO_ENABLE_PROVIDER_CALLS" | "CLOUDFLARE_ACCOUNT_ID" | "CLOUDFLARE_API_TOKEN" | "CLOUDFLARE_D1_DATABASE_ID"> {
+  FUJIYAMA_ENABLE_DELIVERY_CHALLAN?: string;
   SUPABASE_PUBLISHABLE_KEY: string;
   SUPABASE_SERVICE_ROLE_KEY?: string;
   API_KEY_PEPPER?: string;
@@ -5775,6 +5776,7 @@ const worker = {
         const documentMode = String(payload.document_mode ?? "invoice").trim().toLowerCase();
         if (documentMode !== "invoice" && documentMode !== "delivery_challan") return error("DOCUMENT_MODE_INVALID", "Document mode must be invoice or delivery_challan", 400, id, headers);
         if (documentMode === "delivery_challan" && !fujiyamaClient) return error("DOCUMENT_MODE_NOT_ALLOWED", "Delivery Challan mode is only available for Fujiyama API bookings", 403, id, headers);
+        if (documentMode === "delivery_challan" && String(env.FUJIYAMA_ENABLE_DELIVERY_CHALLAN ?? "false").toLowerCase() !== "true") return error("DOCUMENT_MODE_NOT_ENABLED", "Delivery Challan mode is not enabled for this account", 409, id, headers);
         if (documentMode === "delivery_challan" && declaredValue >= 50000) return error("DELIVERY_CHALLAN_NOT_ALLOWED", "Delivery Challan-only booking is not allowed for shipments valued at or above ₹50,000; submit the invoice and E-Way Bill", 400, id, headers);
         if (provider === "delhivery" && documentMode === "delivery_challan" && (!Array.isArray(payload.invoice_documents) || payload.invoice_documents.length < 1)) {
           payload.invoice_documents = [buildDeliveryChallanDocument(payload, resolvedOrderId, invoiceReference, declaredValue)];
