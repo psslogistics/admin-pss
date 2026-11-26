@@ -5777,9 +5777,11 @@ const worker = {
         if (documentMode !== "invoice" && documentMode !== "delivery_challan") return error("DOCUMENT_MODE_INVALID", "Document mode must be invoice or delivery_challan", 400, id, headers);
         if (documentMode === "delivery_challan" && !fujiyamaClient) return error("DOCUMENT_MODE_NOT_ALLOWED", "Delivery Challan mode is only available for Fujiyama API bookings", 403, id, headers);
         if (documentMode === "delivery_challan" && String(env.FUJIYAMA_ENABLE_DELIVERY_CHALLAN ?? "false").toLowerCase() !== "true") return error("DOCUMENT_MODE_NOT_ENABLED", "Delivery Challan mode is not enabled for this account", 409, id, headers);
+        const hasInvoiceSource = (Array.isArray(payload.invoice_documents) && payload.invoice_documents.length > 0) || (Array.isArray(payload.invoice_document_refs) && payload.invoice_document_refs.length > 0);
         if (documentMode === "delivery_challan" && declaredValue >= 50000) return error("DELIVERY_CHALLAN_NOT_ALLOWED", "Delivery Challan-only booking is not allowed for shipments valued at or above ₹50,000; submit the invoice and E-Way Bill", 400, id, headers);
-        if (provider === "delhivery" && documentMode === "delivery_challan" && (!Array.isArray(payload.invoice_documents) || payload.invoice_documents.length < 1)) {
-          payload.invoice_documents = [buildDeliveryChallanDocument(payload, resolvedOrderId, invoiceReference, declaredValue)];
+        if (provider === "delhivery" && fujiyamaClient && declaredValue < 50000 && !hasInvoiceSource) {
+          payload.document_mode = "delivery_challan";
+          payload.invoice_documents = [buildDeliveryChallanDocument(payload, resolvedOrderId, invoiceReference || resolvedOrderId, declaredValue)];
         }
         if (provider === "delhivery" && declaredValue >= 50000) {
           const ewayNumber = String(payload.e_waybill_no ?? payload.e_way_bill_no ?? payload.ewaybill_number ?? "").trim();

@@ -85,13 +85,16 @@ Bill requirements below still apply.
 
 ### Low-value Delivery Challan mode
 
-For Fujiyama bookings below ₹50,000, the request may use
-`"document_mode": "delivery_challan"` and omit invoice fields. PSS generates a
-transport Delivery Challan from the supplied shipment details and sends it to
-Delhivery as a `DELIVERY_CHALLAN` document. This mode is Fujiyama-only and is
-not available for high-value shipments. Delhivery remains authoritative; if
-the assigned account does not accept this document type, the provider error
-is returned and the shipment is not treated as successfully booked.
+For Fujiyama bookings below ₹50,000, if no invoice file or staged invoice
+reference is supplied, PSS automatically generates a transport Delivery
+Challan from the supplied shipment details. The PDF filename is the invoice
+number followed by `.pdf`; when no invoice number is supplied, the order ID is
+used. PSS sends it to Delhivery as a `DELIVERY_CHALLAN` document. The optional
+`"document_mode": "delivery_challan"` remains supported for clarity. This mode
+is Fujiyama-only and is not available for high-value shipments. Delhivery
+remains authoritative; if the assigned account does not accept this document
+type, the provider error is returned and the shipment is not treated as
+successfully booked.
 The production feature flag is currently disabled until Delhivery confirms
 acceptance of this document type.
 
