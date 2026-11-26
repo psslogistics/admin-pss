@@ -83,6 +83,16 @@ for Delhivery B2B bookings. A placeholder, empty, or invalid document remains
 invalid. For declared values of ₹50,000 or more, the invoice and valid E-Way
 Bill requirements below still apply.
 
+### Low-value Delivery Challan mode
+
+For Fujiyama bookings below ₹50,000, the request may use
+`"document_mode": "delivery_challan"` and omit invoice fields. PSS generates a
+transport Delivery Challan from the supplied shipment details and sends it to
+Delhivery as a `DELIVERY_CHALLAN` document. This mode is Fujiyama-only and is
+not available for high-value shipments. Delhivery remains authoritative; if
+the assigned account does not accept this document type, the provider error
+is returned and the shipment is not treated as successfully booked.
+
 `order_id` is required and is used as the provider invoice reference when a
 separate `invoice_number` is not supplied. For Fujiyama API keys, the Worker
 infers the forward/reverse lane and Delhivery provider from the tenant-scoped

@@ -797,6 +797,58 @@ function compactDocument(value: unknown) {
   };
 }
 
+function deliveryChallanPdf(payload: Record<string, unknown>, orderId: string, documentNumber: string, declaredValue: number) {
+  const origin = payload.origin_address as Record<string, unknown>;
+  const destination = payload.destination_address as Record<string, unknown>;
+  const addressLine = (address: Record<string, unknown>) => [address.name, address.line, address.city, address.state, address.pincode, address.phone].map((value) => String(value ?? "").trim()).filter(Boolean).join(" | ");
+  const lines = [
+    "DELIVERY CHALLAN",
+    "Transport document - not a tax invoice",
+    `Challan number: ${documentNumber}`,
+    `Order ID: ${orderId}`,
+    `Date: ${new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata" }).format(new Date())}`,
+    `Consignor: ${addressLine(origin)}`,
+    `Consignee: ${addressLine(destination)}`,
+    `Description: ${String(payload.description ?? "Shipment").slice(0, 180)}`,
+    `Weight (kg): ${String(payload.total_weight_kg ?? "")}`,
+    `Pieces: ${String(payload.pieces ?? "")}`,
+    `Declared value (INR): ${declaredValue.toFixed(2)}`,
+    "Reason for movement: Transport of goods",
+    "This document was generated from information supplied by the consignor.",
+  ];
+  const escapePdfText = (value: string) => value.replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)");
+  const stream = ["BT", "/F1 11 Tf", "50 760 Td", ...lines.flatMap((line, index) => [index ? "0 -32 Td" : "", `(${escapePdfText(line)}) Tj`].filter(Boolean)), "ET"].join("\n");
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`,
+  ];
+  let pdf = "%PDF-1.4\n";
+  const offsets = [0];
+  for (let index = 0; index < objects.length; index += 1) {
+    offsets.push(pdf.length);
+    pdf += `${index + 1} 0 obj\n${objects[index]}\nendobj\n`;
+  }
+  const xrefOffset = pdf.length;
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (let index = 1; index <= objects.length; index += 1) pdf += `${String(offsets[index]).padStart(10, "0")} 00000 n \n`;
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
+  return new TextEncoder().encode(pdf);
+}
+
+function buildDeliveryChallanDocument(payload: Record<string, unknown>, orderId: string, invoiceReference: string, declaredValue: number) {
+  const documentNumber = invoiceReference || `DC-${orderId}`;
+  return {
+    name: `${documentNumber.replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 80)}.pdf`,
+    content_type: "application/pdf",
+    body_base64: providerBytesToBase64(deliveryChallanPdf(payload, orderId, documentNumber, declaredValue)),
+    document_type: "DELIVERY_CHALLAN",
+    invoice_number: documentNumber,
+  };
+}
+
 async function normalizeFujiyamaBookingPayload(env: Env, clientId: string, payload: Record<string, unknown>) {
   const isFujiyamaClient = clientId === FUJIYAMA_FORWARD_CLIENT_ID || clientId === FUJIYAMA_REVERSE_CLIENT_ID;
   if (!isFujiyamaClient) return;
@@ -1845,7 +1897,7 @@ function delhiveryB2bManifestForm(payload: Record<string, unknown>, invoiceDocum
   if (documents.length) {
     const invoices = Array.isArray(payload.invoices) ? payload.invoices as Array<Record<string, unknown>> : [];
     form.append("doc_data", JSON.stringify(documents.map((document, index) => ({
-      doc_type: "INVOICE_COPY",
+      doc_type: String(document.document_type ?? (payload.document_mode === "delivery_challan" ? "DELIVERY_CHALLAN" : "INVOICE_COPY")),
       doc_meta: { invoice_num: [String(document.invoice_number ?? invoices[index]?.inv_num ?? "")] },
     }))));
     for (const document of documents) {
@@ -5719,6 +5771,14 @@ const worker = {
         if (existing) return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
         const provider = typeof payload.provider === "string" && ["delhivery", "ekart", "trackon", "xpressbees", "rivigo"].includes(payload.provider) ? payload.provider : (hasRole(auth, ["employee", "admin", "super_admin"]) ? "delhivery" : null);
         if ((auth.kind === "api" || hasRole(auth, ["client"])) && provider !== "delhivery") return error("DELHIVERY_B2B_ONLY", "Client shipment booking is currently limited to Delhivery B2B", 409, id, headers);
+        const fujiyamaClient = clientId === FUJIYAMA_FORWARD_CLIENT_ID || clientId === FUJIYAMA_REVERSE_CLIENT_ID;
+        const documentMode = String(payload.document_mode ?? "invoice").trim().toLowerCase();
+        if (documentMode !== "invoice" && documentMode !== "delivery_challan") return error("DOCUMENT_MODE_INVALID", "Document mode must be invoice or delivery_challan", 400, id, headers);
+        if (documentMode === "delivery_challan" && !fujiyamaClient) return error("DOCUMENT_MODE_NOT_ALLOWED", "Delivery Challan mode is only available for Fujiyama API bookings", 403, id, headers);
+        if (documentMode === "delivery_challan" && declaredValue >= 50000) return error("DELIVERY_CHALLAN_NOT_ALLOWED", "Delivery Challan-only booking is not allowed for shipments valued at or above ₹50,000; submit the invoice and E-Way Bill", 400, id, headers);
+        if (provider === "delhivery" && documentMode === "delivery_challan" && (!Array.isArray(payload.invoice_documents) || payload.invoice_documents.length < 1)) {
+          payload.invoice_documents = [buildDeliveryChallanDocument(payload, resolvedOrderId, invoiceReference, declaredValue)];
+        }
         if (provider === "delhivery" && declaredValue >= 50000) {
           const ewayNumber = String(payload.e_waybill_no ?? payload.e_way_bill_no ?? payload.ewaybill_number ?? "").trim();
           if (!/^\d{12}$/.test(ewayNumber)) return error("EWAY_NUMBER_REQUIRED", "A valid 12-digit E-Way Bill number is required for shipments valued at or above ₹50,000", 400, id, headers);
@@ -7729,13 +7789,18 @@ const worker = {
         const activeVersion = version ?? await ensureDefaultClientPricing(env, clientId, auth.userId ?? `client:${clientId}`);
         if (!activeVersion) return error("PRICING_NOT_CONFIGURED", "A published PSS rate card is not configured for this client", 409, id, headers);
         const [matrixRows, chargeRules] = await Promise.all([
-          env.DB.prepare("SELECT origin_zone, destination_zone, rate_per_kg FROM pricing_rate_matrix WHERE version_id = ? AND account_scope = 'other' ORDER BY origin_zone, destination_zone").bind((activeVersion as Record<string, unknown>).id).all(),
+          env.DB.prepare("SELECT account_scope, origin_zone, destination_zone, rate_per_kg FROM pricing_rate_matrix WHERE version_id = ? ORDER BY account_scope, origin_zone, destination_zone").bind((activeVersion as Record<string, unknown>).id).all(),
           env.DB.prepare("SELECT code, label, calculation_type, value, basis, minimum_value, maximum_value, enabled, marker FROM pricing_charge_rules WHERE version_id = ? ORDER BY display_order, code").bind((activeVersion as Record<string, unknown>).id).all(),
         ]);
-        const contractMatrix = fujiyamaLane ? fujiyamaContractMatrix(fujiyamaLane) : matrixRows.results;
+        const matrices: Record<string, unknown[]> = { other: [] };
+        for (const row of matrixRows.results as Array<Record<string, unknown>>) {
+          const scope = String(row.account_scope ?? "other");
+          (matrices[scope] ??= []).push({ origin_zone: row.origin_zone, destination_zone: row.destination_zone, rate_per_kg: Number(row.rate_per_kg) });
+        }
+        const contractMatrix = fujiyamaLane ? fujiyamaContractMatrix(fujiyamaLane) : matrices.other;
         const contractRules = fujiyamaLane ? fujiyamaContractRules(fujiyamaLane).map((rule) => ({ code: rule.code, label: rule.label, calculation_type: rule.kind, value: rule.value, basis: rule.basis, minimum_value: rule.minimum ?? null, maximum_value: rule.maximum ?? null, enabled: rule.enabled === false ? 0 : 1, marker: rule.marker ?? null })) : chargeRules.results;
         const versionData = fujiyamaLane ? { ...(activeVersion as Record<string, unknown>), minimum_weight_kg: 20, volumetric_divisor: 2700, gst_percent: 18, contract_lane: fujiyamaLane } : activeVersion;
-        return json({ ok: true, data: { version: versionData, rate_matrices: { other: contractMatrix }, charge_rules: contractRules, zone_definitions: fujiyamaLane ? fujiyamaContractZoneDefinitions(fujiyamaLane) : [], tat: fujiyamaLane ? (fujiyamaLane === "forward" ? { North: "4 days", West: "5 days", South: "6 days", East: "6 days", "North East": "9 days" } : { "North to North": "2-3 days", "West to North": "3-4 days", "South to North": "4-5 days", "East to North": "5-6 days", "North East to North": "6-7 days" }) : {} } }, 200, headers);
+        return json({ ok: true, data: { version: versionData, rate_matrices: fujiyamaLane ? { other: contractMatrix } : matrices, charge_rules: contractRules, zone_definitions: fujiyamaLane ? fujiyamaContractZoneDefinitions(fujiyamaLane) : [], tat: fujiyamaLane ? (fujiyamaLane === "forward" ? { North: "4 days", West: "5 days", South: "6 days", East: "6 days", "North East": "9 days" } : { "North to North": "2-3 days", "West to North": "3-4 days", "South to North": "4-5 days", "East to North": "5-6 days", "North East to North": "6-7 days" }) : {} } }, 200, headers);
       }
       if (route === "/pricing/versions" && request.method === "GET") {
         if (!hasScope(auth, "pricing.read")) return error("FORBIDDEN", "Pricing view permission required", 403, id, headers);
