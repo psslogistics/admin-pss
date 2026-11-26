@@ -18,6 +18,8 @@ const checks = [
   ["compact payload resolves city and state from pincode", source.includes("pricingPincode(env, originPincode)") && source.includes("facility_city") && source.includes("facility_state")],
   ["compact payload maps package dimensions", source.includes("packageValue?.dimensions_cm") && source.includes("payload.dimensions = [{ length")],
   ["compact payload maps invoice and eway documents", source.includes("payload.invoice_document ?? payload.invoice") && source.includes("payload.eway_bill")],
+  ["staged invoice references are accepted", source.includes("invoice_document_ref ?? payload.invoice_document_reference") && source.includes("hasInvoiceDocuments") && source.includes("loadStagedInvoiceDocuments")],
+  ["invoice staging remains shipment-scoped", source.includes('route === "/shipments/documents/stage"') && source.includes('hasScope(auth, "shipments.create")') && source.includes("staged/clients/${clientId}/")],
   ["API booking can auto-register a pickup address", source.includes('if (!selectedWarehouseId && operation === "warehouse_prepare")') && source.includes('ensureDelhiveryWarehouse(env, clientId, delhiveryB2bToken, origin')],
   ["booking can derive provider invoice reference from order id", source.includes('payload.invoice_reference ?? payload.invoice_number ?? orderId')],
   ["warehouse registration resolves an account-scoped token", source.includes("DELHIVERY_WAREHOUSE_TOKEN_PSSLOGISTICS10_B2BC") && source.includes("DELHIVERY_TOKEN_PSSLOGISTICS10_B2BC")],

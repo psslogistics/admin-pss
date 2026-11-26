@@ -836,7 +836,8 @@ async function normalizeFujiyamaBookingPayload(env: Env, clientId: string, paylo
   const invoice = compactDocument(payload.invoice_document ?? payload.invoice);
   if (invoice) payload.invoice_documents = [invoice];
   const invoiceReference = payload.invoice_document_ref ?? payload.invoice_document_reference;
-  if (!payload.invoice_documents && invoiceReference) payload.invoice_document_refs = [{ object_key: String(invoiceReference).trim() }];
+  const hasInvoiceDocuments = Array.isArray(payload.invoice_documents) && payload.invoice_documents.length > 0;
+  if (!hasInvoiceDocuments && invoiceReference) payload.invoice_document_refs = [{ object_key: String(invoiceReference).trim() }];
 
   const eway = payload.eway_bill && typeof payload.eway_bill === "object" && !Array.isArray(payload.eway_bill) ? payload.eway_bill as Record<string, unknown> : null;
   if (eway) {

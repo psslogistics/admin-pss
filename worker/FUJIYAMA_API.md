@@ -56,6 +56,33 @@ Booking uses the same server-side PSS rate-card, wallet, audit, idempotency,
 and Delhivery B2B flow as the client panel. Send a unique
 `Idempotency-Key` for every booking attempt.
 
+### Optional staged invoice flow
+
+The existing booking key can be used for a two-step invoice upload when the
+invoice should not be embedded as Base64 in the booking JSON. First call
+`POST /v1/shipments/documents/stage` with the same booking key:
+
+```json
+{
+  "documents": [{
+    "name": "invoice-1001.pdf",
+    "content_type": "application/pdf",
+    "body_base64": "<BASE64_INVOICE>"
+  }]
+}
+```
+
+Send a unique `Idempotency-Key`. The response returns a document `object_key`.
+Then send that value in the booking request as `invoice_document_ref` and omit
+`invoice_documents`. PSS validates the staged file, attaches it to the
+shipment, forwards it to Delhivery, and removes the temporary staged object.
+The reference is tenant-scoped and cannot be reused by another client.
+
+This is only a payload-size convenience; an actual invoice is still required
+for Delhivery B2B bookings. A placeholder, empty, or invalid document remains
+invalid. For declared values of ₹50,000 or more, the invoice and valid E-Way
+Bill requirements below still apply.
+
 `order_id` is required and is used as the provider invoice reference when a
 separate `invoice_number` is not supplied. For Fujiyama API keys, the Worker
 infers the forward/reverse lane and Delhivery provider from the tenant-scoped
