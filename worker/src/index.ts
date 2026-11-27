@@ -1838,7 +1838,10 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
   const paymentMode = String(payload.payment_mode ?? "prepaid").trim().toLowerCase() === "cod" ? "COD" : "Prepaid";
   return {
     pickup_location_name: pickupLocation,
-    payment_mode: paymentMode,
+    // Delhivery's B2B schema is case-sensitive: only `prepaid` and `cod`
+    // are accepted here. Fujiyama may continue sending either casing at the
+    // public boundary; normalize it before constructing the provider form.
+    payment_mode: paymentMode.toLowerCase(),
     cod_amount: paymentMode === "COD" ? Number(payload.cod_amount ?? declaredValue) : undefined,
     weight: Math.max(1, Math.round(weightKg * 1000)),
     dropoff_location: {
