@@ -1845,13 +1845,19 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
     // request contract does not change.
     ident: orderId,
     pickup_location: pickupLocation,
+    pickup_location_name: pickupLocation,
     d_mode: paymentMode,
+    payment_mode: paymentMode.toLowerCase(),
     amount: paymentMode === "COD" ? Number(payload.cod_amount ?? declaredValue) : 0,
+    cod_amount: paymentMode === "COD" ? Number(payload.cod_amount ?? declaredValue) : undefined,
     weight: Math.max(1, Math.round(weightKg * 1000)),
     invoices: [{
       ident: providerInvoiceNumber,
       n_value: declaredValue,
       ewaybill,
+      inv_num: providerInvoiceNumber,
+      inv_amt: declaredValue,
+      inv_qr_code: String(payload.invoice_qr_code ?? ""),
     }],
     suborders: [{
       ident: orderId,
@@ -1873,8 +1879,37 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
     dimensions: length > 0 && width > 0 && height > 0
       ? [{ length, width, breadth: width, height, count: pieces, box_count: pieces }]
       : undefined,
+    dropoff_location: {
+      consignee_name: destination.name,
+      address: destination.line,
+      city: destination.city,
+      state: destination.state,
+      zip: destination.pincode,
+      phone: destination.phone,
+      email: destination.email ?? "",
+    },
+    return_address: {
+      name: origin.name,
+      address: origin.line,
+      city: origin.city,
+      state: origin.state,
+      zip: origin.pincode,
+      phone: origin.phone,
+      email: origin.email,
+    },
     ...(consigneeGstTin ? { consignee_gst_tin: consigneeGstTin } : {}),
     ...(sellerGstTin ? { seller_gst_tin: sellerGstTin } : {}),
+    billing_address: {
+      name: origin.name,
+      company: origin.name,
+      consignor: origin.name,
+      address: origin.line,
+      city: origin.city,
+      state: origin.state,
+      pin: origin.pincode,
+      phone: origin.phone,
+      ...(sellerGstTin ? { gst_number: sellerGstTin } : {}),
+    },
   };
 }
 
