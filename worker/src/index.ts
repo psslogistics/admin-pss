@@ -1860,7 +1860,19 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
       waybills: [],
       master: true,
     }],
-    dimensions: length > 0 && width > 0 && height > 0 ? [{ length, width, height, count: pieces }] : undefined,
+    // The live B2B validator currently requires these compatibility fields in
+    // addition to the documented `suborders`/`count` fields.
+    shipment_details: [{
+      order_id: orderId,
+      box_count: pieces,
+      description: String(payload.description ?? "Shipment").slice(0, 500),
+      weight: Math.max(1, Math.round(weightKg * 1000)),
+      waybills: [],
+      master: false,
+    }],
+    dimensions: length > 0 && width > 0 && height > 0
+      ? [{ length, width, breadth: width, height, count: pieces, box_count: pieces }]
+      : undefined,
     ...(consigneeGstTin ? { consignee_gst_tin: consigneeGstTin } : {}),
     ...(sellerGstTin ? { seller_gst_tin: sellerGstTin } : {}),
   };
