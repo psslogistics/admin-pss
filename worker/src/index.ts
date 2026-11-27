@@ -1826,13 +1826,19 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
   const weightKg = Number(payload.total_weight_kg ?? 0);
   const pieces = Number(payload.pieces ?? 1);
   if (!origin || !destination || !pickupLocation || !providerInvoiceNumber || !Number.isFinite(declaredValue) || declaredValue <= 0 || !Number.isFinite(weightKg) || weightKg <= 0 || !Number.isInteger(pieces) || pieces < 1) return null;
-  const length = Number(payload.length ?? payload.shipment_length ?? 0);
-  const width = Number(payload.width ?? payload.shipment_width ?? 0);
-  const height = Number(payload.height ?? payload.shipment_height ?? 0);
+  const dimensionRecord = Array.isArray(payload.dimensions) && payload.dimensions[0] && typeof payload.dimensions[0] === "object"
+    ? payload.dimensions[0] as Record<string, unknown>
+    : {};
+  // Fujiyama accepts either the compact top-level fields or the normalized
+  // dimensions array. Always emit the provider's B2B shape from one source so
+  // a valid compact request cannot silently lose its box dimensions.
+  const length = Number(payload.length ?? payload.shipment_length ?? dimensionRecord.length ?? 0);
+  const width = Number(payload.width ?? payload.shipment_width ?? dimensionRecord.width ?? dimensionRecord.breadth ?? 0);
+  const height = Number(payload.height ?? payload.shipment_height ?? dimensionRecord.height ?? 0);
   const paymentMode = String(payload.payment_mode ?? "prepaid").trim().toLowerCase() === "cod" ? "COD" : "Prepaid";
   return {
     pickup_location_name: pickupLocation,
-    payment_mode: paymentMode.toLowerCase(),
+    payment_mode: paymentMode,
     cod_amount: paymentMode === "COD" ? Number(payload.cod_amount ?? declaredValue) : undefined,
     weight: Math.max(1, Math.round(weightKg * 1000)),
     dropoff_location: {
@@ -1885,6 +1891,48 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
           : {}),
     },
   };
+}
+
+function validateDelhiveryB2bManifestPayload(manifest: Record<string, unknown>, invoiceDocuments: unknown) {
+  const missing: string[] = [];
+  const requireString = (value: unknown, field: string) => { if (!String(value ?? "").trim()) missing.push(field); };
+  requireString(manifest.pickup_location_name, "pickup_location_name");
+  const dropoff = manifest.dropoff_location && typeof manifest.dropoff_location === "object" ? manifest.dropoff_location as Record<string, unknown> : {};
+  for (const field of ["consignee_name", "address", "city", "state", "zip", "phone"]) requireString(dropoff[field], `dropoff_location.${field}`);
+  const returnAddress = manifest.return_address && typeof manifest.return_address === "object" ? manifest.return_address as Record<string, unknown> : {};
+  for (const field of ["name", "address", "city", "state", "zip", "phone"]) requireString(returnAddress[field], `return_address.${field}`);
+  const details = Array.isArray(manifest.shipment_details) ? manifest.shipment_details : [];
+  const firstDetail = details[0] && typeof details[0] === "object" ? details[0] as Record<string, unknown> : {};
+  requireString(firstDetail.order_id, "shipment_details[0].order_id");
+  if (!Number.isFinite(Number(firstDetail.weight)) || Number(firstDetail.weight) <= 0) missing.push("shipment_details[0].weight");
+  if (!Number.isInteger(Number(firstDetail.box_count)) || Number(firstDetail.box_count) < 1) missing.push("shipment_details[0].box_count");
+  const dimensions = Array.isArray(manifest.dimensions) ? manifest.dimensions : [];
+  const firstDimensions = dimensions[0] && typeof dimensions[0] === "object" ? dimensions[0] as Record<string, unknown> : {};
+  for (const field of ["length", "breadth", "height"]) if (!Number.isFinite(Number(firstDimensions[field])) || Number(firstDimensions[field]) <= 0) missing.push(`dimensions[0].${field}`);
+  const invoices = Array.isArray(manifest.invoices) ? manifest.invoices : [];
+  const firstInvoice = invoices[0] && typeof invoices[0] === "object" ? invoices[0] as Record<string, unknown> : {};
+  requireString(firstInvoice.inv_num, "invoices[0].inv_num");
+  if (!Number.isFinite(Number(firstInvoice.inv_amt)) || Number(firstInvoice.inv_amt) <= 0) missing.push("invoices[0].inv_amt");
+  const documents = Array.isArray(invoiceDocuments) ? invoiceDocuments.filter((item) => Boolean(item) && typeof item === "object") : [];
+  if (!documents.length) missing.push("doc_file");
+  if (missing.length) return { ok: false as const, fields: missing, message: `Delhivery B2B manifest is missing or invalid: ${missing.join(", ")}` };
+  return { ok: true as const };
+}
+
+function providerFieldErrors(value: unknown) {
+  const fields: string[] = [];
+  const visit = (node: unknown, path = "", depth = 0) => {
+    if (depth > 3 || node == null) return;
+    if (typeof node === "string") {
+      if (path) fields.push(`${path}: ${node.replace(/\s+/g, " ").trim().slice(0, 180)}`);
+      return;
+    }
+    if (Array.isArray(node)) { node.slice(0, 12).forEach((item, index) => visit(item, path ? `${path}[${index}]` : `[${index}]`, depth + 1)); return; }
+    if (typeof node !== "object") return;
+    for (const [key, child] of Object.entries(node as Record<string, unknown>)) visit(child, path ? `${path}.${key}` : key, depth + 1);
+  };
+  visit(value);
+  return [...new Set(fields)].slice(0, 20);
 }
 
 function delhiveryB2bManifestForm(payload: Record<string, unknown>, invoiceDocuments: unknown) {
@@ -3156,6 +3204,10 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   }
   const delhiveryCreate = provider === "delhivery" && operation === "shipments" ? useDelhiveryB2b ? delhiveryB2bManifestPayload(env, providerPayload) : delhiveryCreatePayload(env, providerPayload) : null;
   if (provider === "delhivery" && operation === "shipments" && !delhiveryCreate) return { enabled: false, status: "invalid_request" as const, reason: "Delhivery requires valid origin/destination addresses, a registered client name, and a pickup location" };
+  if (provider === "delhivery" && operation === "shipments" && useDelhiveryB2b && clientId && (clientId === FUJIYAMA_FORWARD_CLIENT_ID || clientId === FUJIYAMA_REVERSE_CLIENT_ID)) {
+    const manifestValidation = validateDelhiveryB2bManifestPayload(delhiveryCreate as Record<string, unknown>, providerPayload.invoice_documents);
+    if (!manifestValidation.ok) return { enabled: true, status: "invalid_request" as const, code: "PROVIDER_PAYLOAD_INVALID", error: manifestValidation.message, field_errors: manifestValidation.fields };
+  }
   const delhiveryPickup = provider === "delhivery" && operation === "pickups" ? delhiveryPickupPayload(env, providerPayload, useDelhiveryB2b) : null;
   if (provider === "delhivery" && operation === "pickups" && !delhiveryPickup) return { enabled: false, status: "invalid_request" as const, reason: "Delhivery requires a valid pickup date and registered pickup location" };
   const rivigoCreate = provider === "rivigo" && operation === "shipments" ? rivigoBookingPayload(payload, rivigo!) : null;
@@ -3953,7 +4005,9 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
   const providerErrorCode = providerBodyError
     ? String(providerBodyError.code ?? providerBodyError.error_code ?? (providerBodyStatus || "provider_rejected")).slice(0, 120)
     : providerAccepted ? undefined : `HTTP_${response.status}`;
-  return { enabled: true, status: providerAccepted ? "accepted" as const : "failed" as const, providerStatus: providerBodyRejected ? (providerBodyStatus || response.status) : response.status, normalized_status: normalizedTracking?.status, edd: providerEdd, tracking: normalizedTracking ? { status: normalizedTracking.status, location: normalizedTracking.location, description: normalizedTracking.description, event_time: normalizedTracking.eventTime } : undefined, tracking_events: operation === "tracking" ? normalizedTrackingEvents.map((event) => ({ status: event.status, location: event.location, description: event.description, event_time: event.eventTime, source: `provider:${provider}` })) : undefined, provider_weight_received: ["freight_charges", "tracking"].includes(operation) && payload.weight_reconciliation === true ? providerWeightReceived : undefined, amount: providerAmountValue, provider_account_id: account?.id, account_name: account?.account_name, confidence_score: account?.confidence_score, priority: account?.priority, rate_card_id: account?.rate_card_id ?? undefined, error: normalizedError, error_code: providerErrorCode, provider_request_id: requestIdValue };
+  const providerFieldErrorSource = providerBodyError?.fields ?? providerBodyError?.field_errors ?? providerBodyError?.details ?? providerBodyRecord?.fields ?? providerBodyRecord?.field_errors ?? providerBodyRecord?.details;
+  const fieldErrors = providerAccepted ? undefined : providerFieldErrors(providerFieldErrorSource);
+  return { enabled: true, status: providerAccepted ? "accepted" as const : "failed" as const, providerStatus: providerBodyRejected ? (providerBodyStatus || response.status) : response.status, normalized_status: normalizedTracking?.status, edd: providerEdd, tracking: normalizedTracking ? { status: normalizedTracking.status, location: normalizedTracking.location, description: normalizedTracking.description, event_time: normalizedTracking.eventTime } : undefined, tracking_events: operation === "tracking" ? normalizedTrackingEvents.map((event) => ({ status: event.status, location: event.location, description: event.description, event_time: event.eventTime, source: `provider:${provider}` })) : undefined, provider_weight_received: ["freight_charges", "tracking"].includes(operation) && payload.weight_reconciliation === true ? providerWeightReceived : undefined, amount: providerAmountValue, provider_account_id: account?.id, account_name: account?.account_name, confidence_score: account?.confidence_score, priority: account?.priority, rate_card_id: account?.rate_card_id ?? undefined, error: normalizedError, error_code: providerErrorCode, field_errors: fieldErrors, provider_request_id: requestIdValue };
 }
 
 async function recordPickupAttempt(env: Env, details: { pickupId: string; clientId: string; provider: string; providerAccountId?: string | null; requestId?: string | null; idempotencyKey?: string | null; requestedDate?: string | null; requestedWindow?: string | null; status: string; providerStatus?: string | number | null; providerReference?: string | null; providerErrorCode?: string | null; errorMessage?: string | null }) {
@@ -5982,7 +6036,10 @@ const worker = {
          // remains a hard failure and is never reported as booked.
          const delhiveryLrPending = provider === "delhivery" && Boolean(providerBookingId) && !providerResultLr && !providerResultAwb && !providerResultReference;
          if (provider && providerResult.status !== "accepted" && !delhiveryLrPending) {
-          const failureReason = String((providerResult as { error?: string; reason?: string }).error ?? (providerResult as { reason?: string }).reason ?? `The ${provider} shipment was not accepted`).slice(0, 500);
+          const providerFields = Array.isArray((providerResult as { field_errors?: unknown }).field_errors)
+            ? (providerResult as { field_errors: unknown[] }).field_errors.map((field) => String(field).replace(/\s+/g, " ").trim()).filter(Boolean).slice(0, 10)
+            : [];
+          const failureReason = `${String((providerResult as { error?: string; reason?: string }).error ?? (providerResult as { reason?: string }).reason ?? `The ${provider} shipment was not accepted`)}${providerFields.length ? `; fields: ${providerFields.join(" | ")}` : ""}`.slice(0, 500);
           const providerCode = String((providerResult as { code?: string }).code ?? "") || (provider === "delhivery" && /awaiting provider activation|not active|not (?:been )?configured|warehouse.*activation|pickup.*warehouse.*pending/i.test(failureReason) ? "WAREHOUSE_ACTIVATION_PENDING" : "");
           // A synchronous booking must never be reported as booked when the
           // provider rejected the manifest. Pickup activation is a separate
