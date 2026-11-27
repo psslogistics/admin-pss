@@ -17,7 +17,7 @@ const checks = [
   ["compact payload derives lane and courier", source.includes('payload.lane = String(payload.lane ?? (clientId === FUJIYAMA_FORWARD_CLIENT_ID ? "forward" : "reverse"))') && source.includes('payload.provider = String(payload.provider ?? "delhivery")')],
   ["compact payload resolves city and state from pincode", source.includes("pricingPincode(env, originPincode)") && source.includes("facility_city") && source.includes("facility_state")],
   ["compact payload maps package dimensions", source.includes("packageValue?.dimensions_cm") && source.includes("payload.dimensions = [{ length")],
-  ["B2B manifest preserves compact dimensions and lowercase payment mode", source.includes("dimensionRecord.width") && source.includes('payment_mode: paymentMode.toLowerCase()') && source.includes('breadth: width')],
+  ["B2B manifest maps the official Delhivery schema", source.includes("dimensionRecord.width") && source.includes("pickup_location: pickupLocation") && source.includes("d_mode: paymentMode") && source.includes("invoices: [{") && source.includes("suborders: [{") && source.includes("n_value: declaredValue") && source.includes("count: pieces")],
   ["Fujiyama B2B manifest is validated before provider submission", source.includes("validateDelhiveryB2bManifestPayload") && source.includes('code: "PROVIDER_PAYLOAD_INVALID"')],
   ["provider validation details are returned safely", source.includes("function providerFieldErrors") && source.includes("field_errors: fieldErrors")],
   ["compact payload maps invoice and eway documents", source.includes("payload.invoice_document ?? payload.invoice") && source.includes("payload.eway_bill")],
