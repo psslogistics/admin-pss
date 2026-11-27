@@ -1836,49 +1836,13 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
   const width = Number(payload.width ?? payload.shipment_width ?? dimensionRecord.width ?? dimensionRecord.breadth ?? 0);
   const height = Number(payload.height ?? payload.shipment_height ?? dimensionRecord.height ?? 0);
   const paymentMode = String(payload.payment_mode ?? "prepaid").trim().toLowerCase() === "cod" ? "COD" : "Prepaid";
-  const ewaybill = String(payload.e_way_bill_no ?? payload.e_waybill_no ?? payload.ewaybill_number ?? "").trim();
-  const sellerGstTin = String(payload.client_gst_tin ?? payload.seller_gst_tin ?? "").trim();
-  const consigneeGstTin = String(payload.consignee_gst_tin ?? payload.destination_gst_tin ?? "").trim();
   return {
-    // These names and casing are Delhivery's B2B /v2/manifest contract.
-    // Keep this translation inside the provider adapter so Fujiyama's public
-    // request contract does not change.
-    ident: orderId,
-    pickup_location: pickupLocation,
     pickup_location_name: pickupLocation,
-    d_mode: paymentMode,
+    // Delhivery's live LTL endpoint uses this legacy B2B contract. The public
+    // Fujiyama request remains compact; this adapter normalizes casing here.
     payment_mode: paymentMode.toLowerCase(),
-    amount: paymentMode === "COD" ? Number(payload.cod_amount ?? declaredValue) : 0,
     cod_amount: paymentMode === "COD" ? Number(payload.cod_amount ?? declaredValue) : undefined,
     weight: Math.max(1, Math.round(weightKg * 1000)),
-    invoices: [{
-      ident: providerInvoiceNumber,
-      n_value: declaredValue,
-      ewaybill,
-      inv_num: providerInvoiceNumber,
-      inv_amt: declaredValue,
-      inv_qr_code: String(payload.invoice_qr_code ?? ""),
-    }],
-    suborders: [{
-      ident: orderId,
-      count: pieces,
-      description: String(payload.description ?? "Shipment").slice(0, 500),
-      waybills: [],
-      master: true,
-    }],
-    // The live B2B validator currently requires these compatibility fields in
-    // addition to the documented `suborders`/`count` fields.
-    shipment_details: [{
-      order_id: orderId,
-      box_count: pieces,
-      description: String(payload.description ?? "Shipment").slice(0, 500),
-      weight: Math.max(1, Math.round(weightKg * 1000)),
-      waybills: [],
-      master: false,
-    }],
-    dimensions: length > 0 && width > 0 && height > 0
-      ? [{ length, width, breadth: width, height, count: pieces, box_count: pieces }]
-      : undefined,
     dropoff_location: {
       consignee_name: destination.name,
       address: destination.line,
@@ -1897,8 +1861,22 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
       phone: origin.phone,
       email: origin.email,
     },
-    ...(consigneeGstTin ? { consignee_gst_tin: consigneeGstTin } : {}),
-    ...(sellerGstTin ? { seller_gst_tin: sellerGstTin } : {}),
+    shipment_details: [{
+      order_id: orderId,
+      box_count: pieces,
+      description: String(payload.description ?? "Shipment").slice(0, 500),
+      weight: Math.max(1, Math.round(weightKg * 1000)),
+      waybills: [],
+      master: false,
+    }],
+    dimensions: length > 0 && width > 0 && height > 0 ? [{ length, width, breadth: width, height, box_count: pieces }] : undefined,
+    invoices: [{
+      ewaybill: String(payload.e_way_bill_no ?? payload.e_waybill_no ?? payload.ewaybill_number ?? ""),
+      inv_num: providerInvoiceNumber,
+      inv_amt: declaredValue,
+      inv_qr_code: String(payload.invoice_qr_code ?? ""),
+    }],
+    rov_insurance: payload.rov_type === true,
     billing_address: {
       name: origin.name,
       company: origin.name,
@@ -1908,7 +1886,11 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
       state: origin.state,
       pin: origin.pincode,
       phone: origin.phone,
-      ...(sellerGstTin ? { gst_number: sellerGstTin } : {}),
+      ...(String(payload.client_gst_tin ?? payload.seller_gst_tin ?? "").trim()
+        ? { gst_number: String(payload.client_gst_tin ?? payload.seller_gst_tin).trim() }
+        : String(payload.client_pan ?? payload.client_pan_number ?? payload.pan_number ?? "").trim()
+          ? { pan_number: String(payload.client_pan ?? payload.client_pan_number ?? payload.pan_number).trim() }
+          : {}),
     },
   };
 }
@@ -1916,23 +1898,26 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
 function validateDelhiveryB2bManifestPayload(manifest: Record<string, unknown>, invoiceDocuments: unknown) {
   const missing: string[] = [];
   const requireString = (value: unknown, field: string) => { if (!String(value ?? "").trim()) missing.push(field); };
-  requireString(manifest.ident, "ident");
-  requireString(manifest.pickup_location, "pickup_location");
-  requireString(manifest.d_mode, "d_mode");
-  if (!["Prepaid", "COD"].includes(String(manifest.d_mode))) missing.push("d_mode (Prepaid or COD)");
+  requireString(manifest.pickup_location_name, "pickup_location_name");
+  requireString(manifest.payment_mode, "payment_mode");
+  if (!["prepaid", "cod"].includes(String(manifest.payment_mode))) missing.push("payment_mode (prepaid or cod)");
   if (!Number.isFinite(Number(manifest.weight)) || Number(manifest.weight) <= 0) missing.push("weight");
-  if (!Number.isFinite(Number(manifest.amount)) || Number(manifest.amount) < 0) missing.push("amount");
-  const details = Array.isArray(manifest.suborders) ? manifest.suborders : [];
+  const dropoff = manifest.dropoff_location && typeof manifest.dropoff_location === "object" ? manifest.dropoff_location as Record<string, unknown> : {};
+  for (const field of ["consignee_name", "address", "city", "state", "zip", "phone"]) requireString(dropoff[field], `dropoff_location.${field}`);
+  const returnAddress = manifest.return_address && typeof manifest.return_address === "object" ? manifest.return_address as Record<string, unknown> : {};
+  for (const field of ["name", "address", "city", "state", "zip", "phone"]) requireString(returnAddress[field], `return_address.${field}`);
+  const details = Array.isArray(manifest.shipment_details) ? manifest.shipment_details : [];
   const firstDetail = details[0] && typeof details[0] === "object" ? details[0] as Record<string, unknown> : {};
-  requireString(firstDetail.ident, "suborders[0].ident");
-  if (!Number.isInteger(Number(firstDetail.count)) || Number(firstDetail.count) < 1) missing.push("suborders[0].count");
+  requireString(firstDetail.order_id, "shipment_details[0].order_id");
+  if (!Number.isFinite(Number(firstDetail.weight)) || Number(firstDetail.weight) <= 0) missing.push("shipment_details[0].weight");
+  if (!Number.isInteger(Number(firstDetail.box_count)) || Number(firstDetail.box_count) < 1) missing.push("shipment_details[0].box_count");
   const dimensions = Array.isArray(manifest.dimensions) ? manifest.dimensions : [];
   const firstDimensions = dimensions[0] && typeof dimensions[0] === "object" ? dimensions[0] as Record<string, unknown> : {};
-  for (const field of ["length", "width", "height"]) if (!Number.isFinite(Number(firstDimensions[field])) || Number(firstDimensions[field]) <= 0) missing.push(`dimensions[0].${field}`);
+  for (const field of ["length", "breadth", "height"]) if (!Number.isFinite(Number(firstDimensions[field])) || Number(firstDimensions[field]) <= 0) missing.push(`dimensions[0].${field}`);
   const invoices = Array.isArray(manifest.invoices) ? manifest.invoices : [];
   const firstInvoice = invoices[0] && typeof invoices[0] === "object" ? invoices[0] as Record<string, unknown> : {};
-  requireString(firstInvoice.ident, "invoices[0].ident");
-  if (!Number.isFinite(Number(firstInvoice.n_value)) || Number(firstInvoice.n_value) <= 0) missing.push("invoices[0].n_value");
+  if ((!String(firstInvoice.inv_num ?? "").trim() && !String(firstInvoice.inv_qr_code ?? "").trim()) || (!String(firstInvoice.inv_num ?? "").trim() && !String(firstInvoice.inv_amt ?? "").trim())) missing.push("invoices[0].inv_num/inv_amt or inv_qr_code");
+  if (!Number.isFinite(Number(firstInvoice.inv_amt)) || Number(firstInvoice.inv_amt) <= 0) missing.push("invoices[0].inv_amt");
   const documents = Array.isArray(invoiceDocuments) ? invoiceDocuments.filter((item) => Boolean(item) && typeof item === "object") : [];
   if (!documents.length) missing.push("doc_file");
   if (missing.length) return { ok: false as const, fields: missing, message: `Delhivery B2B manifest is missing or invalid: ${missing.join(", ")}` };
