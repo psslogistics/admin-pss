@@ -4659,7 +4659,17 @@ function delhiveryLabelCallbackSize(payload: Record<string, unknown>, fallback: 
 function delhiveryCallbackAssetAllowed(value: string) {
   try {
     const host = new URL(value).hostname.toLowerCase();
-    return host === "delhivery.com" || host.endsWith(".delhivery.com") || host.endsWith(".delhivery.co.in") || host.endsWith(".delhivery.net");
+    // Delhivery's asynchronous label callback currently returns signed PDFs
+    // from its AWS S3 bucket (for example, ltl-uploads-mum-prod.s3.amazonaws.com)
+    // instead of a Delhivery hostname. Keep the allow-list narrow: only
+    // Delhivery domains and AWS S3 hosts are accepted, never arbitrary URLs.
+    return host === "delhivery.com"
+      || host.endsWith(".delhivery.com")
+      || host.endsWith(".delhivery.co.in")
+      || host.endsWith(".delhivery.net")
+      || host === "s3.amazonaws.com"
+      || host.endsWith(".s3.amazonaws.com")
+      || host.endsWith(".s3.ap-south-1.amazonaws.com");
   } catch { return false; }
 }
 
