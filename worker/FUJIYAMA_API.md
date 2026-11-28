@@ -147,6 +147,24 @@ applies the corresponding Fujiyama rate card, recalculates pricing, checks the
 wallet, and then submits the Delhivery B2B booking. The Delhivery/provider
 amount is never returned as the client billing amount.
 
+## Booking response and courier documents
+
+The booking call waits for Delhivery's LR, master AWB, shipper LR copy, and A4
+label. Allow at least 120 seconds for the HTTP request, including the booking
+itself and the roughly 60-second document wait after Delhivery acknowledges it.
+A completed handoff returns HTTP 201 with `data.handoff_status = "ready"`,
+`data.lr_number`, `data.master_awb`, and `data.documents`.
+
+Decode `body_base64` on the `delhivery-lr-copy-*.pdf` and
+`delhivery-label-*.pdf` document entries to save the PDFs directly from the
+booking response. Each entry also includes a `download_path` usable with
+the tracking key. The booking response includes inline PDFs up to 16 MiB
+of combined PDF bytes.
+
+If Delhivery takes longer, HTTP 202 identifies the existing shipment.
+Continue with the returned `status_path` and the tracking key. A retry of
+the original POST must reuse the same payload and `Idempotency-Key`.
+
 ## Key lifecycle
 
 Create and revoke keys from the Super Admin API-key workspace. Secrets are

@@ -3313,8 +3313,18 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     ? crypto.randomUUID()
     : null;
   if (labelCallbackToken && typeof payload.shipment_id === "string" && clientId) {
-    await env.DB.prepare("INSERT INTO delhivery_label_callback_tokens (token, shipment_id, client_id, label_size, expires_at) VALUES (?, ?, ?, ?, datetime('now', '+30 minutes'))")
-      .bind(labelCallbackToken, payload.shipment_id, clientId, String(payload.label_size ?? "a4")).run();
+    const size = String(payload.label_size ?? "a4");
+    const registration = await env.DB.prepare(`INSERT INTO delhivery_label_callback_tokens (token, shipment_id, client_id, label_size, expires_at)
+      SELECT ?, ?, ?, ?, datetime('now', '+30 minutes')
+      WHERE ? = 0 OR NOT EXISTS (
+        SELECT 1 FROM delhivery_label_callback_tokens
+        WHERE shipment_id = ? AND client_id = ? AND label_size = ?
+          AND created_at >= datetime('now', '-45 seconds') AND expires_at > CURRENT_TIMESTAMP
+      )`).bind(labelCallbackToken, payload.shipment_id, clientId, size, payload.fujiyama_handoff === true ? 1 : 0, payload.shipment_id, clientId, size).run();
+    if (!registration.meta?.changes) {
+      await env.DB.prepare("UPDATE integration_requests SET status = 'accepted', updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(integrationId).run();
+      return { enabled: true, status: "pending" as const };
+    }
   }
   const requestBody = provider === "delhivery" && operation === "shipments"
     ? useDelhiveryB2b ? delhiveryB2bManifestForm(delhiveryCreate as Record<string, unknown>, providerPayload.invoice_documents) : `format=json&data=${encodeURIComponent(JSON.stringify(delhiveryCreate))}`
@@ -3673,7 +3683,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       ?? null;
     const jobId = findProviderReference(parsedProviderBody, new Set(["job_id", "jobid", "manifest_job_id", "request_id", "requestid"]));
     delhiveryManifestJobId = jobId;
-    if (!initialLr && !initialAwb && jobId) {
+    if (!initialLr && !initialAwb && jobId && payload.fujiyama_handoff !== true) {
       // Delhivery's B2B manifest can acknowledge the POST with a job id and
       // publish the LR/AWB on the immediately-following status response. This
       // is the synchronous 21-Oct behaviour: bounded, in-request lookup only.
@@ -3733,9 +3743,9 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       // the provider correlation key and let the route perform its bounded
       // reconciliation pass before returning a truthful pending response.
       const pending = "Delhivery accepted the booking and returned a provider job ID. LR/AWB is still being confirmed.";
-      await env.DB.prepare("UPDATE shipments SET provider_booking_id = COALESCE(?, provider_booking_id), provider_sync_status = 'pending', status = 'booked', provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(providerBookingId, pending, payload.shipment_id, clientId).run();
+      await env.DB.prepare("UPDATE shipments SET provider_booking_id = COALESCE(?, provider_booking_id), provider_account_id = COALESCE(?, provider_account_id), provider_sync_status = CASE WHEN lr_number IS NULL AND master_awb IS NULL THEN 'pending' ELSE provider_sync_status END, provider_last_error = CASE WHEN lr_number IS NULL AND master_awb IS NULL THEN ? ELSE provider_last_error END, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(providerBookingId, account?.id ?? null, pending, payload.shipment_id, clientId).run();
       await env.DB.prepare("UPDATE integration_requests SET status = 'accepted', error_code = NULL, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(pending, integrationId).run();
-      return { enabled: true, status: "accepted" as const, providerStatus: response.status, providerPending: true, providerBookingId, message: pending };
+      return { enabled: true, status: "accepted" as const, providerStatus: response.status, providerPending: true, providerBookingId, provider_account_id: account?.id, message: pending };
     }
     if (useDelhiveryB2b && !createdReference) {
       const failure = "Delhivery accepted the request but returned no LR or AWB. The pickup request was not treated as a shipment booking.";
@@ -4363,6 +4373,15 @@ async function reconcilePendingDelhiveryReferences(env: Env, cron: string) {
     }
   }
   if (pending.results.length) console.log(JSON.stringify({ job: "delhivery_reference_reconciliation", candidates: pending.results.length }));
+  const incompleteHandoffs = await env.DB.prepare(`SELECT s.id, s.client_id FROM shipments s
+    WHERE s.provider = 'delhivery' AND s.client_id IN (?, ?) AND s.lr_number IS NOT NULL
+      AND s.status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery')
+      AND s.created_at >= datetime('now', '-1 day')
+      AND (NOT EXISTS (SELECT 1 FROM shipment_documents d WHERE d.shipment_id = s.id AND d.client_id = s.client_id AND d.original_filename LIKE 'delhivery-lr-copy-%')
+        OR NOT EXISTS (SELECT 1 FROM shipment_documents d WHERE d.shipment_id = s.id AND d.client_id = s.client_id AND d.original_filename LIKE 'delhivery-label-%'))
+    ORDER BY s.updated_at ASC LIMIT 10`).bind(FUJIYAMA_FORWARD_CLIENT_ID, FUJIYAMA_REVERSE_CLIENT_ID).all<{ id: string; client_id: string }>();
+  await Promise.allSettled(incompleteHandoffs.results.map((shipment) =>
+    ensureFujiyamaHandoffDocuments(env, shipment.client_id, shipment.id, `cron:${cron}:fujiyama-handoff:${shipment.id}`)));
 }
 async function reconcileDeferredShipmentBilling(env: Env, cron: string) {
   // Only retry shipments explicitly marked by the billing completion path.
@@ -4783,9 +4802,9 @@ async function fujiyamaHandoff(env: Env, shipmentId: string, clientId: string) {
     download_path: `/v1/documents/${document.id}`,
     created_at: document.created_at,
   }));
-  const hasReference = Boolean(String(shipment.lr_number ?? shipment.master_awb ?? shipment.provider_reference ?? shipment.tracking_number ?? "").trim());
-  const hasLabel = documentRows.some((document) => /^delhivery-label-/i.test(document.name));
-  const hasLrCopy = documentRows.some((document) => /^delhivery-lr-copy-/i.test(document.name));
+  const hasReferences = Boolean(shipment.lr_number && shipment.master_awb);
+  const hasLabel = documentRows.some((document) => document.content_type === "application/pdf" && /^delhivery-label-/i.test(document.name));
+  const hasLrCopy = documentRows.some((document) => document.content_type === "application/pdf" && /^delhivery-lr-copy-/i.test(document.name));
   return {
     shipment_id: shipment.id,
     order_id: shipment.order_id,
@@ -4797,7 +4816,7 @@ async function fujiyamaHandoff(env: Env, shipmentId: string, clientId: string) {
     lr_number: shipment.lr_number,
     master_awb: shipment.master_awb,
     provider_reference: shipment.provider_reference,
-    handoff_status: hasReference && hasLabel && hasLrCopy ? "ready" : "pending",
+    handoff_status: hasReferences && hasLabel && hasLrCopy ? "ready" : "pending",
     documents: documentRows,
     status_path: `/v1/fujiyama/shipments/${shipment.id}`,
     updated_at: shipment.updated_at,
@@ -4841,15 +4860,16 @@ async function persistInlineProviderDocuments(env: Env, clientId: string, shipme
 
 async function ensureFujiyamaHandoffDocuments(env: Env, clientId: string, shipmentId: string, requestIdValue: string) {
   if (clientId !== FUJIYAMA_FORWARD_CLIENT_ID && clientId !== FUJIYAMA_REVERSE_CLIENT_ID) return false;
-  const shipment = await env.DB.prepare("SELECT lr_number, master_awb, tracking_number, provider_reference, provider_account_id FROM shipments WHERE id = ? AND client_id = ? LIMIT 1")
+  const shipment = await env.DB.prepare("SELECT lr_number, pieces, provider_account_id FROM shipments WHERE id = ? AND client_id = ? AND provider = 'delhivery' LIMIT 1")
     .bind(shipmentId, clientId)
-    .first<{ lr_number: string | null; master_awb: string | null; tracking_number: string | null; provider_reference: string | null; provider_account_id: string | null }>();
-  const reference = String(shipment?.lr_number ?? shipment?.master_awb ?? shipment?.provider_reference ?? shipment?.tracking_number ?? "").trim();
+    .first<{ lr_number: string | null; pieces: number | null; provider_account_id: string | null }>();
+  const reference = String(shipment?.lr_number ?? "").trim();
   if (!reference) return false;
   const documents = await env.DB.prepare("SELECT original_filename FROM shipment_documents WHERE shipment_id = ? AND client_id = ?")
     .bind(shipmentId, clientId).all<{ original_filename: string }>();
   const names = documents.results.map((row) => row.original_filename);
-  if (!names.some((name) => /^delhivery-lr-copy-/i.test(name))) {
+  const fetchLrCopy = async () => {
+    if (names.some((name) => /^delhivery-lr-copy-/i.test(name))) return;
     try {
       const lrCopyResult = await safeProviderRequest(env, "delhivery", "lr_copy", {
         shipment_id: shipmentId,
@@ -4863,8 +4883,9 @@ async function ensureFujiyamaHandoffDocuments(env: Env, clientId: string, shipme
     } catch (caught) {
       console.warn(JSON.stringify({ event: "fujiyama_lr_copy_backfill_failed", request_id: requestIdValue, shipment_id: shipmentId, error: caught instanceof Error ? caught.message : "unknown_error" }));
     }
-  }
-  if (!names.some((name) => /^delhivery-label-/i.test(name))) {
+  };
+  const fetchLabel = async () => {
+    if (names.some((name) => /^delhivery-label-/i.test(name))) return;
     try {
       const labelResult = await safeProviderRequest(env, "delhivery", "labels", {
         shipment_id: shipmentId,
@@ -4873,17 +4894,71 @@ async function ensureFujiyamaHandoffDocuments(env: Env, clientId: string, shipme
         provider_account_id: shipment?.provider_account_id ?? undefined,
         label_size: "a4",
         label_api_variant: "pdf",
-        boxes: 1,
+        boxes: Math.max(1, Number(shipment?.pieces ?? 1)),
+        fujiyama_handoff: true,
       }, `${requestIdValue}:label`, clientId, `${requestIdValue}:label`, 8000);
       await persistInlineProviderDocuments(env, clientId, shipmentId, reference, "label", labelResult.artifact);
     } catch (caught) {
       console.warn(JSON.stringify({ event: "fujiyama_label_backfill_failed", request_id: requestIdValue, shipment_id: shipmentId, error: caught instanceof Error ? caught.message : "unknown_error" }));
     }
-  }
+  };
+  await Promise.all([fetchLrCopy(), fetchLabel()]);
   await env.DB.prepare("UPDATE shipments SET provider_sync_status = 'confirmed', provider_retry_at = NULL, provider_booking_payload_json = NULL, provider_last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ? AND COALESCE(lr_number, master_awb, provider_reference, tracking_number, '') <> ''")
     .bind(shipmentId, clientId).run();
   await completeConfirmedShipmentBilling(env, clientId, shipmentId, "fujiyama_handoff_backfill").catch(() => undefined);
   return true;
+}
+
+async function waitForFujiyamaHandoff(env: Env, clientId: string, shipmentId: string, requestIdValue: string, providerAccountId: string | null | undefined, signal: AbortSignal) {
+  const deadline = Date.now() + 60_000;
+  let nextReferenceLookup = 0;
+  let nextDocumentFetch = 0;
+  let handoff = await fujiyamaHandoff(env, shipmentId, clientId);
+  while (handoff && handoff.handoff_status !== "ready" && !signal.aborted && Date.now() < deadline) {
+    const now = Date.now();
+    if ((!handoff.lr_number || !handoff.master_awb) && handoff.provider_booking_id && now >= nextReferenceLookup && deadline - now >= 8000) {
+      nextReferenceLookup = now + 5000;
+      await safeProviderRequest(env, "delhivery", "shipment_status", {
+        shipment_id: shipmentId,
+        provider_booking_id: handoff.provider_booking_id,
+        provider_account_id: providerAccountId,
+      }, `${requestIdValue}:manifest-status:${now}`, clientId, undefined, 3500);
+      handoff = await fujiyamaHandoff(env, shipmentId, clientId);
+    }
+    if (handoff?.lr_number && handoff.handoff_status !== "ready" && Date.now() >= nextDocumentFetch && deadline - Date.now() >= 12000) {
+      nextDocumentFetch = Date.now() + 6000;
+      await ensureFujiyamaHandoffDocuments(env, clientId, shipmentId, `${requestIdValue}:handoff:${now}`);
+      handoff = await fujiyamaHandoff(env, shipmentId, clientId);
+    }
+    if (!handoff || handoff.handoff_status === "ready" || signal.aborted || Date.now() >= deadline) break;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(1500, Math.max(0, deadline - Date.now()))));
+    handoff = await fujiyamaHandoff(env, shipmentId, clientId);
+  }
+  return handoff;
+}
+
+async function fujiyamaBookingResponse(env: Env, clientId: string, serialized: string, status: number, headers: HeadersInit) {
+  if (status !== 201) return new Response(serialized, { status, headers: { ...headers, "content-type": "application/json" } });
+  const result = JSON.parse(serialized) as { data: { id: string; documents?: Array<{ id: string; name: string; size: number; content_type: string; body_base64?: string }> } };
+  // D1 stores only the response metadata. Read the two courier PDFs from R2
+  // when sending the booking response or replaying its idempotency key.
+  let remainingBytes = 16 * 1024 * 1024;
+  for (const document of result.data.documents ?? []) {
+    if (document.content_type !== "application/pdf" || !/^delhivery-(lr-copy|label)-/i.test(document.name) || document.size > remainingBytes) continue;
+    try {
+      const row = await env.DB.prepare("SELECT object_key FROM shipment_documents WHERE id = ? AND shipment_id = ? AND client_id = ?")
+        .bind(document.id, result.data.id, clientId).first<{ object_key: string }>();
+      const object = row ? await env.FILES.get(row.object_key) : null;
+      if (!object || object.size > remainingBytes) continue;
+      const bytes = new Uint8Array(await object.arrayBuffer());
+      if (!documentSignatureMatches("application/pdf", bytes)) continue;
+      document.body_base64 = providerBytesToBase64(bytes);
+      remainingBytes -= bytes.byteLength;
+    } catch {
+      // Keep the original download path usable if object storage is unavailable.
+    }
+  }
+  return json(result, status, headers);
 }
 
 async function handleProviderWebhook(request: Request, env: Env, provider: "delhivery" | "ekart" | "trackon", requestIdValue: string, headers: HeadersInit) {
@@ -5981,6 +6056,8 @@ const worker = {
         const key = request.headers.get("Idempotency-Key");
         if (!key) return error("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key is required", 400, id, headers);
         const fujiyamaClient = clientId === FUJIYAMA_FORWARD_CLIENT_ID || clientId === FUJIYAMA_REVERSE_CLIENT_ID;
+        const waitForHandoff = fujiyamaClient && url.pathname === "/v1/fujiyama/bookings";
+        if (waitForHandoff && key.length > 128) return error("VALIDATION_ERROR", "Idempotency-Key must be at most 128 characters", 400, id, headers);
         const existing = await idempotentResponse(env, key, clientId, "POST /v1/shipments", requestHash);
         if (existing) {
           // A pending Fujiyama response is a resumable handoff, not a final
@@ -6000,13 +6077,16 @@ const worker = {
               const handoff = pendingShipmentId ? await fujiyamaHandoff(env, pendingShipmentId, clientId) : null;
               if (handoff?.handoff_status === "ready") {
                 const refreshed = JSON.stringify({ ok: true, data: { ...handoff, id: pendingShipmentId, client_id: clientId, status: "booked", provider: "delhivery", handoff_status: "ready" }, request_id: id });
-                await saveIdempotent(env, key, clientId, "POST /v1/shipments", 201, refreshed, requestHash);
+                await env.DB.prepare("UPDATE idempotency_keys SET response_status = 201, response_body = ? WHERE idempotency_key = ? AND client_id = ? AND endpoint = 'POST /v1/shipments' AND request_hash = ? AND response_status = 202")
+                  .bind(refreshed, key, clientId, requestHash).run();
+                if (waitForHandoff) return fujiyamaBookingResponse(env, clientId, refreshed, 201, headers);
                 return new Response(refreshed, { status: 201, headers: { ...headers, "content-type": "application/json" } });
               }
             } catch (caught) {
               console.warn(JSON.stringify({ event: "fujiyama_idempotency_refresh_failed", request_id: id, error: caught instanceof Error ? caught.message : "unknown_error" }));
             }
           }
+          if (waitForHandoff) return fujiyamaBookingResponse(env, clientId, existing.response_body, existing.response_status, headers);
           return new Response(existing.response_body, { status: existing.response_status, headers: { ...headers, "content-type": "application/json" } });
         }
         const provider = typeof payload.provider === "string" && ["delhivery", "ekart", "trackon", "xpressbees", "rivigo"].includes(payload.provider) ? payload.provider : (hasRole(auth, ["employee", "admin", "super_admin"]) ? "delhivery" : null);
@@ -6078,13 +6158,35 @@ const worker = {
           if (Number(wallet?.balance ?? 0) < pricingAmount) return error("INSUFFICIENT_WALLET_BALANCE", "The client wallet does not have enough balance for this PSS booking", 409, id, headers);
         }
         const shipmentId = crypto.randomUUID();
+        if (waitForHandoff) {
+          const claimed = await env.DB.prepare(`INSERT INTO idempotency_keys (idempotency_key, client_id, endpoint, request_hash, response_status, response_body, expires_at)
+            VALUES (?, ?, 'POST /v1/shipments', ?, 409, ?, datetime('now', '+24 hours'))
+            ON CONFLICT(idempotency_key, client_id, endpoint) DO UPDATE SET request_hash = excluded.request_hash,
+              response_status = excluded.response_status, response_body = excluded.response_body, expires_at = excluded.expires_at
+            WHERE idempotency_keys.expires_at <= CURRENT_TIMESTAMP`).bind(key, clientId, requestHash, JSON.stringify({
+              ok: false, error: { code: "BOOKING_IN_PROGRESS", message: "The booking request is already being processed." },
+              data: { id: shipmentId, status_path: `/v1/fujiyama/shipments/${shipmentId}` }, request_id: id,
+            })).run();
+          if (!claimed.meta?.changes) {
+            const current = await idempotentResponse(env, key, clientId, "POST /v1/shipments", requestHash);
+            if (current) return fujiyamaBookingResponse(env, clientId, current.response_body, current.response_status, headers);
+            return error("BOOKING_IN_PROGRESS", "The booking request is already being processed.", 409, id, headers);
+          }
+        }
+        const saveBookingResponse = async (status: number, serialized: string) => {
+          if (!waitForHandoff) return saveIdempotent(env, key, clientId, "POST /v1/shipments", status, serialized, requestHash);
+          await env.DB.prepare("UPDATE idempotency_keys SET response_status = ?, response_body = ? WHERE idempotency_key = ? AND client_id = ? AND endpoint = 'POST /v1/shipments' AND request_hash = ?")
+            .bind(status, serialized, key, clientId, requestHash).run();
+        };
         const requestedProviderAccountId = typeof payload.provider_account_id === "string" && payload.provider_account_id.trim() ? payload.provider_account_id.trim() : null;
         await env.DB.prepare("INSERT INTO shipments (id, order_id, invoice_reference, client_id, created_by_user_id, provider, provider_account_id, client_gst_number, client_pan_number, kyc_version, status, description, origin, destination, origin_address_json, destination_address_json, consignee, total_weight_kg, declared_value, pieces, edd, dimensions_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'booked', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(shipmentId, resolvedOrderId, invoiceReference || null, clientId, auth.userId ?? `api:${clientId}`, provider, requestedProviderAccountId, shipmentGst, shipmentPan, kyc?.kyc_version ?? null, description, origin, destination, JSON.stringify(originAddress), JSON.stringify(destinationAddress), String(destinationAddress.name), weight, declaredValue, pieces, typeof payload.edd === "string" ? payload.edd : null, dimensionsJson).run();
         await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'booked', 'Shipment created', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipmentId, auth.userId ?? `api:${clientId}`).run();
         const storedDocuments = await persistShipmentDocuments(env, clientId, shipmentId, payload.invoice_documents, auth.userId ?? `api:${clientId}`);
         if (!storedDocuments.ok) {
           await env.DB.prepare("UPDATE shipments SET status = 'exception', provider_sync_status = 'failed', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(shipmentId, clientId).run();
-          return error("INVOICE_DOCUMENT_INVALID", storedDocuments.error, 400, id, headers);
+          const failure = error("INVOICE_DOCUMENT_INVALID", storedDocuments.error, 400, id, headers);
+          if (waitForHandoff) await saveBookingResponse(400, await failure.clone().text());
+          return failure;
         }
         if (provider === "delhivery" && payload.eway_document && typeof payload.eway_document === "object") {
           const ewayDocument = payload.eway_document as Record<string, unknown>;
@@ -6094,7 +6196,9 @@ const worker = {
           }], auth.userId ?? `api:${clientId}`);
           if (!storedEway.ok) {
             await env.DB.prepare("UPDATE shipments SET status = 'exception', provider_sync_status = 'failed', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(shipmentId, clientId).run();
-            return error("EWAY_DOCUMENT_INVALID", "The E-Way Bill could not be saved before the Delhivery booking request", 400, id, headers);
+            const failure = error("EWAY_DOCUMENT_INVALID", "The E-Way Bill could not be saved before the Delhivery booking request", 400, id, headers);
+            if (waitForHandoff) await saveBookingResponse(400, await failure.clone().text());
+            return failure;
           }
           delete payload.eway_document;
         }
@@ -6107,7 +6211,7 @@ const worker = {
             .bind(JSON.stringify(retryPayload), shipmentId, clientId).run();
         }
         const providerStartedAt = Date.now();
-        const providerResult = provider ? await safeProviderRequest(env, provider as CourierProvider, "shipments", { shipment_id: shipmentId, ...payload }, id, clientId, key) : { enabled: false, status: "not_requested" as const };
+        const providerResult = provider ? await safeProviderRequest(env, provider as CourierProvider, "shipments", { shipment_id: shipmentId, ...payload, fujiyama_handoff: waitForHandoff }, id, clientId, key) : { enabled: false, status: "not_requested" as const };
         console.log(JSON.stringify({ event: "shipment_booking_timing", request_id: id, shipment_id: shipmentId, provider: provider ?? "none", pricing_ms: pricingDurationMs, provider_ms: Date.now() - providerStartedAt, total_ms: Date.now() - bookingStartedAt, provider_result: providerResult.status }));
         const selectedProviderAccountId = (providerResult as { provider_account_id?: string }).provider_account_id;
         if (selectedProviderAccountId) await env.DB.prepare("UPDATE shipments SET provider_account_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(selectedProviderAccountId, shipmentId, clientId).run();
@@ -6143,7 +6247,7 @@ const worker = {
              ? "Delhivery accepted the request but did not return an LR/AWB immediately. The booking was not confirmed and no charge was applied."
              : "The courier did not accept this booking; correct the provider issue before retrying.";
            const failedResponse = JSON.stringify({ ok: false, error: { code: failureCode, category: "provider", message: lrTimeout ? "Delhivery did not return an LR/AWB within the synchronous booking window." : "The shipment could not be booked with the courier.", user_safe_message: userSafeMessage, technical_message: failureReason, provider_code: providerCode || failureCode, request_id: id, retryable: !lrTimeout, stale_data: false }, data: { id: shipmentId, client_id: clientId, status: "exception", provider, pricing_amount: null }, request_id: id });
-          await saveIdempotent(env, key, clientId, "POST /v1/shipments", 502, failedResponse, requestHash);
+          await saveBookingResponse(502, failedResponse);
           await audit(env, ctx, auth, id, "shipment.provider_failed", "shipment", shipmentId, { client_id: clientId, provider, reason: failureReason });
           return new Response(failedResponse, { status: 502, headers: { ...headers, "content-type": "application/json" } });
         }
@@ -6153,7 +6257,15 @@ const worker = {
         let reconciledProviderLr = providerLr;
         let reconciledProviderAwb = providerAwb;
         let reconciledProviderReference = providerReference;
-        if (provider === "delhivery" && providerBookingId && !reconciledProviderLr && !reconciledProviderAwb && !reconciledProviderReference) {
+        const waitedHandoff = waitForHandoff
+          ? await waitForFujiyamaHandoff(env, clientId, shipmentId, id, selectedProviderAccountId ?? requestedProviderAccountId, request.signal)
+          : null;
+        if (waitedHandoff) {
+          reconciledProviderLr ||= String(waitedHandoff.lr_number ?? "");
+          reconciledProviderAwb ||= String(waitedHandoff.master_awb ?? "");
+          reconciledProviderReference ||= String(waitedHandoff.provider_reference ?? "");
+        }
+        if (!waitForHandoff && provider === "delhivery" && providerBookingId && !reconciledProviderLr && !reconciledProviderAwb && !reconciledProviderReference) {
           // Delhivery may acknowledge the manifest first and persist the LR/AWB
           // through its callback a few seconds later. Reconcile that callback
           // in this request before exposing a pending booking to the client.
@@ -6176,12 +6288,12 @@ const worker = {
           // visible in Delhivery yet; retaining the payload lets the scheduled
           // reconciler continue polling the same job without creating a
           // duplicate manifest if Delhivery is slow to materialize it.
-          await env.DB.prepare("UPDATE shipments SET provider_booking_id = COALESCE(?, provider_booking_id), provider_sync_status = 'pending', status = 'booked', provider_booking_payload_json = COALESCE(?, provider_booking_payload_json), provider_retry_at = datetime('now', '+1 minute'), provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?")
+          await env.DB.prepare("UPDATE shipments SET provider_booking_id = COALESCE(?, provider_booking_id), provider_sync_status = 'pending', status = 'booked', provider_booking_payload_json = COALESCE(?, provider_booking_payload_json), provider_retry_at = datetime('now', '+1 minute'), provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ? AND lr_number IS NULL AND master_awb IS NULL AND provider_reference IS NULL")
             .bind(providerBookingId, retryPayload ? JSON.stringify(retryPayload) : null, timeoutReason, shipmentId, clientId).run();
           await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, description, created_by_user_id, event_time, created_at) VALUES (?, ?, 'booked', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
             .bind(crypto.randomUUID(), shipmentId, timeoutReason, auth.userId ?? `api:${clientId}`).run();
           const pendingResponse = JSON.stringify({ ok: true, data: { id: shipmentId, client_id: clientId, status: "booked", provider_status: "pending", provider_sync_status: "pending", provider_pending: true, handoff_status: "pending", provider_booking_id: providerBookingId, status_path: fujiyamaClient ? `/v1/fujiyama/shipments/${shipmentId}` : undefined, retry_at: "scheduled", message: "Delhivery accepted the booking, but the LR/AWB is still being published." }, request_id: id });
-          await saveIdempotent(env, key, clientId, "POST /v1/shipments", 202, pendingResponse, requestHash);
+          await saveBookingResponse(202, pendingResponse);
           await audit(env, ctx, auth, id, "shipment.provider_lr_pending", "shipment", shipmentId, { client_id: clientId, provider, provider_booking_id: providerBookingId });
           return new Response(pendingResponse, { status: 202, headers: { ...headers, "content-type": "application/json" } });
         }
@@ -6196,7 +6308,7 @@ const worker = {
         // will persist the label and the status endpoint will expose it later;
         // a label-generation failure must not turn an accepted shipment into
         // a duplicate-prone booking retry.
-        if (fujiyamaClient && (reconciledProviderLr || reconciledProviderAwb || reconciledProviderReference)) {
+        if (fujiyamaClient && !waitForHandoff && (reconciledProviderLr || reconciledProviderAwb || reconciledProviderReference)) {
           const handoffReference = reconciledProviderLr || reconciledProviderAwb || reconciledProviderReference;
           try {
             const lrCopyResult = await safeProviderRequest(env, "delhivery", "lr_copy", {
@@ -6232,7 +6344,7 @@ const worker = {
             const billingFailure = "The LR was received, but the PSS wallet transaction could not be completed safely. Contact support before retrying.";
             await env.DB.prepare("UPDATE shipments SET status = 'exception', provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(completedBilling.error, shipmentId, clientId).run();
             const failedBillingResponse = JSON.stringify({ ok: false, error: { code: "BILLING_FAILED", category: "request", message: billingFailure, user_safe_message: billingFailure, technical_message: completedBilling.error, request_id: id, retryable: false, stale_data: false }, data: { id: shipmentId, client_id: clientId, status: "exception", provider, lr_number: providerLr || null, master_awb: providerAwb || null }, request_id: id });
-            await saveIdempotent(env, key, clientId, "POST /v1/shipments", 409, failedBillingResponse, requestHash);
+            await saveBookingResponse(409, failedBillingResponse);
             await audit(env, ctx, auth, id, "shipment.billing_failed", "shipment", shipmentId, { client_id: clientId, provider, reason: completedBilling.error });
             return new Response(failedBillingResponse, { status: 409, headers: { ...headers, "content-type": "application/json" } });
           }
@@ -6240,13 +6352,13 @@ const worker = {
         // Return only provider-owned references. Delhivery may assign the LR
         // asynchronously, so read persisted courier values after the provider call.
         const bookedShipment = await env.DB.prepare("SELECT tracking_number, lr_number, provider_reference FROM shipments WHERE id = ? AND client_id = ? LIMIT 1").bind(shipmentId, clientId).first<{ tracking_number: string | null; lr_number: string | null; provider_reference: string | null }>();
-        const hasProviderReference = Boolean(bookedShipment?.tracking_number || bookedShipment?.lr_number || reconciledProviderAwb || bookedShipment?.provider_reference);
         const handoff = fujiyamaClient ? await fujiyamaHandoff(env, shipmentId, clientId) : null;
         const handoffReady = !fujiyamaClient || handoff?.handoff_status === "ready";
         const responseStatus = handoffReady ? 201 : 202;
-        const serialized = JSON.stringify({ ok: true, data: { id: shipmentId, client_id: clientId, status: "booked", provider, provider_booking_id: providerBookingId, tracking_number: bookedShipment?.tracking_number ?? null, lr_number: bookedShipment?.lr_number ?? null, master_awb: reconciledProviderAwb || null, provider_reference: bookedShipment?.provider_reference ?? null, handoff_status: handoff?.handoff_status ?? (hasProviderReference ? "pending" : "pending"), documents: handoff?.documents ?? [], status_path: fujiyamaClient ? `/v1/fujiyama/shipments/${shipmentId}` : undefined, pricing_amount: pricingAmount || null, provider_status: providerResult.status, ...(liveServiceabilityProvenance ? { serviceability_provenance: liveServiceabilityProvenance } : {}) }, request_id: id });
-        await saveIdempotent(env, key, clientId, "POST /v1/shipments", responseStatus, serialized, requestHash);
+        const serialized = JSON.stringify({ ok: true, data: { id: shipmentId, client_id: clientId, status: "booked", provider, provider_booking_id: handoff?.provider_booking_id ?? providerBookingId, tracking_number: handoff?.tracking_number ?? bookedShipment?.tracking_number ?? null, lr_number: handoff?.lr_number ?? bookedShipment?.lr_number ?? null, master_awb: handoff?.master_awb ?? (reconciledProviderAwb || null), provider_reference: handoff?.provider_reference ?? bookedShipment?.provider_reference ?? null, handoff_status: handoff?.handoff_status ?? "pending", documents: handoff?.documents ?? [], status_path: handoff?.status_path, pricing_amount: pricingAmount || null, provider_status: providerResult.status, ...(liveServiceabilityProvenance ? { serviceability_provenance: liveServiceabilityProvenance } : {}) }, request_id: id });
+        await saveBookingResponse(responseStatus, serialized);
         await audit(env, ctx, auth, id, handoffReady ? "shipment.created" : "shipment.handoff_pending", "shipment", shipmentId, { client_id: clientId, provider });
+        if (waitForHandoff) return fujiyamaBookingResponse(env, clientId, serialized, responseStatus, headers);
         return new Response(serialized, { status: responseStatus, headers: { ...headers, "content-type": "application/json" } });
       }
 
