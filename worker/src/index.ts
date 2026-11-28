@@ -7040,10 +7040,16 @@ const worker = {
       }
       const documentMatch = route.match(/^\/documents\/([^/]+)$/);
       if (documentMatch && request.method === "GET") {
-        if (!hasScope(auth, "documents.read")) return error("FORBIDDEN", "Document read scope required", 403, id, headers);
         const documentVisibility = hidesClientTestData(auth) ? " AND COALESCE(s.is_test, 0) = 0" : "";
-        const row = await env.DB.prepare(`SELECT d.object_key, d.client_id, d.content_type FROM shipment_documents d LEFT JOIN shipments s ON s.id = d.shipment_id WHERE d.id = ?${documentVisibility} LIMIT 1`).bind(documentMatch[1]).first<{ object_key: string; client_id: string; content_type: string }>();
+        const row = await env.DB.prepare(`SELECT d.object_key, d.client_id, d.content_type, s.provider FROM shipment_documents d LEFT JOIN shipments s ON s.id = d.shipment_id WHERE d.id = ?${documentVisibility} LIMIT 1`).bind(documentMatch[1]).first<{ object_key: string; client_id: string; content_type: string; provider: string | null }>();
         if (!row || !canAccessClient(auth, row.client_id)) return error("NOT_FOUND", "Document not found", 404, id, headers);
+        // Fujiyama's two-key API contract exposes handoff documents through
+        // the tracking key. Keep the exception tenant- and provider-scoped;
+        // every other client still needs the explicit documents.read scope.
+        const fujiyamaTrackingDocument = (row.client_id === FUJIYAMA_FORWARD_CLIENT_ID || row.client_id === FUJIYAMA_REVERSE_CLIENT_ID)
+          && row.provider === "delhivery"
+          && hasScope(auth, "tracking.read");
+        if (!hasScope(auth, "documents.read") && !fujiyamaTrackingDocument) return error("FORBIDDEN", "Document read scope required", 403, id, headers);
         const object = await env.FILES.get(row.object_key); if (!object) return error("NOT_FOUND", "Document not found", 404, id, headers);
         return new Response(object.body, { headers: withCors(request, env, { "content-type": object.httpMetadata?.contentType ?? row.content_type, "cache-control": "private, no-store", "content-disposition": "attachment" }) });
       }
