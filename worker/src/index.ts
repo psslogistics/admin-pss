@@ -4673,6 +4673,17 @@ function delhiveryCallbackAssetAllowed(value: string) {
   } catch { return false; }
 }
 
+function delhiveryCallbackAssetHeaders(value: string, tokenValue: string | null) {
+  const headers: Record<string, string> = { accept: "application/pdf" };
+  try {
+    const host = new URL(value).hostname.toLowerCase();
+    if (host === "delhivery.com" || host.endsWith(".delhivery.com") || host.endsWith(".delhivery.co.in") || host.endsWith(".delhivery.net")) {
+      if (tokenValue) headers.Authorization = `Bearer ${tokenValue}`;
+    }
+  } catch { /* The allow-list check rejects invalid URLs before this is used. */ }
+  return headers;
+}
+
 async function handleDelhiveryLabelWebhook(request: Request, env: Env, requestIdValue: string, headers: HeadersInit) {
   const rawBody = await request.text();
   if (rawBody.length > 1024 * 1024) return error("PAYLOAD_TOO_LARGE", "Label callback payload is too large", 413, requestIdValue, headers);
@@ -4701,7 +4712,7 @@ async function handleDelhiveryLabelWebhook(request: Request, env: Env, requestId
   if (base64) { const bytes = bytesFromBase64(base64); if (bytes && documentSignatureMatches("application/pdf", bytes)) assets.push({ bytes, contentType: "application/pdf" }); }
   for (const url of urls.slice(0, 32)) {
     try {
-      const response = await providerFetch(url, { method: "GET", headers: { accept: "application/pdf", ...(tokenValue ? { Authorization: `Bearer ${tokenValue}` } : {}) } }, 10000);
+      const response = await providerFetch(url, { method: "GET", headers: delhiveryCallbackAssetHeaders(url, tokenValue) }, 10000);
       if (!response.ok) {
         console.warn(JSON.stringify({ event: "delhivery_label_asset_fetch", request_id: requestIdValue, host: new URL(url).hostname, http_status: response.status, accepted: false }));
         continue;
@@ -4723,7 +4734,7 @@ async function handleDelhiveryLabelWebhook(request: Request, env: Env, requestId
           try { labelPayload = JSON.parse(labelBody); } catch { labelPayload = labelBody.trim() || null; }
         } catch { labelPayload = null; }
         for (const url of findProviderUrls(labelPayload, [], 0, "", labelResponse.url).filter(delhiveryCallbackAssetAllowed).slice(0, 32)) {
-          const response = await providerFetch(url, { method: "GET", headers: { accept: "application/pdf", Authorization: `Bearer ${tokenValue}` } }, 10000);
+          const response = await providerFetch(url, { method: "GET", headers: delhiveryCallbackAssetHeaders(url, tokenValue) }, 10000);
           if (!response.ok) continue;
           const bytes = await providerResponseBytes(response, 12 * 1024 * 1024);
           const contentType = providerContentTypeFromBytes(bytes, response.headers.get("content-type") ?? "application/pdf");
