@@ -2223,6 +2223,15 @@ function validDelhiveryPickupReference(value: unknown) {
   return /^\d{6,20}$/.test(reference) ? reference : null;
 }
 
+function delhiveryManifestJobReference(body: unknown, requestedJobId?: unknown, requestId?: string) {
+  const requested = typeof requestedJobId === "string" ? requestedJobId.trim() : "";
+  if (requested) return requested;
+  const explicit = findProviderReference(body, new Set(["job_id", "jobid", "manifest_job_id"]));
+  if (explicit) return explicit;
+  const legacy = findProviderReference(body, new Set(["request_id", "requestid"]));
+  return legacy && legacy !== requestId && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(legacy) ? legacy : null;
+}
+
 function findProviderUrls(value: unknown, result: string[] = [], depth = 0, parentKey = "", baseUrl?: string): string[] {
   if (depth > 8 || value === null || value === undefined) return result;
   if (typeof value === "string") {
@@ -3546,8 +3555,8 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     // Only Delhivery's explicit invalid-job response is strong enough to
     // release an asynchronous booking for a safe retry. Other failures must
     // never clear the job id or risk creating a duplicate shipment.
-    await env.DB.prepare("UPDATE shipments SET provider_booking_id = NULL, provider_sync_status = 'failed', status = CASE WHEN status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery') THEN 'exception' ELSE status END, provider_retry_at = NULL, provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ? AND provider_reference IS NULL AND lr_number IS NULL AND master_awb IS NULL")
-      .bind("Delhivery invalidated the asynchronous booking job; queued for a safe retry", payload.shipment_id, clientId).run();
+    await env.DB.prepare("UPDATE shipments SET provider_booking_id = NULL, provider_sync_status = 'failed', status = CASE WHEN status IN ('booked', 'picked_up', 'in_transit', 'out_for_delivery') THEN 'exception' ELSE status END, provider_retry_at = NULL, provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ? AND provider_booking_id = ? AND provider_reference IS NULL AND lr_number IS NULL AND master_awb IS NULL")
+      .bind("Delhivery invalidated the asynchronous booking job; queued for a safe retry", payload.shipment_id, clientId, String(payload.provider_booking_id ?? "")).run();
   }
   if (provider === "delhivery" && operation === "labels") {
     const bodyObject = parsedProviderBody && typeof parsedProviderBody === "object" ? parsedProviderBody as Record<string, unknown> : null;
@@ -3627,7 +3636,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       .bind(payload.shipment_id, clientId).run();
     const statusLr = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["lrnum", "lr_num", "lr_number", "lr_no", "lrn", "lrn_number", "lr"]))) ?? responseBody.match(/(?:lr(?:n|[_ ]?(?:number|num|no))?)[^A-Za-z0-9]{0,12}(\d{6,20})/i)?.[1] ?? null;
     const statusAwb = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["mwn", "mwn_number", "master_awb", "master_awb_number", "masterawb", "master_waybill", "master_waybill_number", "awb", "awb_number", "waybill", "waybill_number", "waybill_no"]))) ?? responseBody.match(/(?:mwn|master[_ ]?awb|awb|waybill)[^A-Za-z0-9]{0,12}(\d{6,20})/i)?.[1] ?? null;
-    const statusJobId = findProviderReference(parsedProviderBody, new Set(["job_id", "jobid", "manifest_job_id", "request_id", "requestid"])) ?? (String(payload.provider_booking_id ?? "").trim() || null);
+    const statusJobId = delhiveryManifestJobReference(parsedProviderBody, payload.provider_booking_id, requestIdValue);
     if (statusLr || statusAwb) {
       await env.DB.prepare("UPDATE shipments SET lr_number = COALESCE(?, lr_number), master_awb = COALESCE(?, master_awb), box_awbs_json = COALESCE(?, box_awbs_json), provider_sync_status = 'confirmed', status = CASE WHEN status = 'exception' THEN 'booked' ELSE status END, tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(provider_reference, ?), provider_last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(statusLr, statusAwb, statusAwb ? JSON.stringify([statusAwb]) : null, statusLr ?? statusAwb, statusAwb ?? statusLr, payload.shipment_id, clientId).run();
       // A provider-confirmed LR is the billing completion signal whether it
@@ -3638,7 +3647,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       return { enabled: true, status: "accepted" as const, providerStatus: response.status, providerPending: false, providerBookingId: statusJobId, providerReference: statusAwb ?? statusLr, lr_number: statusLr, master_awb: statusAwb };
     }
     const pendingMessage = "Delhivery accepted the booking but has not published the LR/AWB yet.";
-    await env.DB.prepare("UPDATE shipments SET provider_booking_id = COALESCE(?, provider_booking_id), provider_sync_status = 'pending', status = 'booked', provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ? AND provider_reference IS NULL AND lr_number IS NULL AND master_awb IS NULL")
+    await env.DB.prepare("UPDATE shipments SET provider_booking_id = COALESCE(provider_booking_id, ?), provider_sync_status = 'pending', status = 'booked', provider_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ? AND provider_reference IS NULL AND lr_number IS NULL AND master_awb IS NULL")
       .bind(statusJobId, pendingMessage, payload.shipment_id, clientId).run();
     return { enabled: true, status: "accepted" as const, providerStatus: response.status, providerPending: true, providerBookingId: statusJobId, message: pendingMessage };
   }
@@ -3681,7 +3690,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     const initialAwb = delhiveryB2bNumber(findProviderReference(parsedProviderBody, new Set(["mwn", "mwn_number", "master_awb", "master_awb_number", "masterawb", "master_waybill", "master_waybill_number", "awb", "awb_number", "waybill", "waybill_number", "waybill_no"])))
       ?? responseBody.match(/(?:master[_ ]?awb|awb|waybill)[^A-Za-z0-9]{0,12}(\d{6,20})/i)?.[1]
       ?? null;
-    const jobId = findProviderReference(parsedProviderBody, new Set(["job_id", "jobid", "manifest_job_id", "request_id", "requestid"]));
+    const jobId = delhiveryManifestJobReference(parsedProviderBody, undefined, requestIdValue);
     delhiveryManifestJobId = jobId;
     if (!initialLr && !initialAwb && jobId && payload.fujiyama_handoff !== true) {
       // Delhivery's B2B manifest can acknowledge the POST with a job id and
@@ -3735,7 +3744,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
     // Preserve the original manifest job id when the provider's status body
     // contains only the eventual LR/AWB fields. The job id is the correlation
     // key for late reconciliation; it is never itself a shipment reference.
-    const providerBookingId = findProviderReference(parsedProviderBody, new Set(["job_id", "jobid", "manifest_job_id", "request_id", "requestid"])) ?? delhiveryManifestJobId;
+    const providerBookingId = delhiveryManifestJobReference(parsedProviderBody, delhiveryManifestJobId, requestIdValue);
     const createdReference = useDelhiveryB2b ? b2bLrReference ?? b2bAwbReference : findProviderReference(parsedProviderBody, new Set(["waybill", "awb", "tracking_number", "trackingid", "shipment_id"]));
     const providerReference = useDelhiveryB2b ? b2bAwbReference ?? createdReference : createdReference;
     if (useDelhiveryB2b && !createdReference && providerBookingId) {

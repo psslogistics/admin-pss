@@ -7,13 +7,23 @@ import ts from "typescript";
 const source = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
 const functions = source.slice(source.indexOf("async function waitForFujiyamaHandoff("), source.indexOf("async function handleProviderWebhook("));
 const normalizer = source.slice(source.indexOf("async function normalizeFujiyamaBookingPayload("), source.indexOf("async function ensureDefaultClientPricing("));
-const script = ts.transpileModule(`${normalizer}\n${functions}`, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+const references = source.slice(source.indexOf("function findProviderReference("), source.indexOf("function findProviderUrls("));
+const script = ts.transpileModule(`${normalizer}\n${references}\n${functions}`, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
 
 test("provider audit status writes use values permitted by production D1", () => {
   const allowed = new Set(["pending", "succeeded", "failed", "retrying"]);
   const writes = [...source.matchAll(/UPDATE integration_requests SET status = '([^']+)'/g)];
   assert.ok(writes.length > 0);
   for (const [, status] of writes) assert.ok(allowed.has(status), `Invalid integration request status: ${status}`);
+});
+
+test("a status response cannot replace the accepted manifest job with a trace ID", () => {
+  const { context } = setup();
+  const job = "2a3a2757-54f6-40c2-bc89-aa2f82f67669";
+  const trace = "a6174649cedd51de:manifest-status:1795846918781";
+  assert.equal(context.delhiveryManifestJobReference({ request_id: trace, data: { job_id: job } }), job);
+  assert.equal(context.delhiveryManifestJobReference({ request_id: trace }, job, trace), job);
+  assert.equal(context.delhiveryManifestJobReference({ request_id: trace }, undefined, trace), null);
 });
 
 function setup({ publish = true } = {}) {
