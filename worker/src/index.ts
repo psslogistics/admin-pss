@@ -4354,6 +4354,7 @@ async function reconcilePendingDelhiveryReferences(env: Env, cron: string) {
       // safeProviderRequest. Once it exists, remove the original booking
       // retry payload and timer so a confirmed shipment cannot be replayed.
       await env.DB.prepare("UPDATE shipments SET provider_retry_at = NULL, provider_booking_payload_json = NULL, provider_last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ? AND provider_sync_status = 'confirmed' AND COALESCE(lr_number, master_awb, provider_reference, '') <> ''").bind(shipment.id, shipment.client_id).run();
+      await ensureFujiyamaHandoffDocuments(env, shipment.client_id, shipment.id, `cron:${cron}:delhivery-reference:${shipment.id}`);
     } catch (caught) {
       console.error(JSON.stringify({ job: "delhivery_reference_reconciliation", shipment_id: shipment.id, error: caught instanceof Error ? caught.message : "unknown_error" }));
     }
@@ -4814,6 +4815,53 @@ async function persistInlineProviderDocuments(env: Env, clientId: string, shipme
   return stored;
 }
 
+async function ensureFujiyamaHandoffDocuments(env: Env, clientId: string, shipmentId: string, requestIdValue: string) {
+  if (clientId !== FUJIYAMA_FORWARD_CLIENT_ID && clientId !== FUJIYAMA_REVERSE_CLIENT_ID) return false;
+  const shipment = await env.DB.prepare("SELECT lr_number, master_awb, tracking_number, provider_reference, provider_account_id FROM shipments WHERE id = ? AND client_id = ? LIMIT 1")
+    .bind(shipmentId, clientId)
+    .first<{ lr_number: string | null; master_awb: string | null; tracking_number: string | null; provider_reference: string | null; provider_account_id: string | null }>();
+  const reference = String(shipment?.lr_number ?? shipment?.master_awb ?? shipment?.provider_reference ?? shipment?.tracking_number ?? "").trim();
+  if (!reference) return false;
+  const documents = await env.DB.prepare("SELECT original_filename FROM shipment_documents WHERE shipment_id = ? AND client_id = ?")
+    .bind(shipmentId, clientId).all<{ original_filename: string }>();
+  const names = documents.results.map((row) => row.original_filename);
+  if (!names.some((name) => /^delhivery-lr-copy-/i.test(name))) {
+    try {
+      const lrCopyResult = await safeProviderRequest(env, "delhivery", "lr_copy", {
+        shipment_id: shipmentId,
+        tracking_number: reference,
+        lr_number: shipment?.lr_number ?? reference,
+        provider_reference: reference,
+        provider_account_id: shipment?.provider_account_id ?? undefined,
+        lr_copy_type: "SHIPPER COPY",
+      }, `${requestIdValue}:lr-copy`, clientId, `${requestIdValue}:lr-copy`, 8000);
+      await persistInlineProviderDocuments(env, clientId, shipmentId, reference, "lr-copy", lrCopyResult.artifact);
+    } catch (caught) {
+      console.warn(JSON.stringify({ event: "fujiyama_lr_copy_backfill_failed", request_id: requestIdValue, shipment_id: shipmentId, error: caught instanceof Error ? caught.message : "unknown_error" }));
+    }
+  }
+  if (!names.some((name) => /^delhivery-label-/i.test(name))) {
+    try {
+      const labelResult = await safeProviderRequest(env, "delhivery", "labels", {
+        shipment_id: shipmentId,
+        tracking_number: shipment?.lr_number ?? reference,
+        provider_reference: reference,
+        provider_account_id: shipment?.provider_account_id ?? undefined,
+        label_size: "a4",
+        label_api_variant: "pdf",
+        boxes: 1,
+      }, `${requestIdValue}:label`, clientId, `${requestIdValue}:label`, 8000);
+      await persistInlineProviderDocuments(env, clientId, shipmentId, reference, "label", labelResult.artifact);
+    } catch (caught) {
+      console.warn(JSON.stringify({ event: "fujiyama_label_backfill_failed", request_id: requestIdValue, shipment_id: shipmentId, error: caught instanceof Error ? caught.message : "unknown_error" }));
+    }
+  }
+  await env.DB.prepare("UPDATE shipments SET provider_sync_status = 'confirmed', provider_retry_at = NULL, provider_booking_payload_json = NULL, provider_last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ? AND COALESCE(lr_number, master_awb, provider_reference, tracking_number, '') <> ''")
+    .bind(shipmentId, clientId).run();
+  await completeConfirmedShipmentBilling(env, clientId, shipmentId, "fujiyama_handoff_backfill").catch(() => undefined);
+  return true;
+}
+
 async function handleProviderWebhook(request: Request, env: Env, provider: "delhivery" | "ekart" | "trackon", requestIdValue: string, headers: HeadersInit) {
   const rawBody = await request.text();
   if (rawBody.length > 1024 * 1024) return error("PAYLOAD_TOO_LARGE", "Webhook payload is too large", 413, requestIdValue, headers);
@@ -4875,6 +4923,7 @@ async function handleProviderWebhook(request: Request, env: Env, provider: "delh
         // even when we intentionally leave the local status unchanged.
         if (providerLr || providerAwb) {
           await env.DB.prepare("UPDATE shipments SET lr_number = COALESCE(?, lr_number), master_awb = COALESCE(?, master_awb), tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(?, provider_reference), provider_sync_status = 'confirmed', updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(providerLr, providerAwb, providerAwb ?? providerLr, providerAwb ?? providerLr, shipment.id).run();
+           if (provider === "delhivery") await ensureFujiyamaHandoffDocuments(env, shipment.client_id, shipment.id, requestIdValue);
            if (provider === "delhivery") await completeConfirmedShipmentBilling(env, shipment.client_id, shipment.id, "out_of_order_webhook");
           await env.DB.prepare("UPDATE webhook_events SET status = 'processed', processed_at = CURRENT_TIMESTAMP WHERE provider = ? AND event_id = ?").bind(provider, eventId).run();
           return json({ ok: true, accepted: true, matched: true, applied: false, reference_reconciled: true, request_id: requestIdValue }, 202, headers);
@@ -4887,6 +4936,7 @@ async function handleProviderWebhook(request: Request, env: Env, provider: "delh
       }
       const deliveredAt = status.includes("deliver") ? new Date().toISOString() : null;
       await env.DB.prepare("UPDATE shipments SET provider = ?, lr_number = COALESCE(?, lr_number), master_awb = COALESCE(?, master_awb), tracking_number = COALESCE(tracking_number, ?), provider_reference = COALESCE(?, provider_reference), provider_sync_status = CASE WHEN ? IS NOT NULL OR ? IS NOT NULL THEN 'confirmed' ELSE provider_sync_status END, provider_booking_id = COALESCE(provider_booking_id, ?), status = ?, delivered_at = COALESCE(?, delivered_at), updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(provider, providerLr, providerAwb, providerAwb ?? providerLr, providerAwb ?? providerLr ?? null, providerLr, providerAwb, findProviderReference(payload, new Set(["job_id", "jobid", "manifest_job_id", "request_id", "requestid"])), status, deliveredAt, shipment.id).run();
+      if (provider === "delhivery" && (providerLr || providerAwb)) await ensureFujiyamaHandoffDocuments(env, shipment.client_id, shipment.id, requestIdValue);
        if (provider === "delhivery" && (providerLr || providerAwb)) await completeConfirmedShipmentBilling(env, shipment.client_id, shipment.id, "status_webhook");
       await env.DB.prepare("INSERT INTO tracking_events (id, shipment_id, status, location, description, created_by_user_id, event_time, created_at) VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), CURRENT_TIMESTAMP)").bind(crypto.randomUUID(), shipment.id, status, location, description, `webhook:${provider}`, delhiveryDetails?.eventTime ?? null).run();
        if (provider === "delhivery") {
@@ -6571,6 +6621,9 @@ const worker = {
             provider_reference: owner.provider_reference,
             provider_account_id: owner.provider_account_id,
           }, id, owner.client_id, undefined, 10000);
+        }
+        if (owner.provider === "delhivery" && (owner.lr_number || owner.master_awb || owner.provider_reference || owner.tracking_number)) {
+          await ensureFujiyamaHandoffDocuments(env, owner.client_id, shipmentId, id);
         }
         const handoff = await fujiyamaHandoff(env, shipmentId, owner.client_id);
         if (!handoff) return error("NOT_FOUND", "Fujiyama shipment not found", 404, id, headers);
