@@ -6175,8 +6175,8 @@ const worker = {
         }
         const saveBookingResponse = async (status: number, serialized: string) => {
           if (!waitForHandoff) return saveIdempotent(env, key, clientId, "POST /v1/shipments", status, serialized, requestHash);
-          await env.DB.prepare("UPDATE idempotency_keys SET response_status = ?, response_body = ? WHERE idempotency_key = ? AND client_id = ? AND endpoint = 'POST /v1/shipments' AND request_hash = ?")
-            .bind(status, serialized, key, clientId, requestHash).run();
+          await env.DB.prepare("UPDATE idempotency_keys SET response_status = ?, response_body = ? WHERE idempotency_key = ? AND client_id = ? AND endpoint = 'POST /v1/shipments' AND request_hash = ? AND (response_status <> 201 OR ? <> 202)")
+            .bind(status, serialized, key, clientId, requestHash, status).run();
         };
         const requestedProviderAccountId = typeof payload.provider_account_id === "string" && payload.provider_account_id.trim() ? payload.provider_account_id.trim() : null;
         await env.DB.prepare("INSERT INTO shipments (id, order_id, invoice_reference, client_id, created_by_user_id, provider, provider_account_id, client_gst_number, client_pan_number, kyc_version, status, description, origin, destination, origin_address_json, destination_address_json, consignee, total_weight_kg, declared_value, pieces, edd, dimensions_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'booked', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(shipmentId, resolvedOrderId, invoiceReference || null, clientId, auth.userId ?? `api:${clientId}`, provider, requestedProviderAccountId, shipmentGst, shipmentPan, kyc?.kyc_version ?? null, description, origin, destination, JSON.stringify(originAddress), JSON.stringify(destinationAddress), String(destinationAddress.name), weight, declaredValue, pieces, typeof payload.edd === "string" ? payload.edd : null, dimensionsJson).run();
@@ -6257,6 +6257,19 @@ const worker = {
         let reconciledProviderLr = providerLr;
         let reconciledProviderAwb = providerAwb;
         let reconciledProviderReference = providerReference;
+        if (waitForHandoff) {
+          // Persist the accepted shipment before a long wait. A client
+          // disconnect can terminate this request while the courier runs.
+          await saveBookingResponse(202, JSON.stringify({
+            ok: true,
+            data: {
+              id: shipmentId, client_id: clientId, status: "booked", provider,
+              provider_booking_id: providerBookingId, handoff_status: "pending",
+              status_path: `/v1/fujiyama/shipments/${shipmentId}`,
+            },
+            request_id: id,
+          }));
+        }
         const waitedHandoff = waitForHandoff
           ? await waitForFujiyamaHandoff(env, clientId, shipmentId, id, selectedProviderAccountId ?? requestedProviderAccountId, request.signal)
           : null;
