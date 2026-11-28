@@ -3341,7 +3341,10 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
               callback: {
                 // Label generation callbacks are separate from shipment-status
                 // webhooks and are not sent with the status-webhook signature.
-                uri: `https://pss-api.psslogisticsadmin.workers.dev/v1/webhooks/delhivery/labels?token=${encodeURIComponent(labelCallbackToken ?? "")}`,
+                // Delhivery validates callback URIs strictly and rejects
+                // query-string tokens. Authenticate the callback through the
+                // Authorization/header fields below instead.
+                uri: "https://pss-api.psslogisticsadmin.workers.dev/v1/webhooks/delhivery/labels",
                 method: "POST",
                 authorization: `Bearer ${labelCallbackToken ?? ""}`,
                 // Delhivery's async label service expects the callback auth
