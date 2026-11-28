@@ -4702,10 +4702,15 @@ async function handleDelhiveryLabelWebhook(request: Request, env: Env, requestId
   for (const url of urls.slice(0, 32)) {
     try {
       const response = await providerFetch(url, { method: "GET", headers: { accept: "application/pdf", ...(tokenValue ? { Authorization: `Bearer ${tokenValue}` } : {}) } }, 10000);
-      if (!response.ok) continue;
+      if (!response.ok) {
+        console.warn(JSON.stringify({ event: "delhivery_label_asset_fetch", request_id: requestIdValue, host: new URL(url).hostname, http_status: response.status, accepted: false }));
+        continue;
+      }
       const bytes = await providerResponseBytes(response, 12 * 1024 * 1024);
       const contentType = providerContentTypeFromBytes(bytes, response.headers.get("content-type") ?? "application/pdf");
-      if (contentType === "application/pdf" && documentSignatureMatches(contentType, bytes)) assets.push({ bytes, contentType });
+      const accepted = contentType === "application/pdf" && documentSignatureMatches(contentType, bytes);
+      console.warn(JSON.stringify({ event: "delhivery_label_asset_fetch", request_id: requestIdValue, host: new URL(url).hostname, http_status: response.status, declared_content_type: response.headers.get("content-type") ?? null, detected_content_type: contentType, byte_size: bytes.byteLength, accepted }));
+      if (accepted) assets.push({ bytes, contentType });
     } catch { /* Keep processing other provider assets. */ }
   }
   if (!assets.length && effectiveReference && tokenValue) {
