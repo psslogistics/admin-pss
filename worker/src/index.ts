@@ -1817,6 +1817,13 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
   // separate provider values. Never use the account label as the warehouse.
   const pickupLocation = String(payload.delhivery_pickup_location ?? payload.pickup_location ?? "").trim();
   const orderId = String(payload.order_id ?? payload.invoice_reference ?? payload.invoice_number ?? "").trim().slice(0, 80);
+  // Delhivery's live B2B `shipment_details.order_id` field is bounded. Keep
+  // Fujiyama's full order_id in PSS, but send a deterministic provider-only
+  // reference that stays within Delhivery's 25-character limit.
+  const normalizedOrderId = orderId.replace(/[^A-Za-z0-9\/-]/g, "-").replace(/-{2,}/g, "-").replace(/^-|-$/g, "");
+  const providerOrderId = normalizedOrderId.length <= 25
+    ? normalizedOrderId
+    : `${normalizedOrderId.slice(0, 4)}-${normalizedOrderId.slice(-20)}`.slice(0, 25);
   // The API contract already requires a unique order_id. Use it as the
   // provider invoice reference when callers supply the invoice document but
   // omit a separate invoice_number.
@@ -1862,7 +1869,7 @@ function delhiveryB2bManifestPayload(env: Env, payload: Record<string, unknown>)
       email: origin.email,
     },
     shipment_details: [{
-      order_id: orderId,
+      order_id: providerOrderId,
       box_count: pieces,
       description: String(payload.description ?? "Shipment").slice(0, 500),
       weight: Math.max(1, Math.round(weightKg * 1000)),
@@ -1952,7 +1959,7 @@ function delhiveryB2bManifestForm(payload: Record<string, unknown>, invoiceDocum
     const invoices = Array.isArray(payload.invoices) ? payload.invoices as Array<Record<string, unknown>> : [];
     form.append("doc_data", JSON.stringify(documents.map((document, index) => ({
       doc_type: String(document.document_type ?? (payload.document_mode === "delivery_challan" ? "DELIVERY_CHALLAN" : "INVOICE_COPY")),
-      doc_meta: { invoice_num: [String(document.invoice_number ?? invoices[index]?.ident ?? "")] },
+      doc_meta: { invoice_num: [String(invoices[index]?.inv_num ?? document.invoice_number ?? invoices[index]?.ident ?? "")] },
     }))));
     for (const document of documents) {
       const encoded = String(document.body_base64 ?? "").replace(/^data:[^,]+,/, "");

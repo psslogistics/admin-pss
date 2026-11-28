@@ -18,6 +18,7 @@ const checks = [
   ["compact payload resolves city and state from pincode", source.includes("pricingPincode(env, originPincode)") && source.includes("facility_city") && source.includes("facility_state")],
   ["compact payload maps package dimensions", source.includes("packageValue?.dimensions_cm") && source.includes("payload.dimensions = [{ length")],
   ["B2B manifest maps the live Delhivery contract", source.includes("dimensionRecord.width") && source.includes("pickup_location_name: pickupLocation") && source.includes("payment_mode: paymentMode.toLowerCase()") && source.includes("shipment_details: [{") && source.includes("inv_num: providerInvoiceNumber") && source.includes("box_count: pieces")],
+  ["B2B provider order reference is bounded", source.includes("providerOrderId") && source.includes("order_id: providerOrderId") && source.includes("slice(0, 25)")],
   ["Fujiyama B2B manifest is validated before provider submission", source.includes("validateDelhiveryB2bManifestPayload") && source.includes('code: "PROVIDER_PAYLOAD_INVALID"')],
   ["provider validation details are returned safely", source.includes("function providerFieldErrors") && source.includes("field_errors: fieldErrors")],
   ["compact payload maps invoice and eway documents", source.includes("payload.invoice_document ?? payload.invoice") && source.includes("payload.eway_bill")],
