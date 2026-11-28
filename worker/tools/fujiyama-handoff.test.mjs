@@ -6,7 +6,15 @@ import ts from "typescript";
 
 const source = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
 const functions = source.slice(source.indexOf("async function waitForFujiyamaHandoff("), source.indexOf("async function handleProviderWebhook("));
-const script = ts.transpileModule(functions, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+const normalizer = source.slice(source.indexOf("async function normalizeFujiyamaBookingPayload("), source.indexOf("async function ensureDefaultClientPricing("));
+const script = ts.transpileModule(`${normalizer}\n${functions}`, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+
+test("provider audit status writes use values permitted by production D1", () => {
+  const allowed = new Set(["pending", "succeeded", "failed", "retrying"]);
+  const writes = [...source.matchAll(/UPDATE integration_requests SET status = '([^']+)'/g)];
+  assert.ok(writes.length > 0);
+  for (const [, status] of writes) assert.ok(allowed.has(status), `Invalid integration request status: ${status}`);
+});
 
 function setup({ publish = true } = {}) {
   let elapsed = 0;
@@ -26,6 +34,14 @@ function setup({ publish = true } = {}) {
   let labelStarted;
   const context = vm.createContext({
     console: { log: (message) => logs.push(JSON.parse(message)) },
+    FUJIYAMA_FORWARD_CLIENT_ID: "tenant",
+    FUJIYAMA_REVERSE_CLIENT_ID: "reverse-tenant",
+    compactDocument: () => null,
+    pricingPincode: async (_env, pincode) => ({
+      pincode,
+      facility_city: pincode === "110001" ? "Delhi" : "Bengaluru",
+      facility_state: pincode === "110001" ? "Delhi" : "Karnataka",
+    }),
     Date: { now: () => elapsed },
     setTimeout: (callback, delay) => { elapsed += delay; callback(); },
     fujiyamaHandoff: async () => {
@@ -52,6 +68,18 @@ function setup({ publish = true } = {}) {
 
 test("waits through delayed LR/AWB and a later label callback, then includes both PDFs in the booking response", async () => {
   const { context, env, lookups, logs, pdf } = setup();
+  const payload = {
+    order_id: "FUJIYAMA-TEST-ONLY", invoice_number: "TEST-ONLY", description: "Solar equipment",
+    origin: "New Delhi", destination: "Bengaluru", consignee: "TEST ONLY Consignee", payment_mode: "prepaid",
+    origin_address: { name: "TEST ONLY Sender", line: "Building A, Synthetic Pickup Street", pincode: "110001", phone: "9999999999" },
+    destination_address: { name: "TEST ONLY Consignee", line: "Building B, Synthetic Delivery Street", pincode: "560102", phone: "9999999999" },
+    total_weight_kg: 25, pieces: 1, declared_value: 1000, length: 10, width: 10, height: 10, provider: "delhivery",
+  };
+  await context.normalizeFujiyamaBookingPayload(env, "tenant", payload);
+  assert.equal(payload.origin_address.line, "Building A, Synthetic Pickup Street");
+  assert.equal(payload.destination_address.pincode, "560102");
+  assert.equal(payload.destination_address.city, "Bengaluru");
+  assert.equal(payload.lane, "forward");
   const handoff = await context.waitForFujiyamaHandoff(env, "tenant", "shipment", "request", "courier-account", { aborted: false });
   assert.equal(handoff.handoff_status, "ready");
   assert.equal(handoff.lr_number, "123456");

@@ -3322,7 +3322,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
           AND created_at >= datetime('now', '-45 seconds') AND expires_at > CURRENT_TIMESTAMP
       )`).bind(labelCallbackToken, payload.shipment_id, clientId, size, payload.fujiyama_handoff === true ? 1 : 0, payload.shipment_id, clientId, size).run();
     if (!registration.meta?.changes) {
-      await env.DB.prepare("UPDATE integration_requests SET status = 'accepted', updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(integrationId).run();
+      await env.DB.prepare("UPDATE integration_requests SET status = 'succeeded', updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(integrationId).run();
       return { enabled: true, status: "pending" as const };
     }
   }
@@ -3744,7 +3744,7 @@ async function providerRequest(env: Env, provider: CourierProvider, operation: s
       // reconciliation pass before returning a truthful pending response.
       const pending = "Delhivery accepted the booking and returned a provider job ID. LR/AWB is still being confirmed.";
       await env.DB.prepare("UPDATE shipments SET provider_booking_id = COALESCE(?, provider_booking_id), provider_account_id = COALESCE(?, provider_account_id), provider_sync_status = CASE WHEN lr_number IS NULL AND master_awb IS NULL THEN 'pending' ELSE provider_sync_status END, provider_last_error = CASE WHEN lr_number IS NULL AND master_awb IS NULL THEN ? ELSE provider_last_error END, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND client_id = ?").bind(providerBookingId, account?.id ?? null, pending, payload.shipment_id, clientId).run();
-      await env.DB.prepare("UPDATE integration_requests SET status = 'accepted', error_code = NULL, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(pending, integrationId).run();
+      await env.DB.prepare("UPDATE integration_requests SET status = 'succeeded', error_code = NULL, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(pending, integrationId).run();
       return { enabled: true, status: "accepted" as const, providerStatus: response.status, providerPending: true, providerBookingId, provider_account_id: account?.id, message: pending };
     }
     if (useDelhiveryB2b && !createdReference) {
