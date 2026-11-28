@@ -166,6 +166,11 @@ export function calculatePssRate(input: PricingInput): PricingResult {
     if (rule.code === "gst") continue;
     if (rule.condition === "oda_or_opa" && !input.oda && !input.opa) continue;
     if (rule.condition === "rto" && !input.rto) continue;
+    // A minimum-waybill adjustment is only a floor for shipments at or below
+    // the configured minimum chargeable-weight threshold. Once the shipment
+    // is above that threshold, its calculated freight must stand on its own;
+    // otherwise a 31 kg quote can still receive a 20 kg minimum adjustment.
+    if (rule.kind === "minimum" && chargeableWeightKg > (input.minimumWeightKg ?? 20)) continue;
     const basis = context[rule.basis ?? "freight"] ?? 0;
     let amount = rule.kind === "percent" ? basis * rule.value / 100 : rule.kind === "per_kg" ? chargeableWeightKg * rule.value : rule.kind === "minimum" ? Math.max(basis, rule.value) - basis : rule.kind === "maximum" ? Math.min(basis, rule.value) : rule.value;
     if (rule.minimum !== undefined) amount = Math.max(amount, rule.minimum);
