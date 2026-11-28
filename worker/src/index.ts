@@ -4937,9 +4937,18 @@ async function waitForFujiyamaHandoff(env: Env, clientId: string, shipmentId: st
   return handoff;
 }
 
-async function fujiyamaBookingResponse(env: Env, clientId: string, serialized: string, status: number, headers: HeadersInit) {
-  if (status !== 201) return new Response(serialized, { status, headers: { ...headers, "content-type": "application/json" } });
-  const result = JSON.parse(serialized) as { data: { id: string; documents?: Array<{ id: string; name: string; size: number; content_type: string; body_base64?: string }> } };
+async function fujiyamaBookingResponse(env: Env, clientId: string, serialized: string, status: number, headers: HeadersInit, initialRequest = false) {
+  if (status !== 201) {
+    if (initialRequest && status === 202) {
+      const pending = JSON.parse(serialized) as { request_id: string; data: { id: string } };
+      console.log(JSON.stringify({ event: "fujiyama_booking_handoff_response", request_id: pending.request_id, shipment_id: pending.data.id, http_status: status, initial_request: true }));
+    }
+    return new Response(serialized, { status, headers: { ...headers, "content-type": "application/json" } });
+  }
+  const result = JSON.parse(serialized) as {
+    request_id?: string;
+    data: { id: string; lr_number?: string; master_awb?: string; documents?: Array<{ id: string; name: string; size: number; content_type: string; body_base64?: string }> };
+  };
   // D1 stores only the response metadata. Read the two courier PDFs from R2
   // when sending the booking response or replaying its idempotency key.
   let remainingBytes = 16 * 1024 * 1024;
@@ -4958,7 +4967,19 @@ async function fujiyamaBookingResponse(env: Env, clientId: string, serialized: s
       // Keep the original download path usable if object storage is unavailable.
     }
   }
-  return json(result, status, headers);
+  const response = json(result, status, headers);
+  console.log(JSON.stringify({
+    event: "fujiyama_booking_handoff_response",
+    request_id: result.request_id,
+    shipment_id: result.data.id,
+    initial_request: initialRequest,
+    http_status: status,
+    has_lr: Boolean(result.data.lr_number),
+    has_master_awb: Boolean(result.data.master_awb),
+    inline_lr_pdf: (result.data.documents ?? []).some((document) => document.body_base64 && /^delhivery-lr-copy-/i.test(document.name)),
+    inline_label_pdf: (result.data.documents ?? []).some((document) => document.body_base64 && /^delhivery-label-/i.test(document.name)),
+  }));
+  return response;
 }
 
 async function handleProviderWebhook(request: Request, env: Env, provider: "delhivery" | "ekart" | "trackon", requestIdValue: string, headers: HeadersInit) {
@@ -6308,6 +6329,7 @@ const worker = {
           const pendingResponse = JSON.stringify({ ok: true, data: { id: shipmentId, client_id: clientId, status: "booked", provider_status: "pending", provider_sync_status: "pending", provider_pending: true, handoff_status: "pending", provider_booking_id: providerBookingId, status_path: fujiyamaClient ? `/v1/fujiyama/shipments/${shipmentId}` : undefined, retry_at: "scheduled", message: "Delhivery accepted the booking, but the LR/AWB is still being published." }, request_id: id });
           await saveBookingResponse(202, pendingResponse);
           await audit(env, ctx, auth, id, "shipment.provider_lr_pending", "shipment", shipmentId, { client_id: clientId, provider, provider_booking_id: providerBookingId });
+          if (waitForHandoff) return fujiyamaBookingResponse(env, clientId, pendingResponse, 202, headers, true);
           return new Response(pendingResponse, { status: 202, headers: { ...headers, "content-type": "application/json" } });
         }
         if (reconciledProviderLr || reconciledProviderAwb || reconciledProviderReference) {
@@ -6371,7 +6393,7 @@ const worker = {
         const serialized = JSON.stringify({ ok: true, data: { id: shipmentId, client_id: clientId, status: "booked", provider, provider_booking_id: handoff?.provider_booking_id ?? providerBookingId, tracking_number: handoff?.tracking_number ?? bookedShipment?.tracking_number ?? null, lr_number: handoff?.lr_number ?? bookedShipment?.lr_number ?? null, master_awb: handoff?.master_awb ?? (reconciledProviderAwb || null), provider_reference: handoff?.provider_reference ?? bookedShipment?.provider_reference ?? null, handoff_status: handoff?.handoff_status ?? "pending", documents: handoff?.documents ?? [], status_path: handoff?.status_path, pricing_amount: pricingAmount || null, provider_status: providerResult.status, ...(liveServiceabilityProvenance ? { serviceability_provenance: liveServiceabilityProvenance } : {}) }, request_id: id });
         await saveBookingResponse(responseStatus, serialized);
         await audit(env, ctx, auth, id, handoffReady ? "shipment.created" : "shipment.handoff_pending", "shipment", shipmentId, { client_id: clientId, provider });
-        if (waitForHandoff) return fujiyamaBookingResponse(env, clientId, serialized, responseStatus, headers);
+        if (waitForHandoff) return fujiyamaBookingResponse(env, clientId, serialized, responseStatus, headers, true);
         return new Response(serialized, { status: responseStatus, headers: { ...headers, "content-type": "application/json" } });
       }
 

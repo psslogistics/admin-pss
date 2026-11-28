@@ -11,6 +11,7 @@ const script = ts.transpileModule(functions, { compilerOptions: { target: ts.Scr
 function setup({ publish = true } = {}) {
   let elapsed = 0;
   const lookups = [];
+  const logs = [];
   const pdf = Buffer.from("%PDF-1.4\nfixture");
   const documents = ["lr-copy", "label"].map((kind) => ({
     id: kind, name: `delhivery-${kind}-123456.pdf`, content_type: "application/pdf", size: pdf.length,
@@ -24,6 +25,7 @@ function setup({ publish = true } = {}) {
   let references = false;
   let labelStarted;
   const context = vm.createContext({
+    console: { log: (message) => logs.push(JSON.parse(message)) },
     Date: { now: () => elapsed },
     setTimeout: (callback, delay) => { elapsed += delay; callback(); },
     fujiyamaHandoff: async () => {
@@ -45,22 +47,27 @@ function setup({ publish = true } = {}) {
     Response,
   });
   vm.runInContext(script, context);
-  return { context, env, lookups, pdf, elapsed: () => elapsed };
+  return { context, env, lookups, logs, pdf, elapsed: () => elapsed };
 }
 
 test("waits through delayed LR/AWB and a later label callback, then includes both PDFs in the booking response", async () => {
-  const { context, env, lookups, pdf } = setup();
+  const { context, env, lookups, logs, pdf } = setup();
   const handoff = await context.waitForFujiyamaHandoff(env, "tenant", "shipment", "request", "courier-account", { aborted: false });
   assert.equal(handoff.handoff_status, "ready");
   assert.equal(handoff.lr_number, "123456");
   assert.equal(handoff.master_awb, "987654");
   assert.equal(lookups.length, 2);
   assert.ok(lookups.every(({ operation, payload }) => operation === "shipment_status" && payload.provider_booking_id === "manifest-job" && payload.provider_account_id === "courier-account"));
-  const response = await context.fujiyamaBookingResponse(env, "tenant", JSON.stringify({ data: handoff }), 201, {});
+  const response = await context.fujiyamaBookingResponse(env, "tenant", JSON.stringify({ request_id: "request", data: handoff }), 201, {}, true);
   assert.equal(response.status, 201);
   const result = await response.json();
   assert.equal(result.data.documents.length, 2);
   for (const document of result.data.documents) assert.equal(document.body_base64, pdf.toString("base64"));
+  assert.deepEqual(logs, [{
+    event: "fujiyama_booking_handoff_response", request_id: "request", shipment_id: "shipment",
+    initial_request: true, http_status: 201, has_lr: true, has_master_awb: true,
+    inline_lr_pdf: true, inline_label_pdf: true,
+  }]);
 });
 
 test("bounded wait preserves an unpublished shipment as pending", async () => {
